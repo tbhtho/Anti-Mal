@@ -48,7 +48,7 @@ The current milestone is "agent boot": get a benign Windows base image far enoug
 
 The active blockers are:
 
-- Push from loader read to GuestAgent heartbeat. The newest probe now records `winload.efi data read` and `SYSTEM hive data read` as boot milestones. The guest still times out before COM2 GuestAgent hello, with visible Windows Recovery `0xc0000225`, so the next investigation is why the loader/SYSTEM-hive path falls back to recovery instead of entering the installed Windows user-mode service.
+- Push from loader read to GuestAgent heartbeat. The newest probe now records `winload.efi data read` and `SYSTEM hive data read` as boot milestones. It does not read `ntoskrnl.exe`, HAL, CI, SOFTWARE, or boot storage drivers before falling back to the visible Windows Recovery `0xc0000225` screen, so the active blocker is before kernel handoff and before GuestAgent user mode.
 - Keep the Windows boot manager contract visible in diagnostics after BCD and code-integrity policy loads. ACPI PM1/S5 metadata is no longer treated as the immediate blocker: the FADT advertises legacy and extended PM1 blocks, the PM1 control trap preserves byte writes, and only S4/S5 requests stop the VM.
 - Continue interrupt diagnostics while boot repair is pending. Run diagnostics record pending IDE/PIT/RTC latches, IOAPIC redirection entries, PIC vector bases, PIC masks, and whether each interrupt was delivered by IOAPIC, PIC fallback, or failed routing.
 - Apply BCD recovery-policy and `bootstat.dat` cleanup to the disposable run overlay before boot. This is deliberately overlay-only: it can prove whether recovery-loop state is the blocker without mutating `C:\AntiMalRuns\_base\AntiMalBase.vhdx`.
@@ -59,11 +59,12 @@ The active blockers are:
 Latest local probe:
 
 - `ANTIMAL_FIRMWARE_NAME=OVMF-debug.fd`
-- `AntiMal.HostCli.exe detonate bin\x64\Release\AntiMal.Tests.exe --network disabled --timeout-sec 75`
-- Run `9c322a4b-fb67-46b7-af76-9d95b33a6b88`
-- Result: timed out after loader/SYSTEM-hive reads; `sampleExecuted=false`; `guestAgentConnected=false`; 49 real framebuffer frames captured; GuestAgent heartbeat has not started yet.
+- `AntiMal.HostCli.exe detonate bin\x64\Release\AntiMal.Tests.exe --network disabled --timeout-sec 90`
+- Run `22863028-7ecb-45d5-ac78-9c2a3d5e32c8`
+- Result: timed out after loader/SYSTEM-hive reads; `sampleExecuted=false`; `guestAgentConnected=false`; 59 real framebuffer frames captured; GuestAgent heartbeat has not started yet.
 - The run emitted `vm.boot-overlay.patched`: the disposable overlay had default-loader `recoveryenabled=false`, `bootstatuspolicy=IgnoreAllFailures`, and `bootstat.dat` zeroed before the VM started.
 - Disk I/O is now target-aware: `Windows\System32\winload.efi` is at LBA `12643640-12650175` and was read by 26 IDE commands; `Windows\System32\config\SYSTEM` is at LBA `29561144-29581623` and was read by 80 IDE commands.
+- The same probe tracks later handoff files too. `ntoskrnl.exe`, `hal.dll`, `kdcom.dll`, `ci.dll`, SOFTWARE, `acpi.sys`, `pci.sys`, `pciide.sys`, `intelide.sys`, `atapi.sys`, `disk.sys`, `partmgr.sys`, `mountmgr.sys`, `classpnp.sys`, `volmgr*.sys`, `fvevol.sys`, and `Wdf01000.sys` all have known LBA targets but zero read commands in the latest run.
 - Boot milestones include fallback bootloader open, `bootmgfw` load, BCD open, code-integrity policy open, `winload.efi data read`, and `SYSTEM hive data read`. OVMF QemuVideo/GOP initializes at `1280x800x32`; the old 2 GiB VGA BAR resource conflict is fixed.
 - The host now writes boot-file read targets to `vm-diagnostics.txt`, `vm-summary.json`, `events.jsonl`, `report.json`, and the HTML report's dynamic summary. PM1 S0 writes are diagnostics-only, while real S4/S5 requests still stop the host.
 - This shell was not elevated, so the base validator/repair and offline GuestAgent service install could not be run here.

@@ -2159,7 +2159,8 @@ int CommandBaseInspect(int argc, wchar_t **argv,
                   << systemHive->fileRecord << "\n";
         PrintNtfsDataRuns("Windows\\System32\\config\\SYSTEM", *systemHive,
                           windows->firstLba, ntfs.SectorsPerCluster());
-        const auto systemBytes = ntfs.ReadFile(*systemHive, 64ull * 1024ull * 1024ull);
+        const auto systemBytes =
+            ntfs.ReadFile(*systemHive, 64ull * 1024ull * 1024ull);
         if (systemBytes.empty()) {
           std::cout << "SYSTEM hive boot storage summary:\n"
                     << "  unreadable registry hive bytes\n";
@@ -2170,6 +2171,38 @@ int CommandBaseInspect(int argc, wchar_t **argv,
       } else {
         std::cout << "MISSING: Windows\\System32\\config\\SYSTEM\n";
         ok = false;
+      }
+      const char *extraBootFiles[] = {
+          "Windows\\System32\\ntoskrnl.exe",
+          "Windows\\System32\\hal.dll",
+          "Windows\\System32\\kdcom.dll",
+          "Windows\\System32\\ci.dll",
+          "Windows\\System32\\config\\SOFTWARE",
+          "Windows\\System32\\drivers\\acpi.sys",
+          "Windows\\System32\\drivers\\pci.sys",
+          "Windows\\System32\\drivers\\pciide.sys",
+          "Windows\\System32\\drivers\\intelide.sys",
+          "Windows\\System32\\drivers\\atapi.sys",
+          "Windows\\System32\\drivers\\disk.sys",
+          "Windows\\System32\\drivers\\partmgr.sys",
+          "Windows\\System32\\drivers\\mountmgr.sys",
+          "Windows\\System32\\drivers\\classpnp.sys",
+          "Windows\\System32\\drivers\\volmgr.sys",
+          "Windows\\System32\\drivers\\volmgrx.sys",
+          "Windows\\System32\\drivers\\fvevol.sys",
+          "Windows\\System32\\drivers\\Wdf01000.sys",
+      };
+      std::cout << "Optional boot handoff file targets:\n";
+      for (const char *path : extraBootFiles) {
+        const auto entry = ntfs.FindPath(path);
+        if (!entry) {
+          std::cout << "  MISSING(optional): " << path << "\n";
+          continue;
+        }
+        std::cout << "  OK(optional): " << path << " size=" << entry->size
+                  << " fileRecord=" << entry->fileRecord << "\n";
+        PrintNtfsDataRuns(path, *entry, windows->firstLba,
+                          ntfs.SectorsPerCluster());
       }
     }
   }

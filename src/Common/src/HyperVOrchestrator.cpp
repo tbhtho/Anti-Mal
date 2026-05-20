@@ -1005,9 +1005,27 @@ std::vector<BootReadTarget> DiscoverBootReadTargets(hv::IBlockDevice &disk) {
   if (!ntfs.Init()) {
     return targets;
   }
-  const std::array<const char *, 2> paths = {
+  const char *paths[] = {
       "Windows\\System32\\winload.efi",
+      "Windows\\System32\\ntoskrnl.exe",
+      "Windows\\System32\\hal.dll",
+      "Windows\\System32\\kdcom.dll",
+      "Windows\\System32\\ci.dll",
       "Windows\\System32\\config\\SYSTEM",
+      "Windows\\System32\\config\\SOFTWARE",
+      "Windows\\System32\\drivers\\acpi.sys",
+      "Windows\\System32\\drivers\\pci.sys",
+      "Windows\\System32\\drivers\\pciide.sys",
+      "Windows\\System32\\drivers\\intelide.sys",
+      "Windows\\System32\\drivers\\atapi.sys",
+      "Windows\\System32\\drivers\\disk.sys",
+      "Windows\\System32\\drivers\\partmgr.sys",
+      "Windows\\System32\\drivers\\mountmgr.sys",
+      "Windows\\System32\\drivers\\classpnp.sys",
+      "Windows\\System32\\drivers\\volmgr.sys",
+      "Windows\\System32\\drivers\\volmgrx.sys",
+      "Windows\\System32\\drivers\\fvevol.sys",
+      "Windows\\System32\\drivers\\Wdf01000.sys",
   };
   for (const char *path : paths) {
     const auto entry = ntfs.FindPath(path);
@@ -1071,6 +1089,14 @@ std::string FormatBootReadObservations(
   return out.str();
 }
 
+std::string FileNameFromBootPath(const std::string &path) {
+  const auto slash = path.find_last_of("\\/");
+  if (slash == std::string::npos) {
+    return path;
+  }
+  return path.substr(slash + 1);
+}
+
 void AddBootReadMilestones(
     BootSignalSummary *signals,
     const std::vector<BootReadObservation> &observations) {
@@ -1083,8 +1109,18 @@ void AddBootReadMilestones(
     }
     if (ContainsTextNoCase(observation.target.name, "winload.efi")) {
       AddMilestone(signals, "winload.efi data read");
+    } else if (ContainsTextNoCase(observation.target.name, "ntoskrnl.exe")) {
+      AddMilestone(signals, "ntoskrnl.exe data read");
+    } else if (ContainsTextNoCase(observation.target.name, "hal.dll")) {
+      AddMilestone(signals, "HAL data read");
+    } else if (ContainsTextNoCase(observation.target.name, "\\drivers\\")) {
+      AddMilestone(signals,
+                   "boot driver data read: " +
+                       FileNameFromBootPath(observation.target.name));
     } else if (ContainsTextNoCase(observation.target.name, "SYSTEM")) {
       AddMilestone(signals, "SYSTEM hive data read");
+    } else if (ContainsTextNoCase(observation.target.name, "SOFTWARE")) {
+      AddMilestone(signals, "SOFTWARE hive data read");
     }
   }
 }
