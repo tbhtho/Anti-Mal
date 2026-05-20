@@ -158,7 +158,7 @@ powershell -ExecutionPolicy Bypass -File tools\Test-AntiMalBaseBoot.ps1 `
   -RepairBcd
 ```
 
-`-RepairBcd` reruns `bcdboot`, restores `EFI\BOOT\BOOTX64.EFI`, inspects the BCD store, and sets boot recovery policy so the sandbox base does not loop into recovery UI. It does not disable code integrity or signature checks.
+`-RepairBcd` reruns `bcdboot`, restores `EFI\BOOT\BOOTX64.EFI`, pins `{bootmgr}` to the ESP, pins `{default}` `device`/`osdevice`/`path`/`systemroot` to the mounted Windows partition, re-inspects the BCD store, and sets boot recovery policy so the sandbox base does not loop into recovery UI. It does not disable code integrity or signature checks.
 
 To install the current GuestAgent into the base image for heartbeat testing:
 

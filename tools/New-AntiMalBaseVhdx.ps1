@@ -229,7 +229,7 @@ function Resolve-GuestAgentPath {
   return ""
 }
 
-function Test-AntiMalBaseVhdx([string]$VhdxPath) {
+function Test-AntiMalBaseVhdx([string]$VhdxPath, [switch]$RepairBcd) {
   $validator = Join-Path $PSScriptRoot "Test-AntiMalBaseBoot.ps1"
   if (-not (Test-Path -LiteralPath $validator -PathType Leaf)) {
     throw "Base validation script is missing: $validator"
@@ -237,12 +237,16 @@ function Test-AntiMalBaseVhdx([string]$VhdxPath) {
 
   Write-Host "Validating AntiMal base boot files..."
   $agent = Resolve-GuestAgentPath
+  $args = @("-NoProfile", "-ExecutionPolicy", "Bypass", "-File", $validator, "-BaseVhdxPath", $VhdxPath)
+  if ($RepairBcd) {
+    $args += "-RepairBcd"
+  }
   if ($agent) {
-    & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $validator -BaseVhdxPath $VhdxPath -GuestAgentPath $agent
+    $args += @("-GuestAgentPath", $agent)
   } else {
     Write-Warning "AntiMal.GuestAgent.exe was not found; base will validate but will not auto-start the agent."
-    & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $validator -BaseVhdxPath $VhdxPath
   }
+  & powershell.exe @args
   if ($LASTEXITCODE -ne 0) {
     throw "Base boot validation failed with exit code $LASTEXITCODE"
   }
@@ -315,7 +319,7 @@ try {
   }
 }
 
-Test-AntiMalBaseVhdx $OutputVhdxPath
+Test-AntiMalBaseVhdx $OutputVhdxPath -RepairBcd
 
 if ($WriteConfig) {
   Write-AntiMalConfig

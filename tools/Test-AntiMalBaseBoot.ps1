@@ -33,9 +33,23 @@ function Test-BcdStore([string]$BcdPath) {
   if (($output -notmatch "\{default\}") -and ($output -notmatch "winload\.efi")) {
     throw "BCD validation failed: no default Windows loader entry was found."
   }
-  if ($output -notmatch "winload\.efi") {
-    Write-Warning "BCD store did not print winload.efi explicitly; continuing because the loader file exists."
+  if ($output -notmatch "(?im)^\s*path\s+\\Windows\\system32\\winload\.efi\s*$") {
+    throw "BCD validation failed: {default} does not point at \Windows\System32\winload.efi."
   }
+  if ($output -notmatch "(?im)^\s*device\s+partition=") {
+    throw "BCD validation failed: no partition-backed device entry was found."
+  }
+  if ($output -notmatch "(?im)^\s*osdevice\s+partition=") {
+    throw "BCD validation failed: no partition-backed osdevice entry was found."
+  }
+}
+
+function Format-BcdPartitionDevice([string]$Root) {
+  $full = [System.IO.Path]::GetFullPath($Root)
+  if ($full -match "^([A-Za-z]):\\?$") {
+    return "partition=$($Matches[1]):"
+  }
+  throw "BCD partition device can only be set from a drive-letter root; got: $Root"
 }
 
 function Repair-BcdStore([string]$WindowsRoot, [string]$EspRoot) {
@@ -51,10 +65,18 @@ function Repair-BcdStore([string]$WindowsRoot, [string]$EspRoot) {
   }
 
   $bcdPath = Join-Path $EspRoot "EFI\Microsoft\Boot\BCD"
-  Test-BcdStore $bcdPath
+  $espDevice = Format-BcdPartitionDevice $EspRoot
+  $windowsDevice = Format-BcdPartitionDevice $WindowsRoot
+  Test-FilePresent $bcdPath "BCD store"
+  Invoke-Checked "bcdedit.exe" @("/store", $bcdPath, "/set", "{bootmgr}", "device", $espDevice) "Pinning boot manager to ESP partition..."
+  Invoke-Checked "bcdedit.exe" @("/store", $bcdPath, "/set", "{default}", "device", $windowsDevice) "Pinning Windows loader device..."
+  Invoke-Checked "bcdedit.exe" @("/store", $bcdPath, "/set", "{default}", "osdevice", $windowsDevice) "Pinning Windows loader OS device..."
+  Invoke-Checked "bcdedit.exe" @("/store", $bcdPath, "/set", "{default}", "path", "\Windows\System32\winload.efi") "Pinning Windows loader path..."
+  Invoke-Checked "bcdedit.exe" @("/store", $bcdPath, "/set", "{default}", "systemroot", "\Windows") "Pinning Windows system root..."
   Invoke-Checked "bcdedit.exe" @("/store", $bcdPath, "/set", "{default}", "recoveryenabled", "No") "Disabling recovery auto-loop for sandbox base..."
   Invoke-Checked "bcdedit.exe" @("/store", $bcdPath, "/set", "{default}", "bootstatuspolicy", "IgnoreAllFailures") "Setting bootstatuspolicy for sandbox base..."
   Invoke-Checked "bcdedit.exe" @("/store", $bcdPath, "/set", "{bootmgr}", "timeout", "0") "Setting boot manager timeout..."
+  Test-BcdStore $bcdPath
 }
 
 function Get-FreeDriveLetter {
