@@ -684,6 +684,21 @@ public:
   uint64_t MftLcn() const noexcept { return mftLcn_; }
   uint32_t FileRecordBytes() const noexcept { return fileRecordBytes_; }
 
+  std::vector<uint8_t> ReadFile(const Entry &entry, uint64_t maxBytes) {
+    if (entry.directory || entry.dataRuns.empty() || entry.size == 0) {
+      return {};
+    }
+    const uint64_t bytes = std::min<uint64_t>(entry.size, maxBytes);
+    if (bytes > static_cast<uint64_t>(std::numeric_limits<size_t>::max())) {
+      return {};
+    }
+    std::vector<uint8_t> out(static_cast<size_t>(bytes));
+    if (!ReadStreamBytes(entry.dataRuns, 0, out.data(), out.size())) {
+      return {};
+    }
+    return out;
+  }
+
 private:
   struct Attribute {
     uint32_t type = 0;
@@ -1412,6 +1427,295 @@ private:
   const std::vector<uint8_t> &bytes_;
 };
 
+std::optional<uint32_t>
+FindHivePath(const RegistryHiveReader &hive,
+             std::initializer_list<std::string> components) {
+  auto current = hive.RootIndex();
+  if (!current) {
+    return std::nullopt;
+  }
+  for (const auto component : components) {
+    current = hive.FindSubkey(*current, component);
+    if (!current) {
+      return std::nullopt;
+    }
+  }
+  return current;
+}
+
+std::optional<uint32_t> HiveDwordValue(const RegistryHiveReader &hive,
+                                       uint32_t key,
+                                       const std::string &name) {
+  const auto value = hive.FindValue(key, name);
+  if (!value || value->data.size() < 4) {
+    return std::nullopt;
+  }
+  return ReadLe32(value->data.data());
+}
+
+std::string HiveStringValue(const RegistryHiveReader &hive, uint32_t key,
+                            const std::string &name) {
+  const auto value = hive.FindValue(key, name);
+  if (!value || value->data.empty()) {
+    return {};
+  }
+  if (value->type == 1 || value->type == 2) {
+    return Utf16LeAsciiString(value->data);
+  }
+  if (value->type == 4 && value->data.size() >= 4) {
+    return std::to_string(ReadLe32(value->data.data()));
+  }
+  return {};
+}
+
+std::string FormatHiveDword(std::optional<uint32_t> value) {
+  if (!value) {
+    return "(missing)";
+  }
+  return std::to_string(*value);
+}
+
+std::optional<uint32_t>
+SelectOfflineControlSet(const RegistryHiveReader &hive) {
+  const auto select = FindHivePath(hive, {"Select"});
+  if (!select) {
+    return std::nullopt;
+  }
+  const auto current = HiveDwordValue(hive, *select, "Current");
+  const auto def = HiveDwordValue(hive, *select, "Default");
+  if (current && *current != 0) {
+    return *current;
+  }
+  if (def && *def != 0) {
+    return *def;
+  }
+  return 1u;
+}
+
+std::string FormatControlSetName(uint32_t controlSet) {
+  std::ostringstream out;
+  out << "ControlSet" << std::setw(3) << std::setfill('0') << controlSet;
+  return out.str();
+}
+
+struct ServiceBootState {
+  std::string name;
+  bool present = false;
+  std::optional<uint32_t> start;
+  std::optional<uint32_t> type;
+  std::optional<uint32_t> errorControl;
+  std::optional<uint32_t> startOverride0;
+  std::string group;
+  std::string imagePath;
+};
+
+ServiceBootState ReadServiceBootState(const RegistryHiveReader &hive,
+                                      const std::string &controlSet,
+                                      const std::string &service) {
+  ServiceBootState state;
+  state.name = service;
+  const auto serviceKey =
+      FindHivePath(hive, {controlSet, "Services", service});
+  if (!serviceKey) {
+    return state;
+  }
+  state.present = true;
+  state.start = HiveDwordValue(hive, *serviceKey, "Start");
+  state.type = HiveDwordValue(hive, *serviceKey, "Type");
+  state.errorControl = HiveDwordValue(hive, *serviceKey, "ErrorControl");
+  state.group = HiveStringValue(hive, *serviceKey, "Group");
+  state.imagePath = HiveStringValue(hive, *serviceKey, "ImagePath");
+  if (const auto startOverride =
+          hive.FindSubkey(*serviceKey, "StartOverride")) {
+    state.startOverride0 = HiveDwordValue(hive, *startOverride, "0");
+  }
+  return state;
+}
+
+bool IsBootStartReady(const ServiceBootState &state) {
+  return state.present && state.start && *state.start == 0 &&
+         (!state.startOverride0 || *state.startOverride0 == 0);
+}
+
+void PrintServiceBootState(const ServiceBootState &state) {
+  std::cout << "    " << state.name << ": ";
+  if (!state.present) {
+    std::cout << "missing\n";
+    return;
+  }
+  std::cout << "Start=" << FormatHiveDword(state.start)
+            << " Type=" << FormatHiveDword(state.type)
+            << " ErrorControl=" << FormatHiveDword(state.errorControl)
+            << " StartOverride\\0="
+            << FormatHiveDword(state.startOverride0);
+  if (!state.group.empty()) {
+    std::cout << " Group=\"" << state.group << "\"";
+  }
+  if (!state.imagePath.empty()) {
+    std::cout << " ImagePath=\"" << state.imagePath << "\"";
+  }
+  std::cout << " verdict="
+            << (IsBootStartReady(state) ? "boot-start-ready"
+                                        : "not-boot-start")
+            << "\n";
+}
+
+struct CriticalDeviceState {
+  std::string id;
+  bool present = false;
+  std::string service;
+  std::string classGuid;
+};
+
+CriticalDeviceState
+ReadCriticalDeviceState(const RegistryHiveReader &hive,
+                        const std::string &controlSet,
+                        const std::string &deviceId) {
+  CriticalDeviceState state;
+  state.id = deviceId;
+  const auto key = FindHivePath(
+      hive, {controlSet, "Control", "CriticalDeviceDatabase", deviceId});
+  if (!key) {
+    return state;
+  }
+  state.present = true;
+  state.service = HiveStringValue(hive, *key, "Service");
+  state.classGuid = HiveStringValue(hive, *key, "ClassGUID");
+  return state;
+}
+
+void PrintCriticalDeviceState(const CriticalDeviceState &state) {
+  std::cout << "    " << state.id << ": ";
+  if (!state.present) {
+    std::cout << "missing\n";
+    return;
+  }
+  std::cout << "Service=\""
+            << (state.service.empty() ? "(missing)" : state.service)
+            << "\" ClassGUID=\""
+            << (state.classGuid.empty() ? "(missing)" : state.classGuid)
+            << "\"\n";
+}
+
+void PrintRelatedCriticalDeviceDatabaseEntries(const RegistryHiveReader &hive,
+                                               const std::string &controlSet) {
+  const auto cdd =
+      FindHivePath(hive, {controlSet, "Control", "CriticalDeviceDatabase"});
+  if (!cdd) {
+    std::cout << "  Related CriticalDeviceDatabase entries: unavailable\n";
+    return;
+  }
+  std::cout << "  Related CriticalDeviceDatabase entries:\n";
+  size_t printed = 0;
+  for (const auto child : hive.SubkeyIndexes(*cdd)) {
+    const auto key = hive.ReadKey(child);
+    if (!key) {
+      continue;
+    }
+    const auto upper = ToUpperAscii(key->name);
+    const bool relevant =
+        upper.find("VEN_8086") != std::string::npos ||
+        upper.find("CC_0101") != std::string::npos ||
+        upper.find("IDE") != std::string::npos ||
+        upper.find("ATAPI") != std::string::npos;
+    if (!relevant) {
+      continue;
+    }
+    const auto service = HiveStringValue(hive, child, "Service");
+    const auto classGuid = HiveStringValue(hive, child, "ClassGUID");
+    std::cout << "    " << key->name << ": Service=\""
+              << (service.empty() ? "(missing)" : service)
+              << "\" ClassGUID=\""
+              << (classGuid.empty() ? "(missing)" : classGuid) << "\"\n";
+    if (++printed >= 64) {
+      std::cout << "    ... more related entries omitted\n";
+      return;
+    }
+  }
+  if (printed == 0) {
+    std::cout << "    none\n";
+  }
+}
+
+void PrintSystemBootStorageSummary(const std::vector<uint8_t> &systemBytes) {
+  RegistryHiveReader hive(systemBytes);
+  std::cout << "SYSTEM hive boot storage summary:\n";
+  if (!hive.IsValid()) {
+    std::cout << "  unreadable registry hive\n";
+    return;
+  }
+
+  const auto select = FindHivePath(hive, {"Select"});
+  if (select) {
+    std::cout << "  Select: Current="
+              << FormatHiveDword(HiveDwordValue(hive, *select, "Current"))
+              << " Default="
+              << FormatHiveDword(HiveDwordValue(hive, *select, "Default"))
+              << " LastKnownGood="
+              << FormatHiveDword(
+                     HiveDwordValue(hive, *select, "LastKnownGood"))
+              << "\n";
+  } else {
+    std::cout << "  Select: missing\n";
+  }
+
+  const auto selected = SelectOfflineControlSet(hive);
+  if (!selected) {
+    std::cout << "  Boot storage verdict: unknown (no control set)\n";
+    return;
+  }
+  const auto controlSet = FormatControlSetName(*selected);
+  std::cout << "  Using " << controlSet << " for offline boot inspection\n";
+  std::cout << "  Boot-critical storage services:\n";
+
+  std::vector<ServiceBootState> services;
+  for (const auto *name :
+       {"pciide", "intelide", "atapi", "disk", "partmgr", "mountmgr"}) {
+    services.push_back(ReadServiceBootState(hive, controlSet, name));
+    PrintServiceBootState(services.back());
+  }
+
+  std::cout << "  CriticalDeviceDatabase entries for emulated PIIX IDE:\n";
+  std::vector<CriticalDeviceState> criticalDevices;
+  for (const auto *id : {"pci#ven_8086&dev_7111",
+                         "pci#ven_8086&dev_7111&cc_0101",
+                         "pci#ven_8086&dev_7111&cc_01018a",
+                         "pci#cc_0101",
+                         "pci#cc_01018a"}) {
+    criticalDevices.push_back(ReadCriticalDeviceState(hive, controlSet, id));
+    PrintCriticalDeviceState(criticalDevices.back());
+  }
+  PrintRelatedCriticalDeviceDatabaseEntries(hive, controlSet);
+
+  bool storageCoreReady = true;
+  for (const auto &state : services) {
+    if (state.name == "disk" || state.name == "partmgr" ||
+        state.name == "mountmgr") {
+      storageCoreReady = storageCoreReady && IsBootStartReady(state);
+    }
+  }
+  const bool ideServiceReady =
+      std::any_of(services.begin(), services.end(), [](const auto &state) {
+        return (state.name == "pciide" || state.name == "intelide" ||
+                state.name == "atapi") &&
+               IsBootStartReady(state);
+      });
+  const bool piixCriticalReady =
+      std::any_of(criticalDevices.begin(), criticalDevices.end(),
+                  [](const auto &state) {
+                    return state.present && EqualNoCase(state.service, "pciide");
+                  });
+  std::cout << "  Boot storage verdict: "
+            << (storageCoreReady && ideServiceReady && piixCriticalReady
+                    ? "piix-ide-ready"
+                    : "needs-ide-boot-repair")
+            << " storageCore="
+            << (storageCoreReady ? "ready" : "needs-repair")
+            << " ideService=" << (ideServiceReady ? "ready" : "needs-repair")
+            << " criticalDevice="
+            << (piixCriticalReady ? "ready" : "needs-repair") << "\n";
+}
+
 std::optional<uint32_t> BcdObjectType(const RegistryHiveReader &hive,
                                       uint32_t objectKey) {
   const auto description = hive.FindSubkey(objectKey, "Description");
@@ -1855,6 +2159,14 @@ int CommandBaseInspect(int argc, wchar_t **argv,
                   << systemHive->fileRecord << "\n";
         PrintNtfsDataRuns("Windows\\System32\\config\\SYSTEM", *systemHive,
                           windows->firstLba, ntfs.SectorsPerCluster());
+        const auto systemBytes = ntfs.ReadFile(*systemHive, 64ull * 1024ull * 1024ull);
+        if (systemBytes.empty()) {
+          std::cout << "SYSTEM hive boot storage summary:\n"
+                    << "  unreadable registry hive bytes\n";
+          ok = false;
+        } else {
+          PrintSystemBootStorageSummary(systemBytes);
+        }
       } else {
         std::cout << "MISSING: Windows\\System32\\config\\SYSTEM\n";
         ok = false;

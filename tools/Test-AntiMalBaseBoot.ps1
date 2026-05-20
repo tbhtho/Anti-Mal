@@ -134,6 +134,54 @@ function Get-OfflineControlSet([string]$SystemHiveName) {
   return "ControlSet{0:D3}" -f $default
 }
 
+function Repair-BootStorageDrivers([string]$WindowsRoot) {
+  $systemHiveName = "AntiMalBaseSystemStorageRepair"
+  $systemHivePath = Join-Path $WindowsRoot "Windows\System32\Config\SYSTEM"
+  $systemLoaded = $false
+  try {
+    Invoke-Checked "reg.exe" @("load", "HKLM\$systemHiveName", $systemHivePath) "Loading offline SYSTEM hive for boot-storage repair..."
+    $systemLoaded = $true
+    $controlSet = Get-OfflineControlSet $systemHiveName
+
+    foreach ($service in @("pciide", "intelide", "atapi", "disk", "partmgr", "mountmgr")) {
+      $servicePsPath = "HKLM:\$systemHiveName\$controlSet\Services\$service"
+      $serviceRegPath = "HKLM\$systemHiveName\$controlSet\Services\$service"
+      if (-not (Test-Path -LiteralPath $servicePsPath)) {
+        Write-Warning "Boot-storage service is not present in offline hive: $service"
+        continue
+      }
+      Invoke-Checked "reg.exe" @("add", $serviceRegPath, "/v", "Start", "/t", "REG_DWORD", "/d", "0", "/f") "Marking $service as boot-start..."
+      Invoke-Checked "reg.exe" @("add", $serviceRegPath, "/v", "ErrorControl", "/t", "REG_DWORD", "/d", "1", "/f") "Marking $service as normal-error boot service..."
+
+      $startOverridePsPath = Join-Path $servicePsPath "StartOverride"
+      if (Test-Path -LiteralPath $startOverridePsPath) {
+        $startOverrideRegPath = "$serviceRegPath\StartOverride"
+        Invoke-Checked "reg.exe" @("add", $startOverrideRegPath, "/v", "0", "/t", "REG_DWORD", "/d", "0", "/f") "Clearing $service StartOverride\0..."
+      }
+    }
+
+    $criticalRoot = "HKLM\$systemHiveName\$controlSet\Control\CriticalDeviceDatabase"
+    $piixIdeIds = @(
+      "pci#ven_8086&dev_7111",
+      "pci#ven_8086&dev_7111&cc_0101",
+      "pci#ven_8086&dev_7111&cc_01018a",
+      "pci#cc_0101",
+      "pci#cc_01018a"
+    )
+    foreach ($id in $piixIdeIds) {
+      $key = "$criticalRoot\$id"
+      Invoke-Checked "reg.exe" @("add", $key, "/v", "Service", "/t", "REG_SZ", "/d", "pciide", "/f") "Adding CriticalDeviceDatabase mapping for $id..."
+      Invoke-Checked "reg.exe" @("add", $key, "/v", "ClassGUID", "/t", "REG_SZ", "/d", "{4D36E96A-E325-11CE-BFC1-08002BE10318}", "/f") "Adding CriticalDeviceDatabase class for $id..."
+    }
+  } finally {
+    if ($systemLoaded) {
+      & reg.exe unload "HKLM\$systemHiveName" | Out-Null
+    }
+  }
+
+  Write-Host "OK: repaired offline boot-storage services for the emulated PIIX IDE controller."
+}
+
 function Install-GuestAgent([string]$WindowsRoot, [string]$AgentPath) {
   if (-not $AgentPath) {
     return
@@ -263,6 +311,7 @@ try {
     } else {
       Repair-BcdStore $windows.Root $esp.Root
     }
+    Repair-BootStorageDrivers $windows.Root
   }
 
   Install-GuestAgent $windows.Root $GuestAgentPath

@@ -52,6 +52,7 @@ The active blockers are:
 - Keep the Windows boot manager contract visible in diagnostics after BCD and code-integrity policy loads. ACPI PM1/S5 metadata is no longer treated as the immediate blocker: the FADT advertises legacy and extended PM1 blocks, the PM1 control trap preserves byte writes, and only S4/S5 requests stop the VM.
 - Continue interrupt diagnostics while boot repair is pending. Run diagnostics record pending IDE/PIT/RTC latches, IOAPIC redirection entries, PIC vector bases, PIC masks, and whether each interrupt was delivered by IOAPIC, PIC fallback, or failed routing.
 - Apply BCD recovery-policy and `bootstat.dat` cleanup to the disposable run overlay before boot. This is deliberately overlay-only: it can prove whether recovery-loop state is the blocker without mutating `C:\AntiMalRuns\_base\AntiMalBase.vhdx`.
+- Repair the offline SYSTEM hive's boot device binding for the emulated PIIX IDE controller. The non-admin base inspector now shows `pciide`, `intelide`, `atapi`, `disk`, `partmgr`, and `mountmgr` are already boot-start, but `CriticalDeviceDatabase` has no mapping for `pci#ven_8086&dev_7111` or the generic `pci#cc_0101` / `pci#cc_01018a` IDE class IDs. The elevated repair path now adds those mappings to `pciide`.
 - Install GuestAgent into the base image and auto-start it from the offline SYSTEM hive service entry. The older HKLM Run autostart remains as a fallback.
 - Decode COM2 GuestAgent frames in the host report path, send a benign `healthcheck` job, and return `agent-health.json` once the guest service reaches user mode.
 
@@ -75,6 +76,7 @@ Latest base image inspection:
 - ESP boot files are present: `EFI\BOOT\BOOTX64.EFI`, `EFI\Microsoft\Boot\bootmgfw.efi`, `EFI\Microsoft\Boot\BCD`, and `EFI\Microsoft\Boot\Fonts\wgl4_boot.ttf`.
 - The internal BCD hive decoder verifies `{bootmgr}` on the ESP and the default Windows loader on the Windows/basic-data partition. `winload.efi`, `\Windows`, `device`, and `osdevice` all decode coherently. The base loader does not currently carry explicit `recoveryenabled` or `bootstatuspolicy` elements; the current run path patches those policy elements in the disposable overlay while leaving the base VHDX unchanged. Non-admin `bcdedit /store` still returns access denied against the dumped hive, but AntiMal can now inspect and patch the needed boot contract itself.
 - The internal NTFS reader verifies `Windows\System32\winload.efi` (`3344880` bytes) and `Windows\System32\config\SYSTEM` (`10485760` bytes) directly from the Windows partition without mounting the VHDX.
+- The internal SYSTEM hive decoder now inspects the offline boot storage contract. Current evidence: `pciide`, `intelide`, `atapi`, `disk`, `partmgr`, and `mountmgr` are all boot-start-ready, but the hive is missing CriticalDeviceDatabase bindings for the emulated Intel PIIX IDE controller (`pci#ven_8086&dev_7111`) and generic PCI IDE class IDs. This is the sharpest current suspect for the visible Windows Recovery `0xc0000225` after `winload.efi`/SYSTEM reads.
 
 ## Safety Model
 
@@ -180,7 +182,7 @@ powershell -ExecutionPolicy Bypass -File tools\Test-AntiMalBaseBoot.ps1 `
   -RepairBcd
 ```
 
-`-RepairBcd` reruns `bcdboot`, restores `EFI\BOOT\BOOTX64.EFI`, pins `{bootmgr}` to the ESP, pins `{default}` `device`/`osdevice`/`path`/`systemroot` to the mounted Windows partition, re-inspects the BCD store, and sets boot recovery policy so the sandbox base does not loop into recovery UI. It does not disable code integrity or signature checks.
+`-RepairBcd` reruns `bcdboot`, restores `EFI\BOOT\BOOTX64.EFI`, pins `{bootmgr}` to the ESP, pins `{default}` `device`/`osdevice`/`path`/`systemroot` to the mounted Windows partition, re-inspects the BCD store, sets boot recovery policy so the sandbox base does not loop into recovery UI, marks boot storage services as boot-start, and adds CriticalDeviceDatabase mappings for the emulated PIIX IDE controller to `pciide`. It does not disable code integrity or signature checks.
 
 To install the current GuestAgent into the base image for heartbeat testing:
 
@@ -192,7 +194,7 @@ powershell -ExecutionPolicy Bypass -File tools\Test-AntiMalBaseBoot.ps1 `
 
 This copies the agent to `C:\AntiMal\AntiMal.GuestAgent.exe`, adds an automatic `AntiMalGuestAgent` service in the offline SYSTEM hive, and leaves a Run-key fallback for interactive logon scenarios.
 
-You can also inspect the base VHDX without administrator privileges. This path does not repair anything; it reads the VHDX through AntiMal's block device layer, parses GPT, parses the FAT32 ESP, checks the UEFI boot files, decodes the BCD registry hive, verifies the boot manager/default loader contract, parses the NTFS Windows partition, prints NTFS data-run/LBA ranges for boot files, verifies `winload.efi`, and can dump the BCD hive for offline inspection:
+You can also inspect the base VHDX without administrator privileges. This path does not repair anything; it reads the VHDX through AntiMal's block device layer, parses GPT, parses the FAT32 ESP, checks the UEFI boot files, decodes the BCD registry hive, verifies the boot manager/default loader contract, parses the NTFS Windows partition, prints NTFS data-run/LBA ranges for boot files, verifies `winload.efi`, decodes SYSTEM hive boot-storage service state, and can dump the BCD hive for offline inspection:
 
 ```powershell
 bin\x64\Release\AntiMal.HostCli.exe base inspect `
