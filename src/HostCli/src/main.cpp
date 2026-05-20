@@ -1111,6 +1111,12 @@ std::string BcdElementName(const std::string &id) {
   if (upper == "14000006") {
     return "inherit";
   }
+  if (upper == "16000009") {
+    return "recoveryenabled";
+  }
+  if (upper == "16000060") {
+    return "isolatedcontext";
+  }
   if (upper == "22000002") {
     return "systemroot";
   }
@@ -1128,6 +1134,15 @@ std::string BcdElementName(const std::string &id) {
   }
   if (upper == "25000004") {
     return "timeout";
+  }
+  if (upper == "25000020") {
+    return "nx";
+  }
+  if (upper == "250000C2") {
+    return "bootmenupolicy";
+  }
+  if (upper == "250000E0") {
+    return "bootstatuspolicy";
   }
   return upper;
 }
@@ -1468,8 +1483,31 @@ std::string BcdElementDescription(const std::string &id,
     return value.data[0] != 0 ? "true" : "false";
   }
   if (value.type == 3 && value.data.size() == 8) {
+    const uint64_t raw = ReadLe64(value.data.data());
+    if (ToUpperAscii(id) == "250000E0") {
+      switch (raw) {
+      case 0:
+        return "DisplayAllFailures";
+      case 1:
+        return "IgnoreAllFailures";
+      case 2:
+        return "IgnoreShutdownFailures";
+      case 3:
+        return "IgnoreBootFailures";
+      case 4:
+        return "IgnoreCheckpointFailures";
+      case 5:
+        return "DisplayShutdownFailures";
+      case 6:
+        return "DisplayBootFailures";
+      case 7:
+        return "DisplayCheckpointFailures";
+      default:
+        break;
+      }
+    }
     std::ostringstream out;
-    out << ReadLe64(value.data.data());
+    out << raw;
     return out.str();
   }
   std::ostringstream out;
@@ -1556,7 +1594,8 @@ void PrintBcdDecodedSummary(const std::vector<uint8_t> &bcdBytes,
   if (defaultObject) {
     PrintBcdObjectLine(hive, *defaultObject, defaultGuid, partitions,
                        {"11000001", "21000001", "12000002", "22000002",
-                        "12000004", "23000003"});
+                        "12000004", "23000003", "16000009", "250000E0",
+                        "16000060", "25000020", "250000C2"});
   } else if (!defaultGuid.empty()) {
     std::cout << "  MISSING default loader object " << defaultGuid << "\n";
   } else {

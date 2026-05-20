@@ -57,13 +57,14 @@ The active blockers are:
 Latest local probe:
 
 - `ANTIMAL_FIRMWARE_NAME=OVMF-debug.fd`
-- `AntiMal.HostCli.exe detonate bin\x64\Release\AntiMal.Tests.exe --network disabled --timeout-sec 75`
-- Run `cbcabd11-5cf8-4d3f-9c95-591faa484c59`
+- `AntiMal.HostCli.exe detonate bin\x64\Release\AntiMal.Tests.exe --network disabled --timeout-sec 180`
+- Run `d24bf895-2f9b-40ce-aa95-7f251aa2af0b`
 - Result: timed out before `winload`; `sampleExecuted=false`; `guestAgentConnected=false`; real framebuffer frames captured; guest screen shows Windows Recovery `0xc0000225`.
 - Disk I/O is real: `ideCommandsIssued=530`, `ideReadCommands=515`, `ideSectorsRead=60017`, `ideWriteCommands=5`, and `ideSectorsWritten=38`.
-- Interrupt routing is still blocked: `ideInterruptsRequested=40670`, `ideInterruptsInjected=0`, `ideInterruptsFailed=40670`, `irqIoApicDeliveries=0`, `irqPicFallbackDeliveries=0`, and `irqDeliveryFailures=2680187`.
+- Interrupt routing is still blocked: `ideInterruptsRequested=25202`, `ideInterruptsInjected=0`, `ideInterruptsFailed=25202`, `irqIoApicDeliveries=0`, `irqPicFallbackDeliveries=0`, and `irqDeliveryFailures=4901892`.
 - Legacy interrupt state is now explicit: IRQ0, IRQ3, IRQ4, IRQ8, IRQ14, and IRQ15 IOAPIC entries are masked; master/slave PIC vector bases are `0x00`; master/slave PIC masks are `0xff`.
 - Boot milestones include fallback bootloader open, `bootmgfw` load, BCD open, and code-integrity policy open. OVMF QemuVideo/GOP now initializes at `1280x800x32`; the old 2 GiB VGA BAR resource conflict is fixed.
+- Serial log now shows Windows Boot Manager opening `bootstat.dat`, `BOOT\Recovery`, BCD, CI policy files, and boot fonts before displaying Recovery and issuing `ResetSystem2: Shutdown`. The host keeps that visible because PM1 writes `0x2001` as non-stopping S0.
 - This shell was not elevated, so the base validator/repair and offline GuestAgent service install could not be run here.
 
 Latest base image inspection:
@@ -72,7 +73,7 @@ Latest base image inspection:
 - Result: passed without elevation.
 - GPT layout is readable through the in-house VHDX block device: MSR, EFI System Partition, and Windows/basic-data partition.
 - ESP boot files are present: `EFI\BOOT\BOOTX64.EFI`, `EFI\Microsoft\Boot\bootmgfw.efi`, `EFI\Microsoft\Boot\BCD`, and `EFI\Microsoft\Boot\Fonts\wgl4_boot.ttf`.
-- The internal BCD hive decoder verifies `{bootmgr}` on the ESP and the default Windows loader on the Windows/basic-data partition. `winload.efi`, `\Windows`, `device`, and `osdevice` all decode coherently. Non-admin `bcdedit /store` still returns access denied against the dumped hive, but AntiMal can now inspect this boot contract itself.
+- The internal BCD hive decoder verifies `{bootmgr}` on the ESP and the default Windows loader on the Windows/basic-data partition. `winload.efi`, `\Windows`, `device`, and `osdevice` all decode coherently. The default loader does not currently carry explicit `recoveryenabled` or `bootstatuspolicy` elements, which keeps the elevated repair path relevant because `bootstatuspolicy IgnoreAllFailures` is the next likely recovery-loop bypass to prove. Non-admin `bcdedit /store` still returns access denied against the dumped hive, but AntiMal can now inspect this boot contract itself.
 - The internal NTFS reader verifies `Windows\System32\winload.efi` (`3344880` bytes) and `Windows\System32\config\SYSTEM` (`10485760` bytes) directly from the Windows partition without mounting the VHDX.
 
 ## Safety Model
