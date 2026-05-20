@@ -66,6 +66,14 @@ Latest local probe:
 - Boot milestones include fallback bootloader open, `bootmgfw` load, BCD open, and code-integrity policy open. OVMF QemuVideo/GOP now initializes at `1280x800x32`; the old 2 GiB VGA BAR resource conflict is fixed.
 - This shell was not elevated, so the base validator/repair and offline GuestAgent service install could not be run here.
 
+Latest base image inspection:
+
+- `AntiMal.HostCli.exe base inspect --vhdx C:\AntiMalRuns\_base\AntiMalBase.vhdx`
+- Result: passed without elevation.
+- GPT layout is readable through the in-house VHDX block device: MSR, EFI System Partition, and Windows/basic-data partition.
+- ESP boot files are present: `EFI\BOOT\BOOTX64.EFI`, `EFI\Microsoft\Boot\bootmgfw.efi`, `EFI\Microsoft\Boot\BCD`, and `EFI\Microsoft\Boot\Fonts\wgl4_boot.ttf`.
+- Extracted BCD bytes contain `winload.efi` and `\Windows` hints. Non-admin `bcdedit /store` still returns access denied against the dumped hive, so exact BCD element decoding still needs the elevated validator/repair path or a future internal BCD hive parser.
+
 ## Safety Model
 
 AntiMal is meant for malware analysis, so safety beats speed.
@@ -169,6 +177,14 @@ powershell -ExecutionPolicy Bypass -File tools\Test-AntiMalBaseBoot.ps1 `
 ```
 
 This copies the agent to `C:\AntiMal\AntiMal.GuestAgent.exe`, adds an automatic `AntiMalGuestAgent` service in the offline SYSTEM hive, and leaves a Run-key fallback for interactive logon scenarios.
+
+You can also inspect the base VHDX without administrator privileges. This path does not repair anything; it reads the VHDX through AntiMal's block device layer, parses GPT and the FAT32 ESP, checks the UEFI boot files, and can dump the BCD hive for offline inspection:
+
+```powershell
+bin\x64\Release\AntiMal.HostCli.exe base inspect `
+  --vhdx C:\AntiMalRuns\_base\AntiMalBase.vhdx `
+  --dump-bcd C:\AntiMalRuns\_base\AntiMalBase-esp.bcd
+```
 
 ## Repository Layout
 
