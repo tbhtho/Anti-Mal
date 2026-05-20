@@ -90,6 +90,25 @@ struct VmRunSummary {
   int timerInterruptsInjected = 0;
   int ideInterruptsRequested = 0;
   int ideInterruptsInjected = 0;
+  int ideInterruptsFailed = 0;
+  int ideInterruptsIoApic = 0;
+  int ideInterruptsPicFallback = 0;
+  int ideInterruptsPending = 0;
+  int pitInterruptsFailed = 0;
+  int pitInterruptsIoApic = 0;
+  int pitInterruptsPicFallback = 0;
+  int pitInterruptsPending = 0;
+  int rtcInterruptsFailed = 0;
+  int rtcInterruptsIoApic = 0;
+  int rtcInterruptsPicFallback = 0;
+  int rtcInterruptsPending = 0;
+  int irqIoApicDeliveries = 0;
+  int irqPicFallbackDeliveries = 0;
+  int irqDeliveryFailures = 0;
+  uint8_t masterPicVectorBase = 0;
+  uint8_t slavePicVectorBase = 0;
+  uint8_t masterPicMask = 0xFF;
+  uint8_t slavePicMask = 0xFF;
   int watchdogCancellations = 0;
   int unhandledIo = 0;
   int unhandledMmio = 0;
@@ -175,6 +194,7 @@ struct VmRunSummary {
   // so the host-side diagnostics writer doesn't need to keep the live VM
   // alive to render it.
   std::vector<PcIoDevices::CmosAccess> recentCmosAccesses;
+  std::vector<std::string> legacyIrqDiagnostics;
   std::string serialOutput;
   std::string hostChannelOutput;
   uint32_t ideCommandsIssued = 0;

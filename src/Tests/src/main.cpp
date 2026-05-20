@@ -811,6 +811,9 @@ void TestPcIoPicVectorBaseTracking() {
   pic.OnWrite(0x21, 0xFE, 1);
   Expect(pic.MasterPicVectorBase() == 0x20,
          "PIC: post-init data write does not overwrite vector base");
+  Expect(pic.MasterPicMask() == 0xFE, "PIC: master mask remembered");
+  pic.OnWrite(0xA1, 0xFD, 1);
+  Expect(pic.SlavePicMask() == 0xFD, "PIC: slave mask remembered");
 }
 
 void TestIoApicProgramRedirection() {
@@ -857,6 +860,40 @@ void TestIoApicProgramRedirection() {
   ioApic.IndirectWrite(lowIndex, 0x00010076u); // bit 16 = mask
   Expect(!ioApic.RaiseIrq(14), "IOAPIC: re-masked entry stops delivering");
   Expect(capture.calls == 1, "IOAPIC: deliver not called on masked raise");
+}
+
+void TestIdeInterruptRetriedUntilDelivered() {
+  struct Capture {
+    int calls = 0;
+  } capture;
+  auto deliver = +[](void *context, uint32_t, uint8_t) -> bool {
+    auto *c = static_cast<Capture *>(context);
+    ++c->calls;
+    return true;
+  };
+
+  antimal::hv::MemoryBlockDevice disk(8);
+  antimal::hv::IdeController ide(&disk);
+  antimal::hv::IoApic ioApic;
+  ioApic.SetDeliveryCallback(deliver, &capture);
+
+  ide.OnWrite(antimal::hv::IdeController::kPrimaryBase + 7, 0xEC, 1);
+  Expect(ide.InterruptPending(),
+         "IDE IRQ retry: IDENTIFY leaves interrupt pending");
+  Expect(!ioApic.RaiseIrq(ide.IrqLine()),
+         "IDE IRQ retry: masked IOAPIC delivery fails");
+  Expect(ide.InterruptPending(),
+         "IDE IRQ retry: failed delivery keeps interrupt pending");
+
+  const uint8_t lowIndex = 0x10 + ide.IrqLine() * 2;
+  ioApic.IndirectWrite(lowIndex, 0x00000076u);
+  ioApic.IndirectWrite(static_cast<uint8_t>(lowIndex + 1), 0x00000000u);
+  if (ioApic.RaiseIrq(ide.IrqLine())) {
+    (void)ide.ConsumeInterrupt();
+  }
+  Expect(capture.calls == 1, "IDE IRQ retry: unmasked delivery called once");
+  Expect(!ide.InterruptPending(),
+         "IDE IRQ retry: successful delivery consumes interrupt");
 }
 
 void TestMmioBusRouting() {
@@ -1964,8 +2001,19 @@ void TestReportRoundtripAndFramePaths() {
   report.scannerVerdict.tags.push_back({"loader", "capability", 60, {"test"}});
   report.dynamicSummary.started = true;
   report.dynamicSummary.status = "boot attempted";
+  report.dynamicSummary.ideInterruptsRequested = 7;
+  report.dynamicSummary.ideInterruptsInjected = 3;
+  report.dynamicSummary.ideInterruptsFailed = 4;
+  report.dynamicSummary.ideInterruptsPending = 1;
+  report.dynamicSummary.irqPicFallbackDeliveries = 3;
+  report.dynamicSummary.masterPicVectorBase = 0x20;
+  report.dynamicSummary.slavePicVectorBase = 0x28;
+  report.dynamicSummary.masterPicMask = 0xFE;
+  report.dynamicSummary.slavePicMask = 0xFD;
   report.dynamicSummary.bootMilestones.push_back("bootmgfw loaded");
   report.dynamicSummary.bootMilestones.push_back("BCD opened");
+  report.dynamicSummary.interruptDiagnostics.push_back(
+      "irq14: ioapicMasked=true picBase=0x28");
   report.artifacts.push_back(std::filesystem::path("artifacts") / "agent-health.json");
   antimal::EventRecord ev;
   ev.timestampUtc = "2026-05-18T12:00:00Z";
@@ -1990,6 +2038,10 @@ void TestReportRoundtripAndFramePaths() {
          "report load: event details preserved");
   Expect(loaded.dynamicSummary.bootMilestones.size() == 2,
          "report load: boot milestones preserved");
+  Expect(loaded.dynamicSummary.ideInterruptsRequested == 7,
+         "report load: IDE IRQ counters preserved");
+  Expect(loaded.dynamicSummary.interruptDiagnostics.size() == 1,
+         "report load: interrupt diagnostics preserved");
   Expect(loaded.artifacts.size() == 1, "report load: artifacts preserved");
   Expect(loaded.networkDomains.size() == 1, "report load: network preserved");
   Expect(loaded.errors.size() == 1, "report load: errors preserved");
@@ -2280,6 +2332,7 @@ int main() {
     TestIdeAssertsInterrupt();
     TestPcIoPicVectorBaseTracking();
     TestIoApicProgramRedirection();
+    TestIdeInterruptRetriedUntilDelivered();
     TestMmioBusRouting();
     TestPeParser();
     TestBrowserRisk();

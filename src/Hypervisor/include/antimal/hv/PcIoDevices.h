@@ -146,6 +146,8 @@ public:
   // has registered its own handlers.
   uint8_t MasterPicVectorBase() const noexcept { return masterPicVectorBase_; }
   uint8_t SlavePicVectorBase() const noexcept { return slavePicVectorBase_; }
+  uint8_t MasterPicMask() const noexcept { return masterPicMask_; }
+  uint8_t SlavePicMask() const noexcept { return slavePicMask_; }
 
 private:
   void WritePicCommand(bool master, uint8_t value);

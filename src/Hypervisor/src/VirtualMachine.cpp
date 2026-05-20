@@ -8,6 +8,7 @@
 #include <chrono>
 #include <cctype>
 #include <cstring>
+#include <sstream>
 #include <stop_token>
 #include <string_view>
 #include <thread>
@@ -31,6 +32,12 @@ constexpr uint64_t kMmioGapStart = 0xFEC00000ull;
 constexpr uint64_t kMmioGapEnd = 0xFEF00000ull;
 constexpr uint64_t kImageSearchBackBytes = 256ull * 1024ull * 1024ull;
 
+enum class IrqDeliveryBackend {
+  Failed,
+  IoApic,
+  PicFallback,
+};
+
 uint16_t ReadLe16(const uint8_t *p) {
   return static_cast<uint16_t>(p[0] | (static_cast<uint16_t>(p[1]) << 8));
 }
@@ -44,6 +51,28 @@ uint32_t ReadLe32(const uint8_t *p) {
 
 bool IsPrintablePathChar(uint8_t c) {
   return c >= 0x20 && c < 0x7Fu;
+}
+
+std::string FormatLegacyIrqState(const IoApic &ioApic,
+                                 const PcIoDevices &pcIo, uint8_t irq) {
+  const uint64_t entry = ioApic.RedirectionEntry(irq);
+  const bool masked = (entry & (1ull << 16)) != 0;
+  const uint8_t vector = static_cast<uint8_t>(entry & 0xFFu);
+  const uint8_t picBase =
+      irq < 8 ? pcIo.MasterPicVectorBase() : pcIo.SlavePicVectorBase();
+  const uint8_t picMask = irq < 8 ? pcIo.MasterPicMask() : pcIo.SlavePicMask();
+  const bool picMasked = (picMask & (1u << (irq < 8 ? irq : irq - 8))) != 0;
+  std::ostringstream out;
+  out << "irq" << static_cast<int>(irq) << ": ioapicEntry=0x" << std::hex
+      << std::uppercase << entry << std::dec
+      << " ioapicMasked=" << (masked ? "true" : "false")
+      << " ioapicVector=0x" << std::hex << std::uppercase
+      << static_cast<int>(vector) << std::dec
+      << " picBase=0x" << std::hex << std::uppercase
+      << static_cast<int>(picBase) << " picMask=0x"
+      << static_cast<int>(picMask) << std::dec
+      << " picMasked=" << (picMasked ? "true" : "false");
+  return out.str();
 }
 
 std::string ExtractCodeViewPath(const uint8_t *bytes, size_t length,
@@ -1157,21 +1186,27 @@ VmRunSummary VirtualMachine::RunLoop(
     // base for early-boot OVMF, which uses the 8259 path until the IOAPIC
     // is enabled. Either route succeeds when the corresponding controller
     // has been programmed by the guest; otherwise the IRQ stays latched.
-    auto tryRaiseLegacyIrq = [&](uint8_t irq) {
-      bool delivered = ioApic_.RaiseIrq(irq);
-      if (!delivered) {
-        const uint8_t base =
-            irq < 8 ? pcIo_.MasterPicVectorBase() : pcIo_.SlavePicVectorBase();
-        if (base != 0) {
-          const uint8_t vector =
-              static_cast<uint8_t>(base + (irq < 8 ? irq : (irq - 8)));
-          delivered = vcpu_.TryRequestFixedInterrupt(vector);
+    auto tryRaiseLegacyIrq = [&](uint8_t irq) -> IrqDeliveryBackend {
+      if (ioApic_.RaiseIrq(irq)) {
+        ++summary.irqIoApicDeliveries;
+        return IrqDeliveryBackend::IoApic;
+      }
+
+      const uint8_t line = static_cast<uint8_t>(irq < 8 ? irq : irq - 8);
+      const uint8_t base =
+          irq < 8 ? pcIo_.MasterPicVectorBase() : pcIo_.SlavePicVectorBase();
+      const uint8_t mask =
+          irq < 8 ? pcIo_.MasterPicMask() : pcIo_.SlavePicMask();
+      if (base != 0 && (mask & (1u << line)) == 0) {
+        const uint8_t vector = static_cast<uint8_t>(base + line);
+        if (vcpu_.TryRequestFixedInterrupt(vector)) {
+          ++summary.irqPicFallbackDeliveries;
+          return IrqDeliveryBackend::PicFallback;
         }
       }
-      if (delivered) {
-        return true;
-      }
-      return false;
+
+      ++summary.irqDeliveryFailures;
+      return IrqDeliveryBackend::Failed;
     };
 
     if (com1_.InterruptPending()) {
@@ -1190,22 +1225,46 @@ VmRunSummary VirtualMachine::RunLoop(
       }
       const uint8_t irq = controller->IrqLine();
       ++summary.ideInterruptsRequested;
-      if (tryRaiseLegacyIrq(irq)) {
+      const auto backend = tryRaiseLegacyIrq(irq);
+      if (backend != IrqDeliveryBackend::Failed) {
         ++summary.ideInterruptsInjected;
+        if (backend == IrqDeliveryBackend::IoApic) {
+          ++summary.ideInterruptsIoApic;
+        } else {
+          ++summary.ideInterruptsPicFallback;
+        }
+        controller->ConsumeInterrupt();
+      } else {
+        ++summary.ideInterruptsFailed;
       }
-      controller->ConsumeInterrupt();
     };
     tryRaiseIdeIrq(ide_.get());
     tryRaiseIdeIrq(secondaryIde_.get());
 
     if (pcIo_.PitInterruptPending()) {
-      if (tryRaiseLegacyIrq(0)) {
+      const auto backend = tryRaiseLegacyIrq(0);
+      if (backend != IrqDeliveryBackend::Failed) {
+        if (backend == IrqDeliveryBackend::IoApic) {
+          ++summary.pitInterruptsIoApic;
+        } else {
+          ++summary.pitInterruptsPicFallback;
+        }
         pcIo_.ConsumePitInterrupt();
+      } else {
+        ++summary.pitInterruptsFailed;
       }
     }
     if (pcIo_.RtcInterruptPending()) {
-      if (tryRaiseLegacyIrq(8)) {
+      const auto backend = tryRaiseLegacyIrq(8);
+      if (backend != IrqDeliveryBackend::Failed) {
+        if (backend == IrqDeliveryBackend::IoApic) {
+          ++summary.rtcInterruptsIoApic;
+        } else {
+          ++summary.rtcInterruptsPicFallback;
+        }
         pcIo_.ConsumeRtcInterrupt();
+      } else {
+        ++summary.rtcInterruptsFailed;
       }
     }
     if (madeProgress) {
@@ -1365,6 +1424,9 @@ VmRunSummary VirtualMachine::RunLoop(
   summary.ideCommandsIssued = (ide_ ? ide_->CommandsIssued() : 0) +
                               (secondaryIde_ ? secondaryIde_->CommandsIssued()
                                              : 0);
+  summary.ideInterruptsPending =
+      (ide_ && ide_->InterruptPending() ? 1 : 0) +
+      (secondaryIde_ && secondaryIde_->InterruptPending() ? 1 : 0);
   auto collectIde = [&](const std::unique_ptr<IdeController> &controller) {
     if (!controller) {
       return;
@@ -1384,6 +1446,10 @@ VmRunSummary VirtualMachine::RunLoop(
   summary.ioApicRaises = ioApic_.RaiseCount();
   summary.ioApicDeliveries = ioApic_.Deliveries();
   summary.ioApicMaskedDrops = ioApic_.MaskedDrops();
+  summary.masterPicVectorBase = pcIo_.MasterPicVectorBase();
+  summary.slavePicVectorBase = pcIo_.SlavePicVectorBase();
+  summary.masterPicMask = pcIo_.MasterPicMask();
+  summary.slavePicMask = pcIo_.SlavePicMask();
   summary.pm1SleepEnable = pcIo_.LastPm1SleepEnable();
   summary.pm1SleepType = pcIo_.LastSleepType();
   summary.pm1ControlValue = pcIo_.LastPm1ControlValue();
@@ -1391,6 +1457,8 @@ VmRunSummary VirtualMachine::RunLoop(
   summary.pm1SleepRequests = pcIo_.Pm1SleepRequestCount();
   summary.hpetReads = hpet_.Reads();
   summary.hpetWrites = hpet_.Writes();
+  summary.pitInterruptsPending = pcIo_.PitInterruptPending() ? 1 : 0;
+  summary.rtcInterruptsPending = pcIo_.RtcInterruptPending() ? 1 : 0;
   summary.pitIrqsDelivered = pcIo_.PitIrqCount();
   summary.rtcIrqsDelivered = pcIo_.RtcIrqCount();
   summary.fwCfgFileDirBytesRead = pcIo_.FwCfgFileDirBytesRead();
@@ -1416,6 +1484,11 @@ VmRunSummary VirtualMachine::RunLoop(
   }
   summary.ripHotspots = std::move(ripHotspots);
   summary.recentCmosAccesses = pcIo_.RecentCmosAccesses();
+  for (const uint8_t irq : {uint8_t{0}, uint8_t{3}, uint8_t{4}, uint8_t{8},
+                            uint8_t{14}, uint8_t{15}}) {
+    summary.legacyIrqDiagnostics.push_back(
+        FormatLegacyIrqState(ioApic_, pcIo_, irq));
+  }
   summary.crashed = summary.fatal;
   summary.completed = !summary.fatal && !summary.timedOut &&
                       !summary.idleLoop && !summary.halted;

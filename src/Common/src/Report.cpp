@@ -437,6 +437,36 @@ DynamicRunSummary ParseDynamicSummary(const JsonValue *value) {
       static_cast<uint32_t>(IntValue(Member(*value, "unhandledMmio")));
   summary.watchdogCancellations =
       static_cast<uint32_t>(IntValue(Member(*value, "watchdogCancellations")));
+  summary.ideInterruptsRequested =
+      static_cast<uint32_t>(IntValue(Member(*value, "ideInterruptsRequested")));
+  summary.ideInterruptsInjected =
+      static_cast<uint32_t>(IntValue(Member(*value, "ideInterruptsInjected")));
+  summary.ideInterruptsFailed =
+      static_cast<uint32_t>(IntValue(Member(*value, "ideInterruptsFailed")));
+  summary.ideInterruptsPending =
+      static_cast<uint32_t>(IntValue(Member(*value, "ideInterruptsPending")));
+  summary.ideInterruptsIoApic =
+      static_cast<uint32_t>(IntValue(Member(*value, "ideInterruptsIoApic")));
+  summary.ideInterruptsPicFallback = static_cast<uint32_t>(
+      IntValue(Member(*value, "ideInterruptsPicFallback")));
+  summary.pitInterruptsPending =
+      static_cast<uint32_t>(IntValue(Member(*value, "pitInterruptsPending")));
+  summary.rtcInterruptsPending =
+      static_cast<uint32_t>(IntValue(Member(*value, "rtcInterruptsPending")));
+  summary.irqIoApicDeliveries =
+      static_cast<uint32_t>(IntValue(Member(*value, "irqIoApicDeliveries")));
+  summary.irqPicFallbackDeliveries = static_cast<uint32_t>(
+      IntValue(Member(*value, "irqPicFallbackDeliveries")));
+  summary.irqDeliveryFailures =
+      static_cast<uint32_t>(IntValue(Member(*value, "irqDeliveryFailures")));
+  summary.masterPicVectorBase =
+      static_cast<uint32_t>(IntValue(Member(*value, "masterPicVectorBase")));
+  summary.slavePicVectorBase =
+      static_cast<uint32_t>(IntValue(Member(*value, "slavePicVectorBase")));
+  summary.masterPicMask =
+      static_cast<uint32_t>(IntValue(Member(*value, "masterPicMask")));
+  summary.slavePicMask =
+      static_cast<uint32_t>(IntValue(Member(*value, "slavePicMask")));
   summary.pm1SleepEnable = BoolValue(Member(*value, "pm1SleepEnable"));
   summary.pm1HostStopRequested =
       BoolValue(Member(*value, "pm1HostStopRequested"));
@@ -447,6 +477,8 @@ DynamicRunSummary ParseDynamicSummary(const JsonValue *value) {
   summary.pm1SleepRequests =
       static_cast<uint64_t>(IntValue(Member(*value, "pm1SleepRequests")));
   summary.bootMilestones = StringArrayValue(Member(*value, "bootMilestones"));
+  summary.interruptDiagnostics =
+      StringArrayValue(Member(*value, "interruptDiagnostics"));
   summary.serialLogPath =
       Utf8ToWide(StringValue(Member(*value, "serialLogPath")));
   summary.vmSummaryPath =
@@ -897,6 +929,23 @@ std::string BuildHtmlReportWithFrames(const AnalysisReport &report,
     html << "<div class=\"k\">IDE reads</div><div class=\"mono\">"
          << report.dynamicSummary.ideReadCommands << " command(s), "
          << report.dynamicSummary.ideSectorsRead << " sector(s)</div>";
+    if (report.dynamicSummary.ideInterruptsRequested != 0 ||
+        report.dynamicSummary.ideInterruptsPending != 0) {
+      html << "<div class=\"k\">IDE IRQ</div><div class=\"mono\">"
+           << report.dynamicSummary.ideInterruptsInjected << "/"
+           << report.dynamicSummary.ideInterruptsRequested
+           << " delivered, pending "
+           << report.dynamicSummary.ideInterruptsPending << ", failed "
+           << report.dynamicSummary.ideInterruptsFailed << "</div>";
+    }
+    if (report.dynamicSummary.irqIoApicDeliveries != 0 ||
+        report.dynamicSummary.irqPicFallbackDeliveries != 0 ||
+        report.dynamicSummary.irqDeliveryFailures != 0) {
+      html << "<div class=\"k\">IRQ route</div><div class=\"mono\">ioapic "
+           << report.dynamicSummary.irqIoApicDeliveries << ", pic "
+           << report.dynamicSummary.irqPicFallbackDeliveries << ", failed "
+           << report.dynamicSummary.irqDeliveryFailures << "</div>";
+    }
     if (report.dynamicSummary.pm1SleepRequests != 0 ||
         report.dynamicSummary.pm1ControlValue != 0) {
       html << "<div class=\"k\">PM1 sleep</div><div class=\"mono\">"

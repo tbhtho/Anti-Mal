@@ -158,6 +158,11 @@ BootSignalSummary AnalyzeBootSignals(const hv::VmRunSummary &vm) {
   if (ContainsTextNoCase(serialOutput, "ResetSystem2") ||
       ContainsTextNoCase(serialOutput, "ResetType Shutdown")) {
     AddMilestone(&signals, "firmware reset/shutdown requested");
+    if (vm.pm1SleepEnable && !vm.pm1HostStopRequested &&
+        vm.pm1SleepType == 0) {
+      AddMilestone(&signals,
+                   "ResetSystem shutdown ignored as non-host-stop S0");
+    }
   }
 
   return signals;
@@ -521,6 +526,33 @@ DynamicRunSummary ToDynamicSummary(const hv::VmRunSummary &vm,
   summary.unhandledMmio = static_cast<uint32_t>(std::max(0, vm.unhandledMmio));
   summary.watchdogCancellations =
       static_cast<uint32_t>(std::max(0, vm.watchdogCancellations));
+  summary.ideInterruptsRequested =
+      static_cast<uint32_t>(std::max(0, vm.ideInterruptsRequested));
+  summary.ideInterruptsInjected =
+      static_cast<uint32_t>(std::max(0, vm.ideInterruptsInjected));
+  summary.ideInterruptsFailed =
+      static_cast<uint32_t>(std::max(0, vm.ideInterruptsFailed));
+  summary.ideInterruptsPending =
+      static_cast<uint32_t>(std::max(0, vm.ideInterruptsPending));
+  summary.ideInterruptsIoApic =
+      static_cast<uint32_t>(std::max(0, vm.ideInterruptsIoApic));
+  summary.ideInterruptsPicFallback =
+      static_cast<uint32_t>(std::max(0, vm.ideInterruptsPicFallback));
+  summary.pitInterruptsPending =
+      static_cast<uint32_t>(std::max(0, vm.pitInterruptsPending));
+  summary.rtcInterruptsPending =
+      static_cast<uint32_t>(std::max(0, vm.rtcInterruptsPending));
+  summary.irqIoApicDeliveries =
+      static_cast<uint32_t>(std::max(0, vm.irqIoApicDeliveries));
+  summary.irqPicFallbackDeliveries =
+      static_cast<uint32_t>(std::max(0, vm.irqPicFallbackDeliveries));
+  summary.irqDeliveryFailures =
+      static_cast<uint32_t>(std::max(0, vm.irqDeliveryFailures));
+  summary.masterPicVectorBase = vm.masterPicVectorBase;
+  summary.slavePicVectorBase = vm.slavePicVectorBase;
+  summary.masterPicMask = vm.masterPicMask;
+  summary.slavePicMask = vm.slavePicMask;
+  summary.interruptDiagnostics = vm.legacyIrqDiagnostics;
   summary.pm1SleepEnable = vm.pm1SleepEnable;
   summary.pm1HostStopRequested = vm.pm1HostStopRequested;
   summary.pm1SleepType = vm.pm1SleepType;
@@ -714,6 +746,10 @@ std::string FormatVmDiagnostics(const hv::VmRunSummary &vm) {
   out << "timerInterruptsInjected: " << vm.timerInterruptsInjected << "\n";
   out << "ideInterruptsRequested: " << vm.ideInterruptsRequested << "\n";
   out << "ideInterruptsInjected: " << vm.ideInterruptsInjected << "\n";
+  out << "ideInterruptsFailed: " << vm.ideInterruptsFailed << "\n";
+  out << "ideInterruptsPending: " << vm.ideInterruptsPending << "\n";
+  out << "ideInterruptsIoApic: " << vm.ideInterruptsIoApic << "\n";
+  out << "ideInterruptsPicFallback: " << vm.ideInterruptsPicFallback << "\n";
   out << "ideCommandsIssued: " << vm.ideCommandsIssued << "\n";
   out << "ideIdentifyCommands: " << vm.ideIdentifyCommands << "\n";
   out << "ideReadCommands: " << vm.ideReadCommands << "\n";
@@ -747,8 +783,27 @@ std::string FormatVmDiagnostics(const hv::VmRunSummary &vm) {
   out << "ioApicRaises: " << vm.ioApicRaises << "\n";
   out << "ioApicDeliveries: " << vm.ioApicDeliveries << "\n";
   out << "ioApicMaskedDrops: " << vm.ioApicMaskedDrops << "\n";
+  out << "irqIoApicDeliveries: " << vm.irqIoApicDeliveries << "\n";
+  out << "irqPicFallbackDeliveries: " << vm.irqPicFallbackDeliveries << "\n";
+  out << "irqDeliveryFailures: " << vm.irqDeliveryFailures << "\n";
+  out << "masterPicVectorBase: 0x" << std::hex << std::uppercase
+      << static_cast<int>(vm.masterPicVectorBase) << std::dec << "\n";
+  out << "slavePicVectorBase: 0x" << std::hex << std::uppercase
+      << static_cast<int>(vm.slavePicVectorBase) << std::dec << "\n";
+  out << "masterPicMask: 0x" << std::hex << std::uppercase
+      << static_cast<int>(vm.masterPicMask) << std::dec << "\n";
+  out << "slavePicMask: 0x" << std::hex << std::uppercase
+      << static_cast<int>(vm.slavePicMask) << std::dec << "\n";
   out << "hpetReads: " << vm.hpetReads << "\n";
   out << "hpetWrites: " << vm.hpetWrites << "\n";
+  out << "pitInterruptsPending: " << vm.pitInterruptsPending << "\n";
+  out << "pitInterruptsFailed: " << vm.pitInterruptsFailed << "\n";
+  out << "pitInterruptsIoApic: " << vm.pitInterruptsIoApic << "\n";
+  out << "pitInterruptsPicFallback: " << vm.pitInterruptsPicFallback << "\n";
+  out << "rtcInterruptsPending: " << vm.rtcInterruptsPending << "\n";
+  out << "rtcInterruptsFailed: " << vm.rtcInterruptsFailed << "\n";
+  out << "rtcInterruptsIoApic: " << vm.rtcInterruptsIoApic << "\n";
+  out << "rtcInterruptsPicFallback: " << vm.rtcInterruptsPicFallback << "\n";
   out << "pitIrqsDelivered: " << vm.pitIrqsDelivered << "\n";
   out << "rtcIrqsDelivered: " << vm.rtcIrqsDelivered << "\n";
   out << "fwCfgFileDirBytesRead: " << vm.fwCfgFileDirBytesRead << "\n";
@@ -763,6 +818,12 @@ std::string FormatVmDiagnostics(const hv::VmRunSummary &vm) {
         << vm.lastPageFaultAssistGva << std::dec << "\n";
     out << "lastPageFaultAssistGpa: 0x" << std::hex << std::uppercase
         << vm.lastPageFaultAssistGpa << std::dec << "\n";
+  }
+  if (!vm.legacyIrqDiagnostics.empty()) {
+    out << "\nLegacy IRQ diagnostics:\n";
+    for (const auto &line : vm.legacyIrqDiagnostics) {
+      out << "  " << line << "\n";
+    }
   }
   out << "\nTop IO ports:\n";
   for (const auto &[port, count] : topEntries(vm.ioPortHistogram, 32)) {
@@ -1604,6 +1665,26 @@ DetonationResult InHouseOrchestrator::PrepareAndRun(
            std::to_string(result.dynamicSummary.ideSectorsRead)},
           {"ideAbortedCommands",
            std::to_string(result.dynamicSummary.ideAbortedCommands)},
+          {"ideInterruptsRequested",
+           std::to_string(result.dynamicSummary.ideInterruptsRequested)},
+          {"ideInterruptsInjected",
+           std::to_string(result.dynamicSummary.ideInterruptsInjected)},
+          {"ideInterruptsFailed",
+           std::to_string(result.dynamicSummary.ideInterruptsFailed)},
+          {"ideInterruptsPending",
+           std::to_string(result.dynamicSummary.ideInterruptsPending)},
+          {"irqIoApicDeliveries",
+           std::to_string(result.dynamicSummary.irqIoApicDeliveries)},
+          {"irqPicFallbackDeliveries",
+           std::to_string(result.dynamicSummary.irqPicFallbackDeliveries)},
+          {"irqDeliveryFailures",
+           std::to_string(result.dynamicSummary.irqDeliveryFailures)},
+          {"masterPicVectorBase",
+           std::to_string(result.dynamicSummary.masterPicVectorBase)},
+          {"slavePicVectorBase",
+           std::to_string(result.dynamicSummary.slavePicVectorBase)},
+          {"masterPicMask", std::to_string(result.dynamicSummary.masterPicMask)},
+          {"slavePicMask", std::to_string(result.dynamicSummary.slavePicMask)},
           {"bootMilestones",
            JoinStrings(result.dynamicSummary.bootMilestones, ", ")},
           {"firmwareIdle", result.dynamicSummary.firmwareIdle ? "true" : "false"},

@@ -199,12 +199,31 @@ std::string ToJson(const DynamicRunSummary &summary) {
   obj.AddNumber("unhandledIo", summary.unhandledIo);
   obj.AddNumber("unhandledMmio", summary.unhandledMmio);
   obj.AddNumber("watchdogCancellations", summary.watchdogCancellations);
+  obj.AddNumber("ideInterruptsRequested", summary.ideInterruptsRequested);
+  obj.AddNumber("ideInterruptsInjected", summary.ideInterruptsInjected);
+  obj.AddNumber("ideInterruptsFailed", summary.ideInterruptsFailed);
+  obj.AddNumber("ideInterruptsPending", summary.ideInterruptsPending);
+  obj.AddNumber("ideInterruptsIoApic", summary.ideInterruptsIoApic);
+  obj.AddNumber("ideInterruptsPicFallback",
+                summary.ideInterruptsPicFallback);
+  obj.AddNumber("pitInterruptsPending", summary.pitInterruptsPending);
+  obj.AddNumber("rtcInterruptsPending", summary.rtcInterruptsPending);
+  obj.AddNumber("irqIoApicDeliveries", summary.irqIoApicDeliveries);
+  obj.AddNumber("irqPicFallbackDeliveries",
+                summary.irqPicFallbackDeliveries);
+  obj.AddNumber("irqDeliveryFailures", summary.irqDeliveryFailures);
+  obj.AddNumber("masterPicVectorBase", summary.masterPicVectorBase);
+  obj.AddNumber("slavePicVectorBase", summary.slavePicVectorBase);
+  obj.AddNumber("masterPicMask", summary.masterPicMask);
+  obj.AddNumber("slavePicMask", summary.slavePicMask);
   obj.AddBool("pm1SleepEnable", summary.pm1SleepEnable);
   obj.AddBool("pm1HostStopRequested", summary.pm1HostStopRequested);
   obj.AddNumber("pm1SleepType", summary.pm1SleepType);
   obj.AddNumber("pm1ControlValue", summary.pm1ControlValue);
   obj.AddNumber("pm1SleepRequests", summary.pm1SleepRequests);
   obj.AddRaw("bootMilestones", JsonStringArray(summary.bootMilestones));
+  obj.AddRaw("interruptDiagnostics",
+             JsonStringArray(summary.interruptDiagnostics));
   obj.AddString("serialLogPath", PathToUtf8(summary.serialLogPath));
   obj.AddString("vmSummaryPath", PathToUtf8(summary.vmSummaryPath));
   return obj.Finish();
