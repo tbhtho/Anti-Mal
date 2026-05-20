@@ -88,6 +88,7 @@ struct VmRunSummary {
   std::vector<VmApRunState> apStates;
   int timerInterruptsRequested = 0;
   int timerInterruptsInjected = 0;
+  int keyboardScancodesInjected = 0;
   int ideInterruptsRequested = 0;
   int ideInterruptsInjected = 0;
   int ideInterruptsFailed = 0;
@@ -302,6 +303,12 @@ struct VmRunRequest {
   VmProgressCallback progressCallback;
   std::chrono::milliseconds progressInterval{1500};
   std::shared_ptr<std::atomic_bool> cancelRequested;
+  // Optional probe input. Disabled by default. Scancodes are queued into the
+  // emulated PS/2 controller after keyboardInjectAfter has elapsed. This is
+  // intentionally primitive and is meant for boot UI probes such as pressing
+  // Enter on Windows Recovery, not for general interactive control.
+  std::vector<uint8_t> keyboardScancodes;
+  std::chrono::milliseconds keyboardInjectAfter{0};
 };
 
 class VirtualMachine {
@@ -329,7 +336,10 @@ private:
                        const VmProgressCallback &progressCallback = nullptr,
                        std::chrono::milliseconds progressInterval =
                            std::chrono::milliseconds{1500},
-                       std::shared_ptr<std::atomic_bool> cancelRequested = {});
+                       std::shared_ptr<std::atomic_bool> cancelRequested = {},
+                       std::vector<uint8_t> keyboardScancodes = {},
+                       std::chrono::milliseconds keyboardInjectAfter =
+                           std::chrono::milliseconds{0});
   void AttachDefaultDevices();
   void AttachIdeDisk(IBlockDevice *disk);
   uint8_t *HostPointerForGpa(uint64_t gpa, size_t length) noexcept;

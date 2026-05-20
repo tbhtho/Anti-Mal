@@ -744,6 +744,7 @@ std::string FormatVmDiagnostics(const hv::VmRunSummary &vm) {
   out << "watchdogCancellations: " << vm.watchdogCancellations << "\n";
   out << "timerInterruptsRequested: " << vm.timerInterruptsRequested << "\n";
   out << "timerInterruptsInjected: " << vm.timerInterruptsInjected << "\n";
+  out << "keyboardScancodesInjected: " << vm.keyboardScancodesInjected << "\n";
   out << "ideInterruptsRequested: " << vm.ideInterruptsRequested << "\n";
   out << "ideInterruptsInjected: " << vm.ideInterruptsInjected << "\n";
   out << "ideInterruptsFailed: " << vm.ideInterruptsFailed << "\n";
@@ -1354,6 +1355,23 @@ DetonationResult InHouseOrchestrator::PrepareAndRun(
       // that the timeout — not the step cap — is the binding constraint.
       request.maxSteps = std::numeric_limits<int>::max();
       request.progressInterval = std::chrono::milliseconds{1500};
+      {
+        char buf[16]{};
+        size_t needed = 0;
+        if (getenv_s(&needed, buf, sizeof(buf),
+                     "ANTIMAL_PROBE_PRESS_ENTER_SEC") == 0 &&
+            needed > 1 && buf[0] != '\0') {
+          const int seconds = std::atoi(buf);
+          if (seconds >= 0 && seconds <= 600) {
+            request.keyboardInjectAfter =
+                std::chrono::milliseconds{static_cast<int64_t>(seconds) *
+                                          1000};
+            // Set-1 Enter make/break. This is a boot UI probe only; it does
+            // not authorize sample execution.
+            request.keyboardScancodes = {0x1C, 0x9C};
+          }
+        }
+      }
       auto stopAfterGuestAgentProbe = std::make_shared<std::atomic_bool>(false);
       request.cancelRequested = stopAfterGuestAgentProbe;
       auto liveHostChannel = std::make_shared<hv::HostSerialChannel>();

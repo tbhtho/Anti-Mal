@@ -140,6 +140,16 @@ bin\x64\Release\AntiMal.HostCli.exe detonate C:\Path\To\File.exe --network disab
 
 This currently creates a run directory under `C:\AntiMalRuns`, writes `job.json`, `events.jsonl`, `report.json`, `report.html`, `serial.log`, `vm-summary.json`, and `vm-diagnostics.txt`, and keeps sample execution blocked.
 
+Optional boot UI probe:
+
+```powershell
+$env:ANTIMAL_PROBE_PRESS_ENTER_SEC = "20"
+bin\x64\Release\AntiMal.HostCli.exe detonate C:\Path\To\File.exe --network disabled --timeout-sec 180
+Remove-Item Env:\ANTIMAL_PROBE_PRESS_ENTER_SEC
+```
+
+That injects a PS/2 Enter make/break into the guest after the requested delay. It is for Recovery/firmware UI diagnostics only and does not enable sample execution.
+
 ## Base Image
 
 AntiMal does not ship Windows. You provide a Windows ISO and build a clean local base VHDX:

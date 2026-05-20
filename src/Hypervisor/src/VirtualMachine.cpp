@@ -703,7 +703,8 @@ VmRunSummary VirtualMachine::Run(const VmRunRequest &request) {
   auto summary = RunLoop(request.maxSteps,
                          std::chrono::steady_clock::now() + timeout,
                          request.progressCallback, request.progressInterval,
-                         request.cancelRequested);
+                         request.cancelRequested, request.keyboardScancodes,
+                         request.keyboardInjectAfter);
   summary.networkMode = request.networkMode;
   return summary;
 }
@@ -712,7 +713,9 @@ VmRunSummary VirtualMachine::RunLoop(
     int maxSteps, std::chrono::steady_clock::time_point deadline,
     const VmProgressCallback &progressCallback,
     std::chrono::milliseconds progressInterval,
-    std::shared_ptr<std::atomic_bool> cancelRequested) {
+    std::shared_ptr<std::atomic_bool> cancelRequested,
+    std::vector<uint8_t> keyboardScancodes,
+    std::chrono::milliseconds keyboardInjectAfter) {
   VmRunSummary summary;
   summary.started = true;
   summary.processorCount = host_.ProcessorCount();
@@ -860,6 +863,7 @@ VmRunSummary VirtualMachine::RunLoop(
   uint64_t lastIdeCommands = 0;
   const auto runStarted = std::chrono::steady_clock::now();
   auto lastProgressFire = runStarted;
+  bool keyboardInjected = keyboardScancodes.empty();
 
   // Per-BSP RIP-at-exit ring + 16-byte-bucket hotspot histogram. Both are
   // free observability: we already have the exit context in hand, no extra
@@ -1274,6 +1278,14 @@ VmRunSummary VirtualMachine::RunLoop(
     }
 
     const auto now = std::chrono::steady_clock::now();
+    if (!keyboardInjected && now - runStarted >= keyboardInjectAfter) {
+      ps2_.InjectKeyboardScancodes(keyboardScancodes.data(),
+                                   keyboardScancodes.size());
+      summary.keyboardScancodesInjected +=
+          static_cast<int>(keyboardScancodes.size());
+      keyboardInjected = true;
+      madeProgress = true;
+    }
     if (progressCallback && now - lastProgressFire >= progressInterval) {
       VmProgressSnapshot snapshot{};
       snapshot.steps = summary.steps;
