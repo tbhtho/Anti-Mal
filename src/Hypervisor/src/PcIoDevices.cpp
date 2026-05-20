@@ -283,6 +283,7 @@ void PcIoDevices::OnWrite(uint16_t port, uint32_t value, uint8_t accessSize) {
     return;
   }
   if (port >= kPciConfigData && port < kPciConfigData + 4) {
+    WritePciConfigData(port, value, accessSize);
     return;
   }
   if (port >= kVgaLegacyBase && port <= kVgaLegacyLast) {
@@ -682,6 +683,37 @@ void PcIoDevices::WritePciAddressWindow(uint16_t port, uint32_t value,
       (pciConfigAddress_ & ~mask) | ((value << shift) & mask);
 }
 
+void PcIoDevices::WritePciConfigData(uint16_t port, uint32_t value,
+                                     uint8_t accessSize) {
+  if ((pciConfigAddress_ & 0x80000000u) == 0) {
+    return;
+  }
+
+  const uint8_t bus = static_cast<uint8_t>((pciConfigAddress_ >> 16) & 0xFFu);
+  const uint8_t device =
+      static_cast<uint8_t>((pciConfigAddress_ >> 11) & 0x1Fu);
+  const uint8_t function =
+      static_cast<uint8_t>((pciConfigAddress_ >> 8) & 0x07u);
+  const uint8_t reg = static_cast<uint8_t>(pciConfigAddress_ & 0xFCu);
+  const uint8_t shift = static_cast<uint8_t>((port - kPciConfigData) * 8u);
+  const uint32_t mask = AccessMask(accessSize) << shift;
+
+  if (vgaControllerPresent_ && bus == 0 && device == 2 && function == 0 &&
+      reg == 0x10) {
+    vgaBar0WriteValue_ =
+        (vgaBar0WriteValue_ & ~mask) | ((value << shift) & mask);
+    if ((vgaBar0WriteValue_ & 0xFFFFFFF0u) == 0xFFFFFFF0u) {
+      vgaBar0Sizing_ = true;
+      return;
+    }
+    vgaBar0Sizing_ = false;
+    vgaBar0_ = (vgaBar0WriteValue_ & 0xFF000000u) | 0x08u;
+    if ((vgaBar0_ & 0xFF000000u) == 0) {
+      vgaBar0_ = static_cast<uint32_t>(BochsVbeDevice::kFramebufferGpa) | 0x08u;
+    }
+  }
+}
+
 uint32_t PcIoDevices::ReadPciConfigDword() const {
   if ((pciConfigAddress_ & 0x80000000u) == 0) {
     return 0xFFFFFFFFu;
@@ -772,9 +804,12 @@ uint32_t PcIoDevices::ReadPciConfigDword() const {
     case 0x0C:
       return 0x00000000u; // Type-0 header.
     case 0x10:
-      // BAR0 — linear framebuffer at the configured GPA. Bit 3 set marks
-      // the BAR as prefetchable, bits [1:0] = 0 means 32-bit memory.
-      return static_cast<uint32_t>(BochsVbeDevice::kFramebufferGpa) | 0x8u;
+      // BAR0 — linear framebuffer. During PCI BAR sizing, OVMF writes all
+      // ones and expects a mask that reports the aperture size. Returning the
+      // fixed framebuffer GPA in that window made OVMF believe the VGA BAR was
+      // 2 GiB wide, exhausting the root bridge MMIO aperture before GOP could
+      // start. A 16 MiB mask matches the mapped Bochs framebuffer.
+      return vgaBar0Sizing_ ? 0xFF000008u : vgaBar0_;
     case 0x14:
       return 0;          // BAR1 — unused.
     case 0x18:

@@ -13,7 +13,7 @@ AntiMal has two major layers:
 
 The scanner can already hash files, calculate entropy, parse PE metadata, mine strings and IOCs, apply rules/tags, and optionally call external tools such as YARA, capa, and Detect It Easy when those binaries are present. Threat-intel lookup support exists for MalwareBazaar and VirusTotal, but outbound intel is off by default.
 
-The in-house VM path is past the toy stage but not finished. The WHP frontend can create a partition, run vCPUs, map RAM and OVMF firmware, emulate enough PC hardware for OVMF to boot, expose an IDE disk, stream OVMF debug output, create per-run copy-on-write overlays, and render host-side live progress frames. The current Windows boot probe reaches `bootmgfw.efi`, opens BCD and code-integrity policy files, performs real IDE reads/writes, then requests UEFI shutdown before `winload.efi` appears in the trace. The latest implementation fixed a false host stop on ACPI PM1 value `0x2001` by treating S0 sleep as diagnostics-only, and added IRQ routing diagnostics for IDE, PIT, RTC, PIC, and IOAPIC state. The latest probe shows the boot path still times out before `winload.efi`; all key IOAPIC redirection entries remain masked, PIC vector bases remain unset, and the guest never establishes a deliverable legacy interrupt route before shutdown/reset.
+The in-house VM path is past the toy stage but not finished. The WHP frontend can create a partition, run vCPUs, map RAM and OVMF firmware, emulate enough PC hardware for OVMF to boot, expose an IDE disk, stream OVMF debug output, create per-run copy-on-write overlays, and render host-side live progress frames. The current Windows boot probe reaches `bootmgfw.efi`, opens BCD and code-integrity policy files, performs real IDE reads/writes, brings up OVMF QemuVideo/GOP, and captures real guest framebuffer PNGs. The latest visible guest state is Windows Recovery error `0xc0000225`, so the remaining 45% blocker is now sharply identified as base/BCD boot repair before `winload.efi`, not a blind firmware or graphics hang.
 
 Real malware execution remains intentionally blocked. The project stages samples and creates reports, but `dynamic_execution_enabled = false` is the default and `sampleExecuted` stays false until the benign GuestAgent channel, overlay discard, artifact return, and report pipeline are proven end to end.
 
@@ -38,7 +38,8 @@ Real malware execution remains intentionally blocked. The project stages samples
   - serial debugcon capture
   - CMOS/RTC, PIT, PIC, LAPIC timer injection, IOAPIC, HPET, fw_cfg, ACPI table generation
   - PIIX/IDE PIO storage against VHDX or raw/COW overlays
-  - Bochs VBE and PS/2 scaffolding
+  - QEMU/Bochs VGA BAR sizing, Bochs VBE, OVMF GOP, and real guest framebuffer capture
+  - PS/2 scaffolding
   - COM2 host-channel codec and safe GuestAgent heartbeat mode
 
 ## What Is In Progress
@@ -47,22 +48,22 @@ The current milestone is "agent boot": get a benign Windows base image far enoug
 
 The active blockers are:
 
-- Validate or repair the base VHDX boot files so `bootmgfw.efi` proceeds to `winload.efi`.
-- Confirm the Windows boot manager contract after BCD and code-integrity policy loads. ACPI PM1/S5 metadata is no longer treated as the immediate blocker: the FADT advertises legacy and extended PM1 blocks, the PM1 control trap preserves byte writes, and `0x2001` / S0 is recorded in `vm-summary.json`, `events.jsonl`, and diagnostics without stopping the host. Only S4/S5 requests stop the VM.
-- Determine why the guest never unmasks/programs IOAPIC or PIC routes for legacy disk/timer interrupts before the current reset/shutdown path. New run diagnostics record pending IDE/PIT/RTC latches, IOAPIC redirection entries, PIC vector bases, PIC masks, and whether each interrupt was delivered by IOAPIC, PIC fallback, or failed routing.
+- Validate or repair the base VHDX boot files so `bootmgfw.efi` proceeds to `winload.efi`. The newest guest framebuffer shows Windows Recovery error `0xc0000225`, which is the strongest evidence so far that the next step is BCD/device repair on the base image.
+- Keep the Windows boot manager contract visible in diagnostics after BCD and code-integrity policy loads. ACPI PM1/S5 metadata is no longer treated as the immediate blocker: the FADT advertises legacy and extended PM1 blocks, the PM1 control trap preserves byte writes, and only S4/S5 requests stop the VM.
+- Continue interrupt diagnostics while boot repair is pending. Run diagnostics record pending IDE/PIT/RTC latches, IOAPIC redirection entries, PIC vector bases, PIC masks, and whether each interrupt was delivered by IOAPIC, PIC fallback, or failed routing.
 - Install GuestAgent into the base image and auto-start it from the offline SYSTEM hive service entry. The older HKLM Run autostart remains as a fallback.
 - Decode COM2 GuestAgent frames in the host report path, send a benign `healthcheck` job, and return `agent-health.json` once the guest service reaches user mode.
 
 Latest local probe:
 
 - `ANTIMAL_FIRMWARE_NAME=OVMF-debug.fd`
-- `AntiMal.HostCli.exe detonate bin\x64\Release\AntiMal.Tests.exe --network disabled --timeout-sec 180`
-- Run `371a6f69-e56d-4fae-ba59-594cc21c46a8`
-- Result: timed out before `winload`; `sampleExecuted=false`; `pm1ControlValue=0x2001`; `pm1SleepType=S0`; `pm1HostStopRequested=false`; `guestAgentConnected=false`.
-- Disk I/O is real: `ideCommandsIssued=396`, `ideReadCommands=383`, `ideSectorsRead=55870`, `ideWriteCommands=3`, and `ideSectorsWritten=21`.
-- Interrupt routing is still blocked: `ideInterruptsRequested=17742`, `ideInterruptsInjected=0`, `ideInterruptsFailed=17742`, `irqIoApicDeliveries=0`, `irqPicFallbackDeliveries=0`, and `irqDeliveryFailures=4997826`.
+- `AntiMal.HostCli.exe detonate bin\x64\Release\AntiMal.Tests.exe --network disabled --timeout-sec 75`
+- Run `cbcabd11-5cf8-4d3f-9c95-591faa484c59`
+- Result: timed out before `winload`; `sampleExecuted=false`; `guestAgentConnected=false`; real framebuffer frames captured; guest screen shows Windows Recovery `0xc0000225`.
+- Disk I/O is real: `ideCommandsIssued=530`, `ideReadCommands=515`, `ideSectorsRead=60017`, `ideWriteCommands=5`, and `ideSectorsWritten=38`.
+- Interrupt routing is still blocked: `ideInterruptsRequested=40670`, `ideInterruptsInjected=0`, `ideInterruptsFailed=40670`, `irqIoApicDeliveries=0`, `irqPicFallbackDeliveries=0`, and `irqDeliveryFailures=2680187`.
 - Legacy interrupt state is now explicit: IRQ0, IRQ3, IRQ4, IRQ8, IRQ14, and IRQ15 IOAPIC entries are masked; master/slave PIC vector bases are `0x00`; master/slave PIC masks are `0xff`.
-- Boot milestones include fallback bootloader open, `bootmgfw` load, BCD open, code-integrity policy open, firmware reset/shutdown request, and `ResetSystem shutdown ignored as non-host-stop S0`.
+- Boot milestones include fallback bootloader open, `bootmgfw` load, BCD open, and code-integrity policy open. OVMF QemuVideo/GOP now initializes at `1280x800x32`; the old 2 GiB VGA BAR resource conflict is fixed.
 - This shell was not elevated, so the base validator/repair and offline GuestAgent service install could not be run here.
 
 ## Safety Model

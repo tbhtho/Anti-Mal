@@ -148,10 +148,13 @@ public:
   uint8_t SlavePicVectorBase() const noexcept { return slavePicVectorBase_; }
   uint8_t MasterPicMask() const noexcept { return masterPicMask_; }
   uint8_t SlavePicMask() const noexcept { return slavePicMask_; }
+  uint32_t VgaBar0() const noexcept { return vgaBar0_; }
+  bool VgaBar0Sizing() const noexcept { return vgaBar0Sizing_; }
 
 private:
   void WritePicCommand(bool master, uint8_t value);
   void WritePicData(bool master, uint8_t value);
+  void WritePciConfigData(uint16_t port, uint32_t value, uint8_t accessSize);
 
   void HandlePitWrite(uint16_t port, uint8_t value);
   uint8_t ReadPitChannel(uint8_t channel);
@@ -165,6 +168,9 @@ private:
   uint8_t slavePicInitStep_ = 0;
   uint8_t port92_ = 0x02; // A20 enabled.
   uint32_t pciConfigAddress_ = 0;
+  uint32_t vgaBar0_ = 0x80000008u;
+  uint32_t vgaBar0WriteValue_ = 0x80000008u;
+  bool vgaBar0Sizing_ = false;
   std::string debugOutput_;
   bool ideControllerPresent_ = false;
   bool vgaControllerPresent_ = false;

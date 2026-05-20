@@ -689,6 +689,26 @@ void TestBochsVbeDataPortAliases() {
          "Bochs VBE: aligned data port reads ID");
 }
 
+void TestPcIoVgaBarSizing() {
+  antimal::hv::PcIoDevices pc;
+  pc.SetVgaControllerPresent(true);
+
+  // PCI config mechanism #1 address for bus 0, device 2, function 0, BAR0.
+  pc.OnWrite(0xCF8, 0x80001010u, 4);
+  Expect(pc.OnRead(0xCFC, 4) == 0x80000008u,
+         "PCI VGA BAR: starts at AntiMal framebuffer GPA");
+
+  pc.OnWrite(0xCFC, 0xFFFFFFFFu, 4);
+  Expect(pc.VgaBar0Sizing(), "PCI VGA BAR: all-ones write enters sizing mode");
+  Expect(pc.OnRead(0xCFC, 4) == 0xFF000008u,
+         "PCI VGA BAR: reports 16 MiB memory aperture mask");
+
+  pc.OnWrite(0xCFC, 0x80000000u, 4);
+  Expect(!pc.VgaBar0Sizing(), "PCI VGA BAR: base write leaves sizing mode");
+  Expect(pc.OnRead(0xCFC, 4) == 0x80000008u,
+         "PCI VGA BAR: assigned base preserves prefetchable memory bits");
+}
+
 void TestIdeIdentifyDevice() {
   antimal::hv::MemoryBlockDevice disk(2048);
   antimal::hv::IdeController ide(&disk);
@@ -2325,6 +2345,7 @@ int main() {
     TestPcIoFwCfgAcpiFiles();
     TestPcIoFwCfgE820MemoryInventory();
     TestBochsVbeDataPortAliases();
+    TestPcIoVgaBarSizing();
     TestHpetMmioCounter();
     TestIdeIdentifyDevice();
     TestIdeReadWriteSectors();
