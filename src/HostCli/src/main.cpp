@@ -576,6 +576,402 @@ private:
   uint64_t dataStartLba_ = 0;
 };
 
+class NtfsReader {
+public:
+  NtfsReader(antimal::hv::IBlockDevice &disk, uint64_t firstLba)
+      : disk_(disk), firstLba_(firstLba) {}
+
+  struct Entry {
+    uint64_t fileRecord = 0;
+    uint64_t size = 0;
+    bool directory = false;
+  };
+
+  bool Init() {
+    std::array<uint8_t, antimal::hv::IBlockDevice::kSectorSize> bs{};
+    if (!disk_.ReadSectors(firstLba_, 1, bs.data()) ||
+        std::memcmp(bs.data() + 3, "NTFS    ", 8) != 0) {
+      return false;
+    }
+    bytesPerSector_ = ReadLe16(bs.data() + 11);
+    sectorsPerCluster_ = bs[13];
+    mftLcn_ = ReadLe64(bs.data() + 48);
+    const int8_t fileRecordClusters =
+        static_cast<int8_t>(static_cast<char>(bs[64]));
+    if (bytesPerSector_ != antimal::hv::IBlockDevice::kSectorSize ||
+        sectorsPerCluster_ == 0 || mftLcn_ == 0) {
+      return false;
+    }
+    if (fileRecordClusters < 0) {
+      fileRecordBytes_ = 1ull << static_cast<unsigned>(-fileRecordClusters);
+    } else {
+      fileRecordBytes_ = static_cast<uint32_t>(fileRecordClusters) *
+                         ClusterBytes();
+    }
+    if (fileRecordBytes_ < 512 || fileRecordBytes_ > 4096) {
+      return false;
+    }
+
+    std::vector<uint8_t> record0(fileRecordBytes_);
+    if (!ReadVolumeBytes(mftLcn_ * ClusterBytes(), record0.data(),
+                         record0.size()) ||
+        !ApplyFixups(record0, "FILE")) {
+      return false;
+    }
+    for (const auto &attr : Attributes(record0)) {
+      if (attr.type == 0x80 && attr.nonResident && !attr.runs.empty()) {
+        mftRuns_ = attr.runs;
+        mftDataSize_ = attr.realSize;
+        break;
+      }
+    }
+    if (mftRuns_.empty()) {
+      mftRuns_.push_back({mftLcn_, 1024 * 1024});
+      mftDataSize_ = 1024ull * 1024ull * fileRecordBytes_;
+    }
+    return true;
+  }
+
+  std::optional<Entry> FindPath(std::string path) {
+    auto components = SplitPathComponents(std::move(path));
+    if (components.empty()) {
+      return std::nullopt;
+    }
+
+    Entry current;
+    current.fileRecord = 5; // NTFS root directory.
+    current.directory = true;
+    for (size_t i = 0; i < components.size(); ++i) {
+      if (!current.directory) {
+        return std::nullopt;
+      }
+      const auto entries = ReadDirectory(current.fileRecord);
+      std::optional<Entry> next;
+      for (const auto &entry : entries) {
+        if (entry.nameSpace == 2) {
+          continue; // Prefer Win32 names over DOS 8.3 aliases.
+        }
+        if (entry.name == components[i]) {
+          next = Entry{entry.fileRecord, entry.size, entry.directory};
+          break;
+        }
+      }
+      if (!next) {
+        return std::nullopt;
+      }
+      current = *next;
+    }
+    return current;
+  }
+
+  uint16_t BytesPerSector() const noexcept { return bytesPerSector_; }
+  uint8_t SectorsPerCluster() const noexcept { return sectorsPerCluster_; }
+  uint64_t MftLcn() const noexcept { return mftLcn_; }
+  uint32_t FileRecordBytes() const noexcept { return fileRecordBytes_; }
+
+private:
+  struct DataRun {
+    uint64_t lcn = 0;
+    uint64_t clusters = 0;
+  };
+
+  struct Attribute {
+    uint32_t type = 0;
+    bool nonResident = false;
+    std::vector<uint8_t> residentData;
+    std::vector<DataRun> runs;
+    uint64_t realSize = 0;
+  };
+
+  struct DirectoryEntry {
+    std::string name;
+    uint8_t nameSpace = 0;
+    uint64_t fileRecord = 0;
+    uint64_t size = 0;
+    bool directory = false;
+  };
+
+  size_t ClusterBytes() const noexcept {
+    return static_cast<size_t>(bytesPerSector_) * sectorsPerCluster_;
+  }
+
+  bool ReadVolumeBytes(uint64_t volumeOffset, uint8_t *out, size_t bytes) {
+    return ReadDiskBytes(disk_,
+                         firstLba_ * antimal::hv::IBlockDevice::kSectorSize +
+                             volumeOffset,
+                         out, bytes);
+  }
+
+  static int64_t ReadSignedRunOffset(const uint8_t *p, uint8_t bytes) {
+    int64_t value = 0;
+    for (uint8_t i = 0; i < bytes; ++i) {
+      value |= static_cast<int64_t>(p[i]) << (i * 8);
+    }
+    if (bytes > 0 && (p[bytes - 1] & 0x80u) != 0) {
+      value |= -1ll << (bytes * 8);
+    }
+    return value;
+  }
+
+  static uint64_t ReadUnsignedRunLength(const uint8_t *p, uint8_t bytes) {
+    uint64_t value = 0;
+    for (uint8_t i = 0; i < bytes; ++i) {
+      value |= static_cast<uint64_t>(p[i]) << (i * 8);
+    }
+    return value;
+  }
+
+  std::vector<DataRun> ParseDataRuns(const uint8_t *p, size_t bytes) const {
+    std::vector<DataRun> runs;
+    int64_t currentLcn = 0;
+    size_t offset = 0;
+    while (offset < bytes && p[offset] != 0) {
+      const uint8_t header = p[offset++];
+      const uint8_t lengthBytes = header & 0x0Fu;
+      const uint8_t offsetBytes = (header >> 4) & 0x0Fu;
+      if (lengthBytes == 0 || offset + lengthBytes + offsetBytes > bytes) {
+        break;
+      }
+      const uint64_t clusters = ReadUnsignedRunLength(p + offset, lengthBytes);
+      offset += lengthBytes;
+      const int64_t lcnDelta = ReadSignedRunOffset(p + offset, offsetBytes);
+      offset += offsetBytes;
+      currentLcn += lcnDelta;
+      if (currentLcn >= 0 && clusters != 0) {
+        runs.push_back({static_cast<uint64_t>(currentLcn), clusters});
+      }
+    }
+    return runs;
+  }
+
+  bool ReadStreamBytes(const std::vector<DataRun> &runs, uint64_t streamOffset,
+                       uint8_t *out, size_t bytes) {
+    size_t done = 0;
+    uint64_t logical = 0;
+    const uint64_t clusterBytes = ClusterBytes();
+    for (const auto &run : runs) {
+      const uint64_t runBytes = run.clusters * clusterBytes;
+      if (streamOffset >= logical + runBytes) {
+        logical += runBytes;
+        continue;
+      }
+      const uint64_t inRun =
+          streamOffset > logical ? streamOffset - logical : 0;
+      const uint64_t take =
+          std::min<uint64_t>(bytes - done, runBytes - inRun);
+      if (!ReadVolumeBytes(run.lcn * clusterBytes + inRun, out + done,
+                           static_cast<size_t>(take))) {
+        return false;
+      }
+      done += static_cast<size_t>(take);
+      streamOffset += take;
+      logical += runBytes;
+      if (done == bytes) {
+        return true;
+      }
+    }
+    return done == bytes;
+  }
+
+  bool ApplyFixups(std::vector<uint8_t> &record, const char *signature) const {
+    if (record.size() < 8 || std::memcmp(record.data(), signature, 4) != 0) {
+      return false;
+    }
+    const uint16_t usaOffset = ReadLe16(record.data() + 4);
+    const uint16_t usaCount = ReadLe16(record.data() + 6);
+    if (usaOffset + usaCount * 2ull > record.size() || usaCount == 0) {
+      return false;
+    }
+    const uint16_t sectors =
+        static_cast<uint16_t>(record.size() / bytesPerSector_);
+    if (usaCount < sectors + 1) {
+      return false;
+    }
+    const uint16_t updateSequence = ReadLe16(record.data() + usaOffset);
+    for (uint16_t i = 0; i < sectors; ++i) {
+      const size_t trailer = (i + 1ull) * bytesPerSector_ - 2;
+      if (trailer + 2 > record.size() ||
+          ReadLe16(record.data() + trailer) != updateSequence) {
+        return false;
+      }
+      const uint16_t replacement =
+          ReadLe16(record.data() + usaOffset + (i + 1ull) * 2);
+      record[trailer] = static_cast<uint8_t>(replacement & 0xFFu);
+      record[trailer + 1] = static_cast<uint8_t>((replacement >> 8) & 0xFFu);
+    }
+    return true;
+  }
+
+  bool ReadFileRecord(uint64_t fileRecord, std::vector<uint8_t> &out) {
+    out.assign(fileRecordBytes_, 0);
+    const uint64_t offset = fileRecord * fileRecordBytes_;
+    if (offset + fileRecordBytes_ > mftDataSize_ ||
+        !ReadStreamBytes(mftRuns_, offset, out.data(), out.size())) {
+      return false;
+    }
+    return ApplyFixups(out, "FILE");
+  }
+
+  std::vector<Attribute> Attributes(const std::vector<uint8_t> &record) const {
+    std::vector<Attribute> out;
+    if (record.size() < 24) {
+      return out;
+    }
+    size_t offset = ReadLe16(record.data() + 20);
+    while (offset + 16 <= record.size()) {
+      const uint32_t type = ReadLe32(record.data() + offset);
+      if (type == 0xFFFFFFFFu) {
+        break;
+      }
+      const uint32_t length = ReadLe32(record.data() + offset + 4);
+      if (length < 16 || offset + length > record.size()) {
+        break;
+      }
+      Attribute attr;
+      attr.type = type;
+      attr.nonResident = record[offset + 8] != 0;
+      if (!attr.nonResident) {
+        if (offset + 24 <= record.size()) {
+          const uint32_t valueLength = ReadLe32(record.data() + offset + 16);
+          const uint16_t valueOffset = ReadLe16(record.data() + offset + 20);
+          if (valueOffset + valueLength <= length) {
+            attr.residentData.assign(record.begin() + offset + valueOffset,
+                                     record.begin() + offset + valueOffset +
+                                         valueLength);
+          }
+        }
+      } else if (offset + 64 <= record.size()) {
+        const uint16_t runOffset = ReadLe16(record.data() + offset + 32);
+        attr.realSize = ReadLe64(record.data() + offset + 48);
+        if (runOffset < length) {
+          attr.runs = ParseDataRuns(record.data() + offset + runOffset,
+                                    length - runOffset);
+        }
+      }
+      out.push_back(std::move(attr));
+      offset += length;
+    }
+    return out;
+  }
+
+  static uint64_t FileReferenceToRecord(uint64_t reference) {
+    return reference & 0x0000FFFFFFFFFFFFull;
+  }
+
+  static std::string NtfsFileNameToAscii(const uint8_t *p, size_t bytes) {
+    if (bytes < 66) {
+      return {};
+    }
+    const uint8_t nameLength = p[64];
+    const size_t nameBytes = static_cast<size_t>(nameLength) * 2;
+    if (66 + nameBytes > bytes) {
+      return {};
+    }
+    return ToUpperAscii(Utf16LeAsciiName(p + 66, nameBytes));
+  }
+
+  std::vector<DirectoryEntry> ParseIndexEntries(const uint8_t *data,
+                                                size_t bytes) const {
+    std::vector<DirectoryEntry> entries;
+    size_t offset = 0;
+    size_t guard = 0;
+    while (offset + 16 <= bytes && guard++ < 65536) {
+      const uint64_t reference = ReadLe64(data + offset);
+      const uint16_t entryLength = ReadLe16(data + offset + 8);
+      const uint16_t keyLength = ReadLe16(data + offset + 10);
+      const uint16_t flags = ReadLe16(data + offset + 12);
+      if ((flags & 0x2u) != 0) {
+        break;
+      }
+      if (entryLength < 16 || offset + entryLength > bytes) {
+        break;
+      }
+      if (keyLength >= 66 && 16ull + keyLength <= entryLength) {
+        const uint8_t *name = data + offset + 16;
+        DirectoryEntry entry;
+        entry.name = NtfsFileNameToAscii(name, keyLength);
+        entry.nameSpace = name[65];
+        entry.fileRecord = FileReferenceToRecord(reference);
+        entry.size = ReadLe64(name + 48);
+        const uint32_t fileFlags = ReadLe32(name + 56);
+        entry.directory = (fileFlags & 0x10000000u) != 0;
+        if (!entry.name.empty() && entry.name != "." && entry.name != "$I30") {
+          entries.push_back(std::move(entry));
+        }
+      }
+      offset += entryLength;
+    }
+    return entries;
+  }
+
+  std::vector<DirectoryEntry> ReadDirectory(uint64_t fileRecord) {
+    std::vector<DirectoryEntry> out;
+    std::vector<uint8_t> record;
+    if (!ReadFileRecord(fileRecord, record)) {
+      return out;
+    }
+    uint32_t indexBlockSize = 0;
+    for (const auto &attr : Attributes(record)) {
+      if (attr.type != 0x90 || attr.residentData.size() < 32) {
+        continue;
+      }
+      indexBlockSize = ReadLe32(attr.residentData.data() + 8);
+      const size_t indexHeader = 16;
+      const uint32_t entryOffset =
+          ReadLe32(attr.residentData.data() + indexHeader);
+      const uint32_t totalSize =
+          ReadLe32(attr.residentData.data() + indexHeader + 4);
+      const size_t start = indexHeader + entryOffset;
+      const size_t end = std::min<size_t>(indexHeader + totalSize,
+                                          attr.residentData.size());
+      if (start < end) {
+        auto entries =
+            ParseIndexEntries(attr.residentData.data() + start, end - start);
+        out.insert(out.end(), entries.begin(), entries.end());
+      }
+    }
+    for (const auto &attr : Attributes(record)) {
+      if (attr.type != 0xA0 || !attr.nonResident || attr.runs.empty() ||
+          indexBlockSize == 0 || attr.realSize == 0 ||
+          attr.realSize > 256ull * 1024ull * 1024ull) {
+        continue;
+      }
+      std::vector<uint8_t> stream(static_cast<size_t>(attr.realSize));
+      if (!ReadStreamBytes(attr.runs, 0, stream.data(), stream.size())) {
+        continue;
+      }
+      for (size_t offset = 0; offset + indexBlockSize <= stream.size();
+           offset += indexBlockSize) {
+        std::vector<uint8_t> block(stream.begin() + offset,
+                                   stream.begin() + offset + indexBlockSize);
+        if (!ApplyFixups(block, "INDX") || block.size() < 0x28) {
+          continue;
+        }
+        const size_t indexHeader = 0x18;
+        const uint32_t entryOffset = ReadLe32(block.data() + indexHeader);
+        const uint32_t totalSize = ReadLe32(block.data() + indexHeader + 4);
+        const size_t start = indexHeader + entryOffset;
+        const size_t end =
+            std::min<size_t>(indexHeader + totalSize, block.size());
+        if (start < end) {
+          auto entries = ParseIndexEntries(block.data() + start, end - start);
+          out.insert(out.end(), entries.begin(), entries.end());
+        }
+      }
+    }
+    return out;
+  }
+
+  antimal::hv::IBlockDevice &disk_;
+  uint64_t firstLba_ = 0;
+  uint16_t bytesPerSector_ = 0;
+  uint8_t sectorsPerCluster_ = 0;
+  uint64_t mftLcn_ = 0;
+  uint32_t fileRecordBytes_ = 0;
+  uint64_t mftDataSize_ = 0;
+  std::vector<DataRun> mftRuns_;
+};
+
 bool ContainsUtf16AsciiNoCase(const std::vector<uint8_t> &bytes,
                               std::string needle) {
   needle = ToUpperAscii(std::move(needle));
@@ -1216,6 +1612,7 @@ int CommandBaseInspect(int argc, wchar_t **argv,
   const auto partitions = ReadGptPartitions(disk);
   std::cout << "GPT partitions: " << partitions.size() << "\n";
   const GptPartitionInfo *esp = nullptr;
+  const GptPartitionInfo *windows = nullptr;
   for (const auto &part : partitions) {
     const auto kind = PartitionKind(part.typeGuid);
     std::cout << "  [" << part.index << "] " << kind
@@ -1231,6 +1628,9 @@ int CommandBaseInspect(int argc, wchar_t **argv,
     std::cout << "\n";
     if (!esp && kind == "ESP") {
       esp = &part;
+    }
+    if (!windows && kind == "Windows/basic-data") {
+      windows = &part;
     }
   }
 
@@ -1300,6 +1700,42 @@ int CommandBaseInspect(int argc, wchar_t **argv,
       std::cout << "Wrote BCD dump: " << antimal::PathToUtf8(outPath) << "\n";
     }
     ok = ok && hasWinload && hasWindowsRoot;
+  }
+
+  if (!windows) {
+    std::cout << "MISSING: Windows/basic-data partition\n";
+    ok = false;
+  } else {
+    NtfsReader ntfs(disk, windows->firstLba);
+    if (!ntfs.Init()) {
+      std::cout << "MISSING: readable NTFS Windows partition\n";
+      ok = false;
+    } else {
+      std::cout << "Windows NTFS: bytesPerSector=" << ntfs.BytesPerSector()
+                << " sectorsPerCluster="
+                << static_cast<unsigned>(ntfs.SectorsPerCluster())
+                << " mftLcn=" << ntfs.MftLcn()
+                << " fileRecordBytes=" << ntfs.FileRecordBytes() << "\n";
+      const auto winload = ntfs.FindPath("Windows\\System32\\winload.efi");
+      if (winload) {
+        std::cout << "OK: Windows\\System32\\winload.efi size="
+                  << winload->size << " fileRecord=" << winload->fileRecord
+                  << "\n";
+      } else {
+        std::cout << "MISSING: Windows\\System32\\winload.efi\n";
+        ok = false;
+      }
+      const auto systemHive =
+          ntfs.FindPath("Windows\\System32\\config\\SYSTEM");
+      if (systemHive) {
+        std::cout << "OK: Windows\\System32\\config\\SYSTEM size="
+                  << systemHive->size << " fileRecord="
+                  << systemHive->fileRecord << "\n";
+      } else {
+        std::cout << "MISSING: Windows\\System32\\config\\SYSTEM\n";
+        ok = false;
+      }
+    }
   }
 
   return ok ? 0 : 1;
