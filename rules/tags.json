@@ -1,0 +1,194 @@
+{
+  "comment": "AntiMal tag rules. See src/Common/include/antimal/Tagger.h. Each rule fires its weight onto the named tag when ANY needle in ANY listed category matches the evidence. Missing categories are ignored. Weights sum across rules and across multiple matches within a rule, capped at 100.",
+  "rules": [
+    {
+      "tag": "packed",
+      "category": "packer",
+      "weight": 40,
+      "findings": ["entropy.high"],
+      "yara": ["packer", "packed"],
+      "die": ["packer"]
+    },
+    {
+      "tag": "dotnet",
+      "category": "language",
+      "weight": 20,
+      "imports": ["mscoree.dll", "mscorlib"],
+      "strings": ["_CorExeMain", "_CorDllMain"],
+      "yara": ["dotnet"],
+      "die": ["Microsoft Visual C#", "Microsoft .NET", ".NET"]
+    },
+    {
+      "tag": "netreactor",
+      "category": "packer",
+      "weight": 60,
+      "yara": ["netreactor"],
+      "die": [".NET Reactor", "Reactor"]
+    },
+    {
+      "tag": "upx",
+      "category": "packer",
+      "weight": 50,
+      "strings": ["UPX0", "UPX1"],
+      "yara": ["upx"],
+      "die": ["UPX"]
+    },
+    {
+      "tag": "themida",
+      "category": "packer",
+      "weight": 60,
+      "strings": ["Themida"],
+      "yara": ["themida"],
+      "die": ["Themida"]
+    },
+    {
+      "tag": "vmprotect",
+      "category": "packer",
+      "weight": 60,
+      "strings": ["VMProtect"],
+      "yara": ["vmprotect"],
+      "die": ["VMProtect"]
+    },
+    {
+      "tag": "obfuscar",
+      "category": "obfuscator",
+      "weight": 40,
+      "yara": ["obfuscar"],
+      "die": ["Obfuscar"]
+    },
+    {
+      "tag": "confuserex",
+      "category": "obfuscator",
+      "weight": 50,
+      "yara": ["confuserex"],
+      "die": ["ConfuserEx"]
+    },
+    {
+      "tag": "injector",
+      "category": "capability",
+      "weight": 50,
+      "imports": [
+        "WriteProcessMemory",
+        "CreateRemoteThread",
+        "NtCreateThreadEx",
+        "VirtualAllocEx",
+        "QueueUserAPC",
+        "SetThreadContext",
+        "NtMapViewOfSection"
+      ],
+      "findings": ["imports.process_injection"],
+      "yara": ["injector", "inject"],
+      "capa": ["T1055"]
+    },
+    {
+      "tag": "downloader",
+      "category": "capability",
+      "weight": 40,
+      "imports": [
+        "URLDownloadToFile",
+        "InternetOpenUrl",
+        "WinHttpOpen",
+        "WinHttpConnect",
+        "WinHttpSendRequest"
+      ],
+      "findings": ["imports.network_loader"],
+      "yara": ["downloader", "loader"],
+      "capa": ["T1105"]
+    },
+    {
+      "tag": "stealer",
+      "category": "family",
+      "weight": 50,
+      "imports": ["CryptUnprotectData"],
+      "strings": [
+        "login.live.com",
+        "Cookies",
+        "Local State",
+        "wallet.dat",
+        "Login Data",
+        "passwords",
+        "Web Data"
+      ],
+      "yara": ["stealer", "infostealer"],
+      "capa": ["T1555", "T1539"]
+    },
+    {
+      "tag": "keylogger",
+      "category": "capability",
+      "weight": 45,
+      "imports": [
+        "SetWindowsHookEx",
+        "GetAsyncKeyState",
+        "GetKeyState",
+        "GetForegroundWindow"
+      ],
+      "strings": ["keylog"],
+      "yara": ["keylog", "keylogger"],
+      "capa": ["T1056"]
+    },
+    {
+      "tag": "ransomware",
+      "category": "family",
+      "weight": 60,
+      "imports": ["BCryptEncrypt", "CryptEncrypt"],
+      "strings": [
+        ".locked",
+        ".encrypted",
+        "README_FOR_DECRYPT",
+        "DECRYPT_INSTRUCTIONS",
+        "ransom",
+        "your files have been encrypted"
+      ],
+      "yara": ["ransom"],
+      "capa": ["T1486"]
+    },
+    {
+      "tag": "anti-vm",
+      "category": "capability",
+      "weight": 25,
+      "imports": ["IsDebuggerPresent", "CheckRemoteDebuggerPresent"],
+      "strings": ["VBoxService", "VMware", "Sandboxie", "Wireshark", "OllyDbg"],
+      "yara": ["anti-vm", "anti-debug", "antidebug"],
+      "capa": ["T1497"]
+    },
+    {
+      "tag": "rat",
+      "category": "family",
+      "weight": 45,
+      "yara": ["rat", "remote-access"],
+      "capa": ["T1059.003"]
+    },
+    {
+      "tag": "persistence",
+      "category": "capability",
+      "weight": 30,
+      "imports": [
+        "RegSetValueExA",
+        "RegSetValueExW",
+        "RegCreateKeyExA",
+        "RegCreateKeyExW"
+      ],
+      "findings": ["imports.registry_persistence"],
+      "strings": ["\\Run", "RunOnce", "Winlogon", "Shell"],
+      "yara": ["persistence"],
+      "capa": ["T1547"]
+    },
+    {
+      "tag": "powershell-abuse",
+      "category": "capability",
+      "weight": 35,
+      "findings": ["strings.encoded_powershell"],
+      "strings": ["powershell", "EncodedCommand", "FromBase64String"],
+      "yara": ["powershell"],
+      "capa": ["T1059.001"]
+    },
+    {
+      "tag": "network-c2",
+      "category": "capability",
+      "weight": 30,
+      "strings": ["User-Agent", "POST /", "GET /"],
+      "yara": ["c2", "command-and-control"],
+      "capa": ["T1071"]
+    }
+  ]
+}

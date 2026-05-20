@@ -1,0 +1,78 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Project DefaultTargets="Build" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <ItemGroup Label="ProjectConfigurations">
+    <ProjectConfiguration Include="Debug|x64"><Configuration>Debug</Configuration><Platform>x64</Platform></ProjectConfiguration>
+    <ProjectConfiguration Include="Release|x64"><Configuration>Release</Configuration><Platform>x64</Platform></ProjectConfiguration>
+  </ItemGroup>
+  <PropertyGroup Label="Globals">
+    <VCProjectVersion>17.0</VCProjectVersion>
+    <Keyword>Win32Proj</Keyword>
+    <ProjectGuid>{6B9E2797-1B1F-42F3-9F97-55F5FD8B41F1}</ProjectGuid>
+    <RootNamespace>AntiMalCommon</RootNamespace>
+    <WindowsTargetPlatformVersion>10.0.26100.0</WindowsTargetPlatformVersion>
+  </PropertyGroup>
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.Default.props" />
+  <PropertyGroup Label="Configuration" Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">
+    <ConfigurationType>StaticLibrary</ConfigurationType>
+    <UseDebugLibraries>true</UseDebugLibraries>
+  </PropertyGroup>
+  <PropertyGroup Label="Configuration" Condition="'$(Configuration)|$(Platform)'=='Release|x64'">
+    <ConfigurationType>StaticLibrary</ConfigurationType>
+    <UseDebugLibraries>false</UseDebugLibraries>
+    <WholeProgramOptimization>true</WholeProgramOptimization>
+  </PropertyGroup>
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.props" />
+  <PropertyGroup>
+    <OutDir>$(SolutionDir)bin\$(Platform)\$(Configuration)\</OutDir>
+    <IntDir>$(SolutionDir)obj\AntiMal.Common\$(Platform)\$(Configuration)\</IntDir>
+  </PropertyGroup>
+  <ItemDefinitionGroup>
+    <ClCompile>
+      <AdditionalIncludeDirectories>$(ProjectDir)include;$(SolutionDir)src\Hypervisor\include;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <LanguageStandard>stdcpp20</LanguageStandard>
+      <AdditionalOptions>/utf-8 %(AdditionalOptions)</AdditionalOptions>
+    </ClCompile>
+  </ItemDefinitionGroup>
+  <ItemGroup>
+    <ClInclude Include="include\antimal\BrowserImpact.h" />
+    <ClInclude Include="include\antimal\Config.h" />
+    <ClInclude Include="include\antimal\Crypto.h" />
+    <ClInclude Include="include\antimal\EventJournal.h" />
+    <ClInclude Include="include\antimal\ExternalTools.h" />
+    <ClInclude Include="include\antimal\FileUtil.h" />
+    <ClInclude Include="include\antimal\GuestMonitor.h" />
+    <ClInclude Include="include\antimal\Http.h" />
+    <ClInclude Include="include\antimal\HyperVOrchestrator.h" />
+    <ClInclude Include="include\antimal\IntelLookup.h" />
+    <ClInclude Include="include\antimal\Json.h" />
+    <ClInclude Include="include\antimal\PeParser.h" />
+    <ClInclude Include="include\antimal\Report.h" />
+    <ClInclude Include="include\antimal\Scanner.h" />
+    <ClInclude Include="include\antimal\Screenshot.h" />
+    <ClInclude Include="include\antimal\Strings.h" />
+    <ClInclude Include="include\antimal\Subprocess.h" />
+    <ClInclude Include="include\antimal\Tagger.h" />
+    <ClInclude Include="include\antimal\Types.h" />
+  </ItemGroup>
+  <ItemGroup>
+    <ClCompile Include="src\BrowserImpact.cpp" />
+    <ClCompile Include="src\Config.cpp" />
+    <ClCompile Include="src\Crypto.cpp" />
+    <ClCompile Include="src\EventJournal.cpp" />
+    <ClCompile Include="src\ExternalTools.cpp" />
+    <ClCompile Include="src\FileUtil.cpp" />
+    <ClCompile Include="src\GuestMonitor.cpp" />
+    <ClCompile Include="src\Http.cpp" />
+    <ClCompile Include="src\HyperVOrchestrator.cpp" />
+    <ClCompile Include="src\IntelLookup.cpp" />
+    <ClCompile Include="src\Json.cpp" />
+    <ClCompile Include="src\PeParser.cpp" />
+    <ClCompile Include="src\Report.cpp" />
+    <ClCompile Include="src\Scanner.cpp" />
+    <ClCompile Include="src\Screenshot.cpp" />
+    <ClCompile Include="src\Strings.cpp" />
+    <ClCompile Include="src\Subprocess.cpp" />
+    <ClCompile Include="src\Tagger.cpp" />
+  </ItemGroup>
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
+</Project>

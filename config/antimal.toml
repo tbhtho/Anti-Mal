@@ -1,0 +1,27 @@
+base_vhdx_path = "C:\AntiMalRuns\_base\AntiMalBase.vhdx"
+base_disk_path = "C:/AntiMalRuns/_base/AntiMalBase.raw"
+base_disk_format = "raw"
+workspace_root = "C:/AntiMalRuns"
+vm_name_prefix = "AntiMal"
+default_timeout_sec = 180
+network_mode = "disabled"
+driver_bridge_mode = "off"
+vm_provider = "inhouse"
+
+# Enrichment pipeline. Tools shell out to redistributables next to AntiMal.exe.
+enrich_yara = true
+enrich_capa = true
+enrich_die = true
+enrich_tagger = true
+yara_rules_dir = ""
+tags_rules_path = ""
+
+# Network-required threat intel. Off by default. virustotal needs a key.
+intel_enabled = false
+intel_malwarebazaar = true
+virustotal_api_key = ""
+
+# Dynamic-observation knobs. Read by GuestAgent.
+dynamic_execution_enabled = false
+collect_screenshots = true
+screenshot_interval_ms = 2000

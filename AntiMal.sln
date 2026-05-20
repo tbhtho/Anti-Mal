@@ -1,0 +1,57 @@
+Microsoft Visual Studio Solution File, Format Version 12.00
+# Visual Studio Version 17
+VisualStudioVersion = 17.0.31903.59
+MinimumVisualStudioVersion = 10.0.40219.1
+Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "AntiMal.Common", "src\Common\AntiMal.Common.vcxproj", "{6B9E2797-1B1F-42F3-9F97-55F5FD8B41F1}"
+EndProject
+Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "AntiMal.HostCli", "src\HostCli\AntiMal.HostCli.vcxproj", "{A6DE18D0-8E68-4F40-9D93-63138A28AA58}"
+EndProject
+Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "AntiMal.App", "src\App\AntiMal.App.vcxproj", "{BE92F2CF-6BC8-4E65-88FE-7F7F4F7E8453}"
+EndProject
+Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "AntiMal.GuestAgent", "src\GuestAgent\AntiMal.GuestAgent.vcxproj", "{C5736E30-CFE3-40FE-8EE8-5537E2D44256}"
+EndProject
+Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "AntiMal.Tests", "src\Tests\AntiMal.Tests.vcxproj", "{DB81093D-35B4-4362-995A-607D6E7E1E82}"
+EndProject
+Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "AntiMal.DriverBridge", "src\DriverBridge\AntiMal.DriverBridge.vcxproj", "{F04111DD-CA9D-4050-B886-E7F0D6F221B8}"
+EndProject
+Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "AntiMal.Hypervisor", "src\Hypervisor\AntiMal.Hypervisor.vcxproj", "{E3B8D01A-15C0-44E8-8B60-577E85CC3C40}"
+EndProject
+Global
+	GlobalSection(SolutionConfigurationPlatforms) = preSolution
+		Debug|x64 = Debug|x64
+		Release|x64 = Release|x64
+	EndGlobalSection
+	GlobalSection(ProjectConfigurationPlatforms) = postSolution
+		{6B9E2797-1B1F-42F3-9F97-55F5FD8B41F1}.Debug|x64.ActiveCfg = Debug|x64
+		{6B9E2797-1B1F-42F3-9F97-55F5FD8B41F1}.Debug|x64.Build.0 = Debug|x64
+		{6B9E2797-1B1F-42F3-9F97-55F5FD8B41F1}.Release|x64.ActiveCfg = Release|x64
+		{6B9E2797-1B1F-42F3-9F97-55F5FD8B41F1}.Release|x64.Build.0 = Release|x64
+		{A6DE18D0-8E68-4F40-9D93-63138A28AA58}.Debug|x64.ActiveCfg = Debug|x64
+		{A6DE18D0-8E68-4F40-9D93-63138A28AA58}.Debug|x64.Build.0 = Debug|x64
+		{A6DE18D0-8E68-4F40-9D93-63138A28AA58}.Release|x64.ActiveCfg = Release|x64
+		{A6DE18D0-8E68-4F40-9D93-63138A28AA58}.Release|x64.Build.0 = Release|x64
+		{BE92F2CF-6BC8-4E65-88FE-7F7F4F7E8453}.Debug|x64.ActiveCfg = Debug|x64
+		{BE92F2CF-6BC8-4E65-88FE-7F7F4F7E8453}.Debug|x64.Build.0 = Debug|x64
+		{BE92F2CF-6BC8-4E65-88FE-7F7F4F7E8453}.Release|x64.ActiveCfg = Release|x64
+		{BE92F2CF-6BC8-4E65-88FE-7F7F4F7E8453}.Release|x64.Build.0 = Release|x64
+		{C5736E30-CFE3-40FE-8EE8-5537E2D44256}.Debug|x64.ActiveCfg = Debug|x64
+		{C5736E30-CFE3-40FE-8EE8-5537E2D44256}.Debug|x64.Build.0 = Debug|x64
+		{C5736E30-CFE3-40FE-8EE8-5537E2D44256}.Release|x64.ActiveCfg = Release|x64
+		{C5736E30-CFE3-40FE-8EE8-5537E2D44256}.Release|x64.Build.0 = Release|x64
+		{DB81093D-35B4-4362-995A-607D6E7E1E82}.Debug|x64.ActiveCfg = Debug|x64
+		{DB81093D-35B4-4362-995A-607D6E7E1E82}.Debug|x64.Build.0 = Debug|x64
+		{DB81093D-35B4-4362-995A-607D6E7E1E82}.Release|x64.ActiveCfg = Release|x64
+		{DB81093D-35B4-4362-995A-607D6E7E1E82}.Release|x64.Build.0 = Release|x64
+		{F04111DD-CA9D-4050-B886-E7F0D6F221B8}.Debug|x64.ActiveCfg = Debug|x64
+		{F04111DD-CA9D-4050-B886-E7F0D6F221B8}.Debug|x64.Build.0 = Debug|x64
+		{F04111DD-CA9D-4050-B886-E7F0D6F221B8}.Release|x64.ActiveCfg = Release|x64
+		{F04111DD-CA9D-4050-B886-E7F0D6F221B8}.Release|x64.Build.0 = Release|x64
+		{E3B8D01A-15C0-44E8-8B60-577E85CC3C40}.Debug|x64.ActiveCfg = Debug|x64
+		{E3B8D01A-15C0-44E8-8B60-577E85CC3C40}.Debug|x64.Build.0 = Debug|x64
+		{E3B8D01A-15C0-44E8-8B60-577E85CC3C40}.Release|x64.ActiveCfg = Release|x64
+		{E3B8D01A-15C0-44E8-8B60-577E85CC3C40}.Release|x64.Build.0 = Release|x64
+	EndGlobalSection
+	GlobalSection(SolutionProperties) = preSolution
+		HideSolutionNode = FALSE
+	EndGlobalSection
+EndGlobal

@@ -1,0 +1,4 @@
+# Firmware blobs are intentionally committed in this private checkpoint so a
+# fresh clone preserves the current WHP/OVMF boot debugging state. Large
+# fetched source trees and toolchains remain ignored under external\.gitignore.
+*.tmp
