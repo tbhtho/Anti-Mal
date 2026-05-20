@@ -82,6 +82,7 @@ void IdeController::Reset() {
   transferOffset_ = 0;
   pendingWriteLba_ = 0;
   pendingWriteCount_ = 0;
+  pendingWriteCommand_ = 0;
   interruptPending_ = false;
 }
 
@@ -195,7 +196,7 @@ void IdeController::ExecuteCommand(uint8_t command) {
   case kCmdReadSectors:
   case kCmdReadSectorsExt:
     ++readCommands_;
-    StartRead();
+    StartRead(command);
     if ((deviceControl_ & 0x02u) == 0) {
       interruptPending_ = true;
     }
@@ -203,7 +204,7 @@ void IdeController::ExecuteCommand(uint8_t command) {
   case kCmdWriteSectors:
   case kCmdWriteSectorsExt:
     ++writeCommands_;
-    StartWrite();
+    StartWrite(command);
     if ((deviceControl_ & 0x02u) == 0) {
       interruptPending_ = true;
     }
@@ -267,7 +268,7 @@ void IdeController::StartIdentify() {
                   TransferKind::Identify);
 }
 
-void IdeController::StartRead() {
+void IdeController::StartRead(uint8_t command) {
   auto *disk = ActiveDisk();
   if (!disk) {
     SetError(kErrorAbort);
@@ -281,16 +282,18 @@ void IdeController::StartRead() {
     return;
   }
   sectorsRead_ += count;
+  RecordAccess(false, command, lba, count);
   PrepareTransfer(std::move(bytes), TransferKind::Read);
 }
 
-void IdeController::StartWrite() {
+void IdeController::StartWrite(uint8_t command) {
   if (!ActiveDisk()) {
     SetError(kErrorAbort);
     return;
   }
   pendingWriteLba_ = CurrentLba();
   pendingWriteCount_ = RequestedSectorCount();
+  pendingWriteCommand_ = command;
   transfer_.assign(static_cast<size_t>(pendingWriteCount_) *
                        IBlockDevice::kSectorSize,
                    0);
@@ -310,6 +313,8 @@ void IdeController::CompleteWriteIfReady() {
     return;
   }
   sectorsWritten_ += pendingWriteCount_;
+  RecordAccess(true, pendingWriteCommand_, pendingWriteLba_,
+               pendingWriteCount_);
   transferKind_ = TransferKind::None;
   transfer_.clear();
   transferOffset_ = 0;
@@ -371,6 +376,40 @@ uint8_t IdeController::ReadDataByte() {
     status_ = kStatusDrdy | kStatusDsc;
   }
   return value;
+}
+
+void IdeController::RecordAccess(bool write, uint8_t command, uint64_t lba,
+                                 uint16_t count) {
+  if (count == 0) {
+    return;
+  }
+  const uint64_t end = lba + count - 1;
+  if (write) {
+    if (!sawWrite_) {
+      minWriteLba_ = lba;
+      maxWriteEndLba_ = end;
+      sawWrite_ = true;
+    } else {
+      minWriteLba_ = std::min(minWriteLba_, lba);
+      maxWriteEndLba_ = std::max(maxWriteEndLba_, end);
+    }
+  } else {
+    if (!sawRead_) {
+      minReadLba_ = lba;
+      maxReadEndLba_ = end;
+      sawRead_ = true;
+    } else {
+      minReadLba_ = std::min(minReadLba_, lba);
+      maxReadEndLba_ = std::max(maxReadEndLba_, end);
+    }
+  }
+  recentAccesses_.push_back({write, command, lba, count});
+  constexpr size_t kMaxRecentAccesses = 64;
+  if (recentAccesses_.size() > kMaxRecentAccesses) {
+    recentAccesses_.erase(recentAccesses_.begin(),
+                          recentAccesses_.begin() +
+                              (recentAccesses_.size() - kMaxRecentAccesses));
+  }
 }
 
 std::array<uint8_t, IBlockDevice::kSectorSize>

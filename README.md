@@ -13,7 +13,7 @@ AntiMal has two major layers:
 
 The scanner can already hash files, calculate entropy, parse PE metadata, mine strings and IOCs, apply rules/tags, and optionally call external tools such as YARA, capa, and Detect It Easy when those binaries are present. Threat-intel lookup support exists for MalwareBazaar and VirusTotal, but outbound intel is off by default.
 
-The in-house VM path is past the toy stage but not finished. The WHP frontend can create a partition, run vCPUs, map RAM and OVMF firmware, emulate enough PC hardware for OVMF to boot, expose an IDE disk, stream OVMF debug output, create per-run copy-on-write overlays, and render host-side live progress frames. The current Windows boot probe reaches `bootmgfw.efi`, opens BCD and code-integrity policy files, performs real IDE reads/writes, brings up OVMF QemuVideo/GOP, and captures real guest framebuffer PNGs. The latest visible guest state is Windows Recovery error `0xc0000225`, so the remaining 45% blocker is now sharply identified as base/BCD boot repair before `winload.efi`, not a blind firmware or graphics hang.
+The in-house VM path is past the toy stage but not finished. The WHP frontend can create a partition, run vCPUs, map RAM and OVMF firmware, emulate enough PC hardware for OVMF to boot, expose an IDE disk, stream OVMF debug output, create per-run copy-on-write overlays, and render host-side live progress frames. The current Windows boot probe reaches `bootmgfw.efi`, opens BCD and code-integrity policy files, applies an overlay-only BCD/bootstat repair, performs real IDE reads and writes into the Windows partition, brings up OVMF QemuVideo/GOP, and captures real guest framebuffer PNGs. The latest visible guest state is still Windows Recovery error `0xc0000225`, so the remaining 45% blocker has narrowed to the exact boot-manager-to-loader contract before `winload.efi`, not a blind firmware, graphics, or ESP discovery hang.
 
 Real malware execution remains intentionally blocked. The project stages samples and creates reports, but `dynamic_execution_enabled = false` is the default and `sampleExecuted` stays false until the benign GuestAgent channel, overlay discard, artifact return, and report pipeline are proven end to end.
 
@@ -48,23 +48,23 @@ The current milestone is "agent boot": get a benign Windows base image far enoug
 
 The active blockers are:
 
-- Make `bootmgfw.efi` proceed to `winload.efi`. The newest guest framebuffer shows Windows Recovery error `0xc0000225`, but the non-admin inspector now verifies the obvious boot contract and filesystem targets: `{bootmgr}` points at the ESP, `{default}` points at the Windows/basic-data partition, `device` and `osdevice` agree, `path` is `\Windows\system32\winload.efi`, `systemroot` is `\Windows`, and the NTFS reader finds `Windows\System32\winload.efi` plus `Windows\System32\config\SYSTEM`. That shifts the next investigation toward the VM-visible boot-device/storage/firmware contract and interrupt delivery instead of missing files.
+- Make `bootmgfw.efi` proceed to `winload.efi`. The newest guest framebuffer shows Windows Recovery error `0xc0000225`, but the non-admin inspector now verifies the obvious boot contract and filesystem targets: `{bootmgr}` points at the ESP, `{default}` points at the Windows/basic-data partition, `device` and `osdevice` agree, `path` is `\Windows\system32\winload.efi`, `systemroot` is `\Windows`, and the NTFS reader finds `Windows\System32\winload.efi` plus `Windows\System32\config\SYSTEM`. The VM also reads LBAs inside the Windows partition during the boot-manager phase, so the next investigation is correlating runtime IDE reads with the NTFS data runs for `winload.efi` and the SYSTEM hive.
 - Keep the Windows boot manager contract visible in diagnostics after BCD and code-integrity policy loads. ACPI PM1/S5 metadata is no longer treated as the immediate blocker: the FADT advertises legacy and extended PM1 blocks, the PM1 control trap preserves byte writes, and only S4/S5 requests stop the VM.
 - Continue interrupt diagnostics while boot repair is pending. Run diagnostics record pending IDE/PIT/RTC latches, IOAPIC redirection entries, PIC vector bases, PIC masks, and whether each interrupt was delivered by IOAPIC, PIC fallback, or failed routing.
+- Apply BCD recovery-policy and `bootstat.dat` cleanup to the disposable run overlay before boot. This is deliberately overlay-only: it can prove whether recovery-loop state is the blocker without mutating `C:\AntiMalRuns\_base\AntiMalBase.vhdx`.
 - Install GuestAgent into the base image and auto-start it from the offline SYSTEM hive service entry. The older HKLM Run autostart remains as a fallback.
 - Decode COM2 GuestAgent frames in the host report path, send a benign `healthcheck` job, and return `agent-health.json` once the guest service reaches user mode.
 
 Latest local probe:
 
 - `ANTIMAL_FIRMWARE_NAME=OVMF-debug.fd`
-- `AntiMal.HostCli.exe detonate bin\x64\Release\AntiMal.Tests.exe --network disabled --timeout-sec 180`
-- Run `d24bf895-2f9b-40ce-aa95-7f251aa2af0b`
-- Result: timed out before `winload`; `sampleExecuted=false`; `guestAgentConnected=false`; real framebuffer frames captured; guest screen shows Windows Recovery `0xc0000225`.
-- Disk I/O is real: `ideCommandsIssued=530`, `ideReadCommands=515`, `ideSectorsRead=60017`, `ideWriteCommands=5`, and `ideSectorsWritten=38`.
-- Interrupt routing is still blocked: `ideInterruptsRequested=25202`, `ideInterruptsInjected=0`, `ideInterruptsFailed=25202`, `irqIoApicDeliveries=0`, `irqPicFallbackDeliveries=0`, and `irqDeliveryFailures=4901892`.
-- Legacy interrupt state is now explicit: IRQ0, IRQ3, IRQ4, IRQ8, IRQ14, and IRQ15 IOAPIC entries are masked; master/slave PIC vector bases are `0x00`; master/slave PIC masks are `0xff`.
-- Boot milestones include fallback bootloader open, `bootmgfw` load, BCD open, and code-integrity policy open. OVMF QemuVideo/GOP now initializes at `1280x800x32`; the old 2 GiB VGA BAR resource conflict is fixed.
-- Serial log now shows Windows Boot Manager opening `bootstat.dat`, `BOOT\Recovery`, BCD, CI policy files, and boot fonts before displaying Recovery and issuing `ResetSystem2: Shutdown`. The host keeps that visible because PM1 writes `0x2001` as non-stopping S0.
+- `AntiMal.HostCli.exe detonate bin\x64\Release\AntiMal.Tests.exe --network disabled --timeout-sec 125`
+- Run `b2ae81c4-035c-4bca-868d-5e8f82e963d3`
+- Result: timed out before `winload`; `sampleExecuted=false`; `guestAgentConnected=false`; 82 real framebuffer frames captured; guest screen shows Windows Recovery `0xc0000225`.
+- The run emitted `vm.boot-overlay.patched`: the disposable overlay had default-loader `recoveryenabled=false`, `bootstatuspolicy=IgnoreAllFailures`, and `bootstat.dat` zeroed before the VM started.
+- Disk I/O is real and now range-tracked: the VM read LBAs `0-167772159`, wrote LBAs `83768-83785`, and the recent IDE access list includes reads in the Windows/basic-data partition around LBAs `9814976`, `9820096`, and `12898840`.
+- Boot milestones include fallback bootloader open, `bootmgfw` load, BCD open, and code-integrity policy open. OVMF QemuVideo/GOP initializes at `1280x800x32`; the old 2 GiB VGA BAR resource conflict is fixed.
+- Serial log shows Windows Boot Manager opening `bootstat.dat`, `BOOT\Recovery`, BCD, CI policy files, and boot fonts before displaying Recovery. PM1 S0 writes are diagnostics-only, while real S4/S5 requests still stop the host.
 - This shell was not elevated, so the base validator/repair and offline GuestAgent service install could not be run here.
 
 Latest base image inspection:
@@ -73,7 +73,7 @@ Latest base image inspection:
 - Result: passed without elevation.
 - GPT layout is readable through the in-house VHDX block device: MSR, EFI System Partition, and Windows/basic-data partition.
 - ESP boot files are present: `EFI\BOOT\BOOTX64.EFI`, `EFI\Microsoft\Boot\bootmgfw.efi`, `EFI\Microsoft\Boot\BCD`, and `EFI\Microsoft\Boot\Fonts\wgl4_boot.ttf`.
-- The internal BCD hive decoder verifies `{bootmgr}` on the ESP and the default Windows loader on the Windows/basic-data partition. `winload.efi`, `\Windows`, `device`, and `osdevice` all decode coherently. The default loader does not currently carry explicit `recoveryenabled` or `bootstatuspolicy` elements, which keeps the elevated repair path relevant because `bootstatuspolicy IgnoreAllFailures` is the next likely recovery-loop bypass to prove. Non-admin `bcdedit /store` still returns access denied against the dumped hive, but AntiMal can now inspect this boot contract itself.
+- The internal BCD hive decoder verifies `{bootmgr}` on the ESP and the default Windows loader on the Windows/basic-data partition. `winload.efi`, `\Windows`, `device`, and `osdevice` all decode coherently. The base loader does not currently carry explicit `recoveryenabled` or `bootstatuspolicy` elements; the current run path patches those policy elements in the disposable overlay while leaving the base VHDX unchanged. Non-admin `bcdedit /store` still returns access denied against the dumped hive, but AntiMal can now inspect and patch the needed boot contract itself.
 - The internal NTFS reader verifies `Windows\System32\winload.efi` (`3344880` bytes) and `Windows\System32\config\SYSTEM` (`10485760` bytes) directly from the Windows partition without mounting the VHDX.
 
 ## Safety Model
@@ -139,6 +139,8 @@ bin\x64\Release\AntiMal.HostCli.exe detonate C:\Path\To\File.exe --network disab
 ```
 
 This currently creates a run directory under `C:\AntiMalRuns`, writes `job.json`, `events.jsonl`, `report.json`, `report.html`, `serial.log`, `vm-summary.json`, and `vm-diagnostics.txt`, and keeps sample execution blocked.
+
+Before each in-house VM boot, AntiMal may apply a disposable overlay-only boot repair to the run disk: default-loader recovery is disabled, boot status policy is set to ignore failed boots, and `bootstat.dat` is cleared if it exists. The base VHDX is not mutated by this path. Set `ANTIMAL_DISABLE_BOOT_OVERLAY_PATCH=1` to turn that diagnostic patch off for comparison probes.
 
 Optional boot UI probe:
 

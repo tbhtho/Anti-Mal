@@ -15,6 +15,13 @@
 
 namespace antimal::hv {
 
+struct IdeAccessRange {
+  bool write = false;
+  uint8_t command = 0;
+  uint64_t lba = 0;
+  uint16_t count = 0;
+};
+
 class IdeController final : public IIoPortDevice {
 public:
   static constexpr uint16_t kPrimaryBase = 0x1F0;
@@ -38,6 +45,15 @@ public:
   uint32_t AbortedCommands() const noexcept { return abortedCommands_; }
   uint64_t SectorsRead() const noexcept { return sectorsRead_; }
   uint64_t SectorsWritten() const noexcept { return sectorsWritten_; }
+  bool SawRead() const noexcept { return sawRead_; }
+  bool SawWrite() const noexcept { return sawWrite_; }
+  uint64_t MinReadLba() const noexcept { return minReadLba_; }
+  uint64_t MaxReadEndLba() const noexcept { return maxReadEndLba_; }
+  uint64_t MinWriteLba() const noexcept { return minWriteLba_; }
+  uint64_t MaxWriteEndLba() const noexcept { return maxWriteEndLba_; }
+  const std::vector<IdeAccessRange> &RecentAccesses() const noexcept {
+    return recentAccesses_;
+  }
   const std::map<uint8_t, uint32_t> &CommandHistogram() const noexcept {
     return commandHistogram_;
   }
@@ -71,8 +87,8 @@ private:
   void Reset();
   void ExecuteCommand(uint8_t command);
   void StartIdentify();
-  void StartRead();
-  void StartWrite();
+  void StartRead(uint8_t command);
+  void StartWrite(uint8_t command);
   void CompleteWriteIfReady();
   void SetError(uint8_t error);
   IBlockDevice *ActiveDisk() const noexcept;
@@ -81,6 +97,8 @@ private:
   void PrepareTransfer(std::vector<uint8_t> bytes, TransferKind kind);
   void WriteDataByte(uint8_t value);
   uint8_t ReadDataByte();
+  void RecordAccess(bool write, uint8_t command, uint64_t lba,
+                    uint16_t count);
 
   static std::array<uint8_t, IBlockDevice::kSectorSize>
   BuildIdentifyData(const IBlockDevice *disk);
@@ -102,12 +120,20 @@ private:
   uint32_t abortedCommands_ = 0;
   uint64_t sectorsRead_ = 0;
   uint64_t sectorsWritten_ = 0;
+  bool sawRead_ = false;
+  bool sawWrite_ = false;
+  uint64_t minReadLba_ = 0;
+  uint64_t maxReadEndLba_ = 0;
+  uint64_t minWriteLba_ = 0;
+  uint64_t maxWriteEndLba_ = 0;
   std::map<uint8_t, uint32_t> commandHistogram_;
+  std::vector<IdeAccessRange> recentAccesses_;
   TransferKind transferKind_ = TransferKind::None;
   std::vector<uint8_t> transfer_;
   size_t transferOffset_ = 0;
   uint64_t pendingWriteLba_ = 0;
   uint16_t pendingWriteCount_ = 0;
+  uint8_t pendingWriteCommand_ = 0;
   uint16_t commandBase_ = kPrimaryBase;
   uint16_t controlPort_ = kPrimaryControl;
   uint8_t irqLine_ = 14;

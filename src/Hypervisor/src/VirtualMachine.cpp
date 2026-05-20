@@ -1449,6 +1449,39 @@ VmRunSummary VirtualMachine::RunLoop(
     summary.ideAbortedCommands += controller->AbortedCommands();
     summary.ideSectorsRead += controller->SectorsRead();
     summary.ideSectorsWritten += controller->SectorsWritten();
+    if (controller->SawRead()) {
+      if (!summary.ideSawRead) {
+        summary.ideMinReadLba = controller->MinReadLba();
+        summary.ideMaxReadEndLba = controller->MaxReadEndLba();
+        summary.ideSawRead = true;
+      } else {
+        summary.ideMinReadLba =
+            std::min(summary.ideMinReadLba, controller->MinReadLba());
+        summary.ideMaxReadEndLba =
+            std::max(summary.ideMaxReadEndLba, controller->MaxReadEndLba());
+      }
+    }
+    if (controller->SawWrite()) {
+      if (!summary.ideSawWrite) {
+        summary.ideMinWriteLba = controller->MinWriteLba();
+        summary.ideMaxWriteEndLba = controller->MaxWriteEndLba();
+        summary.ideSawWrite = true;
+      } else {
+        summary.ideMinWriteLba =
+            std::min(summary.ideMinWriteLba, controller->MinWriteLba());
+        summary.ideMaxWriteEndLba =
+            std::max(summary.ideMaxWriteEndLba, controller->MaxWriteEndLba());
+      }
+    }
+    const auto &recent = controller->RecentAccesses();
+    summary.ideRecentAccesses.insert(summary.ideRecentAccesses.end(),
+                                     recent.begin(), recent.end());
+    if (summary.ideRecentAccesses.size() > 64) {
+      summary.ideRecentAccesses.erase(
+          summary.ideRecentAccesses.begin(),
+          summary.ideRecentAccesses.begin() +
+              (summary.ideRecentAccesses.size() - 64));
+    }
     for (const auto &[command, count] : controller->CommandHistogram()) {
       summary.ideCommandHistogram[command] += static_cast<int>(count);
     }

@@ -431,6 +431,16 @@ DynamicRunSummary ParseDynamicSummary(const JsonValue *value) {
       static_cast<uint64_t>(IntValue(Member(*value, "ideSectorsRead")));
   summary.ideSectorsWritten =
       static_cast<uint64_t>(IntValue(Member(*value, "ideSectorsWritten")));
+  summary.ideSawRead = BoolValue(Member(*value, "ideSawRead"));
+  summary.ideSawWrite = BoolValue(Member(*value, "ideSawWrite"));
+  summary.ideMinReadLba =
+      static_cast<uint64_t>(IntValue(Member(*value, "ideMinReadLba")));
+  summary.ideMaxReadEndLba =
+      static_cast<uint64_t>(IntValue(Member(*value, "ideMaxReadEndLba")));
+  summary.ideMinWriteLba =
+      static_cast<uint64_t>(IntValue(Member(*value, "ideMinWriteLba")));
+  summary.ideMaxWriteEndLba =
+      static_cast<uint64_t>(IntValue(Member(*value, "ideMaxWriteEndLba")));
   summary.unhandledIo =
       static_cast<uint32_t>(IntValue(Member(*value, "unhandledIo")));
   summary.unhandledMmio =
@@ -929,6 +939,16 @@ std::string BuildHtmlReportWithFrames(const AnalysisReport &report,
     html << "<div class=\"k\">IDE reads</div><div class=\"mono\">"
          << report.dynamicSummary.ideReadCommands << " command(s), "
          << report.dynamicSummary.ideSectorsRead << " sector(s)</div>";
+    if (report.dynamicSummary.ideSawRead) {
+      html << "<div class=\"k\">IDE LBA read</div><div class=\"mono\">"
+           << report.dynamicSummary.ideMinReadLba << "-"
+           << report.dynamicSummary.ideMaxReadEndLba << "</div>";
+    }
+    if (report.dynamicSummary.ideSawWrite) {
+      html << "<div class=\"k\">IDE LBA write</div><div class=\"mono\">"
+           << report.dynamicSummary.ideMinWriteLba << "-"
+           << report.dynamicSummary.ideMaxWriteEndLba << "</div>";
+    }
     if (report.dynamicSummary.ideInterruptsRequested != 0 ||
         report.dynamicSummary.ideInterruptsPending != 0) {
       html << "<div class=\"k\">IDE IRQ</div><div class=\"mono\">"

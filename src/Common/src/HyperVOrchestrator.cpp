@@ -21,12 +21,14 @@
 #include <array>
 #include <atomic>
 #include <chrono>
-#include <cstdlib>
 #include <cctype>
+#include <cstdlib>
+#include <cstring>
 #include <fstream>
 #include <limits>
 #include <map>
 #include <memory>
+#include <optional>
 #include <sstream>
 #include <type_traits>
 #include <vector>
@@ -118,6 +120,848 @@ std::string JoinStrings(const std::vector<std::string> &items,
     out << items[i];
   }
   return out.str();
+}
+
+uint16_t ReadLe16(const uint8_t *p) {
+  return static_cast<uint16_t>(p[0]) |
+         (static_cast<uint16_t>(p[1]) << 8);
+}
+
+uint32_t ReadLe32(const uint8_t *p) {
+  return static_cast<uint32_t>(p[0]) |
+         (static_cast<uint32_t>(p[1]) << 8) |
+         (static_cast<uint32_t>(p[2]) << 16) |
+         (static_cast<uint32_t>(p[3]) << 24);
+}
+
+uint64_t ReadLe64(const uint8_t *p) {
+  return static_cast<uint64_t>(ReadLe32(p)) |
+         (static_cast<uint64_t>(ReadLe32(p + 4)) << 32);
+}
+
+void WriteLe32(uint8_t *p, uint32_t value) {
+  p[0] = static_cast<uint8_t>(value & 0xFFu);
+  p[1] = static_cast<uint8_t>((value >> 8) & 0xFFu);
+  p[2] = static_cast<uint8_t>((value >> 16) & 0xFFu);
+  p[3] = static_cast<uint8_t>((value >> 24) & 0xFFu);
+}
+
+void WriteLe64(uint8_t *p, uint64_t value) {
+  WriteLe32(p, static_cast<uint32_t>(value & 0xFFFFFFFFull));
+  WriteLe32(p + 4, static_cast<uint32_t>((value >> 32) & 0xFFFFFFFFull));
+}
+
+std::string ToUpperAsciiLocal(std::string value) {
+  std::transform(value.begin(), value.end(), value.begin(),
+                 [](unsigned char c) {
+                   return static_cast<char>(std::toupper(c));
+                 });
+  return value;
+}
+
+bool EqualNoCaseLocal(std::string lhs, std::string rhs) {
+  return ToUpperAsciiLocal(std::move(lhs)) == ToUpperAsciiLocal(std::move(rhs));
+}
+
+std::vector<std::string> SplitFatPath(std::string path) {
+  std::replace(path.begin(), path.end(), '/', '\\');
+  std::vector<std::string> out;
+  size_t start = 0;
+  while (start < path.size()) {
+    const size_t slash = path.find('\\', start);
+    const size_t end = slash == std::string::npos ? path.size() : slash;
+    if (end > start) {
+      out.push_back(ToUpperAsciiLocal(path.substr(start, end - start)));
+    }
+    if (slash == std::string::npos) {
+      break;
+    }
+    start = slash + 1;
+  }
+  return out;
+}
+
+bool ReadDiskBytes(hv::IBlockDevice &disk, uint64_t byteOffset, uint8_t *out,
+                   size_t bytes) {
+  size_t done = 0;
+  std::array<uint8_t, hv::IBlockDevice::kSectorSize> sector{};
+  while (done < bytes) {
+    const uint64_t absolute = byteOffset + done;
+    const uint64_t lba = absolute / hv::IBlockDevice::kSectorSize;
+    const size_t inSector =
+        static_cast<size_t>(absolute % hv::IBlockDevice::kSectorSize);
+    const size_t chunk =
+        std::min(bytes - done, hv::IBlockDevice::kSectorSize - inSector);
+    if (!disk.ReadSectors(lba, 1, sector.data())) {
+      return false;
+    }
+    std::memcpy(out + done, sector.data() + inSector, chunk);
+    done += chunk;
+  }
+  return true;
+}
+
+bool WriteDiskBytes(hv::IBlockDevice &disk, uint64_t byteOffset,
+                    const uint8_t *bytes, size_t byteCount) {
+  size_t done = 0;
+  std::array<uint8_t, hv::IBlockDevice::kSectorSize> sector{};
+  while (done < byteCount) {
+    const uint64_t absolute = byteOffset + done;
+    const uint64_t lba = absolute / hv::IBlockDevice::kSectorSize;
+    const size_t inSector =
+        static_cast<size_t>(absolute % hv::IBlockDevice::kSectorSize);
+    const size_t chunk =
+        std::min(byteCount - done, hv::IBlockDevice::kSectorSize - inSector);
+    if ((inSector != 0 || chunk != sector.size()) &&
+        !disk.ReadSectors(lba, 1, sector.data())) {
+      return false;
+    }
+    if (inSector == 0 && chunk == sector.size()) {
+      std::memcpy(sector.data(), bytes + done, sector.size());
+    } else {
+      std::memcpy(sector.data() + inSector, bytes + done, chunk);
+    }
+    if (!disk.WriteSectors(lba, 1, sector.data())) {
+      return false;
+    }
+    done += chunk;
+  }
+  return true;
+}
+
+std::string Utf16LeAsciiName(const uint8_t *p, size_t bytes) {
+  std::string out;
+  for (size_t i = 0; i + 1 < bytes; i += 2) {
+    const uint16_t ch = ReadLe16(p + i);
+    if (ch == 0) {
+      break;
+    }
+    out.push_back(ch >= 32 && ch < 127 ? static_cast<char>(ch) : '?');
+  }
+  while (!out.empty() && out.back() == ' ') {
+    out.pop_back();
+  }
+  return out;
+}
+
+std::string Utf16LeAsciiString(const std::vector<uint8_t> &bytes) {
+  std::string out;
+  for (size_t i = 0; i + 1 < bytes.size(); i += 2) {
+    const uint16_t ch = ReadLe16(bytes.data() + i);
+    if (ch == 0) {
+      break;
+    }
+    out.push_back(ch >= 32 && ch < 127 ? static_cast<char>(ch) : '?');
+  }
+  return out;
+}
+
+std::string FatLongNamePart(const uint8_t *entry) {
+  const int offsets[] = {1, 3, 5, 7, 9, 14, 16, 18, 20, 22, 24, 28, 30};
+  std::string out;
+  for (int offset : offsets) {
+    const uint16_t ch = ReadLe16(entry + offset);
+    if (ch == 0x0000 || ch == 0xFFFF) {
+      break;
+    }
+    out.push_back(ch >= 32 && ch < 127 ? static_cast<char>(ch) : '?');
+  }
+  return out;
+}
+
+std::string FatShortName(const uint8_t *entry) {
+  std::string name(reinterpret_cast<const char *>(entry), 8);
+  std::string ext(reinterpret_cast<const char *>(entry + 8), 3);
+  while (!name.empty() && name.back() == ' ') {
+    name.pop_back();
+  }
+  while (!ext.empty() && ext.back() == ' ') {
+    ext.pop_back();
+  }
+  return ext.empty() ? ToUpperAsciiLocal(name)
+                     : ToUpperAsciiLocal(name + "." + ext);
+}
+
+struct GptPartitionLite {
+  std::string typeGuid;
+  uint64_t firstLba = 0;
+  uint64_t lastLba = 0;
+};
+
+std::string GuidFromGptBytes(const uint8_t *p) {
+  char out[64]{};
+  _snprintf_s(out, sizeof(out), _TRUNCATE,
+              "%02X%02X%02X%02X-%02X%02X-%02X%02X-%02X%02X-"
+              "%02X%02X%02X%02X%02X%02X",
+              p[3], p[2], p[1], p[0], p[5], p[4], p[7], p[6], p[8], p[9],
+              p[10], p[11], p[12], p[13], p[14], p[15]);
+  return out;
+}
+
+std::vector<GptPartitionLite> ReadGptPartitionsLite(hv::IBlockDevice &disk) {
+  std::array<uint8_t, hv::IBlockDevice::kSectorSize> header{};
+  if (!disk.ReadSectors(1, 1, header.data()) ||
+      std::memcmp(header.data(), "EFI PART", 8) != 0) {
+    return {};
+  }
+  const uint64_t entriesLba = ReadLe64(header.data() + 72);
+  const uint32_t entryCount = ReadLe32(header.data() + 80);
+  const uint32_t entrySize = ReadLe32(header.data() + 84);
+  if (entrySize < 128 || entrySize > 4096 || entryCount > 4096) {
+    return {};
+  }
+  std::vector<GptPartitionLite> out;
+  std::vector<uint8_t> entry(entrySize);
+  for (uint32_t i = 0; i < entryCount; ++i) {
+    if (!ReadDiskBytes(disk,
+                       entriesLba * hv::IBlockDevice::kSectorSize +
+                           static_cast<uint64_t>(i) * entrySize,
+                       entry.data(), entry.size())) {
+      return {};
+    }
+    bool empty = true;
+    for (size_t j = 0; j < 16; ++j) {
+      empty = empty && entry[j] == 0;
+    }
+    if (empty) {
+      continue;
+    }
+    out.push_back({GuidFromGptBytes(entry.data()), ReadLe64(entry.data() + 32),
+                   ReadLe64(entry.data() + 40)});
+  }
+  return out;
+}
+
+bool IsEspGuid(const std::string &guid) {
+  return EqualNoCaseLocal(guid, "C12A7328-F81F-11D2-BA4B-00A0C93EC93B");
+}
+
+class Fat32OverlayEditor {
+public:
+  struct Entry {
+    std::string name;
+    uint8_t attributes = 0;
+    uint32_t firstCluster = 0;
+    uint32_t size = 0;
+  };
+
+  Fat32OverlayEditor(hv::IBlockDevice &disk, uint64_t firstLba)
+      : disk_(disk), firstLba_(firstLba) {}
+
+  bool Init() {
+    std::array<uint8_t, hv::IBlockDevice::kSectorSize> bs{};
+    if (!disk_.ReadSectors(firstLba_, 1, bs.data()) ||
+        std::memcmp(bs.data() + 82, "FAT32", 5) != 0) {
+      return false;
+    }
+    bytesPerSector_ = ReadLe16(bs.data() + 11);
+    sectorsPerCluster_ = bs[13];
+    reservedSectors_ = ReadLe16(bs.data() + 14);
+    fatCount_ = bs[16];
+    fatSizeSectors_ = ReadLe32(bs.data() + 36);
+    rootCluster_ = ReadLe32(bs.data() + 44);
+    if (bytesPerSector_ != hv::IBlockDevice::kSectorSize ||
+        sectorsPerCluster_ == 0 || reservedSectors_ == 0 ||
+        fatCount_ == 0 || fatSizeSectors_ == 0 || rootCluster_ < 2) {
+      return false;
+    }
+    fatStartLba_ = firstLba_ + reservedSectors_;
+    dataStartLba_ =
+        fatStartLba_ + static_cast<uint64_t>(fatCount_) * fatSizeSectors_;
+    return true;
+  }
+
+  std::optional<Entry> FindPath(std::string path) {
+    const auto components = SplitFatPath(std::move(path));
+    if (components.empty()) {
+      return std::nullopt;
+    }
+    uint32_t cluster = rootCluster_;
+    std::optional<Entry> current;
+    for (size_t i = 0; i < components.size(); ++i) {
+      current.reset();
+      for (const auto &entry : ReadDirectory(cluster)) {
+        if (entry.name == components[i]) {
+          current = entry;
+          break;
+        }
+      }
+      if (!current) {
+        return std::nullopt;
+      }
+      if (i + 1 < components.size()) {
+        if ((current->attributes & 0x10u) == 0 || current->firstCluster < 2) {
+          return std::nullopt;
+        }
+        cluster = current->firstCluster;
+      }
+    }
+    return current;
+  }
+
+  std::vector<uint8_t> ReadFile(const Entry &entry, size_t maxBytes) {
+    std::vector<uint8_t> out;
+    out.reserve(std::min<size_t>(entry.size, maxBytes));
+    uint32_t cluster = entry.firstCluster;
+    std::vector<uint8_t> clusterBytes(ClusterBytes());
+    size_t guard = 0;
+    while (cluster >= 2 && !IsEoc(cluster) && out.size() < maxBytes &&
+           guard++ < 65536) {
+      if (!ReadCluster(cluster, clusterBytes.data())) {
+        break;
+      }
+      const size_t remainingFile =
+          entry.size > out.size() ? entry.size - out.size() : 0;
+      const size_t take =
+          std::min({clusterBytes.size(), maxBytes - out.size(), remainingFile});
+      out.insert(out.end(), clusterBytes.begin(), clusterBytes.begin() + take);
+      if (take == 0) {
+        break;
+      }
+      cluster = NextCluster(cluster);
+    }
+    return out;
+  }
+
+  bool WriteFileSameSize(const Entry &entry,
+                         const std::vector<uint8_t> &bytes) {
+    if (bytes.size() != entry.size) {
+      return false;
+    }
+    uint32_t cluster = entry.firstCluster;
+    std::vector<uint8_t> clusterBytes(ClusterBytes());
+    size_t offset = 0;
+    size_t guard = 0;
+    while (cluster >= 2 && !IsEoc(cluster) && offset < bytes.size() &&
+           guard++ < 65536) {
+      if (!ReadCluster(cluster, clusterBytes.data())) {
+        return false;
+      }
+      const size_t take = std::min(clusterBytes.size(), bytes.size() - offset);
+      std::memcpy(clusterBytes.data(), bytes.data() + offset, take);
+      if (!WriteCluster(cluster, clusterBytes.data())) {
+        return false;
+      }
+      offset += take;
+      cluster = NextCluster(cluster);
+    }
+    return offset == bytes.size();
+  }
+
+  bool ZeroFile(const Entry &entry, size_t maxBytes) {
+    if (entry.size == 0 || entry.size > maxBytes) {
+      return false;
+    }
+    std::vector<uint8_t> zeros(entry.size, 0);
+    return WriteFileSameSize(entry, zeros);
+  }
+
+private:
+  size_t ClusterBytes() const noexcept {
+    return static_cast<size_t>(bytesPerSector_) * sectorsPerCluster_;
+  }
+
+  bool ReadCluster(uint32_t cluster, uint8_t *out) {
+    if (cluster < 2) {
+      return false;
+    }
+    const uint64_t lba =
+        dataStartLba_ + static_cast<uint64_t>(cluster - 2) * sectorsPerCluster_;
+    return disk_.ReadSectors(lba, sectorsPerCluster_, out);
+  }
+
+  bool WriteCluster(uint32_t cluster, const uint8_t *bytes) {
+    if (cluster < 2) {
+      return false;
+    }
+    const uint64_t lba =
+        dataStartLba_ + static_cast<uint64_t>(cluster - 2) * sectorsPerCluster_;
+    return disk_.WriteSectors(lba, sectorsPerCluster_, bytes);
+  }
+
+  uint32_t NextCluster(uint32_t cluster) {
+    std::array<uint8_t, 4> bytes{};
+    const uint64_t offset = fatStartLba_ * hv::IBlockDevice::kSectorSize +
+                            static_cast<uint64_t>(cluster) * 4ull;
+    if (!ReadDiskBytes(disk_, offset, bytes.data(), bytes.size())) {
+      return 0x0FFFFFFF;
+    }
+    return ReadLe32(bytes.data()) & 0x0FFFFFFFu;
+  }
+
+  static bool IsEoc(uint32_t cluster) noexcept {
+    return cluster >= 0x0FFFFFF8u;
+  }
+
+  std::vector<Entry> ReadDirectory(uint32_t startCluster) {
+    std::vector<Entry> out;
+    uint32_t cluster = startCluster;
+    std::vector<uint8_t> bytes(ClusterBytes());
+    std::string longName;
+    size_t guard = 0;
+    while (cluster >= 2 && !IsEoc(cluster) && guard++ < 65536) {
+      if (!ReadCluster(cluster, bytes.data())) {
+        break;
+      }
+      for (size_t off = 0; off + 32 <= bytes.size(); off += 32) {
+        const uint8_t *entry = bytes.data() + off;
+        if (entry[0] == 0x00) {
+          return out;
+        }
+        if (entry[0] == 0xE5) {
+          longName.clear();
+          continue;
+        }
+        if (entry[11] == 0x0F) {
+          longName = FatLongNamePart(entry) + longName;
+          continue;
+        }
+        Entry dir;
+        dir.name =
+            longName.empty() ? FatShortName(entry) : ToUpperAsciiLocal(longName);
+        dir.attributes = entry[11];
+        dir.firstCluster =
+            (static_cast<uint32_t>(ReadLe16(entry + 20)) << 16) |
+            ReadLe16(entry + 26);
+        dir.size = ReadLe32(entry + 28);
+        out.push_back(std::move(dir));
+        longName.clear();
+      }
+      cluster = NextCluster(cluster);
+    }
+    return out;
+  }
+
+  hv::IBlockDevice &disk_;
+  uint64_t firstLba_ = 0;
+  uint16_t bytesPerSector_ = 0;
+  uint8_t sectorsPerCluster_ = 0;
+  uint16_t reservedSectors_ = 0;
+  uint8_t fatCount_ = 0;
+  uint32_t fatSizeSectors_ = 0;
+  uint32_t rootCluster_ = 0;
+  uint64_t fatStartLba_ = 0;
+  uint64_t dataStartLba_ = 0;
+};
+
+struct BcdValueLocation {
+  uint32_t type = 0;
+  uint32_t dataLength = 0;
+  size_t dataAbsolute = 0;
+  bool inlineData = false;
+};
+
+struct HiveKeyLite {
+  uint32_t index = 0;
+  uint16_t flags = 0;
+  uint32_t subkeyCounts[2] = {0, 0};
+  uint32_t subkeyLists[2] = {0xFFFFFFFFu, 0xFFFFFFFFu};
+  uint32_t valueCount = 0;
+  uint32_t valueList = 0xFFFFFFFFu;
+  size_t nameAbsolute = 0;
+  std::string name;
+};
+
+class MutableHiveView {
+public:
+  explicit MutableHiveView(std::vector<uint8_t> &bytes) : bytes_(bytes) {}
+
+  bool IsValid() const {
+    return bytes_.size() >= 0x1000 && std::memcmp(bytes_.data(), "regf", 4) == 0;
+  }
+
+  std::optional<uint32_t> RootIndex() const {
+    if (!IsValid() || bytes_.size() < 0x28) {
+      return std::nullopt;
+    }
+    return ReadLe32(bytes_.data() + 0x24);
+  }
+
+  std::optional<HiveKeyLite> ReadKey(uint32_t index) const {
+    const auto cell = CellAbsolute(index);
+    if (!cell || *cell + 80 > bytes_.size()) {
+      return std::nullopt;
+    }
+    const size_t data = *cell + 4;
+    if (std::memcmp(bytes_.data() + data, "nk", 2) != 0) {
+      return std::nullopt;
+    }
+    HiveKeyLite key;
+    key.index = index;
+    key.flags = ReadLe16(bytes_.data() + data + 2);
+    key.subkeyCounts[0] = ReadLe32(bytes_.data() + data + 20);
+    key.subkeyCounts[1] = ReadLe32(bytes_.data() + data + 24);
+    key.subkeyLists[0] = ReadLe32(bytes_.data() + data + 28);
+    key.subkeyLists[1] = ReadLe32(bytes_.data() + data + 32);
+    key.valueCount = ReadLe32(bytes_.data() + data + 36);
+    key.valueList = ReadLe32(bytes_.data() + data + 40);
+    const uint16_t nameLen = ReadLe16(bytes_.data() + data + 72);
+    key.nameAbsolute = data + 76;
+    if (key.nameAbsolute + nameLen > bytes_.size()) {
+      return std::nullopt;
+    }
+    if ((key.flags & 0x20u) != 0) {
+      key.name.assign(reinterpret_cast<const char *>(bytes_.data() +
+                                                     key.nameAbsolute),
+                      nameLen);
+    } else {
+      key.name = Utf16LeAsciiName(bytes_.data() + key.nameAbsolute, nameLen);
+    }
+    return key;
+  }
+
+  std::optional<uint32_t> FindSubkey(uint32_t index,
+                                     const std::string &name) const {
+    for (const auto child : SubkeyIndexes(index)) {
+      const auto key = ReadKey(child);
+      if (key && EqualNoCaseLocal(key->name, name)) {
+        return child;
+      }
+    }
+    return std::nullopt;
+  }
+
+  std::optional<BcdValueLocation> FindValue(uint32_t keyIndex,
+                                            const std::string &name) const {
+    const auto key = ReadKey(keyIndex);
+    if (!key || key->valueCount == 0 || key->valueList == 0xFFFFFFFFu) {
+      return std::nullopt;
+    }
+    const auto listCell = CellAbsolute(key->valueList);
+    if (!listCell || *listCell + 4 + key->valueCount * 4ull > bytes_.size()) {
+      return std::nullopt;
+    }
+    const size_t list = *listCell + 4;
+    for (uint32_t i = 0; i < key->valueCount; ++i) {
+      const auto value = ReadValue(ReadLe32(bytes_.data() + list + i * 4ull));
+      if (value && EqualNoCaseLocal(value->name, name)) {
+        return value->location;
+      }
+    }
+    return std::nullopt;
+  }
+
+  std::vector<uint8_t> ValueBytes(const BcdValueLocation &location) const {
+    if (location.dataAbsolute + location.dataLength > bytes_.size()) {
+      return {};
+    }
+    return std::vector<uint8_t>(bytes_.begin() + location.dataAbsolute,
+                                bytes_.begin() + location.dataAbsolute +
+                                    location.dataLength);
+  }
+
+private:
+  struct NamedValue {
+    std::string name;
+    BcdValueLocation location;
+  };
+
+  std::optional<size_t> CellAbsolute(uint32_t index) const {
+    if (index == 0xFFFFFFFFu) {
+      return std::nullopt;
+    }
+    const uint64_t absolute = 0x1000ull + index;
+    if (absolute + 4 > bytes_.size()) {
+      return std::nullopt;
+    }
+    return static_cast<size_t>(absolute);
+  }
+
+  std::vector<uint32_t> SubkeyIndexes(uint32_t index) const {
+    std::vector<uint32_t> out;
+    const auto key = ReadKey(index);
+    if (!key) {
+      return out;
+    }
+    for (size_t i = 0; i < 2; ++i) {
+      if (key->subkeyCounts[i] == 0 || key->subkeyLists[i] == 0xFFFFFFFFu) {
+        continue;
+      }
+      ReadSubkeyList(key->subkeyLists[i], key->subkeyCounts[i], out, 0);
+    }
+    return out;
+  }
+
+  void ReadSubkeyList(uint32_t index, uint32_t requestedCount,
+                      std::vector<uint32_t> &out, size_t depth) const {
+    if (depth > 8) {
+      return;
+    }
+    const auto cell = CellAbsolute(index);
+    if (!cell || *cell + 8 > bytes_.size()) {
+      return;
+    }
+    const size_t data = *cell + 4;
+    const std::string sig(reinterpret_cast<const char *>(bytes_.data() + data),
+                          2);
+    const uint16_t storedCount = ReadLe16(bytes_.data() + data + 2);
+    const uint32_t count =
+        std::min<uint32_t>(requestedCount, storedCount == 0 ? requestedCount
+                                                            : storedCount);
+    if (sig == "lf" || sig == "lh") {
+      for (uint32_t i = 0; i < count; ++i) {
+        if (data + 4 + i * 8ull + 4 > bytes_.size()) {
+          break;
+        }
+        out.push_back(ReadLe32(bytes_.data() + data + 4 + i * 8ull));
+      }
+      return;
+    }
+    if (sig == "li") {
+      for (uint32_t i = 0; i < count; ++i) {
+        if (data + 4 + i * 4ull + 4 > bytes_.size()) {
+          break;
+        }
+        out.push_back(ReadLe32(bytes_.data() + data + 4 + i * 4ull));
+      }
+      return;
+    }
+    if (sig == "ri") {
+      for (uint32_t i = 0; i < count; ++i) {
+        if (data + 4 + i * 4ull + 4 > bytes_.size()) {
+          break;
+        }
+        ReadSubkeyList(ReadLe32(bytes_.data() + data + 4 + i * 4ull), 0xFFFFu,
+                       out, depth + 1);
+      }
+    }
+  }
+
+  std::optional<NamedValue> ReadValue(uint32_t index) const {
+    const auto cell = CellAbsolute(index);
+    if (!cell || *cell + 24 > bytes_.size()) {
+      return std::nullopt;
+    }
+    const size_t data = *cell + 4;
+    if (std::memcmp(bytes_.data() + data, "vk", 2) != 0) {
+      return std::nullopt;
+    }
+    const uint16_t nameLen = ReadLe16(bytes_.data() + data + 2);
+    uint32_t dataLen = ReadLe32(bytes_.data() + data + 4);
+    const uint32_t dataField = ReadLe32(bytes_.data() + data + 8);
+    const uint32_t type = ReadLe32(bytes_.data() + data + 12);
+    const uint16_t flags = ReadLe16(bytes_.data() + data + 16);
+    if (data + 20 + nameLen > bytes_.size()) {
+      return std::nullopt;
+    }
+
+    NamedValue value;
+    if ((flags & 0x1u) != 0) {
+      value.name.assign(reinterpret_cast<const char *>(bytes_.data() + data + 20),
+                        nameLen);
+    } else {
+      value.name = Utf16LeAsciiName(bytes_.data() + data + 20, nameLen);
+    }
+    value.location.type = type;
+    value.location.inlineData = (dataLen & 0x80000000u) != 0;
+    value.location.dataLength = dataLen & 0x7FFFFFFFu;
+    if (value.location.inlineData) {
+      if (value.location.dataLength > 4) {
+        return std::nullopt;
+      }
+      value.location.dataAbsolute = data + 8;
+      return value;
+    }
+    const auto dataCell = CellAbsolute(dataField);
+    if (!dataCell ||
+        *dataCell + 4 + value.location.dataLength > bytes_.size()) {
+      return std::nullopt;
+    }
+    value.location.dataAbsolute = *dataCell + 4;
+    return value;
+  }
+
+  std::vector<uint8_t> &bytes_;
+};
+
+std::string BcdElementString(MutableHiveView &hive, uint32_t objectKey,
+                             const std::string &elementId) {
+  const auto elements = hive.FindSubkey(objectKey, "Elements");
+  if (!elements) {
+    return {};
+  }
+  const auto elementKey = hive.FindSubkey(*elements, elementId);
+  if (!elementKey) {
+    return {};
+  }
+  const auto value = hive.FindValue(*elementKey, "Element");
+  if (!value || value->type != 1) {
+    return {};
+  }
+  return Utf16LeAsciiString(hive.ValueBytes(*value));
+}
+
+struct BootOverlayPatchResult {
+  bool attempted = false;
+  bool espFound = false;
+  bool bcdFound = false;
+  bool bcdPolicyPatched = false;
+  bool recoveryPatched = false;
+  bool bootstatReset = false;
+  std::vector<std::string> notes;
+};
+
+bool PatchBcdDonorElement(MutableHiveView &hive, std::vector<uint8_t> &bcd,
+                          uint32_t elementsKey, const std::string &targetId,
+                          const std::string &donorId,
+                          uint64_t replacementValue,
+                          bool oneByteValue) {
+  if (hive.FindSubkey(elementsKey, targetId)) {
+    return false;
+  }
+  const auto donorIndex = hive.FindSubkey(elementsKey, donorId);
+  if (!donorIndex) {
+    return false;
+  }
+  const auto donorKey = hive.ReadKey(*donorIndex);
+  if (!donorKey || donorKey->name.size() != targetId.size() ||
+      donorKey->nameAbsolute + targetId.size() > bcd.size()) {
+    return false;
+  }
+  const auto value = hive.FindValue(*donorIndex, "Element");
+  if (!value || value->type != 3) {
+    return false;
+  }
+  if (oneByteValue) {
+    if (value->dataLength < 1 || value->dataAbsolute + 4 > bcd.size()) {
+      return false;
+    }
+    WriteLe32(bcd.data() + value->dataAbsolute,
+              static_cast<uint32_t>(replacementValue != 0 ? 1 : 0));
+  } else {
+    if (value->dataLength < 8 || value->dataAbsolute + 8 > bcd.size()) {
+      return false;
+    }
+    WriteLe64(bcd.data() + value->dataAbsolute, replacementValue);
+  }
+  std::memcpy(bcd.data() + donorKey->nameAbsolute, targetId.data(),
+              targetId.size());
+  return true;
+}
+
+bool PatchBcdBootPolicy(std::vector<uint8_t> &bcd,
+                        BootOverlayPatchResult *result) {
+  MutableHiveView hive(bcd);
+  if (!hive.IsValid()) {
+    if (result) {
+      result->notes.push_back("BCD is not a registry hive");
+    }
+    return false;
+  }
+  const auto root = hive.RootIndex();
+  const auto objects = root ? hive.FindSubkey(*root, "Objects") : std::nullopt;
+  const auto bootmgr =
+      objects ? hive.FindSubkey(*objects,
+                                "{9dea862c-5cdd-4e70-acc1-f32b344d4795}")
+              : std::nullopt;
+  const std::string defaultGuid =
+      bootmgr ? BcdElementString(hive, *bootmgr, "23000003") : std::string{};
+  const auto defaultObject =
+      !defaultGuid.empty() && objects ? hive.FindSubkey(*objects, defaultGuid)
+                                      : std::nullopt;
+  const auto elements =
+      defaultObject ? hive.FindSubkey(*defaultObject, "Elements") : std::nullopt;
+  if (!elements) {
+    if (result) {
+      result->notes.push_back("default BCD loader Elements key not found");
+    }
+    return false;
+  }
+
+  bool changed = false;
+  if (PatchBcdDonorElement(hive, bcd, *elements, "16000009", "16000060", 0,
+                           true)) {
+    changed = true;
+    if (result) {
+      result->recoveryPatched = true;
+    }
+  }
+  if (PatchBcdDonorElement(hive, bcd, *elements, "250000E0", "25000020", 1,
+                           false)) {
+    changed = true;
+    if (result) {
+      result->bcdPolicyPatched = true;
+    }
+  }
+  if (!changed && result) {
+    result->notes.push_back("BCD boot policy elements already present or donor "
+                            "elements unavailable");
+  }
+  return changed;
+}
+
+bool BootOverlayPatchDisabled() {
+  char buf[16]{};
+  size_t needed = 0;
+  return getenv_s(&needed, buf, sizeof(buf),
+                  "ANTIMAL_DISABLE_BOOT_OVERLAY_PATCH") == 0 &&
+         needed > 1 && buf[0] != '\0' && std::atoi(buf) != 0;
+}
+
+BootOverlayPatchResult ApplyEphemeralBootOverlay(hv::IBlockDevice &disk) {
+  BootOverlayPatchResult result;
+  result.attempted = true;
+  if (BootOverlayPatchDisabled()) {
+    result.notes.push_back("disabled by ANTIMAL_DISABLE_BOOT_OVERLAY_PATCH");
+    return result;
+  }
+
+  const auto partitions = ReadGptPartitionsLite(disk);
+  const auto esp = std::find_if(partitions.begin(), partitions.end(),
+                                [](const GptPartitionLite &partition) {
+                                  return IsEspGuid(partition.typeGuid);
+                                });
+  if (esp == partitions.end()) {
+    result.notes.push_back("ESP not found");
+    return result;
+  }
+  result.espFound = true;
+  Fat32OverlayEditor fat(disk, esp->firstLba);
+  if (!fat.Init()) {
+    result.notes.push_back("ESP is not readable FAT32");
+    return result;
+  }
+
+  if (const auto bcd = fat.FindPath("EFI\\Microsoft\\Boot\\BCD")) {
+    result.bcdFound = true;
+    auto bytes = fat.ReadFile(*bcd, 4ull * 1024ull * 1024ull);
+    if (bytes.size() == bcd->size && PatchBcdBootPolicy(bytes, &result)) {
+      if (!fat.WriteFileSameSize(*bcd, bytes)) {
+        result.bcdPolicyPatched = false;
+        result.recoveryPatched = false;
+        result.notes.push_back("failed to write patched BCD to overlay");
+      }
+    }
+  } else {
+    result.notes.push_back("BCD not found on ESP");
+  }
+
+  if (const auto bootstat =
+          fat.FindPath("EFI\\Microsoft\\Boot\\bootstat.dat")) {
+    result.bootstatReset = fat.ZeroFile(*bootstat, 1024ull * 1024ull);
+    if (!result.bootstatReset) {
+      result.notes.push_back("bootstat.dat was present but not reset");
+    }
+  } else {
+    result.notes.push_back("bootstat.dat not found on ESP");
+  }
+  return result;
+}
+
+std::map<std::string, std::string>
+BootOverlayPatchDetails(const BootOverlayPatchResult &patch) {
+  std::map<std::string, std::string> details{
+      {"attempted", patch.attempted ? "true" : "false"},
+      {"espFound", patch.espFound ? "true" : "false"},
+      {"bcdFound", patch.bcdFound ? "true" : "false"},
+      {"bcdPolicyPatched", patch.bcdPolicyPatched ? "true" : "false"},
+      {"recoveryPatched", patch.recoveryPatched ? "true" : "false"},
+      {"bootstatReset", patch.bootstatReset ? "true" : "false"},
+      {"scope", "overlay-only"}};
+  if (!patch.notes.empty()) {
+    details["notes"] = JoinStrings(patch.notes, "; ");
+  }
+  return details;
 }
 
 bool ImageLooksLikeWinload(const hv::VmGuestImageInfo &image) {
@@ -522,6 +1366,12 @@ DynamicRunSummary ToDynamicSummary(const hv::VmRunSummary &vm,
   summary.ideAbortedCommands = vm.ideAbortedCommands;
   summary.ideSectorsRead = vm.ideSectorsRead;
   summary.ideSectorsWritten = vm.ideSectorsWritten;
+  summary.ideSawRead = vm.ideSawRead;
+  summary.ideSawWrite = vm.ideSawWrite;
+  summary.ideMinReadLba = vm.ideMinReadLba;
+  summary.ideMaxReadEndLba = vm.ideMaxReadEndLba;
+  summary.ideMinWriteLba = vm.ideMinWriteLba;
+  summary.ideMaxWriteEndLba = vm.ideMaxWriteEndLba;
   summary.unhandledIo = static_cast<uint32_t>(std::max(0, vm.unhandledIo));
   summary.unhandledMmio = static_cast<uint32_t>(std::max(0, vm.unhandledMmio));
   summary.watchdogCancellations =
@@ -758,6 +1608,14 @@ std::string FormatVmDiagnostics(const hv::VmRunSummary &vm) {
   out << "ideAbortedCommands: " << vm.ideAbortedCommands << "\n";
   out << "ideSectorsRead: " << vm.ideSectorsRead << "\n";
   out << "ideSectorsWritten: " << vm.ideSectorsWritten << "\n";
+  if (vm.ideSawRead) {
+    out << "ideReadLbaRange: " << vm.ideMinReadLba << "-"
+        << vm.ideMaxReadEndLba << "\n";
+  }
+  if (vm.ideSawWrite) {
+    out << "ideWriteLbaRange: " << vm.ideMinWriteLba << "-"
+        << vm.ideMaxWriteEndLba << "\n";
+  }
   out << "unhandledIo: " << vm.unhandledIo << "\n";
   out << "unhandledMmio: " << vm.unhandledMmio << "\n";
   out << "unhandledOther: " << vm.unhandledOther << "\n";
@@ -837,6 +1695,21 @@ std::string FormatVmDiagnostics(const hv::VmRunSummary &vm) {
     char hex[16]{};
     _snprintf_s(hex, sizeof(hex), _TRUNCATE, "0x%02X", command);
     out << "  " << hex << ": " << count << "\n";
+  }
+  if (!vm.ideRecentAccesses.empty()) {
+    out << "\nRecent IDE accesses:\n";
+    const size_t start = vm.ideRecentAccesses.size() > 32
+                             ? vm.ideRecentAccesses.size() - 32
+                             : 0;
+    for (size_t i = start; i < vm.ideRecentAccesses.size(); ++i) {
+      const auto &access = vm.ideRecentAccesses[i];
+      char commandHex[16]{};
+      _snprintf_s(commandHex, sizeof(commandHex), _TRUNCATE, "0x%02X",
+                  static_cast<int>(access.command));
+      out << "  " << (access.write ? "write" : "read")
+          << " cmd=" << commandHex << " lba=" << access.lba
+          << " count=" << access.count << "\n";
+    }
   }
   out << "\nCMOS reads:\n";
   for (const auto &[index, count] : topEntries(vm.cmosReadHistogram, 32)) {
@@ -1602,12 +2475,24 @@ DetonationResult InHouseOrchestrator::PrepareAndRun(
       if (preflight.rawBaseReady) {
         auto cow = hv::CowRawBlockDevice::Open(config_.baseDiskPath,
                                                result.overlayDiskPath);
+        const auto bootPatch = ApplyEphemeralBootOverlay(cow);
+        AppendJournalEvent(
+            result.journalPath,
+            MakeSandboxEvent("vm.boot-overlay.patched", result.overlayDiskPath,
+                             BootOverlayPatchDetails(bootPatch)),
+            &events);
         hv::VirtualMachine vm(preflight.firmwarePath, &cow, vmOptions);
         vm.QueueCom2Bytes(BuildHealthcheckJobFrame(result.runId));
         vmSummary = vm.Run(request);
       } else if (preflight.baseVhdxReadable) {
         auto base = hv::VhdxBlockDevice::Open(config_.baseVhdxPath);
         auto cow = hv::CowOverlayBlockDevice::Open(&base, result.overlayDiskPath);
+        const auto bootPatch = ApplyEphemeralBootOverlay(cow);
+        AppendJournalEvent(
+            result.journalPath,
+            MakeSandboxEvent("vm.boot-overlay.patched", result.overlayDiskPath,
+                             BootOverlayPatchDetails(bootPatch)),
+            &events);
         hv::VirtualMachine vm(preflight.firmwarePath, &cow, vmOptions);
         vm.QueueCom2Bytes(BuildHealthcheckJobFrame(result.runId));
         vmSummary = vm.Run(request);
@@ -1721,6 +2606,16 @@ DetonationResult InHouseOrchestrator::PrepareAndRun(
           {"artifactsCaptured",
            std::to_string(result.dynamicSummary.artifactsCaptured)},
           {"sampleExecuted", "false"}};
+      if (result.dynamicSummary.ideSawRead) {
+        details["ideReadLbaRange"] =
+            std::to_string(result.dynamicSummary.ideMinReadLba) + "-" +
+            std::to_string(result.dynamicSummary.ideMaxReadEndLba);
+      }
+      if (result.dynamicSummary.ideSawWrite) {
+        details["ideWriteLbaRange"] =
+            std::to_string(result.dynamicSummary.ideMinWriteLba) + "-" +
+            std::to_string(result.dynamicSummary.ideMaxWriteEndLba);
+      }
       if (vmSummary.timedOut) {
         details["reason"] = "timeout";
       } else if (vmSummary.fatal) {

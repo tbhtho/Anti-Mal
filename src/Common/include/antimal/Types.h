@@ -163,6 +163,12 @@ struct DynamicRunSummary {
   uint32_t ideAbortedCommands = 0;
   uint64_t ideSectorsRead = 0;
   uint64_t ideSectorsWritten = 0;
+  bool ideSawRead = false;
+  bool ideSawWrite = false;
+  uint64_t ideMinReadLba = 0;
+  uint64_t ideMaxReadEndLba = 0;
+  uint64_t ideMinWriteLba = 0;
+  uint64_t ideMaxWriteEndLba = 0;
   uint32_t unhandledIo = 0;
   uint32_t unhandledMmio = 0;
   uint32_t watchdogCancellations = 0;

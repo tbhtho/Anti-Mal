@@ -195,6 +195,13 @@ struct VmRunSummary {
   // so the host-side diagnostics writer doesn't need to keep the live VM
   // alive to render it.
   std::vector<PcIoDevices::CmosAccess> recentCmosAccesses;
+  bool ideSawRead = false;
+  bool ideSawWrite = false;
+  uint64_t ideMinReadLba = 0;
+  uint64_t ideMaxReadEndLba = 0;
+  uint64_t ideMinWriteLba = 0;
+  uint64_t ideMaxWriteEndLba = 0;
+  std::vector<IdeAccessRange> ideRecentAccesses;
   std::vector<std::string> legacyIrqDiagnostics;
   std::string serialOutput;
   std::string hostChannelOutput;

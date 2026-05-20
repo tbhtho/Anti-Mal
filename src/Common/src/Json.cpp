@@ -196,6 +196,12 @@ std::string ToJson(const DynamicRunSummary &summary) {
   obj.AddNumber("ideAbortedCommands", summary.ideAbortedCommands);
   obj.AddNumber("ideSectorsRead", summary.ideSectorsRead);
   obj.AddNumber("ideSectorsWritten", summary.ideSectorsWritten);
+  obj.AddBool("ideSawRead", summary.ideSawRead);
+  obj.AddBool("ideSawWrite", summary.ideSawWrite);
+  obj.AddNumber("ideMinReadLba", summary.ideMinReadLba);
+  obj.AddNumber("ideMaxReadEndLba", summary.ideMaxReadEndLba);
+  obj.AddNumber("ideMinWriteLba", summary.ideMinWriteLba);
+  obj.AddNumber("ideMaxWriteEndLba", summary.ideMaxWriteEndLba);
   obj.AddNumber("unhandledIo", summary.unhandledIo);
   obj.AddNumber("unhandledMmio", summary.unhandledMmio);
   obj.AddNumber("watchdogCancellations", summary.watchdogCancellations);
