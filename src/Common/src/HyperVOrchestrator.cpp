@@ -544,6 +544,565 @@ private:
   uint64_t dataStartLba_ = 0;
 };
 
+struct NtfsRunLite {
+  uint64_t lcn = 0;
+  uint64_t clusters = 0;
+};
+
+struct NtfsEntryLite {
+  uint64_t fileRecord = 0;
+  uint64_t size = 0;
+  bool directory = false;
+  std::vector<NtfsRunLite> dataRuns;
+};
+
+class NtfsBootFileLocator {
+public:
+  NtfsBootFileLocator(hv::IBlockDevice &disk, uint64_t firstLba)
+      : disk_(disk), firstLba_(firstLba) {}
+
+  bool Init() {
+    std::array<uint8_t, hv::IBlockDevice::kSectorSize> bs{};
+    if (!disk_.ReadSectors(firstLba_, 1, bs.data()) ||
+        std::memcmp(bs.data() + 3, "NTFS    ", 8) != 0) {
+      return false;
+    }
+    bytesPerSector_ = ReadLe16(bs.data() + 11);
+    sectorsPerCluster_ = bs[13];
+    mftLcn_ = ReadLe64(bs.data() + 48);
+    const int8_t fileRecordClusters =
+        static_cast<int8_t>(static_cast<char>(bs[64]));
+    if (bytesPerSector_ != hv::IBlockDevice::kSectorSize ||
+        sectorsPerCluster_ == 0 || mftLcn_ == 0) {
+      return false;
+    }
+    fileRecordBytes_ =
+        fileRecordClusters < 0
+            ? 1ull << static_cast<unsigned>(-fileRecordClusters)
+            : static_cast<uint32_t>(fileRecordClusters) * ClusterBytes();
+    if (fileRecordBytes_ < 512 || fileRecordBytes_ > 4096) {
+      return false;
+    }
+
+    std::vector<uint8_t> record0(fileRecordBytes_);
+    if (!ReadVolumeBytes(mftLcn_ * ClusterBytes(), record0.data(),
+                         record0.size()) ||
+        !ApplyFixups(record0, "FILE")) {
+      return false;
+    }
+    for (const auto &attr : Attributes(record0)) {
+      if (attr.type == 0x80 && attr.nonResident && !attr.runs.empty()) {
+        mftRuns_ = attr.runs;
+        mftDataSize_ = attr.realSize;
+        break;
+      }
+    }
+    if (mftRuns_.empty()) {
+      mftRuns_.push_back({mftLcn_, 1024 * 1024});
+      mftDataSize_ = 1024ull * 1024ull * fileRecordBytes_;
+    }
+    return true;
+  }
+
+  std::optional<NtfsEntryLite> FindPath(std::string path) {
+    std::replace(path.begin(), path.end(), '/', '\\');
+    std::vector<std::string> components;
+    size_t start = 0;
+    while (start < path.size()) {
+      const size_t slash = path.find('\\', start);
+      const size_t end = slash == std::string::npos ? path.size() : slash;
+      if (end > start) {
+        components.push_back(ToUpperAsciiLocal(path.substr(start, end - start)));
+      }
+      if (slash == std::string::npos) {
+        break;
+      }
+      start = slash + 1;
+    }
+    if (components.empty()) {
+      return std::nullopt;
+    }
+
+    NtfsEntryLite current;
+    current.fileRecord = 5;
+    current.directory = true;
+    for (const auto &component : components) {
+      if (!current.directory) {
+        return std::nullopt;
+      }
+      std::optional<NtfsEntryLite> next;
+      for (const auto &entry : ReadDirectory(current.fileRecord)) {
+        if (entry.nameSpace == 2) {
+          continue;
+        }
+        if (entry.name == component) {
+          next = NtfsEntryLite{};
+          next->fileRecord = entry.fileRecord;
+          next->size = entry.size;
+          next->directory = entry.directory;
+          break;
+        }
+      }
+      if (!next) {
+        return std::nullopt;
+      }
+      current = *next;
+    }
+    PopulateDataRuns(current);
+    return current;
+  }
+
+  uint8_t SectorsPerCluster() const noexcept { return sectorsPerCluster_; }
+
+private:
+  struct Attribute {
+    uint32_t type = 0;
+    bool nonResident = false;
+    std::vector<uint8_t> residentData;
+    std::vector<NtfsRunLite> runs;
+    uint64_t realSize = 0;
+  };
+
+  struct DirectoryEntry {
+    std::string name;
+    uint8_t nameSpace = 0;
+    uint64_t fileRecord = 0;
+    uint64_t size = 0;
+    bool directory = false;
+  };
+
+  size_t ClusterBytes() const noexcept {
+    return static_cast<size_t>(bytesPerSector_) * sectorsPerCluster_;
+  }
+
+  bool ReadVolumeBytes(uint64_t volumeOffset, uint8_t *out, size_t bytes) {
+    return ReadDiskBytes(disk_, firstLba_ * hv::IBlockDevice::kSectorSize +
+                                    volumeOffset,
+                         out, bytes);
+  }
+
+  static int64_t ReadSignedRunOffset(const uint8_t *p, uint8_t bytes) {
+    int64_t value = 0;
+    for (uint8_t i = 0; i < bytes; ++i) {
+      value |= static_cast<int64_t>(p[i]) << (i * 8);
+    }
+    if (bytes > 0 && (p[bytes - 1] & 0x80u) != 0) {
+      value |= -1ll << (bytes * 8);
+    }
+    return value;
+  }
+
+  static uint64_t ReadUnsignedRunLength(const uint8_t *p, uint8_t bytes) {
+    uint64_t value = 0;
+    for (uint8_t i = 0; i < bytes; ++i) {
+      value |= static_cast<uint64_t>(p[i]) << (i * 8);
+    }
+    return value;
+  }
+
+  std::vector<NtfsRunLite> ParseDataRuns(const uint8_t *p,
+                                         size_t bytes) const {
+    std::vector<NtfsRunLite> runs;
+    int64_t currentLcn = 0;
+    size_t offset = 0;
+    while (offset < bytes && p[offset] != 0) {
+      const uint8_t header = p[offset++];
+      const uint8_t lengthBytes = header & 0x0Fu;
+      const uint8_t offsetBytes = (header >> 4) & 0x0Fu;
+      if (lengthBytes == 0 || offset + lengthBytes + offsetBytes > bytes) {
+        break;
+      }
+      const uint64_t clusters = ReadUnsignedRunLength(p + offset, lengthBytes);
+      offset += lengthBytes;
+      const int64_t lcnDelta = ReadSignedRunOffset(p + offset, offsetBytes);
+      offset += offsetBytes;
+      currentLcn += lcnDelta;
+      if (currentLcn >= 0 && clusters != 0) {
+        runs.push_back({static_cast<uint64_t>(currentLcn), clusters});
+      }
+    }
+    return runs;
+  }
+
+  bool ReadStreamBytes(const std::vector<NtfsRunLite> &runs,
+                       uint64_t streamOffset, uint8_t *out, size_t bytes) {
+    size_t done = 0;
+    uint64_t logical = 0;
+    const uint64_t clusterBytes = ClusterBytes();
+    for (const auto &run : runs) {
+      const uint64_t runBytes = run.clusters * clusterBytes;
+      if (streamOffset >= logical + runBytes) {
+        logical += runBytes;
+        continue;
+      }
+      const uint64_t inRun =
+          streamOffset > logical ? streamOffset - logical : 0;
+      const uint64_t take =
+          std::min<uint64_t>(bytes - done, runBytes - inRun);
+      if (!ReadVolumeBytes(run.lcn * clusterBytes + inRun, out + done,
+                           static_cast<size_t>(take))) {
+        return false;
+      }
+      done += static_cast<size_t>(take);
+      streamOffset += take;
+      logical += runBytes;
+      if (done == bytes) {
+        return true;
+      }
+    }
+    return done == bytes;
+  }
+
+  bool ApplyFixups(std::vector<uint8_t> &record,
+                   const char *signature) const {
+    if (record.size() < 8 || std::memcmp(record.data(), signature, 4) != 0) {
+      return false;
+    }
+    const uint16_t usaOffset = ReadLe16(record.data() + 4);
+    const uint16_t usaCount = ReadLe16(record.data() + 6);
+    if (usaOffset + usaCount * 2ull > record.size() || usaCount == 0) {
+      return false;
+    }
+    const uint16_t sectors =
+        static_cast<uint16_t>(record.size() / bytesPerSector_);
+    if (usaCount < sectors + 1) {
+      return false;
+    }
+    const uint16_t updateSequence = ReadLe16(record.data() + usaOffset);
+    for (uint16_t i = 0; i < sectors; ++i) {
+      const size_t trailer = (i + 1ull) * bytesPerSector_ - 2;
+      if (trailer + 2 > record.size() ||
+          ReadLe16(record.data() + trailer) != updateSequence) {
+        return false;
+      }
+      const uint16_t replacement =
+          ReadLe16(record.data() + usaOffset + (i + 1ull) * 2);
+      record[trailer] = static_cast<uint8_t>(replacement & 0xFFu);
+      record[trailer + 1] =
+          static_cast<uint8_t>((replacement >> 8) & 0xFFu);
+    }
+    return true;
+  }
+
+  bool ReadFileRecord(uint64_t fileRecord, std::vector<uint8_t> &out) {
+    out.assign(fileRecordBytes_, 0);
+    const uint64_t offset = fileRecord * fileRecordBytes_;
+    if (offset + fileRecordBytes_ > mftDataSize_ ||
+        !ReadStreamBytes(mftRuns_, offset, out.data(), out.size())) {
+      return false;
+    }
+    return ApplyFixups(out, "FILE");
+  }
+
+  void PopulateDataRuns(NtfsEntryLite &entry) {
+    if (entry.directory) {
+      return;
+    }
+    std::vector<uint8_t> record;
+    if (!ReadFileRecord(entry.fileRecord, record)) {
+      return;
+    }
+    for (const auto &attr : Attributes(record)) {
+      if (attr.type == 0x80) {
+        entry.size = attr.nonResident ? attr.realSize : attr.residentData.size();
+        entry.dataRuns = attr.runs;
+        return;
+      }
+    }
+  }
+
+  std::vector<Attribute> Attributes(const std::vector<uint8_t> &record) const {
+    std::vector<Attribute> out;
+    if (record.size() < 24) {
+      return out;
+    }
+    size_t offset = ReadLe16(record.data() + 20);
+    while (offset + 16 <= record.size()) {
+      const uint32_t type = ReadLe32(record.data() + offset);
+      if (type == 0xFFFFFFFFu) {
+        break;
+      }
+      const uint32_t length = ReadLe32(record.data() + offset + 4);
+      if (length < 16 || offset + length > record.size()) {
+        break;
+      }
+      Attribute attr;
+      attr.type = type;
+      attr.nonResident = record[offset + 8] != 0;
+      if (!attr.nonResident) {
+        if (offset + 24 <= record.size()) {
+          const uint32_t valueLength = ReadLe32(record.data() + offset + 16);
+          const uint16_t valueOffset = ReadLe16(record.data() + offset + 20);
+          if (valueOffset + valueLength <= length) {
+            attr.residentData.assign(record.begin() + offset + valueOffset,
+                                     record.begin() + offset + valueOffset +
+                                         valueLength);
+          }
+        }
+      } else if (offset + 64 <= record.size()) {
+        const uint16_t runOffset = ReadLe16(record.data() + offset + 32);
+        attr.realSize = ReadLe64(record.data() + offset + 48);
+        if (runOffset < length) {
+          attr.runs =
+              ParseDataRuns(record.data() + offset + runOffset,
+                            length - runOffset);
+        }
+      }
+      out.push_back(std::move(attr));
+      offset += length;
+    }
+    return out;
+  }
+
+  static uint64_t FileReferenceToRecord(uint64_t reference) {
+    return reference & 0x0000FFFFFFFFFFFFull;
+  }
+
+  static std::string NtfsFileNameToAscii(const uint8_t *p, size_t bytes) {
+    if (bytes < 66) {
+      return {};
+    }
+    const uint8_t nameLength = p[64];
+    const size_t nameBytes = static_cast<size_t>(nameLength) * 2;
+    if (66 + nameBytes > bytes) {
+      return {};
+    }
+    return ToUpperAsciiLocal(Utf16LeAsciiName(p + 66, nameBytes));
+  }
+
+  std::vector<DirectoryEntry> ParseIndexEntries(const uint8_t *data,
+                                                size_t bytes) const {
+    std::vector<DirectoryEntry> entries;
+    size_t offset = 0;
+    size_t guard = 0;
+    while (offset + 16 <= bytes && guard++ < 65536) {
+      const uint64_t reference = ReadLe64(data + offset);
+      const uint16_t entryLength = ReadLe16(data + offset + 8);
+      const uint16_t keyLength = ReadLe16(data + offset + 10);
+      const uint16_t flags = ReadLe16(data + offset + 12);
+      if ((flags & 0x2u) != 0) {
+        break;
+      }
+      if (entryLength < 16 || offset + entryLength > bytes) {
+        break;
+      }
+      if (keyLength >= 66 && 16ull + keyLength <= entryLength) {
+        const uint8_t *name = data + offset + 16;
+        DirectoryEntry entry;
+        entry.name = NtfsFileNameToAscii(name, keyLength);
+        entry.nameSpace = name[65];
+        entry.fileRecord = FileReferenceToRecord(reference);
+        entry.size = ReadLe64(name + 48);
+        const uint32_t fileFlags = ReadLe32(name + 56);
+        entry.directory = (fileFlags & 0x10000000u) != 0;
+        if (!entry.name.empty() && entry.name != "." && entry.name != "$I30") {
+          entries.push_back(std::move(entry));
+        }
+      }
+      offset += entryLength;
+    }
+    return entries;
+  }
+
+  std::vector<DirectoryEntry> ReadDirectory(uint64_t fileRecord) {
+    std::vector<DirectoryEntry> out;
+    std::vector<uint8_t> record;
+    if (!ReadFileRecord(fileRecord, record)) {
+      return out;
+    }
+    uint32_t indexBlockSize = 0;
+    for (const auto &attr : Attributes(record)) {
+      if (attr.type != 0x90 || attr.residentData.size() < 32) {
+        continue;
+      }
+      indexBlockSize = ReadLe32(attr.residentData.data() + 8);
+      constexpr size_t kIndexHeader = 16;
+      const uint32_t entryOffset =
+          ReadLe32(attr.residentData.data() + kIndexHeader);
+      const uint32_t totalSize =
+          ReadLe32(attr.residentData.data() + kIndexHeader + 4);
+      const size_t start = kIndexHeader + entryOffset;
+      const size_t end = std::min<size_t>(kIndexHeader + totalSize,
+                                          attr.residentData.size());
+      if (start < end) {
+        auto entries =
+            ParseIndexEntries(attr.residentData.data() + start, end - start);
+        out.insert(out.end(), entries.begin(), entries.end());
+      }
+    }
+    for (const auto &attr : Attributes(record)) {
+      if (attr.type != 0xA0 || !attr.nonResident || attr.runs.empty() ||
+          indexBlockSize == 0 || attr.realSize == 0 ||
+          attr.realSize > 256ull * 1024ull * 1024ull) {
+        continue;
+      }
+      std::vector<uint8_t> stream(static_cast<size_t>(attr.realSize));
+      if (!ReadStreamBytes(attr.runs, 0, stream.data(), stream.size())) {
+        continue;
+      }
+      for (size_t offset = 0; offset + indexBlockSize <= stream.size();
+           offset += indexBlockSize) {
+        std::vector<uint8_t> block(stream.begin() + offset,
+                                   stream.begin() + offset + indexBlockSize);
+        if (!ApplyFixups(block, "INDX") || block.size() < 0x28) {
+          continue;
+        }
+        constexpr size_t kIndexHeader = 0x18;
+        const uint32_t entryOffset = ReadLe32(block.data() + kIndexHeader);
+        const uint32_t totalSize =
+            ReadLe32(block.data() + kIndexHeader + 4);
+        const size_t start = kIndexHeader + entryOffset;
+        const size_t end =
+            std::min<size_t>(kIndexHeader + totalSize, block.size());
+        if (start < end) {
+          auto entries = ParseIndexEntries(block.data() + start, end - start);
+          out.insert(out.end(), entries.begin(), entries.end());
+        }
+      }
+    }
+    return out;
+  }
+
+  hv::IBlockDevice &disk_;
+  uint64_t firstLba_ = 0;
+  uint16_t bytesPerSector_ = 0;
+  uint8_t sectorsPerCluster_ = 0;
+  uint64_t mftLcn_ = 0;
+  uint32_t fileRecordBytes_ = 0;
+  uint64_t mftDataSize_ = 0;
+  std::vector<NtfsRunLite> mftRuns_;
+};
+
+bool IsWindowsBasicDataGuid(const std::string &guid) {
+  return EqualNoCaseLocal(guid, "EBD0A0A2-B9E5-4433-87C0-68B6B72699C7");
+}
+
+struct BootReadTarget {
+  std::string name;
+  uint64_t firstLba = 0;
+  uint64_t lastLba = 0;
+};
+
+struct BootReadObservation {
+  BootReadTarget target;
+  uint64_t readCommands = 0;
+  uint64_t sectorsRead = 0;
+};
+
+std::vector<BootReadTarget> DiscoverBootReadTargets(hv::IBlockDevice &disk) {
+  std::vector<BootReadTarget> targets;
+  const auto partitions = ReadGptPartitionsLite(disk);
+  const auto windows =
+      std::find_if(partitions.begin(), partitions.end(),
+                   [](const GptPartitionLite &partition) {
+                     return IsWindowsBasicDataGuid(partition.typeGuid);
+                   });
+  if (windows == partitions.end()) {
+    return targets;
+  }
+
+  NtfsBootFileLocator ntfs(disk, windows->firstLba);
+  if (!ntfs.Init()) {
+    return targets;
+  }
+  const std::array<const char *, 2> paths = {
+      "Windows\\System32\\winload.efi",
+      "Windows\\System32\\config\\SYSTEM",
+  };
+  for (const char *path : paths) {
+    const auto entry = ntfs.FindPath(path);
+    if (!entry || entry->dataRuns.empty()) {
+      continue;
+    }
+    for (const auto &run : entry->dataRuns) {
+      const uint64_t first =
+          windows->firstLba +
+          run.lcn * static_cast<uint64_t>(ntfs.SectorsPerCluster());
+      const uint64_t sectors =
+          run.clusters * static_cast<uint64_t>(ntfs.SectorsPerCluster());
+      if (sectors != 0) {
+        targets.push_back({path, first, first + sectors - 1});
+      }
+    }
+  }
+  return targets;
+}
+
+std::vector<BootReadObservation>
+AnalyzeBootReadTargets(const hv::VmRunSummary &vm,
+                       const std::vector<BootReadTarget> &targets) {
+  std::vector<BootReadObservation> observations;
+  observations.reserve(targets.size());
+  for (const auto &target : targets) {
+    BootReadObservation observation;
+    observation.target = target;
+    for (const auto &access : vm.ideRecentAccesses) {
+      if (access.write || access.count == 0) {
+        continue;
+      }
+      const uint64_t first = access.lba;
+      const uint64_t last = access.lba + access.count - 1;
+      if (last < target.firstLba || first > target.lastLba) {
+        continue;
+      }
+      ++observation.readCommands;
+      const uint64_t overlapFirst = std::max(first, target.firstLba);
+      const uint64_t overlapLast = std::min(last, target.lastLba);
+      observation.sectorsRead += overlapLast - overlapFirst + 1;
+    }
+    observations.push_back(observation);
+  }
+  return observations;
+}
+
+std::string FormatBootReadObservations(
+    const std::vector<BootReadObservation> &observations) {
+  if (observations.empty()) {
+    return {};
+  }
+  std::ostringstream out;
+  out << "\nBoot file read targets:\n";
+  for (const auto &observation : observations) {
+    out << "  " << observation.target.name << " lba="
+        << observation.target.firstLba << "-" << observation.target.lastLba
+        << " readCommands=" << observation.readCommands
+        << " sectorsRead=" << observation.sectorsRead << "\n";
+  }
+  return out.str();
+}
+
+void AddBootReadMilestones(
+    BootSignalSummary *signals,
+    const std::vector<BootReadObservation> &observations) {
+  if (!signals) {
+    return;
+  }
+  for (const auto &observation : observations) {
+    if (observation.readCommands == 0) {
+      continue;
+    }
+    if (ContainsTextNoCase(observation.target.name, "winload.efi")) {
+      AddMilestone(signals, "winload.efi data read");
+    } else if (ContainsTextNoCase(observation.target.name, "SYSTEM")) {
+      AddMilestone(signals, "SYSTEM hive data read");
+    }
+  }
+}
+
+std::string BootReadDetails(
+    const std::vector<BootReadObservation> &observations) {
+  std::vector<std::string> parts;
+  for (const auto &observation : observations) {
+    std::ostringstream item;
+    item << observation.target.name << " lba=" << observation.target.firstLba
+         << "-" << observation.target.lastLba
+         << " readCommands=" << observation.readCommands
+         << " sectorsRead=" << observation.sectorsRead;
+    parts.push_back(item.str());
+  }
+  return JoinStrings(parts, "; ");
+}
+
 struct BcdValueLocation {
   uint32_t type = 0;
   uint32_t dataLength = 0;
@@ -1697,11 +2256,10 @@ std::string FormatVmDiagnostics(const hv::VmRunSummary &vm) {
     out << "  " << hex << ": " << count << "\n";
   }
   if (!vm.ideRecentAccesses.empty()) {
-    out << "\nRecent IDE accesses:\n";
-    const size_t start = vm.ideRecentAccesses.size() > 32
-                             ? vm.ideRecentAccesses.size() - 32
-                             : 0;
-    for (size_t i = start; i < vm.ideRecentAccesses.size(); ++i) {
+    out << "\nIDE access trace (oldest to newest, captured "
+        << vm.ideRecentAccesses.size()
+        << " record(s), capped at 4096):\n";
+    for (size_t i = 0; i < vm.ideRecentAccesses.size(); ++i) {
       const auto &access = vm.ideRecentAccesses[i];
       char commandHex[16]{};
       _snprintf_s(commandHex, sizeof(commandHex), _TRUNCATE, "0x%02X",
@@ -2455,6 +3013,7 @@ DetonationResult InHouseOrchestrator::PrepareAndRun(
         };
       fireProgress("booting", "Booting VM (firmware -> guest)");
       hv::VmRunSummary vmSummary;
+      std::vector<BootReadTarget> bootReadTargets;
       hv::VirtualMachineOptions vmOptions;
       vmOptions.processorCount = 2;
       // ANTIMAL_VCPU_COUNT lets us test single-CPU vs multi-CPU boot paths
@@ -2476,6 +3035,7 @@ DetonationResult InHouseOrchestrator::PrepareAndRun(
         auto cow = hv::CowRawBlockDevice::Open(config_.baseDiskPath,
                                                result.overlayDiskPath);
         const auto bootPatch = ApplyEphemeralBootOverlay(cow);
+        bootReadTargets = DiscoverBootReadTargets(cow);
         AppendJournalEvent(
             result.journalPath,
             MakeSandboxEvent("vm.boot-overlay.patched", result.overlayDiskPath,
@@ -2488,6 +3048,7 @@ DetonationResult InHouseOrchestrator::PrepareAndRun(
         auto base = hv::VhdxBlockDevice::Open(config_.baseVhdxPath);
         auto cow = hv::CowOverlayBlockDevice::Open(&base, result.overlayDiskPath);
         const auto bootPatch = ApplyEphemeralBootOverlay(cow);
+        bootReadTargets = DiscoverBootReadTargets(cow);
         AppendJournalEvent(
             result.journalPath,
             MakeSandboxEvent("vm.boot-overlay.patched", result.overlayDiskPath,
@@ -2501,12 +3062,17 @@ DetonationResult InHouseOrchestrator::PrepareAndRun(
       }
       vmSummary.framesCaptured =
           realFrameCounter->load(std::memory_order_relaxed);
+      const auto bootReadObservations =
+          AnalyzeBootReadTargets(vmSummary, bootReadTargets);
       fireProgress("finishing", "VM run loop returned; writing diagnostics");
       WriteTextFile(serialLogPath, vmSummary.serialOutput);
-      WriteTextFile(vmDiagnosticsPath, FormatVmDiagnostics(vmSummary));
+      WriteTextFile(vmDiagnosticsPath,
+                    FormatVmDiagnostics(vmSummary) +
+                        FormatBootReadObservations(bootReadObservations));
       result.dynamicSummary =
           ToDynamicSummary(vmSummary, networkMode, serialLogPath, vmSummaryPath);
-      const auto bootSignals = AnalyzeBootSignals(vmSummary);
+      auto bootSignals = AnalyzeBootSignals(vmSummary);
+      AddBootReadMilestones(&bootSignals, bootReadObservations);
       const auto hostCapture =
           ProcessHostChannelOutput(vmSummary.hostChannelOutput, result.journalPath,
                                    result.artifactsDir, &events);
@@ -2615,6 +3181,9 @@ DetonationResult InHouseOrchestrator::PrepareAndRun(
         details["ideWriteLbaRange"] =
             std::to_string(result.dynamicSummary.ideMinWriteLba) + "-" +
             std::to_string(result.dynamicSummary.ideMaxWriteEndLba);
+      }
+      if (!bootReadObservations.empty()) {
+        details["bootFileReads"] = BootReadDetails(bootReadObservations);
       }
       if (vmSummary.timedOut) {
         details["reason"] = "timeout";

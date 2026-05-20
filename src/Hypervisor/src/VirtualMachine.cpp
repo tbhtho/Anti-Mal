@@ -1476,11 +1476,12 @@ VmRunSummary VirtualMachine::RunLoop(
     const auto &recent = controller->RecentAccesses();
     summary.ideRecentAccesses.insert(summary.ideRecentAccesses.end(),
                                      recent.begin(), recent.end());
-    if (summary.ideRecentAccesses.size() > 64) {
+    constexpr size_t kMaxSummaryIdeAccesses = 4096;
+    if (summary.ideRecentAccesses.size() > kMaxSummaryIdeAccesses) {
       summary.ideRecentAccesses.erase(
           summary.ideRecentAccesses.begin(),
           summary.ideRecentAccesses.begin() +
-              (summary.ideRecentAccesses.size() - 64));
+              (summary.ideRecentAccesses.size() - kMaxSummaryIdeAccesses));
     }
     for (const auto &[command, count] : controller->CommandHistogram()) {
       summary.ideCommandHistogram[command] += static_cast<int>(count);

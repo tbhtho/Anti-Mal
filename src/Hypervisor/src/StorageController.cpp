@@ -404,7 +404,7 @@ void IdeController::RecordAccess(bool write, uint8_t command, uint64_t lba,
     }
   }
   recentAccesses_.push_back({write, command, lba, count});
-  constexpr size_t kMaxRecentAccesses = 64;
+  constexpr size_t kMaxRecentAccesses = 4096;
   if (recentAccesses_.size() > kMaxRecentAccesses) {
     recentAccesses_.erase(recentAccesses_.begin(),
                           recentAccesses_.begin() +

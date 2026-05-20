@@ -17,6 +17,7 @@
 #include <fstream>
 #include <iomanip>
 #include <iostream>
+#include <limits>
 #include <optional>
 #include <sstream>
 #include <string>
@@ -581,10 +582,17 @@ public:
   NtfsReader(antimal::hv::IBlockDevice &disk, uint64_t firstLba)
       : disk_(disk), firstLba_(firstLba) {}
 
+  struct DataRun {
+    uint64_t lcn = 0;
+    uint64_t clusters = 0;
+  };
+
   struct Entry {
     uint64_t fileRecord = 0;
     uint64_t size = 0;
     bool directory = false;
+    bool dataResident = false;
+    std::vector<DataRun> dataRuns;
   };
 
   bool Init() {
@@ -652,7 +660,10 @@ public:
           continue; // Prefer Win32 names over DOS 8.3 aliases.
         }
         if (entry.name == components[i]) {
-          next = Entry{entry.fileRecord, entry.size, entry.directory};
+          next = Entry{};
+          next->fileRecord = entry.fileRecord;
+          next->size = entry.size;
+          next->directory = entry.directory;
           break;
         }
       }
@@ -661,20 +672,19 @@ public:
       }
       current = *next;
     }
+    PopulateDataRuns(current);
     return current;
   }
 
   uint16_t BytesPerSector() const noexcept { return bytesPerSector_; }
   uint8_t SectorsPerCluster() const noexcept { return sectorsPerCluster_; }
+  size_t ClusterBytes() const noexcept {
+    return static_cast<size_t>(bytesPerSector_) * sectorsPerCluster_;
+  }
   uint64_t MftLcn() const noexcept { return mftLcn_; }
   uint32_t FileRecordBytes() const noexcept { return fileRecordBytes_; }
 
 private:
-  struct DataRun {
-    uint64_t lcn = 0;
-    uint64_t clusters = 0;
-  };
-
   struct Attribute {
     uint32_t type = 0;
     bool nonResident = false;
@@ -690,10 +700,6 @@ private:
     uint64_t size = 0;
     bool directory = false;
   };
-
-  size_t ClusterBytes() const noexcept {
-    return static_cast<size_t>(bytesPerSector_) * sectorsPerCluster_;
-  }
 
   bool ReadVolumeBytes(uint64_t volumeOffset, uint8_t *out, size_t bytes) {
     return ReadDiskBytes(disk_,
@@ -810,6 +816,25 @@ private:
       return false;
     }
     return ApplyFixups(out, "FILE");
+  }
+
+  void PopulateDataRuns(Entry &entry) {
+    if (entry.directory) {
+      return;
+    }
+    std::vector<uint8_t> record;
+    if (!ReadFileRecord(entry.fileRecord, record)) {
+      return;
+    }
+    for (const auto &attr : Attributes(record)) {
+      if (attr.type != 0x80) {
+        continue;
+      }
+      entry.dataResident = !attr.nonResident;
+      entry.size = attr.nonResident ? attr.realSize : attr.residentData.size();
+      entry.dataRuns = attr.runs;
+      return;
+    }
   }
 
   std::vector<Attribute> Attributes(const std::vector<uint8_t> &record) const {
@@ -1630,6 +1655,62 @@ void PrintBcdDecodedSummary(const std::vector<uint8_t> &bcdBytes,
             << " osDevice=" << (osDeviceOk ? "ok" : "bad") << "\n";
 }
 
+void PrintNtfsDataRuns(const std::string &path, const NtfsReader::Entry &entry,
+                       uint64_t volumeFirstLba, uint8_t sectorsPerCluster) {
+  if (entry.directory) {
+    return;
+  }
+  if (entry.dataResident) {
+    std::cout << "    dataRuns: resident size=" << entry.size << "\n";
+    return;
+  }
+  if (entry.dataRuns.empty()) {
+    std::cout << "    dataRuns: unavailable\n";
+    return;
+  }
+
+  uint64_t minLba = std::numeric_limits<uint64_t>::max();
+  uint64_t maxLba = 0;
+  uint64_t totalSectors = 0;
+  for (const auto &run : entry.dataRuns) {
+    if (run.clusters == 0) {
+      continue;
+    }
+    const uint64_t first =
+        volumeFirstLba + run.lcn * static_cast<uint64_t>(sectorsPerCluster);
+    const uint64_t sectors =
+        run.clusters * static_cast<uint64_t>(sectorsPerCluster);
+    const uint64_t last = first + sectors - 1;
+    minLba = std::min(minLba, first);
+    maxLba = std::max(maxLba, last);
+    totalSectors += sectors;
+  }
+  if (minLba == std::numeric_limits<uint64_t>::max()) {
+    std::cout << "    dataRuns: unavailable\n";
+    return;
+  }
+
+  std::cout << "    dataRuns: count=" << entry.dataRuns.size()
+            << " lbaRange=" << minLba << "-" << maxLba
+            << " sectors=" << totalSectors << "\n";
+  const size_t limit = std::min<size_t>(entry.dataRuns.size(), 16);
+  for (size_t i = 0; i < limit; ++i) {
+    const auto &run = entry.dataRuns[i];
+    const uint64_t first =
+        volumeFirstLba + run.lcn * static_cast<uint64_t>(sectorsPerCluster);
+    const uint64_t sectors =
+        run.clusters * static_cast<uint64_t>(sectorsPerCluster);
+    const uint64_t last = sectors == 0 ? first : first + sectors - 1;
+    std::cout << "      [" << i << "] " << path << " lcn=" << run.lcn
+              << " clusters=" << run.clusters << " lba=" << first << "-"
+              << last << "\n";
+  }
+  if (entry.dataRuns.size() > limit) {
+    std::cout << "      ... " << (entry.dataRuns.size() - limit)
+              << " more run(s)\n";
+  }
+}
+
 int CommandBaseInspect(int argc, wchar_t **argv,
                        const antimal::AppConfig &config) {
   const auto vhdxText = OptionValue(argc, argv, "--vhdx");
@@ -1760,6 +1841,8 @@ int CommandBaseInspect(int argc, wchar_t **argv,
         std::cout << "OK: Windows\\System32\\winload.efi size="
                   << winload->size << " fileRecord=" << winload->fileRecord
                   << "\n";
+        PrintNtfsDataRuns("Windows\\System32\\winload.efi", *winload,
+                          windows->firstLba, ntfs.SectorsPerCluster());
       } else {
         std::cout << "MISSING: Windows\\System32\\winload.efi\n";
         ok = false;
@@ -1770,6 +1853,8 @@ int CommandBaseInspect(int argc, wchar_t **argv,
         std::cout << "OK: Windows\\System32\\config\\SYSTEM size="
                   << systemHive->size << " fileRecord="
                   << systemHive->fileRecord << "\n";
+        PrintNtfsDataRuns("Windows\\System32\\config\\SYSTEM", *systemHive,
+                          windows->firstLba, ntfs.SectorsPerCluster());
       } else {
         std::cout << "MISSING: Windows\\System32\\config\\SYSTEM\n";
         ok = false;
