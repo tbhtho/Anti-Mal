@@ -673,7 +673,8 @@ VmRunSummary VirtualMachine::Run(const VmRunRequest &request) {
                            : std::chrono::milliseconds{1};
   auto summary = RunLoop(request.maxSteps,
                          std::chrono::steady_clock::now() + timeout,
-                         request.progressCallback, request.progressInterval);
+                         request.progressCallback, request.progressInterval,
+                         request.cancelRequested);
   summary.networkMode = request.networkMode;
   return summary;
 }
@@ -681,7 +682,8 @@ VmRunSummary VirtualMachine::Run(const VmRunRequest &request) {
 VmRunSummary VirtualMachine::RunLoop(
     int maxSteps, std::chrono::steady_clock::time_point deadline,
     const VmProgressCallback &progressCallback,
-    std::chrono::milliseconds progressInterval) {
+    std::chrono::milliseconds progressInterval,
+    std::shared_ptr<std::atomic_bool> cancelRequested) {
   VmRunSummary summary;
   summary.started = true;
   summary.processorCount = host_.ProcessorCount();
@@ -920,7 +922,8 @@ VmRunSummary VirtualMachine::RunLoop(
     }
   };
   for (int step = 0; step < maxSteps && !summary.fatal && !summary.idleLoop &&
-       !summary.halted && !summary.timedOut && !summary.guestShutdown; ++step) {
+       !summary.halted && !summary.timedOut && !summary.guestShutdown &&
+       !summary.hostStopRequested; ++step) {
     if (std::chrono::steady_clock::now() >= deadline) {
       summary.timedOut = true;
       break;
@@ -928,6 +931,11 @@ VmRunSummary VirtualMachine::RunLoop(
     if (pcIo_.ShutdownRequested()) {
       summary.guestShutdown = true;
       summary.guestShutdownSleepType = pcIo_.LastSleepType();
+      summary.pm1SleepEnable = pcIo_.LastPm1SleepEnable();
+      summary.pm1SleepType = pcIo_.LastSleepType();
+      summary.pm1ControlValue = pcIo_.LastPm1ControlValue();
+      summary.pm1HostStopRequested = pcIo_.LastPm1HostStopRequested();
+      summary.pm1SleepRequests = pcIo_.Pm1SleepRequestCount();
       summary.halted = true;
       break;
     }
@@ -1297,6 +1305,11 @@ VmRunSummary VirtualMachine::RunLoop(
       lastProgressFire = now;
     }
 
+    if (cancelRequested &&
+        cancelRequested->load(std::memory_order_relaxed)) {
+      summary.hostStopRequested = true;
+    }
+
     if (now >= deadline) {
       summary.timedOut = true;
     }
@@ -1371,6 +1384,11 @@ VmRunSummary VirtualMachine::RunLoop(
   summary.ioApicRaises = ioApic_.RaiseCount();
   summary.ioApicDeliveries = ioApic_.Deliveries();
   summary.ioApicMaskedDrops = ioApic_.MaskedDrops();
+  summary.pm1SleepEnable = pcIo_.LastPm1SleepEnable();
+  summary.pm1SleepType = pcIo_.LastSleepType();
+  summary.pm1ControlValue = pcIo_.LastPm1ControlValue();
+  summary.pm1HostStopRequested = pcIo_.LastPm1HostStopRequested();
+  summary.pm1SleepRequests = pcIo_.Pm1SleepRequestCount();
   summary.hpetReads = hpet_.Reads();
   summary.hpetWrites = hpet_.Writes();
   summary.pitIrqsDelivered = pcIo_.PitIrqCount();

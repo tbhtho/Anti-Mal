@@ -20,8 +20,9 @@
 #include "antimal/hv/Vcpu.h"
 #include "antimal/hv/WhpHost.h"
 
-#include <cstdint>
+#include <atomic>
 #include <chrono>
+#include <cstdint>
 #include <filesystem>
 #include <functional>
 #include <map>
@@ -64,12 +65,18 @@ struct VmRunSummary {
   bool fatal = false;
   bool idleLoop = false;
   bool halted = false;
+  bool hostStopRequested = false;
   // True when the guest issued an ACPI S4/S5 shutdown via PIIX4 PM1a_CNT
   // (typically OVMF's ResetSystemRuntimeDxe responding to RT->ResetSystem
   // (EfiResetShutdown) from bootmgr or the OS). The run loop exits cleanly
   // when this fires instead of timing out.
   bool guestShutdown = false;
   uint8_t guestShutdownSleepType = 0;
+  bool pm1SleepEnable = false;
+  bool pm1HostStopRequested = false;
+  uint8_t pm1SleepType = 0;
+  uint16_t pm1ControlValue = 0;
+  uint64_t pm1SleepRequests = 0;
   VmNetworkMode networkMode = VmNetworkMode::Disabled;
   int steps = 0;
   uint32_t processorCount = 1;
@@ -274,6 +281,7 @@ struct VmRunRequest {
   // must not call back into the VirtualMachine instance.
   VmProgressCallback progressCallback;
   std::chrono::milliseconds progressInterval{1500};
+  std::shared_ptr<std::atomic_bool> cancelRequested;
 };
 
 class VirtualMachine {
@@ -300,7 +308,8 @@ private:
                        std::chrono::steady_clock::time_point deadline,
                        const VmProgressCallback &progressCallback = nullptr,
                        std::chrono::milliseconds progressInterval =
-                           std::chrono::milliseconds{1500});
+                           std::chrono::milliseconds{1500},
+                       std::shared_ptr<std::atomic_bool> cancelRequested = {});
   void AttachDefaultDevices();
   void AttachIdeDisk(IBlockDevice *disk);
   uint8_t *HostPointerForGpa(uint64_t gpa, size_t length) noexcept;

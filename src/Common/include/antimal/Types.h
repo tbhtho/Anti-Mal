@@ -166,6 +166,11 @@ struct DynamicRunSummary {
   uint32_t unhandledIo = 0;
   uint32_t unhandledMmio = 0;
   uint32_t watchdogCancellations = 0;
+  bool pm1SleepEnable = false;
+  bool pm1HostStopRequested = false;
+  uint32_t pm1SleepType = 0;
+  uint32_t pm1ControlValue = 0;
+  uint64_t pm1SleepRequests = 0;
   std::vector<std::string> bootMilestones;
   std::filesystem::path serialLogPath;
   std::filesystem::path vmSummaryPath;

@@ -262,6 +262,7 @@ New-Item -ItemType Directory -Force -Path $outputDir | Out-Null
 if ((Test-Path -LiteralPath $OutputVhdxPath) -and -not $Force) {
   Write-Host "Local base VHDX already exists: $OutputVhdxPath"
   Write-Host "Reusing it. Pass -Force only when you intentionally want to rebuild and replace it."
+  Test-AntiMalBaseVhdx $OutputVhdxPath
   if ($WriteConfig) {
     Write-AntiMalConfig
   }

@@ -45,13 +45,6 @@ constexpr uint16_t kFwCfgAcpiTables = kFwCfgFileFirst + 1;
 constexpr uint16_t kFwCfgTableLoader = kFwCfgFileFirst + 2;
 constexpr uint16_t kFwCfgAcpiRsdp = kFwCfgFileFirst + 3;
 
-std::tm UtcNow() {
-  const std::time_t now = std::time(nullptr);
-  std::tm tm{};
-  gmtime_s(&tm, &now);
-  return tm;
-}
-
 // Returns a wallclock-derived std::tm whose value is guaranteed STABLE
 // across consecutive calls within the same wall-clock second. Each call
 // only recomputes the std::tm when std::time(nullptr) has actually
@@ -258,12 +251,29 @@ void PcIoDevices::OnWrite(uint16_t port, uint32_t value, uint8_t accessSize) {
     // as shutdown for us). OVMF's ResetSystemRuntimeDxe writes here when
     // RT->ResetSystem(EfiResetShutdown) is invoked, then spins waiting
     // for the host to halt the vCPU.
-    if (port == kPmIoBase + 0x04 || port == kPmIoBase + 0x05) {
-      const uint32_t pmCntValue =
-          port == kPmIoBase + 0x04 ? value : (value << 8);
-      if ((pmCntValue & 0x2000u) != 0) {
-        lastSleepType_ = static_cast<uint8_t>((pmCntValue >> 10) & 0x7u);
-        shutdownRequested_ = true;
+    if (port >= kPmIoBase + 0x04 && port < kPmIoBase + 0x06) {
+      const uint8_t offset =
+          static_cast<uint8_t>(port - (kPmIoBase + 0x04));
+      if (accessSize >= 2 && offset == 0) {
+        pm1Control_ = static_cast<uint16_t>(value & 0xFFFFu);
+      } else {
+        const uint16_t mask =
+            static_cast<uint16_t>(0xFFu << (offset * 8u));
+        const uint16_t incoming =
+            static_cast<uint16_t>((value & 0xFFu) << (offset * 8u));
+        pm1Control_ = static_cast<uint16_t>((pm1Control_ & ~mask) | incoming);
+      }
+      lastPm1SleepEnable_ = (pm1Control_ & 0x2000u) != 0;
+      if (lastPm1SleepEnable_) {
+        ++pm1SleepRequestCount_;
+        lastSleepType_ = static_cast<uint8_t>((pm1Control_ >> 10) & 0x7u);
+        lastPm1HostStopRequested_ =
+            lastSleepType_ == 4 || lastSleepType_ == 5;
+        if (lastPm1HostStopRequested_) {
+          shutdownRequested_ = true;
+        }
+      } else {
+        lastPm1HostStopRequested_ = false;
       }
     }
     return;
@@ -779,7 +789,15 @@ uint32_t PcIoDevices::ReadPciConfigDword() const {
   return 0xFFFFFFFFu;
 }
 
-uint32_t PcIoDevices::ReadPmIo(uint16_t port, uint8_t /*accessSize*/) {
+uint32_t PcIoDevices::ReadPmIo(uint16_t port, uint8_t accessSize) {
+  if (port >= kPmIoBase + 0x04 && port < kPmIoBase + 0x06) {
+    if (port == kPmIoBase + 0x04 && accessSize >= 2) {
+      return pm1Control_;
+    }
+    const uint8_t shift =
+        static_cast<uint8_t>((port - (kPmIoBase + 0x04)) * 8u);
+    return (pm1Control_ >> shift) & 0xFFu;
+  }
   if (port >= kPmTimerPort && port < kPmTimerPort + 4) {
     const uint32_t value = CurrentPmTimer();
     const uint8_t shift = static_cast<uint8_t>((port - kPmTimerPort) * 8u);
@@ -837,7 +855,7 @@ std::vector<PcIoDevices::CmosAccess> PcIoDevices::RecentCmosAccesses() const {
 }
 
 uint8_t PcIoDevices::ReadCmos(uint8_t index) const {
-  const std::tm now = UtcNow();
+  const std::tm now = UtcNowStable();
   const uint8_t statusA = cmosWritten_[0x0A] ? cmos_[0x0A] : 0x26;
   const uint8_t statusB = cmosWritten_[0x0B] ? cmos_[0x0B] : 0x06;
   const bool binaryMode = (statusB & 0x04u) != 0;

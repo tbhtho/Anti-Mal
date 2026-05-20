@@ -41,6 +41,7 @@
     <ClInclude Include="include\antimal\ExternalTools.h" />
     <ClInclude Include="include\antimal\FileUtil.h" />
     <ClInclude Include="include\antimal\GuestMonitor.h" />
+    <ClInclude Include="include\antimal\HostChannel.h" />
     <ClInclude Include="include\antimal\Http.h" />
     <ClInclude Include="include\antimal\HyperVOrchestrator.h" />
     <ClInclude Include="include\antimal\IntelLookup.h" />

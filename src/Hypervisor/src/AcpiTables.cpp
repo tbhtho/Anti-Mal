@@ -421,7 +421,17 @@ uint32_t AppendDsdt(std::vector<uint8_t> &out, uint32_t processorCount) {
 
 uint32_t AppendFadt(std::vector<uint8_t> &out, uint32_t facsOffset,
                     uint32_t dsdtOffset) {
-  const auto offset = BeginSdt(out, "FACP", 1);
+  auto appendGas = [&](uint8_t addressSpace, uint8_t bitWidth,
+                       uint8_t bitOffset, uint8_t accessSize,
+                       uint64_t address) {
+    out.push_back(addressSpace);
+    out.push_back(bitWidth);
+    out.push_back(bitOffset);
+    out.push_back(accessSize);
+    PutLe64(out, address);
+  };
+
+  const auto offset = BeginSdt(out, "FACP", 3);
   PutLe32(out, facsOffset); // FirmwareCtrl, adjusted by table-loader.
   PutLe32(out, dsdtOffset); // DSDT, adjusted by table-loader.
   out.push_back(1);      // INT_MODEL: multiple APIC.
@@ -460,6 +470,19 @@ uint32_t AppendFadt(std::vector<uint8_t> &out, uint32_t facsOffset,
   PutLe16(out, 0x0003);  // Legacy devices + 8042 present.
   out.push_back(0);      // Reserved.
   PutLe32(out, 0x000004A5);
+  appendGas(1, 8, 0, 1, 0xCF9); // Reset register (I/O port).
+  out.push_back(0x06);          // Reset value.
+  out.insert(out.end(), 3, 0);  // Reserved.
+  PutLe64(out, facsOffset);     // X_FirmwareCtrl.
+  PutLe64(out, dsdtOffset);     // X_Dsdt.
+  appendGas(1, 32, 0, 3, kPm1EventBlock);
+  appendGas(1, 0, 0, 0, 0);
+  appendGas(1, 16, 0, 2, kPm1ControlBlock);
+  appendGas(1, 0, 0, 0, 0);
+  appendGas(1, 0, 0, 0, 0);
+  appendGas(1, 32, 0, 3, kPmTimerBlock);
+  appendGas(1, 0, 0, 0, 0);
+  appendGas(1, 0, 0, 0, 0);
   EndSdt(out, offset);
   return offset;
 }

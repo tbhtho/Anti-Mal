@@ -416,6 +416,10 @@ void TestAcpiTables() {
          "ACPI: FADT firmware control points to FACS offset");
   Expect(ReadLe32(acpi.tables, acpi.offsets.fadt + 40) == acpi.offsets.dsdt,
          "ACPI: FADT DSDT points to DSDT offset");
+  const uint32_t fadtLen = antimal::hv::AcpiTableLength(acpi.tables, acpi.offsets.fadt);
+  Expect(fadtLen >= 244, "ACPI: FADT includes ACPI 2.0 extended blocks");
+  Expect(acpi.tables[acpi.offsets.fadt + 8] == 3,
+         "ACPI: FADT revision advertises extended fields");
   Expect(acpi.tables[acpi.offsets.fadt + 44] == 1,
          "ACPI: FADT advertises multiple APIC interrupt model");
   Expect(ReadLe32(acpi.tables, acpi.offsets.fadt + 56) == 0xB000u,
@@ -428,6 +432,16 @@ void TestAcpiTables() {
          "ACPI: FADT PM1 event length advertised");
   Expect(acpi.tables[acpi.offsets.fadt + 89] == 2,
          "ACPI: FADT PM1 control length advertised");
+  Expect(ReadLe64(acpi.tables, acpi.offsets.fadt + 132) == acpi.offsets.facs,
+         "ACPI: X_FirmwareCtrl points to FACS offset");
+  Expect(ReadLe64(acpi.tables, acpi.offsets.fadt + 140) == acpi.offsets.dsdt,
+         "ACPI: X_DSDT points to DSDT offset");
+  Expect(ReadLe64(acpi.tables, acpi.offsets.fadt + 152) == 0xB000u,
+         "ACPI: X_PM1a event block GAS matches PM base");
+  Expect(ReadLe64(acpi.tables, acpi.offsets.fadt + 176) == 0xB004u,
+         "ACPI: X_PM1a control block GAS matches shutdown trap");
+  Expect(ReadLe64(acpi.tables, acpi.offsets.fadt + 212) == 0xB008u,
+         "ACPI: X_PM timer block GAS matches PM timer");
   Expect(ReadLe32(acpi.tables, acpi.offsets.madt + 36) == 0xFEE00000u,
          "ACPI: MADT local APIC address");
   Expect(ReadLe32(acpi.tables, acpi.offsets.madt + 48) == 1,
@@ -480,6 +494,40 @@ void TestAcpiTables() {
   }
   Expect(sawPointer, "ACPI: table-loader contains pointer fixups");
   Expect(sawChecksum, "ACPI: table-loader contains checksum fixups");
+}
+
+void TestPcIoPmSleepByteWrites() {
+  antimal::hv::PcIoDevices pc;
+  pc.OnWrite(0xB004, 0x2001, 2);
+  Expect(!pc.ShutdownRequested(),
+         "PM1 control: S0 sleep enable does not request host shutdown");
+  Expect(pc.LastSleepType() == 0,
+         "PM1 control: S0 sleep type is recorded");
+  Expect(pc.LastPm1SleepEnable(),
+         "PM1 control: S0 sleep enable is recorded");
+  Expect(!pc.LastPm1HostStopRequested(),
+         "PM1 control: S0 sleep enable is diagnostic only");
+  Expect(pc.LastPm1ControlValue() == 0x2001,
+         "PM1 control: raw S0 value is recorded");
+
+  antimal::hv::PcIoDevices pcS5;
+  pcS5.OnWrite(0xB004, 0x00, 1);
+  Expect(!pcS5.ShutdownRequested(),
+         "PM1 control: low-byte write alone does not request shutdown");
+  pcS5.OnWrite(0xB005, 0x34, 1);
+  Expect(pcS5.ShutdownRequested(),
+         "PM1 control: high-byte SLP_EN write requests shutdown");
+  Expect(pcS5.LastSleepType() == 5,
+         "PM1 control: byte writes preserve S5 sleep type");
+  Expect(pcS5.LastPm1HostStopRequested(),
+         "PM1 control: S5 sleep requests host stop");
+
+  antimal::hv::PcIoDevices pcS4;
+  pcS4.OnWrite(0xB004, 0x3000, 2);
+  Expect(pcS4.ShutdownRequested(),
+         "PM1 control: S4 sleep enable requests host shutdown");
+  Expect(pcS4.LastSleepType() == 4,
+         "PM1 control: S4 sleep type is recorded");
 }
 
 void TestHpetMmioCounter() {
@@ -1918,6 +1966,7 @@ void TestReportRoundtripAndFramePaths() {
   report.dynamicSummary.status = "boot attempted";
   report.dynamicSummary.bootMilestones.push_back("bootmgfw loaded");
   report.dynamicSummary.bootMilestones.push_back("BCD opened");
+  report.artifacts.push_back(std::filesystem::path("artifacts") / "agent-health.json");
   antimal::EventRecord ev;
   ev.timestampUtc = "2026-05-18T12:00:00Z";
   ev.source = "Test";
@@ -1941,6 +1990,7 @@ void TestReportRoundtripAndFramePaths() {
          "report load: event details preserved");
   Expect(loaded.dynamicSummary.bootMilestones.size() == 2,
          "report load: boot milestones preserved");
+  Expect(loaded.artifacts.size() == 1, "report load: artifacts preserved");
   Expect(loaded.networkDomains.size() == 1, "report load: network preserved");
   Expect(loaded.errors.size() == 1, "report load: errors preserved");
 
@@ -2219,6 +2269,7 @@ int main() {
     TestCom2UartFrames();
     TestPs2QueuedInput();
     TestAcpiTables();
+    TestPcIoPmSleepByteWrites();
     TestPcIoFwCfgAcpiFiles();
     TestPcIoFwCfgE820MemoryInventory();
     TestBochsVbeDataPortAliases();

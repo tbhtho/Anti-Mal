@@ -437,6 +437,15 @@ DynamicRunSummary ParseDynamicSummary(const JsonValue *value) {
       static_cast<uint32_t>(IntValue(Member(*value, "unhandledMmio")));
   summary.watchdogCancellations =
       static_cast<uint32_t>(IntValue(Member(*value, "watchdogCancellations")));
+  summary.pm1SleepEnable = BoolValue(Member(*value, "pm1SleepEnable"));
+  summary.pm1HostStopRequested =
+      BoolValue(Member(*value, "pm1HostStopRequested"));
+  summary.pm1SleepType =
+      static_cast<uint32_t>(IntValue(Member(*value, "pm1SleepType")));
+  summary.pm1ControlValue =
+      static_cast<uint32_t>(IntValue(Member(*value, "pm1ControlValue")));
+  summary.pm1SleepRequests =
+      static_cast<uint64_t>(IntValue(Member(*value, "pm1SleepRequests")));
   summary.bootMilestones = StringArrayValue(Member(*value, "bootMilestones"));
   summary.serialLogPath =
       Utf8ToWide(StringValue(Member(*value, "serialLogPath")));
@@ -888,6 +897,16 @@ std::string BuildHtmlReportWithFrames(const AnalysisReport &report,
     html << "<div class=\"k\">IDE reads</div><div class=\"mono\">"
          << report.dynamicSummary.ideReadCommands << " command(s), "
          << report.dynamicSummary.ideSectorsRead << " sector(s)</div>";
+    if (report.dynamicSummary.pm1SleepRequests != 0 ||
+        report.dynamicSummary.pm1ControlValue != 0) {
+      html << "<div class=\"k\">PM1 sleep</div><div class=\"mono\">"
+           << "0x" << std::hex << std::uppercase
+           << report.dynamicSummary.pm1ControlValue << std::dec
+           << ", S" << report.dynamicSummary.pm1SleepType
+           << ", stop "
+           << (report.dynamicSummary.pm1HostStopRequested ? "yes" : "no")
+           << "</div>";
+    }
     if (!report.dynamicSummary.bootMilestones.empty()) {
       html << "<div class=\"k\">boot</div><div>";
       for (size_t i = 0; i < report.dynamicSummary.bootMilestones.size(); ++i) {
@@ -1028,6 +1047,14 @@ std::string BuildHtmlReportWithFrames(const AnalysisReport &report,
   if (!report.networkDomains.empty()) {
     html << "<h2>Dynamic network</h2>";
     EmitIocList(html, report.networkDomains, "");
+  }
+  if (!report.artifacts.empty()) {
+    html << "<h2>Artifacts</h2><ul>";
+    for (const auto &artifact : report.artifacts) {
+      html << "<li class=\"mono\">" << HtmlEscape(artifact.filename().string())
+           << "</li>";
+    }
+    html << "</ul>";
   }
   if (!report.mitreTechniques.empty()) {
     html << "<h2>MITRE ATT&amp;CK</h2>";

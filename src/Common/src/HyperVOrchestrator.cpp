@@ -2,6 +2,7 @@
 
 #include "antimal/EventJournal.h"
 #include "antimal/FileUtil.h"
+#include "antimal/HostChannel.h"
 #include "antimal/Json.h"
 #include "antimal/Report.h"
 #include "antimal/Scanner.h"
@@ -18,10 +19,14 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <chrono>
 #include <cstdlib>
+#include <cctype>
 #include <fstream>
 #include <limits>
+#include <map>
+#include <memory>
 #include <sstream>
 #include <type_traits>
 #include <vector>
@@ -47,13 +52,39 @@ std::string SelectProvider(const AppConfig &config) {
 
 struct BootSignalSummary {
   std::vector<std::string> milestones;
+};
+
+struct HostChannelCapture {
   bool guestAgentConnected = false;
   uint32_t guestAgentHeartbeats = 0;
   bool reportComplete = false;
+  uint32_t eventsReturned = 0;
+  std::vector<std::filesystem::path> artifacts;
+  std::vector<std::string> milestones;
 };
 
-bool ContainsText(const std::string &haystack, const char *needle) {
-  return haystack.find(needle) != std::string::npos;
+EventRecord MakeSandboxEvent(const std::string &action,
+                             const std::filesystem::path &target,
+                             std::map<std::string, std::string> details);
+void AppendJournalEvent(const std::filesystem::path &journalPath,
+                        const EventRecord &event,
+                        std::vector<EventRecord> *events);
+
+bool ContainsTextNoCase(std::string_view haystack, std::string_view needle) {
+  const auto lower = [](unsigned char c) {
+    return static_cast<char>(std::tolower(c));
+  };
+  std::string h;
+  h.reserve(haystack.size());
+  for (unsigned char c : haystack) {
+    h.push_back(lower(c));
+  }
+  std::string n;
+  n.reserve(needle.size());
+  for (unsigned char c : needle) {
+    n.push_back(lower(c));
+  }
+  return h.find(n) != std::string::npos;
 }
 
 void AddMilestone(BootSignalSummary *summary, std::string milestone) {
@@ -63,6 +94,17 @@ void AddMilestone(BootSignalSummary *summary, std::string milestone) {
   if (std::find(summary->milestones.begin(), summary->milestones.end(),
                 milestone) == summary->milestones.end()) {
     summary->milestones.push_back(std::move(milestone));
+  }
+}
+
+void AddMilestone(std::vector<std::string> *milestones,
+                  std::string milestone) {
+  if (!milestones) {
+    return;
+  }
+  if (std::find(milestones->begin(), milestones->end(), milestone) ==
+      milestones->end()) {
+    milestones->push_back(std::move(milestone));
   }
 }
 
@@ -78,55 +120,128 @@ std::string JoinStrings(const std::vector<std::string> &items,
   return out.str();
 }
 
-BootSignalSummary AnalyzeBootSignals(const std::string &serialOutput,
-                                     const std::string &hostChannelOutput) {
+bool ImageLooksLikeWinload(const hv::VmGuestImageInfo &image) {
+  return image.valid && ContainsTextNoCase(image.pdbPath, "winload");
+}
+
+void AddImageMilestones(BootSignalSummary *signals,
+                        const hv::VmGuestImageInfo &image) {
+  if (ImageLooksLikeWinload(image)) {
+    AddMilestone(signals, "winload image identified");
+  }
+}
+
+BootSignalSummary AnalyzeBootSignals(const hv::VmRunSummary &vm) {
   BootSignalSummary signals;
-  if (ContainsText(serialOutput, "BOOTX64.EFI")) {
+  const auto &serialOutput = vm.serialOutput;
+  if (ContainsTextNoCase(serialOutput, "BOOTX64.EFI")) {
     AddMilestone(&signals, "fallback bootloader opened");
   }
-  if (ContainsText(serialOutput, "bootmgfw.efi")) {
+  if (ContainsTextNoCase(serialOutput, "bootmgfw.efi")) {
     AddMilestone(&signals, "bootmgfw loaded");
   }
-  if (ContainsText(serialOutput, "Open 'BCD' Success") ||
-      ContainsText(serialOutput, "Open 'BCD'")) {
+  if (ContainsTextNoCase(serialOutput, "Open 'BCD' Success") ||
+      ContainsTextNoCase(serialOutput, "Open 'BCD'")) {
     AddMilestone(&signals, "BCD opened");
   }
-  if (ContainsText(serialOutput, "CiPolicies")) {
+  if (ContainsTextNoCase(serialOutput, "CiPolicies")) {
     AddMilestone(&signals, "code-integrity policies opened");
   }
-  if (ContainsText(serialOutput, "winload.efi") ||
-      ContainsText(serialOutput, "winload.exe")) {
+  if (ContainsTextNoCase(serialOutput, "winload.efi") ||
+      ContainsTextNoCase(serialOutput, "winload.exe")) {
     AddMilestone(&signals, "winload opened");
   }
-  if (ContainsText(serialOutput, "ResetSystem2") ||
-      ContainsText(serialOutput, "ResetType Shutdown")) {
+  AddImageMilestones(&signals, vm.fatalRipImage);
+  for (const auto &image : vm.fatalStackReturnImage) {
+    AddImageMilestones(&signals, image);
+  }
+  if (ContainsTextNoCase(serialOutput, "ResetSystem2") ||
+      ContainsTextNoCase(serialOutput, "ResetType Shutdown")) {
     AddMilestone(&signals, "firmware reset/shutdown requested");
   }
 
+  return signals;
+}
+
+std::string SanitizedArtifactName(std::string_view name) {
+  std::string cleaned(name.begin(), name.end());
+  for (char &ch : cleaned) {
+    const unsigned char c = static_cast<unsigned char>(ch);
+    if (!(std::isalnum(c) || ch == '.' || ch == '_' || ch == '-')) {
+      ch = '_';
+    }
+  }
+  const auto filename = std::filesystem::path(cleaned).filename().string();
+  return filename.empty() ? "artifact.bin" : filename;
+}
+
+HostChannelCapture ProcessHostChannelOutput(
+    const std::string &hostChannelOutput,
+    const std::filesystem::path &journalPath,
+    const std::filesystem::path &artifactsDir,
+    std::vector<EventRecord> *events) {
+  HostChannelCapture capture;
   hv::HostSerialChannel channel;
   channel.PushBytes(reinterpret_cast<const uint8_t *>(hostChannelOutput.data()),
                     hostChannelOutput.size());
   while (const auto frame = channel.PopFrame()) {
+    const std::string payload(frame->payload.begin(), frame->payload.end());
     switch (frame->type) {
     case hv::HostChannelMessage::Hello:
-      signals.guestAgentConnected = true;
-      AddMilestone(&signals, "GuestAgent hello");
+      capture.guestAgentConnected = true;
+      AddMilestone(&capture.milestones, "GuestAgent hello");
       break;
     case hv::HostChannelMessage::Heartbeat:
-      signals.guestAgentConnected = true;
-      ++signals.guestAgentHeartbeats;
-      AddMilestone(&signals, "GuestAgent heartbeat");
+      capture.guestAgentConnected = true;
+      ++capture.guestAgentHeartbeats;
+      AddMilestone(&capture.milestones, "GuestAgent heartbeat");
       break;
+    case hv::HostChannelMessage::Event: {
+      auto event = ParseEventJsonLine(payload);
+      AppendJournalEvent(journalPath, event, events);
+      ++capture.eventsReturned;
+      break;
+    }
+    case hv::HostChannelMessage::ArtifactChunk: {
+      const auto split = payload.find('\n');
+      const std::string name = split == std::string::npos
+                                   ? SanitizedArtifactName("artifact.bin")
+                                   : SanitizedArtifactName(
+                                         std::string_view(payload).substr(0, split));
+      const std::string_view bytes =
+          split == std::string::npos
+              ? std::string_view(payload)
+              : std::string_view(payload).substr(split + 1);
+      const auto outPath = artifactsDir / name;
+      WriteTextFile(outPath, bytes);
+      capture.artifacts.push_back(outPath);
+      AppendJournalEvent(journalPath,
+                         MakeSandboxEvent("artifact.received", outPath,
+                                          {{"channel", "COM2"},
+                                           {"bytes", std::to_string(bytes.size())}}),
+                         events);
+      break;
+    }
     case hv::HostChannelMessage::ReportComplete:
-      signals.guestAgentConnected = true;
-      signals.reportComplete = true;
-      AddMilestone(&signals, "GuestAgent report complete");
+      capture.guestAgentConnected = true;
+      capture.reportComplete = true;
+      AddMilestone(&capture.milestones, "GuestAgent report complete");
       break;
     default:
       break;
     }
   }
-  return signals;
+  return capture;
+}
+
+std::vector<uint8_t> BuildHealthcheckJobFrame(const std::string &runId) {
+  JsonObjectBuilder job;
+  job.AddString("kind", "healthcheck");
+  job.AddString("runId", runId);
+  job.AddBool("allowSampleExecution", false);
+  job.AddString("artifactName", "agent-health.json");
+  return hv::HostSerialChannel::EncodeText(hv::HostChannelMessage::JobStart,
+                                           job.Finish());
 }
 
 std::filesystem::path CurrentExecutableDir() {
@@ -330,7 +445,8 @@ void WriteErrorReport(const std::filesystem::path &reportPath,
                       const std::filesystem::path &samplePath,
                       const std::vector<std::string> &errors,
                       const std::vector<EventRecord> &events = {},
-                      const DynamicRunSummary &dynamicSummary = {}) {
+                      const DynamicRunSummary &dynamicSummary = {},
+                      const std::vector<std::filesystem::path> &artifacts = {}) {
   AnalysisReport report;
   report.runId = runId;
   report.samplePath = samplePath;
@@ -338,6 +454,7 @@ void WriteErrorReport(const std::filesystem::path &reportPath,
   report.sandboxVerdict = Verdict::Error;
   report.dynamicSummary = dynamicSummary;
   report.events = events;
+  report.artifacts = artifacts;
   report.errors = errors;
   WriteTextFile(reportPath, ToJson(report));
   WriteReportHtml(reportPath.parent_path() / "report.html", report);
@@ -347,7 +464,8 @@ void WriteStagedReport(const std::filesystem::path &reportPath,
                        const std::string &runId,
                        const std::filesystem::path &samplePath,
                        const std::vector<EventRecord> &events,
-                       const DynamicRunSummary &dynamicSummary = {}) {
+                       const DynamicRunSummary &dynamicSummary = {},
+                       const std::vector<std::filesystem::path> &artifacts = {}) {
   AnalysisReport report;
   report.runId = runId;
   report.samplePath = samplePath;
@@ -355,6 +473,7 @@ void WriteStagedReport(const std::filesystem::path &reportPath,
   report.sandboxVerdict = Verdict::Error;
   report.dynamicSummary = dynamicSummary;
   report.events = events;
+  report.artifacts = artifacts;
   report.errors.push_back(
       "Dynamic execution not started; this run is staged for the in-house VM path.");
   WriteTextFile(reportPath, ToJson(report));
@@ -402,6 +521,11 @@ DynamicRunSummary ToDynamicSummary(const hv::VmRunSummary &vm,
   summary.unhandledMmio = static_cast<uint32_t>(std::max(0, vm.unhandledMmio));
   summary.watchdogCancellations =
       static_cast<uint32_t>(std::max(0, vm.watchdogCancellations));
+  summary.pm1SleepEnable = vm.pm1SleepEnable;
+  summary.pm1HostStopRequested = vm.pm1HostStopRequested;
+  summary.pm1SleepType = vm.pm1SleepType;
+  summary.pm1ControlValue = vm.pm1ControlValue;
+  summary.pm1SleepRequests = vm.pm1SleepRequests;
   summary.serialLogPath = serialLogPath;
   summary.vmSummaryPath = summaryPath;
   if (summary.timedOut) {
@@ -467,7 +591,15 @@ std::string FormatVmDiagnostics(const hv::VmRunSummary &vm) {
   out << "completed: " << (vm.completed ? "true" : "false") << "\n";
   out << "timedOut: " << (vm.timedOut ? "true" : "false") << "\n";
   out << "fatal: " << (vm.fatal ? "true" : "false") << "\n";
+  out << "hostStopRequested: " << (vm.hostStopRequested ? "true" : "false") << "\n";
   out << "guestShutdown: " << (vm.guestShutdown ? "true" : "false") << "\n";
+  out << "pm1SleepRequests: " << vm.pm1SleepRequests << "\n";
+  out << "pm1ControlValue: 0x" << std::hex << std::uppercase
+      << vm.pm1ControlValue << std::dec << "\n";
+  out << "pm1SleepEnable: " << (vm.pm1SleepEnable ? "true" : "false") << "\n";
+  out << "pm1SleepType: S" << static_cast<int>(vm.pm1SleepType) << "\n";
+  out << "pm1HostStopRequested: "
+      << (vm.pm1HostStopRequested ? "true" : "false") << "\n";
   if (vm.guestShutdown) {
     out << "guestShutdownSleepType: S"
         << static_cast<int>(vm.guestShutdownSleepType) << "\n";
@@ -964,6 +1096,7 @@ DetonationResult InHouseOrchestrator::PrepareAndRun(
   result.jobPath = result.runDir / "job.json";
   result.journalPath = result.runDir / "events.jsonl";
   result.screenshotsDir = result.runDir / "screenshots";
+  result.artifactsDir = result.runDir / "artifacts";
   result.overlayDiskPath = result.runDir / "disk" / "overlay.vhdx";
   result.reportPath = result.runDir / "report.json";
   result.dynamicSummary.networkMode = networkMode;
@@ -990,8 +1123,10 @@ DetonationResult InHouseOrchestrator::PrepareAndRun(
   EnsureDirectory(result.runDir / "out");
   EnsureDirectory(result.runDir / "disk");
   EnsureDirectory(result.screenshotsDir);
+  EnsureDirectory(result.artifactsDir);
 
   std::vector<EventRecord> events;
+  std::vector<std::filesystem::path> returnedArtifacts;
   AppendJournalEvent(result.journalPath,
                      MakeSandboxEvent("run.staged", samplePath,
                                       {{"runId", result.runId},
@@ -1158,14 +1293,21 @@ DetonationResult InHouseOrchestrator::PrepareAndRun(
       // that the timeout — not the step cap — is the binding constraint.
       request.maxSteps = std::numeric_limits<int>::max();
       request.progressInterval = std::chrono::milliseconds{1500};
+      auto stopAfterGuestAgentProbe = std::make_shared<std::atomic_bool>(false);
+      request.cancelRequested = stopAfterGuestAgentProbe;
+      auto liveHostChannel = std::make_shared<hv::HostSerialChannel>();
+      auto liveHeartbeatCount = std::make_shared<std::atomic<uint32_t>>(0);
       const std::string runIdCopy = result.runId;
       const std::filesystem::path runDirCopy = result.runDir;
       const std::filesystem::path screenshotsDirCopy = result.screenshotsDir;
       auto frameCounter = std::make_shared<std::atomic<uint32_t>>(0);
-      if (progressCallback) {
-        request.progressCallback = [progressCallback, runIdCopy, runDirCopy,
-                                    screenshotsDirCopy, frameCounter](
-                                       const hv::VmProgressSnapshot &snap) {
+      auto realFrameCounter = std::make_shared<std::atomic<uint32_t>>(0);
+      request.progressCallback = [progressCallback, runIdCopy, runDirCopy,
+                                  screenshotsDirCopy, frameCounter,
+                                  realFrameCounter, liveHostChannel,
+                                  liveHeartbeatCount,
+                                  stopAfterGuestAgentProbe](
+                                     const hv::VmProgressSnapshot &snap) {
           DetonationProgress progress{};
           progress.runId = runIdCopy;
           progress.runDir = runDirCopy;
@@ -1191,6 +1333,25 @@ DetonationResult InHouseOrchestrator::PrepareAndRun(
           progress.framebufferWidth = snap.framebufferWidth;
           progress.framebufferHeight = snap.framebufferHeight;
           progress.framebufferBpp = snap.framebufferBpp;
+          if (!snap.newHostChannelBytes.empty()) {
+            liveHostChannel->PushBytes(
+                reinterpret_cast<const uint8_t *>(snap.newHostChannelBytes.data()),
+                snap.newHostChannelBytes.size());
+            while (const auto frame = liveHostChannel->PopFrame()) {
+              if (frame->type == hv::HostChannelMessage::Heartbeat) {
+                const uint32_t count =
+                    liveHeartbeatCount->fetch_add(1, std::memory_order_relaxed) +
+                    1;
+                if (count >= 2) {
+                  stopAfterGuestAgentProbe->store(true,
+                                                  std::memory_order_relaxed);
+                }
+              } else if (frame->type == hv::HostChannelMessage::ReportComplete) {
+                stopAfterGuestAgentProbe->store(true,
+                                                std::memory_order_relaxed);
+              }
+            }
+          }
           if (snap.textFramebufferActive) {
             std::string screen;
             screen.reserve(81 * 25);
@@ -1319,10 +1480,12 @@ DetonationResult InHouseOrchestrator::PrepareAndRun(
                             "guest-%06u.png", frameIdx);
                 const auto gpuPath = screenshotsDirCopy / gpuName;
                 try {
-                  (void)EncodeFramebufferPng(gpuPath, snap.framebufferHost,
-                                             snap.framebufferWidth,
-                                             snap.framebufferHeight,
-                                             snap.framebufferBpp / 8);
+                  if (EncodeFramebufferPng(gpuPath, snap.framebufferHost,
+                                           snap.framebufferWidth,
+                                           snap.framebufferHeight,
+                                           snap.framebufferBpp / 8)) {
+                    realFrameCounter->fetch_add(1, std::memory_order_relaxed);
+                  }
                 } catch (...) {
                   // Encoding must not break the VM run loop.
                 }
@@ -1330,13 +1493,14 @@ DetonationResult InHouseOrchestrator::PrepareAndRun(
             }
           }
 
-          try {
-            progressCallback(progress);
-          } catch (...) {
-            // Best-effort progress reporting.
+          if (progressCallback) {
+            try {
+              progressCallback(progress);
+            } catch (...) {
+              // Best-effort progress reporting.
+            }
           }
         };
-      }
       fireProgress("booting", "Booting VM (firmware -> guest)");
       hv::VmRunSummary vmSummary;
       hv::VirtualMachineOptions vmOptions;
@@ -1360,50 +1524,67 @@ DetonationResult InHouseOrchestrator::PrepareAndRun(
         auto cow = hv::CowRawBlockDevice::Open(config_.baseDiskPath,
                                                result.overlayDiskPath);
         hv::VirtualMachine vm(preflight.firmwarePath, &cow, vmOptions);
+        vm.QueueCom2Bytes(BuildHealthcheckJobFrame(result.runId));
         vmSummary = vm.Run(request);
       } else if (preflight.baseVhdxReadable) {
         auto base = hv::VhdxBlockDevice::Open(config_.baseVhdxPath);
         auto cow = hv::CowOverlayBlockDevice::Open(&base, result.overlayDiskPath);
         hv::VirtualMachine vm(preflight.firmwarePath, &cow, vmOptions);
+        vm.QueueCom2Bytes(BuildHealthcheckJobFrame(result.runId));
         vmSummary = vm.Run(request);
       } else {
         throw std::runtime_error("no bootable base disk was available");
       }
+      vmSummary.framesCaptured =
+          realFrameCounter->load(std::memory_order_relaxed);
       fireProgress("finishing", "VM run loop returned; writing diagnostics");
       WriteTextFile(serialLogPath, vmSummary.serialOutput);
       WriteTextFile(vmDiagnosticsPath, FormatVmDiagnostics(vmSummary));
       result.dynamicSummary =
           ToDynamicSummary(vmSummary, networkMode, serialLogPath, vmSummaryPath);
-      const auto bootSignals =
-          AnalyzeBootSignals(vmSummary.serialOutput, vmSummary.hostChannelOutput);
+      const auto bootSignals = AnalyzeBootSignals(vmSummary);
+      const auto hostCapture =
+          ProcessHostChannelOutput(vmSummary.hostChannelOutput, result.journalPath,
+                                   result.artifactsDir, &events);
       result.dynamicSummary.bootMilestones = bootSignals.milestones;
+      for (const auto &milestone : hostCapture.milestones) {
+        AddMilestone(&result.dynamicSummary.bootMilestones, milestone);
+      }
       result.dynamicSummary.guestAgentConnected =
-          bootSignals.guestAgentConnected;
+          hostCapture.guestAgentConnected;
+      returnedArtifacts.insert(returnedArtifacts.end(),
+                               hostCapture.artifacts.begin(),
+                               hostCapture.artifacts.end());
+      result.dynamicSummary.artifactsCaptured =
+          static_cast<uint32_t>(returnedArtifacts.size());
       if (result.dynamicSummary.guestAgentConnected &&
           !result.dynamicSummary.crashed) {
         result.dynamicSummary.status = "guest agent connected";
+      }
+      if (hostCapture.reportComplete && !result.dynamicSummary.crashed) {
+        result.dynamicSummary.status = "guest healthcheck complete";
       }
       result.status = result.dynamicSummary.status;
       result.completed = vmSummary.completed;
       result.dynamicSummary.eventsCaptured =
           static_cast<uint32_t>(events.size());
 
-      if (bootSignals.guestAgentConnected) {
+      if (hostCapture.guestAgentConnected) {
         AppendJournalEvent(result.journalPath,
                            MakeSandboxEvent("guest-agent.connected",
                                             result.overlayDiskPath,
                                             {{"channel", "COM2"}}),
                            &events);
       }
-      if (bootSignals.guestAgentHeartbeats != 0) {
+      if (hostCapture.guestAgentHeartbeats != 0) {
         AppendJournalEvent(
             result.journalPath,
             MakeSandboxEvent("guest-agent.heartbeat", result.overlayDiskPath,
                              {{"count", std::to_string(
-                                           bootSignals.guestAgentHeartbeats)}}),
+                                           hostCapture.guestAgentHeartbeats)}}),
             &events);
       }
-      if (bootSignals.reportComplete) {
+      if (hostCapture.reportComplete) {
         AppendJournalEvent(result.journalPath,
                            MakeSandboxEvent("guest-agent.report-complete",
                                             result.overlayDiskPath),
@@ -1426,8 +1607,20 @@ DetonationResult InHouseOrchestrator::PrepareAndRun(
           {"bootMilestones",
            JoinStrings(result.dynamicSummary.bootMilestones, ", ")},
           {"firmwareIdle", result.dynamicSummary.firmwareIdle ? "true" : "false"},
+          {"pm1ControlValue",
+           std::to_string(result.dynamicSummary.pm1ControlValue)},
+          {"pm1SleepEnable",
+           result.dynamicSummary.pm1SleepEnable ? "true" : "false"},
+          {"pm1SleepType",
+           "S" + std::to_string(result.dynamicSummary.pm1SleepType)},
+          {"pm1SleepRequests",
+           std::to_string(result.dynamicSummary.pm1SleepRequests)},
+          {"pm1HostStopRequested",
+           result.dynamicSummary.pm1HostStopRequested ? "true" : "false"},
           {"guestAgentConnected",
            result.dynamicSummary.guestAgentConnected ? "true" : "false"},
+          {"artifactsCaptured",
+           std::to_string(result.dynamicSummary.artifactsCaptured)},
           {"sampleExecuted", "false"}};
       if (vmSummary.timedOut) {
         details["reason"] = "timeout";
@@ -1436,8 +1629,14 @@ DetonationResult InHouseOrchestrator::PrepareAndRun(
       } else if (result.dynamicSummary.firmwareIdle) {
         details["reason"] = "firmware-idle-before-guest";
       }
+      const bool reachedWinload =
+          std::any_of(result.dynamicSummary.bootMilestones.begin(),
+                      result.dynamicSummary.bootMilestones.end(),
+                      [](const std::string &milestone) {
+                        return ContainsTextNoCase(milestone, "winload");
+                      });
       const bool bootReachedGuest =
-          result.dynamicSummary.status == "boot attempted";
+          reachedWinload || result.dynamicSummary.guestAgentConnected;
       AppendJournalEvent(result.journalPath,
                          MakeSandboxEvent(bootReachedGuest
                                               ? "vm.boot.completed"
@@ -1467,15 +1666,17 @@ DetonationResult InHouseOrchestrator::PrepareAndRun(
         "Sample was staged but not executed; host/guest channel and safe sample execution remain disabled.");
     result.dynamicSummary.sampleExecuted = false;
     result.dynamicSummary.eventsCaptured = static_cast<uint32_t>(events.size());
+    result.dynamicSummary.artifactsCaptured =
+        static_cast<uint32_t>(returnedArtifacts.size());
     WriteTextFile(vmSummaryPath, ToJson(result.dynamicSummary));
     WriteErrorReport(result.reportPath, result.runId, samplePath, result.errors,
-                     events, result.dynamicSummary);
+                     events, result.dynamicSummary, returnedArtifacts);
   } else {
     result.status = "staged";
     result.dynamicSummary.status = "staged";
     result.dynamicSummary.eventsCaptured = static_cast<uint32_t>(events.size());
     WriteStagedReport(result.reportPath, result.runId, samplePath, events,
-                      result.dynamicSummary);
+                      result.dynamicSummary, returnedArtifacts);
   }
 
   return result;

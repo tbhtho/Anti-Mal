@@ -73,6 +73,14 @@ public:
   // loop cleanly instead of timing out.
   bool ShutdownRequested() const noexcept { return shutdownRequested_; }
   uint8_t LastSleepType() const noexcept { return lastSleepType_; }
+  bool LastPm1SleepEnable() const noexcept { return lastPm1SleepEnable_; }
+  bool LastPm1HostStopRequested() const noexcept {
+    return lastPm1HostStopRequested_;
+  }
+  uint16_t LastPm1ControlValue() const noexcept { return pm1Control_; }
+  uint64_t Pm1SleepRequestCount() const noexcept {
+    return pm1SleepRequestCount_;
+  }
   uint64_t FwCfgFileDirBytesRead() const noexcept {
     return fwCfgFileDirBytesRead_;
   }
@@ -117,11 +125,15 @@ private:
   mutable size_t cmosRecentCount_ = 0;
   void RecordCmosAccess(uint16_t port, uint8_t index, uint8_t value,
                         bool isWrite) const;
-  // PM1a control register (PIIX4 port 0xB004) write tracking for ACPI S4/S5
-  // shutdown detection. SLP_EN (bit 13) latched together with SLP_TYP
-  // (bits 10-12) signals "leave the run loop now".
+  // PM1a control register (PIIX4 port 0xB004) write tracking for ACPI sleep
+  // diagnostics. Only S4/S5 requests make the host leave the run loop; other
+  // SLP_EN writes are recorded because boot firmware may briefly write S0.
   bool shutdownRequested_ = false;
   uint8_t lastSleepType_ = 0;
+  bool lastPm1SleepEnable_ = false;
+  bool lastPm1HostStopRequested_ = false;
+  uint16_t pm1Control_ = 0;
+  uint64_t pm1SleepRequestCount_ = 0;
 
 public:
   // Returns the 8-bit vector base the guest programmed into the master 8259

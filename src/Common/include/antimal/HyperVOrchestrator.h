@@ -109,6 +109,7 @@ struct DetonationResult {
   std::filesystem::path jobPath;
   std::filesystem::path journalPath;
   std::filesystem::path screenshotsDir;
+  std::filesystem::path artifactsDir;
   std::filesystem::path overlayDiskPath;
   std::filesystem::path reportPath;
   DynamicRunSummary dynamicSummary;

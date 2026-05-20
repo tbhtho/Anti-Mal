@@ -199,6 +199,11 @@ std::string ToJson(const DynamicRunSummary &summary) {
   obj.AddNumber("unhandledIo", summary.unhandledIo);
   obj.AddNumber("unhandledMmio", summary.unhandledMmio);
   obj.AddNumber("watchdogCancellations", summary.watchdogCancellations);
+  obj.AddBool("pm1SleepEnable", summary.pm1SleepEnable);
+  obj.AddBool("pm1HostStopRequested", summary.pm1HostStopRequested);
+  obj.AddNumber("pm1SleepType", summary.pm1SleepType);
+  obj.AddNumber("pm1ControlValue", summary.pm1ControlValue);
+  obj.AddNumber("pm1SleepRequests", summary.pm1SleepRequests);
   obj.AddRaw("bootMilestones", JsonStringArray(summary.bootMilestones));
   obj.AddString("serialLogPath", PathToUtf8(summary.serialLogPath));
   obj.AddString("vmSummaryPath", PathToUtf8(summary.vmSummaryPath));
