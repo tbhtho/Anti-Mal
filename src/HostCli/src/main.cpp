@@ -13,6 +13,7 @@
 #include <cstdint>
 #include <cstring>
 #include <exception>
+#include <functional>
 #include <fstream>
 #include <iomanip>
 #include <iostream>
@@ -620,6 +621,580 @@ bool ContainsAsciiNoCase(const std::vector<uint8_t> &bytes, std::string needle) 
   return false;
 }
 
+std::string TrimTrailingNulls(std::string value) {
+  while (!value.empty() && value.back() == '\0') {
+    value.pop_back();
+  }
+  return value;
+}
+
+std::string Utf16LeAsciiString(const std::vector<uint8_t> &bytes) {
+  std::string out;
+  for (size_t i = 0; i + 1 < bytes.size(); i += 2) {
+    const uint16_t ch = ReadLe16(bytes.data() + i);
+    if (ch == 0) {
+      break;
+    }
+    out.push_back(ch >= 32 && ch < 127 ? static_cast<char>(ch) : '?');
+  }
+  return out;
+}
+
+std::vector<std::string> Utf16LeAsciiMultiString(
+    const std::vector<uint8_t> &bytes) {
+  std::vector<std::string> out;
+  std::string current;
+  for (size_t i = 0; i + 1 < bytes.size(); i += 2) {
+    const uint16_t ch = ReadLe16(bytes.data() + i);
+    if (ch == 0) {
+      if (!current.empty()) {
+        out.push_back(current);
+        current.clear();
+      }
+      continue;
+    }
+    current.push_back(ch >= 32 && ch < 127 ? static_cast<char>(ch) : '?');
+  }
+  if (!current.empty()) {
+    out.push_back(current);
+  }
+  return out;
+}
+
+bool EqualNoCase(std::string lhs, std::string rhs) {
+  return ToUpperAscii(std::move(lhs)) == ToUpperAscii(std::move(rhs));
+}
+
+std::string BcdObjectAlias(const std::string &guid) {
+  const auto upper = ToUpperAscii(guid);
+  if (upper == "{9DEA862C-5CDD-4E70-ACC1-F32B344D4795}") {
+    return "{bootmgr}";
+  }
+  if (upper == "{B2721D73-1DB4-4C62-BF78-C548A880142D}") {
+    return "{memdiag}";
+  }
+  return guid;
+}
+
+std::string BcdObjectTypeName(uint32_t type) {
+  switch (type) {
+  case 0x10100002:
+    return "Windows Boot Manager";
+  case 0x10200003:
+    return "Windows Boot Loader";
+  case 0x10200004:
+    return "Windows Resume Loader";
+  case 0x10200005:
+    return "Windows Memory Diagnostic";
+  case 0x20200003:
+    return "Device Options";
+  case 0x20200004:
+    return "Debugger Settings";
+  default:
+    return "BCD object";
+  }
+}
+
+std::string BcdElementName(const std::string &id) {
+  const auto upper = ToUpperAscii(id);
+  if (upper == "11000001") {
+    return "device";
+  }
+  if (upper == "21000001") {
+    return "osdevice";
+  }
+  if (upper == "12000002") {
+    return "path";
+  }
+  if (upper == "12000004") {
+    return "description";
+  }
+  if (upper == "12000005") {
+    return "locale";
+  }
+  if (upper == "14000006") {
+    return "inherit";
+  }
+  if (upper == "22000002") {
+    return "systemroot";
+  }
+  if (upper == "23000003") {
+    return "default/resumeobject";
+  }
+  if (upper == "23000006") {
+    return "resumeobject";
+  }
+  if (upper == "24000001") {
+    return "displayorder";
+  }
+  if (upper == "24000010") {
+    return "toolsdisplayorder";
+  }
+  if (upper == "25000004") {
+    return "timeout";
+  }
+  return upper;
+}
+
+std::string PartitionLabelForUniqueGuid(
+    const std::vector<GptPartitionInfo> &partitions, const std::string &guid) {
+  for (const auto &part : partitions) {
+    if (EqualNoCase(part.uniqueGuid, guid)) {
+      std::ostringstream out;
+      out << PartitionKind(part.typeGuid) << " partition " << part.index;
+      if (!part.name.empty()) {
+        out << " \"" << part.name << "\"";
+      }
+      return out.str();
+    }
+  }
+  return "not present in GPT";
+}
+
+struct HiveKeyInfo {
+  uint32_t index = 0;
+  uint16_t flags = 0;
+  uint32_t subkeyCounts[2] = {0, 0};
+  uint32_t subkeyLists[2] = {0xFFFFFFFFu, 0xFFFFFFFFu};
+  uint32_t valueCount = 0;
+  uint32_t valueList = 0xFFFFFFFFu;
+  std::string name;
+};
+
+struct HiveValueInfo {
+  std::string name;
+  uint32_t type = 0;
+  std::vector<uint8_t> data;
+};
+
+class RegistryHiveReader {
+public:
+  explicit RegistryHiveReader(const std::vector<uint8_t> &bytes)
+      : bytes_(bytes) {}
+
+  bool IsValid() const {
+    return bytes_.size() >= 0x1000 && std::memcmp(bytes_.data(), "regf", 4) == 0;
+  }
+
+  std::optional<uint32_t> RootIndex() const {
+    if (!IsValid() || bytes_.size() < 0x28) {
+      return std::nullopt;
+    }
+    return ReadLe32(bytes_.data() + 0x24);
+  }
+
+  std::optional<HiveKeyInfo> ReadKey(uint32_t index) const {
+    const auto cell = CellAbsolute(index);
+    if (!cell || *cell + 80 > bytes_.size()) {
+      return std::nullopt;
+    }
+    const size_t data = *cell + 4;
+    if (std::memcmp(bytes_.data() + data, "nk", 2) != 0) {
+      return std::nullopt;
+    }
+    HiveKeyInfo key;
+    key.index = index;
+    key.flags = ReadLe16(bytes_.data() + data + 2);
+    key.subkeyCounts[0] = ReadLe32(bytes_.data() + data + 20);
+    key.subkeyCounts[1] = ReadLe32(bytes_.data() + data + 24);
+    key.subkeyLists[0] = ReadLe32(bytes_.data() + data + 28);
+    key.subkeyLists[1] = ReadLe32(bytes_.data() + data + 32);
+    key.valueCount = ReadLe32(bytes_.data() + data + 36);
+    key.valueList = ReadLe32(bytes_.data() + data + 40);
+    const uint16_t nameLen = ReadLe16(bytes_.data() + data + 72);
+    if (data + 76 + nameLen > bytes_.size()) {
+      return std::nullopt;
+    }
+    if ((key.flags & 0x20u) != 0) {
+      key.name.assign(reinterpret_cast<const char *>(bytes_.data() + data + 76),
+                      nameLen);
+    } else {
+      key.name = Utf16LeAsciiName(bytes_.data() + data + 76, nameLen);
+    }
+    return key;
+  }
+
+  std::vector<uint32_t> SubkeyIndexes(uint32_t index) const {
+    std::vector<uint32_t> out;
+    const auto key = ReadKey(index);
+    if (!key) {
+      return out;
+    }
+    for (size_t i = 0; i < 2; ++i) {
+      if (key->subkeyCounts[i] == 0 || key->subkeyLists[i] == 0xFFFFFFFFu) {
+        continue;
+      }
+      ReadSubkeyList(key->subkeyLists[i], key->subkeyCounts[i], out, 0);
+    }
+    return out;
+  }
+
+  std::optional<uint32_t> FindSubkey(uint32_t index,
+                                     const std::string &name) const {
+    for (const auto child : SubkeyIndexes(index)) {
+      const auto key = ReadKey(child);
+      if (key && EqualNoCase(key->name, name)) {
+        return child;
+      }
+    }
+    return std::nullopt;
+  }
+
+  std::vector<HiveValueInfo> Values(uint32_t index) const {
+    std::vector<HiveValueInfo> out;
+    const auto key = ReadKey(index);
+    if (!key || key->valueCount == 0 || key->valueList == 0xFFFFFFFFu) {
+      return out;
+    }
+    const auto listCell = CellAbsolute(key->valueList);
+    if (!listCell || *listCell + 4 + key->valueCount * 4ull > bytes_.size()) {
+      return out;
+    }
+    const size_t list = *listCell + 4;
+    for (uint32_t i = 0; i < key->valueCount; ++i) {
+      auto value = ReadValue(ReadLe32(bytes_.data() + list + i * 4ull));
+      if (value) {
+        out.push_back(std::move(*value));
+      }
+    }
+    return out;
+  }
+
+  std::optional<HiveValueInfo> FindValue(uint32_t index,
+                                         const std::string &name) const {
+    for (auto value : Values(index)) {
+      if (EqualNoCase(value.name, name)) {
+        return value;
+      }
+    }
+    return std::nullopt;
+  }
+
+private:
+  std::optional<size_t> CellAbsolute(uint32_t index) const {
+    if (index == 0xFFFFFFFFu) {
+      return std::nullopt;
+    }
+    const uint64_t absolute = 0x1000ull + index;
+    if (absolute + 4 > bytes_.size()) {
+      return std::nullopt;
+    }
+    return static_cast<size_t>(absolute);
+  }
+
+  void ReadSubkeyList(uint32_t index, uint32_t requestedCount,
+                      std::vector<uint32_t> &out, size_t depth) const {
+    if (depth > 8) {
+      return;
+    }
+    const auto cell = CellAbsolute(index);
+    if (!cell || *cell + 8 > bytes_.size()) {
+      return;
+    }
+    const size_t data = *cell + 4;
+    const std::string sig(reinterpret_cast<const char *>(bytes_.data() + data),
+                          2);
+    const uint16_t storedCount = ReadLe16(bytes_.data() + data + 2);
+    const uint32_t count =
+        std::min<uint32_t>(requestedCount, storedCount == 0 ? requestedCount
+                                                            : storedCount);
+    if (sig == "lf" || sig == "lh") {
+      for (uint32_t i = 0; i < count; ++i) {
+        if (data + 4 + i * 8ull + 4 > bytes_.size()) {
+          break;
+        }
+        out.push_back(ReadLe32(bytes_.data() + data + 4 + i * 8ull));
+      }
+      return;
+    }
+    if (sig == "li") {
+      for (uint32_t i = 0; i < count; ++i) {
+        if (data + 4 + i * 4ull + 4 > bytes_.size()) {
+          break;
+        }
+        out.push_back(ReadLe32(bytes_.data() + data + 4 + i * 4ull));
+      }
+      return;
+    }
+    if (sig == "ri") {
+      for (uint32_t i = 0; i < count; ++i) {
+        if (data + 4 + i * 4ull + 4 > bytes_.size()) {
+          break;
+        }
+        ReadSubkeyList(ReadLe32(bytes_.data() + data + 4 + i * 4ull), 0xFFFFu,
+                       out, depth + 1);
+      }
+    }
+  }
+
+  std::optional<HiveValueInfo> ReadValue(uint32_t index) const {
+    const auto cell = CellAbsolute(index);
+    if (!cell || *cell + 24 > bytes_.size()) {
+      return std::nullopt;
+    }
+    const size_t data = *cell + 4;
+    if (std::memcmp(bytes_.data() + data, "vk", 2) != 0) {
+      return std::nullopt;
+    }
+    HiveValueInfo value;
+    const uint16_t nameLen = ReadLe16(bytes_.data() + data + 2);
+    uint32_t dataLen = ReadLe32(bytes_.data() + data + 4);
+    const uint32_t dataField = ReadLe32(bytes_.data() + data + 8);
+    value.type = ReadLe32(bytes_.data() + data + 12);
+    const uint16_t flags = ReadLe16(bytes_.data() + data + 16);
+    if (data + 20 + nameLen > bytes_.size()) {
+      return std::nullopt;
+    }
+    if ((flags & 0x1u) != 0) {
+      value.name.assign(reinterpret_cast<const char *>(bytes_.data() + data + 20),
+                        nameLen);
+    } else {
+      value.name = Utf16LeAsciiName(bytes_.data() + data + 20, nameLen);
+    }
+
+    const bool isInline = (dataLen & 0x80000000u) != 0;
+    dataLen &= 0x7FFFFFFFu;
+    if (isInline) {
+      std::array<uint8_t, 4> inlineBytes{};
+      inlineBytes[0] = static_cast<uint8_t>(dataField & 0xFFu);
+      inlineBytes[1] = static_cast<uint8_t>((dataField >> 8) & 0xFFu);
+      inlineBytes[2] = static_cast<uint8_t>((dataField >> 16) & 0xFFu);
+      inlineBytes[3] = static_cast<uint8_t>((dataField >> 24) & 0xFFu);
+      value.data.assign(inlineBytes.begin(),
+                        inlineBytes.begin() + std::min<uint32_t>(dataLen, 4));
+      return value;
+    }
+    const auto dataCell = CellAbsolute(dataField);
+    if (!dataCell || *dataCell + 4 + dataLen > bytes_.size()) {
+      return value;
+    }
+    value.data.assign(bytes_.begin() + *dataCell + 4,
+                      bytes_.begin() + *dataCell + 4 + dataLen);
+    return value;
+  }
+
+  const std::vector<uint8_t> &bytes_;
+};
+
+std::optional<uint32_t> BcdObjectType(const RegistryHiveReader &hive,
+                                      uint32_t objectKey) {
+  const auto description = hive.FindSubkey(objectKey, "Description");
+  if (!description) {
+    return std::nullopt;
+  }
+  const auto type = hive.FindValue(*description, "Type");
+  if (!type || type->data.size() < 4) {
+    return std::nullopt;
+  }
+  return ReadLe32(type->data.data());
+}
+
+std::optional<uint32_t> BcdElementsKey(const RegistryHiveReader &hive,
+                                       uint32_t objectKey) {
+  return hive.FindSubkey(objectKey, "Elements");
+}
+
+std::optional<HiveValueInfo> BcdElementValue(const RegistryHiveReader &hive,
+                                             uint32_t objectKey,
+                                             const std::string &elementId) {
+  const auto elements = BcdElementsKey(hive, objectKey);
+  if (!elements) {
+    return std::nullopt;
+  }
+  const auto element = hive.FindSubkey(*elements, elementId);
+  if (!element) {
+    return std::nullopt;
+  }
+  return hive.FindValue(*element, "Element");
+}
+
+std::string BcdElementString(const RegistryHiveReader &hive, uint32_t objectKey,
+                             const std::string &elementId) {
+  const auto value = BcdElementValue(hive, objectKey, elementId);
+  if (!value) {
+    return {};
+  }
+  if (value->type == 1) {
+    return Utf16LeAsciiString(value->data);
+  }
+  if (value->type == 7) {
+    const auto values = Utf16LeAsciiMultiString(value->data);
+    std::ostringstream out;
+    for (size_t i = 0; i < values.size(); ++i) {
+      if (i != 0) {
+        out << ", ";
+      }
+      out << values[i];
+    }
+    return out.str();
+  }
+  return {};
+}
+
+std::string BcdDeviceDescription(const HiveValueInfo &value,
+                                 const std::vector<GptPartitionInfo> &parts) {
+  if (value.data.size() >= 48) {
+    const auto guid = GuidFromGptBytes(value.data.data() + 32);
+    std::ostringstream out;
+    out << "partitionGuid=" << guid << " ("
+        << PartitionLabelForUniqueGuid(parts, guid) << ")";
+    return out.str();
+  }
+  return "device blob length=" + std::to_string(value.data.size());
+}
+
+std::string BcdElementDescription(const std::string &id,
+                                  const HiveValueInfo &value,
+                                  const std::vector<GptPartitionInfo> &parts) {
+  if (id == "11000001" || id == "21000001") {
+    return BcdDeviceDescription(value, parts);
+  }
+  if (value.type == 1) {
+    return Utf16LeAsciiString(value.data);
+  }
+  if (value.type == 7) {
+    const auto values = Utf16LeAsciiMultiString(value.data);
+    std::ostringstream out;
+    for (size_t i = 0; i < values.size(); ++i) {
+      if (i != 0) {
+        out << ", ";
+      }
+      out << values[i];
+    }
+    return out.str();
+  }
+  if (value.type == 4 && value.data.size() >= 4) {
+    std::ostringstream out;
+    out << ReadLe32(value.data.data());
+    return out.str();
+  }
+  if (value.type == 3 && value.data.size() == 1) {
+    return value.data[0] != 0 ? "true" : "false";
+  }
+  if (value.type == 3 && value.data.size() == 8) {
+    std::ostringstream out;
+    out << ReadLe64(value.data.data());
+    return out.str();
+  }
+  std::ostringstream out;
+  out << "binary length=" << value.data.size();
+  return out.str();
+}
+
+bool BcdDeviceMatchesPartitionKind(const RegistryHiveReader &hive,
+                                   uint32_t objectKey,
+                                   const std::string &elementId,
+                                   const std::vector<GptPartitionInfo> &parts,
+                                   const std::string &kind) {
+  const auto value = BcdElementValue(hive, objectKey, elementId);
+  if (!value || value->data.size() < 48) {
+    return false;
+  }
+  const auto guid = GuidFromGptBytes(value->data.data() + 32);
+  for (const auto &part : parts) {
+    if (EqualNoCase(part.uniqueGuid, guid) &&
+        EqualNoCase(PartitionKind(part.typeGuid), kind)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+void PrintBcdObjectLine(const RegistryHiveReader &hive, uint32_t objectKey,
+                        const std::string &guid,
+                        const std::vector<GptPartitionInfo> &parts,
+                        const std::vector<std::string> &elementIds) {
+  const auto type = BcdObjectType(hive, objectKey).value_or(0);
+  std::cout << "  " << BcdObjectAlias(guid) << " type=0x" << std::hex
+            << std::uppercase << type << std::dec << " "
+            << BcdObjectTypeName(type) << "\n";
+  for (const auto &id : elementIds) {
+    const auto value = BcdElementValue(hive, objectKey, id);
+    if (!value) {
+      std::cout << "    MISSING " << BcdElementName(id) << " (" << id
+                << ")\n";
+      continue;
+    }
+    std::cout << "    " << BcdElementName(id) << " (" << id
+              << "): " << BcdElementDescription(id, *value, parts) << "\n";
+  }
+}
+
+void PrintBcdDecodedSummary(const std::vector<uint8_t> &bcdBytes,
+                            const std::vector<GptPartitionInfo> &partitions) {
+  RegistryHiveReader hive(bcdBytes);
+  if (!hive.IsValid()) {
+    std::cout << "BCD decoded contract: unavailable (not a registry hive)\n";
+    return;
+  }
+  const auto root = hive.RootIndex();
+  if (!root) {
+    std::cout << "BCD decoded contract: unavailable (missing root key)\n";
+    return;
+  }
+  const auto objects = hive.FindSubkey(*root, "Objects");
+  if (!objects) {
+    std::cout << "BCD decoded contract: unavailable (missing Objects key)\n";
+    return;
+  }
+
+  const std::string bootmgrGuid = "{9dea862c-5cdd-4e70-acc1-f32b344d4795}";
+  const auto bootmgr = hive.FindSubkey(*objects, bootmgrGuid);
+  std::optional<uint32_t> defaultObject;
+  std::string defaultGuid;
+  if (bootmgr) {
+    defaultGuid = BcdElementString(hive, *bootmgr, "23000003");
+    if (!defaultGuid.empty()) {
+      defaultObject = hive.FindSubkey(*objects, defaultGuid);
+    }
+  }
+
+  std::cout << "BCD decoded boot contract:\n";
+  if (bootmgr) {
+    PrintBcdObjectLine(hive, *bootmgr, bootmgrGuid, partitions,
+                       {"11000001", "12000002", "12000004", "23000003",
+                        "24000001", "25000004"});
+  } else {
+    std::cout << "  MISSING {bootmgr}\n";
+  }
+  if (defaultObject) {
+    PrintBcdObjectLine(hive, *defaultObject, defaultGuid, partitions,
+                       {"11000001", "21000001", "12000002", "22000002",
+                        "12000004", "23000003"});
+  } else if (!defaultGuid.empty()) {
+    std::cout << "  MISSING default loader object " << defaultGuid << "\n";
+  } else {
+    std::cout << "  MISSING {bootmgr} default object reference\n";
+  }
+
+  const bool bootmgrOnEsp =
+      bootmgr &&
+      BcdDeviceMatchesPartitionKind(hive, *bootmgr, "11000001", partitions,
+                                    "ESP");
+  const bool defaultPathOk =
+      defaultObject &&
+      EqualNoCase(BcdElementString(hive, *defaultObject, "12000002"),
+                  "\\Windows\\system32\\winload.efi");
+  const bool systemRootOk =
+      defaultObject &&
+      EqualNoCase(BcdElementString(hive, *defaultObject, "22000002"),
+                  "\\Windows");
+  const bool loaderDeviceOk =
+      defaultObject &&
+      BcdDeviceMatchesPartitionKind(hive, *defaultObject, "11000001",
+                                    partitions, "Windows/basic-data");
+  const bool osDeviceOk =
+      defaultObject &&
+      BcdDeviceMatchesPartitionKind(hive, *defaultObject, "21000001",
+                                    partitions, "Windows/basic-data");
+  std::cout << "BCD contract verdict: bootmgrDevice="
+            << (bootmgrOnEsp ? "ok" : "bad")
+            << " defaultPath=" << (defaultPathOk ? "ok" : "bad")
+            << " systemroot=" << (systemRootOk ? "ok" : "bad")
+            << " loaderDevice=" << (loaderDeviceOk ? "ok" : "bad")
+            << " osDevice=" << (osDeviceOk ? "ok" : "bad") << "\n";
+}
+
 int CommandBaseInspect(int argc, wchar_t **argv,
                        const antimal::AppConfig &config) {
   const auto vhdxText = OptionValue(argc, argv, "--vhdx");
@@ -708,6 +1283,7 @@ int CommandBaseInspect(int argc, wchar_t **argv,
               << " winload.efi=" << (hasWinload ? "yes" : "no")
               << " \\Windows=" << (hasWindowsRoot ? "yes" : "no")
               << " bytesRead=" << bcdBytes.size() << "\n";
+    PrintBcdDecodedSummary(bcdBytes, partitions);
     if (dumpBcdText) {
       const std::filesystem::path outPath(Utf8ToWide(*dumpBcdText));
       if (!outPath.parent_path().empty()) {

@@ -48,7 +48,7 @@ The current milestone is "agent boot": get a benign Windows base image far enoug
 
 The active blockers are:
 
-- Validate or repair the base VHDX boot files so `bootmgfw.efi` proceeds to `winload.efi`. The newest guest framebuffer shows Windows Recovery error `0xc0000225`, which is the strongest evidence so far that the next step is BCD/device repair on the base image.
+- Make `bootmgfw.efi` proceed to `winload.efi`. The newest guest framebuffer shows Windows Recovery error `0xc0000225`, but the non-admin BCD decoder now verifies the obvious boot contract: `{bootmgr}` points at the ESP, `{default}` points at the Windows/basic-data partition, `device` and `osdevice` agree, `path` is `\Windows\system32\winload.efi`, and `systemroot` is `\Windows`. That shifts the next investigation toward the VM boot-device/storage/firmware contract and interrupt delivery instead of missing ESP files.
 - Keep the Windows boot manager contract visible in diagnostics after BCD and code-integrity policy loads. ACPI PM1/S5 metadata is no longer treated as the immediate blocker: the FADT advertises legacy and extended PM1 blocks, the PM1 control trap preserves byte writes, and only S4/S5 requests stop the VM.
 - Continue interrupt diagnostics while boot repair is pending. Run diagnostics record pending IDE/PIT/RTC latches, IOAPIC redirection entries, PIC vector bases, PIC masks, and whether each interrupt was delivered by IOAPIC, PIC fallback, or failed routing.
 - Install GuestAgent into the base image and auto-start it from the offline SYSTEM hive service entry. The older HKLM Run autostart remains as a fallback.
@@ -72,7 +72,7 @@ Latest base image inspection:
 - Result: passed without elevation.
 - GPT layout is readable through the in-house VHDX block device: MSR, EFI System Partition, and Windows/basic-data partition.
 - ESP boot files are present: `EFI\BOOT\BOOTX64.EFI`, `EFI\Microsoft\Boot\bootmgfw.efi`, `EFI\Microsoft\Boot\BCD`, and `EFI\Microsoft\Boot\Fonts\wgl4_boot.ttf`.
-- Extracted BCD bytes contain `winload.efi` and `\Windows` hints. Non-admin `bcdedit /store` still returns access denied against the dumped hive, so exact BCD element decoding still needs the elevated validator/repair path or a future internal BCD hive parser.
+- The internal BCD hive decoder verifies `{bootmgr}` on the ESP and the default Windows loader on the Windows/basic-data partition. `winload.efi`, `\Windows`, `device`, and `osdevice` all decode coherently. Non-admin `bcdedit /store` still returns access denied against the dumped hive, but AntiMal can now inspect this boot contract itself.
 
 ## Safety Model
 
@@ -151,7 +151,7 @@ powershell -ExecutionPolicy Bypass -File tools\New-AntiMalVmBase.ps1 `
   -WriteConfig
 ```
 
-The local builder uses built-in Windows tools: `diskpart`, `DISM`, and `bcdboot`. It does not launch a third-party VM manager. After `bcdboot`, the builder validates the base with an elevated PowerShell session. This is currently the most important next manual/elevated step because the non-elevated probe reaches `bootmgfw` but not `winload`:
+The local builder uses built-in Windows tools: `diskpart`, `DISM`, and `bcdboot`. It does not launch a third-party VM manager. After `bcdboot`, the builder validates the base with an elevated PowerShell session. This is still useful for repair and GuestAgent installation, but the non-admin inspector can already confirm whether the ESP and BCD boot contract are coherent:
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File tools\Test-AntiMalBaseBoot.ps1 `
@@ -178,7 +178,7 @@ powershell -ExecutionPolicy Bypass -File tools\Test-AntiMalBaseBoot.ps1 `
 
 This copies the agent to `C:\AntiMal\AntiMal.GuestAgent.exe`, adds an automatic `AntiMalGuestAgent` service in the offline SYSTEM hive, and leaves a Run-key fallback for interactive logon scenarios.
 
-You can also inspect the base VHDX without administrator privileges. This path does not repair anything; it reads the VHDX through AntiMal's block device layer, parses GPT and the FAT32 ESP, checks the UEFI boot files, and can dump the BCD hive for offline inspection:
+You can also inspect the base VHDX without administrator privileges. This path does not repair anything; it reads the VHDX through AntiMal's block device layer, parses GPT and the FAT32 ESP, checks the UEFI boot files, decodes the BCD registry hive, verifies the boot manager/default loader contract, and can dump the BCD hive for offline inspection:
 
 ```powershell
 bin\x64\Release\AntiMal.HostCli.exe base inspect `
