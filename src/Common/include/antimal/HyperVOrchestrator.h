@@ -69,6 +69,9 @@ struct HyperVPreflight {
   bool whpDllPresent = false;
   bool whpAvailable = false;
   bool storageBootReady = false;
+  bool baseBootStorageInspected = false;
+  bool baseBootStorageReady = false;
+  std::string baseBootStorageDetails;
   bool bootCapabilityReady = false;
   bool displayReady = false;
   bool hostChannelReady = false;

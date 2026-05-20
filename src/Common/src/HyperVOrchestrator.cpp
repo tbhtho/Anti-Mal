@@ -654,6 +654,19 @@ public:
 
   uint8_t SectorsPerCluster() const noexcept { return sectorsPerCluster_; }
 
+  std::vector<uint8_t> ReadFile(const NtfsEntryLite &entry, size_t maxBytes) {
+    if (entry.directory || entry.dataRuns.empty() || entry.size == 0) {
+      return {};
+    }
+    const size_t bytes = static_cast<size_t>(
+        std::min<uint64_t>(entry.size, static_cast<uint64_t>(maxBytes)));
+    std::vector<uint8_t> out(bytes);
+    if (!ReadStreamBytes(entry.dataRuns, 0, out.data(), out.size())) {
+      return {};
+    }
+    return out;
+  }
+
 private:
   struct Attribute {
     uint32_t type = 0;
@@ -1557,6 +1570,175 @@ BootOverlayPatchDetails(const BootOverlayPatchResult &patch) {
     details["notes"] = JoinStrings(patch.notes, "; ");
   }
   return details;
+}
+
+struct BaseBootStorageInspection {
+  bool inspected = false;
+  bool ready = false;
+  std::string details;
+};
+
+std::optional<uint32_t>
+FindHivePath(MutableHiveView &hive,
+             std::initializer_list<std::string> components) {
+  auto current = hive.RootIndex();
+  if (!current) {
+    return std::nullopt;
+  }
+  for (const auto &component : components) {
+    current = hive.FindSubkey(*current, component);
+    if (!current) {
+      return std::nullopt;
+    }
+  }
+  return current;
+}
+
+std::optional<uint32_t> HiveDwordValue(MutableHiveView &hive, uint32_t key,
+                                       const std::string &name) {
+  const auto value = hive.FindValue(key, name);
+  if (!value || value->dataLength < 4) {
+    return std::nullopt;
+  }
+  const auto bytes = hive.ValueBytes(*value);
+  if (bytes.size() < 4) {
+    return std::nullopt;
+  }
+  return ReadLe32(bytes.data());
+}
+
+std::string HiveStringValue(MutableHiveView &hive, uint32_t key,
+                            const std::string &name) {
+  const auto value = hive.FindValue(key, name);
+  if (!value || value->dataLength == 0) {
+    return {};
+  }
+  const auto bytes = hive.ValueBytes(*value);
+  if (bytes.empty()) {
+    return {};
+  }
+  if (value->type == 1 || value->type == 2) {
+    return Utf16LeAsciiString(bytes);
+  }
+  return {};
+}
+
+std::string FormatControlSetName(uint32_t controlSet) {
+  std::ostringstream out;
+  out << "ControlSet" << std::setw(3) << std::setfill('0') << controlSet;
+  return out.str();
+}
+
+std::optional<std::string> SelectOfflineControlSet(MutableHiveView &hive) {
+  const auto select = FindHivePath(hive, {"Select"});
+  if (!select) {
+    return std::nullopt;
+  }
+  const auto current = HiveDwordValue(hive, *select, "Current");
+  const auto def = HiveDwordValue(hive, *select, "Default");
+  if (current && *current != 0) {
+    return FormatControlSetName(*current);
+  }
+  if (def && *def != 0) {
+    return FormatControlSetName(*def);
+  }
+  return FormatControlSetName(1);
+}
+
+bool ServiceBootStartReady(MutableHiveView &hive,
+                           const std::string &controlSet,
+                           const std::string &service) {
+  const auto key = FindHivePath(hive, {controlSet, "Services", service});
+  if (!key) {
+    return false;
+  }
+  const auto start = HiveDwordValue(hive, *key, "Start");
+  if (!start || *start != 0) {
+    return false;
+  }
+  if (const auto startOverride = hive.FindSubkey(*key, "StartOverride")) {
+    const auto override0 = HiveDwordValue(hive, *startOverride, "0");
+    if (override0 && *override0 != 0) {
+      return false;
+    }
+  }
+  return true;
+}
+
+bool CriticalIdeDeviceReady(MutableHiveView &hive,
+                            const std::string &controlSet) {
+  for (const auto *id : {"pci#ven_8086&dev_7111",
+                         "pci#ven_8086&dev_7111&cc_0101",
+                         "pci#ven_8086&dev_7111&cc_01018a",
+                         "pci#cc_0101",
+                         "pci#cc_01018a"}) {
+    const auto key = FindHivePath(
+        hive, {controlSet, "Control", "CriticalDeviceDatabase", id});
+    if (!key) {
+      continue;
+    }
+    if (EqualNoCaseLocal(HiveStringValue(hive, *key, "Service"), "pciide")) {
+      return true;
+    }
+  }
+  return false;
+}
+
+BaseBootStorageInspection InspectBaseBootStorage(hv::IBlockDevice &disk) {
+  BaseBootStorageInspection inspection;
+  inspection.inspected = true;
+
+  const auto partitions = ReadGptPartitionsLite(disk);
+  const auto windows =
+      std::find_if(partitions.begin(), partitions.end(),
+                   [](const GptPartitionLite &partition) {
+                     return IsWindowsBasicDataGuid(partition.typeGuid);
+                   });
+  if (windows == partitions.end()) {
+    inspection.details = "Windows/basic-data partition not found";
+    return inspection;
+  }
+
+  NtfsBootFileLocator ntfs(disk, windows->firstLba);
+  if (!ntfs.Init()) {
+    inspection.details = "Windows partition is not readable NTFS";
+    return inspection;
+  }
+  const auto system = ntfs.FindPath("Windows\\System32\\config\\SYSTEM");
+  if (!system) {
+    inspection.details = "SYSTEM hive not found";
+    return inspection;
+  }
+  auto bytes = ntfs.ReadFile(*system, 64u * 1024u * 1024u);
+  MutableHiveView hive(bytes);
+  if (bytes.empty() || !hive.IsValid()) {
+    inspection.details = "SYSTEM hive is unreadable";
+    return inspection;
+  }
+
+  const auto controlSet = SelectOfflineControlSet(hive);
+  if (!controlSet) {
+    inspection.details = "SYSTEM Select key is missing";
+    return inspection;
+  }
+  const bool coreReady =
+      ServiceBootStartReady(hive, *controlSet, "disk") &&
+      ServiceBootStartReady(hive, *controlSet, "partmgr") &&
+      ServiceBootStartReady(hive, *controlSet, "mountmgr");
+  const bool ideServiceReady =
+      ServiceBootStartReady(hive, *controlSet, "pciide") ||
+      ServiceBootStartReady(hive, *controlSet, "intelide") ||
+      ServiceBootStartReady(hive, *controlSet, "atapi");
+  const bool criticalReady = CriticalIdeDeviceReady(hive, *controlSet);
+  inspection.ready = coreReady && ideServiceReady && criticalReady;
+  std::ostringstream details;
+  details << "controlSet=" << *controlSet
+          << ";storageCore=" << (coreReady ? "ready" : "needs-repair")
+          << ";ideService=" << (ideServiceReady ? "ready" : "needs-repair")
+          << ";criticalDevice="
+          << (criticalReady ? "ready" : "needs-repair");
+  inspection.details = details.str();
+  return inspection;
 }
 
 bool ImageLooksLikeWinload(const hv::VmGuestImageInfo &image) {
@@ -2522,6 +2704,12 @@ HyperVPreflight InHouseOrchestrator::Preflight() const {
     try {
       auto vhdx = hv::VhdxBlockDevice::Open(config_.baseVhdxPath);
       result.baseVhdxReadable = vhdx.SectorCount() > 0;
+      if (result.baseVhdxReadable) {
+        const auto bootStorage = InspectBaseBootStorage(vhdx);
+        result.baseBootStorageInspected = bootStorage.inspected;
+        result.baseBootStorageReady = bootStorage.ready;
+        result.baseBootStorageDetails = bootStorage.details;
+      }
     } catch (const std::exception &ex) {
       result.messages.push_back("Base VHDX is present but unreadable: " +
                                 std::string(ex.what()));
@@ -2568,6 +2756,11 @@ HyperVPreflight InHouseOrchestrator::Preflight() const {
     } else if (!result.rawBaseReady && result.baseVhdxReadable) {
       result.messages.push_back(
           "Base VHDX will be used directly with a disposable COW overlay.");
+    }
+    if (result.baseBootStorageInspected && !result.baseBootStorageReady) {
+      result.messages.push_back(
+          "Base SYSTEM hive boot-storage contract needs repair: " +
+          result.baseBootStorageDetails);
     }
     if (!result.firmwarePresent) {
       result.blockers.push_back(
@@ -2769,6 +2962,9 @@ DetonationResult InHouseOrchestrator::PrepareAndRun(
                                       {"whpDllPresent", preflight.whpDllPresent ? "true" : "false"},
                                       {"whpAvailable", preflight.whpAvailable ? "true" : "false"},
                                       {"storageBootReady", preflight.storageBootReady ? "true" : "false"},
+                                      {"baseBootStorageInspected", preflight.baseBootStorageInspected ? "true" : "false"},
+                                      {"baseBootStorageReady", preflight.baseBootStorageReady ? "true" : "false"},
+                                      {"baseBootStorageDetails", preflight.baseBootStorageDetails},
                                       {"bootCapabilityReady", preflight.bootCapabilityReady ? "true" : "false"},
                                       {"hostChannelReady", preflight.hostChannelReady ? "true" : "false"},
                                       {"dynamicExecutionEnabled", preflight.dynamicExecutionEnabled ? "true" : "false"},
