@@ -1,7 +1,8 @@
 param(
   [string]$BaseVhdxPath = "C:\AntiMalRuns\_base\AntiMalBase.vhdx",
   [string]$GuestAgentPath = "",
-  [switch]$RepairBcd
+  [switch]$RepairBcd,
+  [switch]$RepairBootStorage
 )
 
 $ErrorActionPreference = "Stop"
@@ -255,7 +256,7 @@ $assignedLetters = [System.Collections.Generic.List[string]]::new()
 $disk = $null
 
 try {
-  $access = if ($RepairBcd -or $GuestAgentPath) { "ReadWrite" } else { "ReadOnly" }
+  $access = if ($RepairBcd -or $RepairBootStorage -or $GuestAgentPath) { "ReadWrite" } else { "ReadOnly" }
   Write-Host "Mounting base VHDX ($access): $BaseVhdxPath"
   Mount-DiskImage -ImagePath $BaseVhdxPath -Access $access | Out-Null
   $imageMounted = $true
@@ -311,6 +312,9 @@ try {
     } else {
       Repair-BcdStore $windows.Root $esp.Root
     }
+  }
+
+  if ($RepairBcd -or $RepairBootStorage) {
     Repair-BootStorageDrivers $windows.Root
   }
 

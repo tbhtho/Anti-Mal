@@ -186,6 +186,14 @@ powershell -ExecutionPolicy Bypass -File tools\Test-AntiMalBaseBoot.ps1 `
 
 `-RepairBcd` reruns `bcdboot`, restores `EFI\BOOT\BOOTX64.EFI`, pins `{bootmgr}` to the ESP, pins `{default}` `device`/`osdevice`/`path`/`systemroot` to the mounted Windows partition, re-inspects the BCD store, sets boot recovery policy so the sandbox base does not loop into recovery UI, marks boot storage services as boot-start, and adds CriticalDeviceDatabase mappings for the emulated PIIX IDE controller to `pciide`. It does not disable code integrity or signature checks.
 
+To repair only the offline SYSTEM boot-storage binding without rerunning `bcdboot`:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File tools\Test-AntiMalBaseBoot.ps1 `
+  -BaseVhdxPath C:\AntiMalRuns\_base\AntiMalBase.vhdx `
+  -RepairBootStorage
+```
+
 To install the current GuestAgent into the base image for heartbeat testing:
 
 ```powershell

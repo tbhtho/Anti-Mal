@@ -1714,6 +1714,10 @@ void PrintSystemBootStorageSummary(const std::vector<uint8_t> &systemBytes) {
             << " ideService=" << (ideServiceReady ? "ready" : "needs-repair")
             << " criticalDevice="
             << (piixCriticalReady ? "ready" : "needs-repair") << "\n";
+  if (!(storageCoreReady && ideServiceReady && piixCriticalReady)) {
+    std::cout << "  Repair hint: run elevated PowerShell with "
+                 "tools\\Test-AntiMalBaseBoot.ps1 -RepairBootStorage\n";
+  }
 }
 
 std::optional<uint32_t> BcdObjectType(const RegistryHiveReader &hive,
