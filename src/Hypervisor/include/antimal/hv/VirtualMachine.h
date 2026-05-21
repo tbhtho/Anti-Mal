@@ -200,6 +200,11 @@ struct VmRunSummary {
   // This catches a loader image that owned a busy loop even when the final
   // RIP alone lands in firmware UI code after a boot handoff failure.
   std::vector<VmRipHotspotImageInfo> ripHotspotImages;
+  // Page-aligned PE images still resident in identity-mapped low RAM when the
+  // run stops. Boot Manager can return to firmware recovery UI after a short
+  // loader handoff, so final RIP and hotspot attribution are not enough by
+  // themselves to prove whether a loader image was present.
+  std::vector<VmGuestImageInfo> residentImages;
   // Snapshot of the most recent CMOS / RTC port accesses (oldest first).
   // Mirrors PcIoDevices::RecentCmosAccesses(); duplicated into the summary
   // so the host-side diagnostics writer doesn't need to keep the live VM
