@@ -1691,6 +1691,7 @@ struct BootOverlayPatchResult {
   bool dbgSettingsDebugTypePatched = false;
   bool dbgSettingsDebugPortPatched = false;
   bool dbgSettingsBaudRatePatched = false;
+  bool bootmgrBootDebugPatched = false;
   std::vector<std::string> notes;
 };
 
@@ -1864,6 +1865,42 @@ bool PatchBcdDebugTransport(std::vector<uint8_t> &bcd,
   return changed;
 }
 
+// Set bootdebug=true on the {bootmgr} object too. If bootmgr itself emits
+// any debug text to COM1 before transferring control to winload, that
+// confirms the UART path is functional and isolates winload's silence as
+// a winload-specific issue (e.g. retail winload may have its DEBUG()
+// macros compiled out, or BlBdInitialize fails for a reason we haven't
+// surfaced yet).
+bool PatchBcdBootmgrDebug(std::vector<uint8_t> &bcd,
+                          BootOverlayPatchResult *result) {
+  MutableHiveView hive(bcd);
+  if (!hive.IsValid()) {
+    return false;
+  }
+  const auto root = hive.RootIndex();
+  const auto objects = root ? hive.FindSubkey(*root, "Objects") : std::nullopt;
+  if (!objects) {
+    return false;
+  }
+  const auto bootmgr =
+      hive.FindSubkey(*objects, "{9dea862c-5cdd-4e70-acc1-f32b344d4795}");
+  if (!bootmgr) {
+    return false;
+  }
+  const auto elements = hive.FindSubkey(*bootmgr, "Elements");
+  if (!elements) {
+    return false;
+  }
+  if (AddBcdElementRaw(hive, *elements, "16000010", 3,
+                       std::vector<uint8_t>{1})) {
+    if (result) {
+      result->bootmgrBootDebugPatched = true;
+    }
+    return true;
+  }
+  return false;
+}
+
 // {dbgsettings} GUID per Microsoft BCD docs. winload reads bootdebug=true on
 // the loader, then pulls debugtype / debugport / baudrate from {dbgsettings}
 // via inheritance. Without these elements present somewhere readable,
@@ -1978,7 +2015,8 @@ BootOverlayPatchResult ApplyEphemeralBootOverlay(hv::IBlockDevice &disk) {
       } else {
         const bool loaderChanged = PatchBcdDebugTransport(bytes, &result);
         const bool dbgChanged = PatchBcdDbgSettings(bytes, &result);
-        transportChanged = loaderChanged || dbgChanged;
+        const bool bootmgrChanged = PatchBcdBootmgrDebug(bytes, &result);
+        transportChanged = loaderChanged || dbgChanged || bootmgrChanged;
       }
       if ((policyChanged || transportChanged) &&
           !fat.WriteFileSameSize(*bcd, bytes)) {
@@ -1991,6 +2029,7 @@ BootOverlayPatchResult ApplyEphemeralBootOverlay(hv::IBlockDevice &disk) {
         result.dbgSettingsDebugTypePatched = false;
         result.dbgSettingsDebugPortPatched = false;
         result.dbgSettingsBaudRatePatched = false;
+        result.bootmgrBootDebugPatched = false;
         result.notes.push_back("failed to write patched BCD to overlay");
       }
     }
@@ -2033,6 +2072,8 @@ BootOverlayPatchDetails(const BootOverlayPatchResult &patch) {
        patch.dbgSettingsDebugPortPatched ? "true" : "false"},
       {"dbgSettingsBaudRatePatched",
        patch.dbgSettingsBaudRatePatched ? "true" : "false"},
+      {"bootmgrBootDebugPatched",
+       patch.bootmgrBootDebugPatched ? "true" : "false"},
       {"scope", "overlay-only"}};
   if (!patch.notes.empty()) {
     details["notes"] = JoinStrings(patch.notes, "; ");
