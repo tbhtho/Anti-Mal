@@ -63,7 +63,8 @@ void PrintUsage() {
       << "                    [--intel] [--vt-key <KEY>] [--json <out.json>]\n"
       << "  antimal detonate <sample> --timeout-sec 180 --network disabled|hostonly|nat\n"
       << "  antimal base convert --vhdx <base.vhdx> --raw <AntiMalBase.raw> [--force]\n"
-      << "  antimal base inspect --vhdx <base.vhdx> [--dump-bcd <out.bcd>]\n"
+      << "  antimal base inspect --vhdx <base.vhdx> [--overlay <overlay.cow>]\n"
+      << "                       [--dump-bcd <out.bcd>]\n"
       << "  antimal report <run-id-or-report.json> --html\n"
       << "  antimal browser-impact <run-id-or-report.json> --decrypt-browser-secrets\n";
 }
@@ -2126,6 +2127,7 @@ void PrintNtfsDataRuns(const std::string &path, const NtfsReader::Entry &entry,
 int CommandBaseInspect(int argc, wchar_t **argv,
                        const antimal::AppConfig &config) {
   const auto vhdxText = OptionValue(argc, argv, "--vhdx");
+  const auto overlayText = OptionValue(argc, argv, "--overlay");
   const auto dumpBcdText = OptionValue(argc, argv, "--dump-bcd");
   const std::filesystem::path vhdx =
       vhdxText ? std::filesystem::path(Utf8ToWide(*vhdxText))
@@ -2141,7 +2143,30 @@ int CommandBaseInspect(int argc, wchar_t **argv,
   std::cout << "Sectors: " << disk.SectorCount() << "\n";
   std::cout << "Block size: " << disk.BlockSize() << " bytes\n";
 
-  const auto partitions = ReadGptPartitions(disk);
+  // Optionally chain a disposable run overlay on top of the base. The overlay
+  // is read-only here (we never call WriteSectors), so we get the post-patch
+  // view of the BCD without mutating the COW file.
+  std::optional<antimal::hv::CowOverlayBlockDevice> overlayDevice;
+  antimal::hv::IBlockDevice *activeDisk = &disk;
+  if (overlayText) {
+    const std::filesystem::path overlayPath(Utf8ToWide(*overlayText));
+    try {
+      overlayDevice.emplace(
+          antimal::hv::CowOverlayBlockDevice::Open(&disk, overlayPath));
+      activeDisk = &*overlayDevice;
+      std::cout << "Overlay COW: " << antimal::PathToUtf8(overlayPath)
+                << " sectors=" << overlayDevice->SectorCount()
+                << " overlay sectors=" << overlayDevice->OverlaySectorCount()
+                << "\n";
+    } catch (const std::exception &ex) {
+      std::cerr << "error: failed to open overlay COW "
+                << antimal::PathToUtf8(overlayPath) << ": " << ex.what()
+                << "\n";
+      return 1;
+    }
+  }
+
+  const auto partitions = ReadGptPartitions(*activeDisk);
   std::cout << "GPT partitions: " << partitions.size() << "\n";
   const GptPartitionInfo *esp = nullptr;
   const GptPartitionInfo *windows = nullptr;
@@ -2171,7 +2196,7 @@ int CommandBaseInspect(int argc, wchar_t **argv,
     return 1;
   }
 
-  Fat32Reader fat(disk, esp->firstLba);
+  Fat32Reader fat(*activeDisk, esp->firstLba);
   if (!fat.Init()) {
     std::cerr << "error: ESP is not a readable FAT32 volume.\n";
     return 1;
@@ -2238,7 +2263,7 @@ int CommandBaseInspect(int argc, wchar_t **argv,
     std::cout << "MISSING: Windows/basic-data partition\n";
     ok = false;
   } else {
-    NtfsReader ntfs(disk, windows->firstLba);
+    NtfsReader ntfs(*activeDisk, windows->firstLba);
     if (!ntfs.Init()) {
       std::cout << "MISSING: readable NTFS Windows partition\n";
       ok = false;
