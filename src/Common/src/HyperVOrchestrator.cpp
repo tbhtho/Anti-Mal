@@ -1342,6 +1342,52 @@ public:
     return keyIndex;
   }
 
+  bool SetBinaryValue(uint32_t keyIndex, const std::string &name,
+                      uint32_t valueType,
+                      const std::vector<uint8_t> &valueBytes) {
+    const auto key = ReadKey(keyIndex);
+    if (!key || name.empty() ||
+        name.size() > std::numeric_limits<uint16_t>::max()) {
+      return false;
+    }
+    if (valueBytes.size() > std::numeric_limits<int32_t>::max()) {
+      return false;
+    }
+    const size_t alloc = valueBytes.empty() ? 1 : valueBytes.size();
+    const auto dataIndex = AllocateCell(alloc);
+    if (!dataIndex) {
+      return false;
+    }
+    const auto dataCell = CellAbsolute(*dataIndex);
+    if (!dataCell) {
+      return false;
+    }
+    if (!valueBytes.empty()) {
+      std::memcpy(bytes_.data() + *dataCell + 4, valueBytes.data(),
+                  valueBytes.size());
+    }
+
+    const auto valueIndex = AllocateCell(20 + name.size());
+    if (!valueIndex) {
+      return false;
+    }
+    const auto valueCell = CellAbsolute(*valueIndex);
+    if (!valueCell) {
+      return false;
+    }
+    const size_t data = *valueCell + 4;
+    std::memcpy(bytes_.data() + data, "vk", 2);
+    WriteLe16(bytes_.data() + data + 2,
+              static_cast<uint16_t>(name.size()));
+    WriteLe32(bytes_.data() + data + 4,
+              static_cast<uint32_t>(valueBytes.size()));
+    WriteLe32(bytes_.data() + data + 8, *dataIndex);
+    WriteLe32(bytes_.data() + data + 12, valueType);
+    WriteLe16(bytes_.data() + data + 16, 0x1u);
+    std::memcpy(bytes_.data() + data + 20, name.data(), name.size());
+    return AppendValue(keyIndex, *valueIndex);
+  }
+
   bool SetAsciiStringValue(uint32_t keyIndex, const std::string &name,
                            const std::wstring &value) {
     const auto key = ReadKey(keyIndex);
@@ -1637,6 +1683,10 @@ struct BootOverlayPatchResult {
   bool bootstatReset = false;
   bool systemHiveFound = false;
   bool bootStoragePatched = false;
+  bool bootDebugPatched = false;
+  bool debugTypePatched = false;
+  bool debugPortPatched = false;
+  bool baudRatePatched = false;
   std::vector<std::string> notes;
 };
 
@@ -1732,11 +1782,97 @@ bool PatchBcdBootPolicy(std::vector<uint8_t> &bcd,
   return changed;
 }
 
+bool AddBcdElementRaw(MutableHiveView &hive, uint32_t elementsKey,
+                      const std::string &elementId, uint32_t valueType,
+                      const std::vector<uint8_t> &valueBytes) {
+  if (hive.FindSubkey(elementsKey, elementId)) {
+    return false;
+  }
+  const auto child = hive.CreateAsciiKey(elementsKey, elementId);
+  if (!child) {
+    return false;
+  }
+  return hive.SetBinaryValue(*child, "Element", valueType, valueBytes);
+}
+
+std::vector<uint8_t> BcdU64Bytes(uint64_t value) {
+  std::vector<uint8_t> bytes(8, 0);
+  WriteLe64(bytes.data(), value);
+  return bytes;
+}
+
+bool PatchBcdDebugTransport(std::vector<uint8_t> &bcd,
+                            BootOverlayPatchResult *result) {
+  MutableHiveView hive(bcd);
+  if (!hive.IsValid()) {
+    return false;
+  }
+  const auto root = hive.RootIndex();
+  const auto objects = root ? hive.FindSubkey(*root, "Objects") : std::nullopt;
+  const auto bootmgr =
+      objects ? hive.FindSubkey(*objects,
+                                "{9dea862c-5cdd-4e70-acc1-f32b344d4795}")
+              : std::nullopt;
+  const std::string defaultGuid =
+      bootmgr ? BcdElementString(hive, *bootmgr, "23000003") : std::string{};
+  const auto defaultObject =
+      !defaultGuid.empty() && objects ? hive.FindSubkey(*objects, defaultGuid)
+                                      : std::nullopt;
+  const auto elements =
+      defaultObject ? hive.FindSubkey(*defaultObject, "Elements") : std::nullopt;
+  if (!elements) {
+    if (result) {
+      result->notes.push_back(
+          "BCD debug transport: default loader Elements key not found");
+    }
+    return false;
+  }
+
+  bool changed = false;
+  if (AddBcdElementRaw(hive, *elements, "16000010", 3,
+                       std::vector<uint8_t>{1})) {
+    changed = true;
+    if (result) {
+      result->bootDebugPatched = true;
+    }
+  }
+  if (AddBcdElementRaw(hive, *elements, "25000022", 3, BcdU64Bytes(0))) {
+    changed = true;
+    if (result) {
+      result->debugTypePatched = true;
+    }
+  }
+  if (AddBcdElementRaw(hive, *elements, "25000023", 3, BcdU64Bytes(1))) {
+    changed = true;
+    if (result) {
+      result->debugPortPatched = true;
+    }
+  }
+  if (AddBcdElementRaw(hive, *elements, "25000024", 3, BcdU64Bytes(115200))) {
+    changed = true;
+    if (result) {
+      result->baudRatePatched = true;
+    }
+  }
+  if (!changed && result) {
+    result->notes.push_back("BCD debug transport elements already present");
+  }
+  return changed;
+}
+
 bool BootOverlayPatchDisabled() {
   char buf[16]{};
   size_t needed = 0;
   return getenv_s(&needed, buf, sizeof(buf),
                   "ANTIMAL_DISABLE_BOOT_OVERLAY_PATCH") == 0 &&
+         needed > 1 && buf[0] != '\0' && std::atoi(buf) != 0;
+}
+
+bool WinloadDebugPatchDisabled() {
+  char buf[16]{};
+  size_t needed = 0;
+  return getenv_s(&needed, buf, sizeof(buf),
+                  "ANTIMAL_DISABLE_WINLOAD_DEBUG") == 0 &&
          needed > 1 && buf[0] != '\0' && std::atoi(buf) != 0;
 }
 
@@ -1767,10 +1903,23 @@ BootOverlayPatchResult ApplyEphemeralBootOverlay(hv::IBlockDevice &disk) {
   if (const auto bcd = fat.FindPath("EFI\\Microsoft\\Boot\\BCD")) {
     result.bcdFound = true;
     auto bytes = fat.ReadFile(*bcd, 4ull * 1024ull * 1024ull);
-    if (bytes.size() == bcd->size && PatchBcdBootPolicy(bytes, &result)) {
-      if (!fat.WriteFileSameSize(*bcd, bytes)) {
+    if (bytes.size() == bcd->size) {
+      const bool policyChanged = PatchBcdBootPolicy(bytes, &result);
+      bool transportChanged = false;
+      if (WinloadDebugPatchDisabled()) {
+        result.notes.push_back(
+            "winload debug patch disabled by ANTIMAL_DISABLE_WINLOAD_DEBUG");
+      } else {
+        transportChanged = PatchBcdDebugTransport(bytes, &result);
+      }
+      if ((policyChanged || transportChanged) &&
+          !fat.WriteFileSameSize(*bcd, bytes)) {
         result.bcdPolicyPatched = false;
         result.recoveryPatched = false;
+        result.bootDebugPatched = false;
+        result.debugTypePatched = false;
+        result.debugPortPatched = false;
+        result.baudRatePatched = false;
         result.notes.push_back("failed to write patched BCD to overlay");
       }
     }
@@ -1802,6 +1951,10 @@ BootOverlayPatchDetails(const BootOverlayPatchResult &patch) {
       {"bootstatReset", patch.bootstatReset ? "true" : "false"},
       {"systemHiveFound", patch.systemHiveFound ? "true" : "false"},
       {"bootStoragePatched", patch.bootStoragePatched ? "true" : "false"},
+      {"bootDebugPatched", patch.bootDebugPatched ? "true" : "false"},
+      {"debugTypePatched", patch.debugTypePatched ? "true" : "false"},
+      {"debugPortPatched", patch.debugPortPatched ? "true" : "false"},
+      {"baudRatePatched", patch.baudRatePatched ? "true" : "false"},
       {"scope", "overlay-only"}};
   if (!patch.notes.empty()) {
     details["notes"] = JoinStrings(patch.notes, "; ");

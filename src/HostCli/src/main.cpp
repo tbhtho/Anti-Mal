@@ -1154,8 +1154,29 @@ std::string BcdElementName(const std::string &id) {
   if (upper == "16000009") {
     return "recoveryenabled";
   }
+  if (upper == "16000010") {
+    return "bootdebug";
+  }
+  if (upper == "16000020") {
+    return "advancedoptions";
+  }
+  if (upper == "16000040") {
+    return "bootlog";
+  }
+  if (upper == "16000045") {
+    return "firstmegabytepolicy";
+  }
+  if (upper == "16000048") {
+    return "allowedinmemorysettings";
+  }
+  if (upper == "16000049") {
+    return "testsigning";
+  }
   if (upper == "16000060") {
     return "isolatedcontext";
+  }
+  if (upper == "16000067") {
+    return "ems";
   }
   if (upper == "22000002") {
     return "systemroot";
@@ -1178,11 +1199,26 @@ std::string BcdElementName(const std::string &id) {
   if (upper == "25000020") {
     return "nx";
   }
+  if (upper == "25000022") {
+    return "debugtype";
+  }
+  if (upper == "25000023") {
+    return "debugport";
+  }
+  if (upper == "25000024") {
+    return "baudrate";
+  }
   if (upper == "250000C2") {
     return "bootmenupolicy";
   }
   if (upper == "250000E0") {
     return "bootstatuspolicy";
+  }
+  if (upper == "26000040") {
+    return "debug";
+  }
+  if (upper == "26000048") {
+    return "nointegritychecks";
   }
   return upper;
 }
@@ -1887,6 +1923,35 @@ void PrintBcdObjectLine(const RegistryHiveReader &hive, uint32_t objectKey,
   }
 }
 
+void PrintBcdAllElements(const RegistryHiveReader &hive, uint32_t objectKey,
+                         const std::vector<GptPartitionInfo> &partitions) {
+  const auto elements = hive.FindSubkey(objectKey, "Elements");
+  if (!elements) {
+    std::cout << "    (Elements key absent)\n";
+    return;
+  }
+  const auto children = hive.SubkeyIndexes(*elements);
+  std::cout << "    full element inventory (" << children.size()
+            << " entries):\n";
+  for (const auto child : children) {
+    const auto key = hive.ReadKey(child);
+    if (!key) {
+      continue;
+    }
+    const auto value = hive.FindValue(child, "Element");
+    if (!value) {
+      std::cout << "      " << key->name << " name=" << BcdElementName(key->name)
+                << " (no Element value)\n";
+      continue;
+    }
+    std::cout << "      " << key->name
+              << " name=" << BcdElementName(key->name)
+              << " type=" << value->type << " size=" << value->data.size()
+              << " value=" << BcdElementDescription(key->name, *value, partitions)
+              << "\n";
+  }
+}
+
 void PrintBcdDecodedSummary(const std::vector<uint8_t> &bcdBytes,
                             const std::vector<GptPartitionInfo> &partitions) {
   RegistryHiveReader hive(bcdBytes);
@@ -1921,6 +1986,7 @@ void PrintBcdDecodedSummary(const std::vector<uint8_t> &bcdBytes,
     PrintBcdObjectLine(hive, *bootmgr, bootmgrGuid, partitions,
                        {"11000001", "12000002", "12000004", "23000003",
                         "24000001", "25000004"});
+    PrintBcdAllElements(hive, *bootmgr, partitions);
   } else {
     std::cout << "  MISSING {bootmgr}\n";
   }
@@ -1929,6 +1995,7 @@ void PrintBcdDecodedSummary(const std::vector<uint8_t> &bcdBytes,
                        {"11000001", "21000001", "12000002", "22000002",
                         "12000004", "23000003", "16000009", "250000E0",
                         "16000060", "25000020", "250000C2"});
+    PrintBcdAllElements(hive, *defaultObject, partitions);
   } else if (!defaultGuid.empty()) {
     std::cout << "  MISSING default loader object " << defaultGuid << "\n";
   } else {
