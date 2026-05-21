@@ -2554,6 +2554,41 @@ DynamicRunSummary ToDynamicSummary(const hv::VmRunSummary &vm,
   return summary;
 }
 
+std::map<uint64_t, std::string>
+ParseUefiImageLoadNames(const std::string &serialOutput) {
+  std::map<uint64_t, std::string> names;
+  std::istringstream lines(serialOutput);
+  std::string line;
+  while (std::getline(lines, line)) {
+    if (line.find("Loading driver at ") == std::string::npos &&
+        line.find("Loading PEIM at ") == std::string::npos) {
+      continue;
+    }
+    const auto addressStart = line.find("0x");
+    const auto addressEnd =
+        addressStart == std::string::npos
+            ? std::string::npos
+            : line.find_first_not_of("0123456789ABCDEFabcdef",
+                                     addressStart + 2);
+    const auto nameStart = line.find_last_of(" \t");
+    if (addressStart == std::string::npos ||
+        addressEnd == std::string::npos ||
+        nameStart == std::string::npos ||
+        nameStart + 1 >= line.size()) {
+      continue;
+    }
+    try {
+      const auto base = std::stoull(
+          line.substr(addressStart + 2, addressEnd - addressStart - 2),
+          nullptr, 16);
+      names[base] = line.substr(nameStart + 1);
+    } catch (...) {
+      // Serial diagnostics are best-effort. Ignore malformed firmware lines.
+    }
+  }
+  return names;
+}
+
 std::string FormatVmDiagnostics(const hv::VmRunSummary &vm) {
   auto topEntries = [](const auto &items, size_t limit) {
     using ContainerT = std::decay_t<decltype(items)>;
@@ -2577,8 +2612,10 @@ std::string FormatVmDiagnostics(const hv::VmRunSummary &vm) {
     }
     out << "\n";
   };
-  auto writeImage = [](std::ostringstream &out, const char *prefix,
-                       const hv::VmGuestImageInfo &image) {
+  const auto uefiImageLoadNames = ParseUefiImageLoadNames(vm.serialOutput);
+  auto writeImage = [&uefiImageLoadNames](std::ostringstream &out,
+                                          const char *prefix,
+                                          const hv::VmGuestImageInfo &image) {
     if (!image.valid) {
       return;
     }
@@ -2596,6 +2633,10 @@ std::string FormatVmDiagnostics(const hv::VmRunSummary &vm) {
         << image.timeDateStamp << std::dec << "\n";
     if (!image.pdbPath.empty()) {
       out << prefix << "ImagePdb: " << image.pdbPath << "\n";
+    }
+    if (const auto loaded = uefiImageLoadNames.find(image.base);
+        loaded != uefiImageLoadNames.end()) {
+      out << prefix << "ImageLoadName: " << loaded->second << "\n";
     }
   };
 

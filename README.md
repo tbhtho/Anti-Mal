@@ -60,13 +60,13 @@ Latest local probe:
 
 - `ANTIMAL_FIRMWARE_NAME=OVMF-debug.fd`
 - `AntiMal.HostCli.exe detonate bin\x64\Release\AntiMal.Tests.exe --network disabled --timeout-sec 90`
-- Run `55b263fb-b726-4c79-9ab6-4e8687551104`
+- Run `8c016721-4feb-46fb-ac8c-280fc394ffc9`
 - Result: timed out after loader/SYSTEM-hive reads; `sampleExecuted=false`; `guestAgentConnected=false`; 59 real framebuffer frames captured; GuestAgent heartbeat has not started yet.
 - The run emitted `vm.boot-overlay.patched`: the disposable overlay had default-loader `recoveryenabled=false`, `bootstatuspolicy=IgnoreAllFailures`, `bootstat.dat` zeroed, and SYSTEM `CriticalDeviceDatabase` PIIX IDE mappings added before the VM started.
 - Disk I/O is now target-aware: `Windows\System32\winload.efi` is at LBA `12643640-12650175` and was read by 26 IDE commands; `Windows\System32\config\SYSTEM` is at LBA `29561144-29581623` and was read by 80 IDE commands.
 - The same probe tracks later handoff files too. `ntoskrnl.exe`, `hal.dll`, `kdcom.dll`, `ci.dll`, SOFTWARE, `acpi.sys`, `pci.sys`, `pciide.sys`, `intelide.sys`, `atapi.sys`, `disk.sys`, `partmgr.sys`, `mountmgr.sys`, `classpnp.sys`, `volmgr*.sys`, `fvevol.sys`, and `Wdf01000.sys` all have known LBA targets but zero read commands in the latest run.
 - Boot milestones include fallback bootloader open, `bootmgfw` load, BCD open, code-integrity policy open, `winload.efi data read`, and `SYSTEM hive data read`. Disk reads of `winload.efi` remain milestones, but only serial `winload` opens or an identified `winload` guest image may turn the VM boot event into `vm.boot.completed`. OVMF QemuVideo/GOP initializes at `1280x800x32`; the old 2 GiB VGA BAR resource conflict is fixed.
-- The host now writes boot-file read targets to `vm-diagnostics.txt`, `vm-summary.json`, `events.jsonl`, `report.json`, and the HTML report's dynamic summary. The corrected latest run emits `vm.boot.incomplete` with `winloadReached=false`; it also attributes the hottest BSP RIP buckets to EFI subsystem images (`0xB` boot-service and `0xC` runtime images) with no identified `winload` image. PM1 S0 writes are diagnostics-only, while real S4/S5 requests still stop the host.
+- The host now writes boot-file read targets to `vm-diagnostics.txt`, `vm-summary.json`, `events.jsonl`, `report.json`, and the HTML report's dynamic summary. The corrected latest run emits `vm.boot.incomplete` with `winloadReached=false`; it also attributes the final RIP and hottest stalled RIP buckets to `PcRtc.efi`, while the earlier hot buckets resolve to OVMF DXE images such as `CpuIo2Dxe.efi`, `PciHostBridgeDxe.efi`, and `LocalApicTimerDxe.efi`. No `winload` guest image is identified yet. PM1 S0 writes are diagnostics-only, while real S4/S5 requests still stop the host.
 - This shell was not elevated, so the base validator/repair and offline GuestAgent service install could not be run here.
 
 Latest base image inspection:
