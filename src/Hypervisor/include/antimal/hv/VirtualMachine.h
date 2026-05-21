@@ -224,6 +224,7 @@ struct VmRunSummary {
   std::vector<IdeAccessRange> ideRecentAccesses;
   std::vector<std::string> legacyIrqDiagnostics;
   std::string serialOutput;
+  std::string firmwareDebugOutput;
   std::string hostChannelOutput;
   uint32_t ideCommandsIssued = 0;
   uint32_t ideIdentifyCommands = 0;

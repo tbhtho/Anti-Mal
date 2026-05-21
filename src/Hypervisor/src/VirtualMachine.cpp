@@ -1454,13 +1454,8 @@ VmRunSummary VirtualMachine::RunLoop(
   summary.apUnhandledExits =
       apUnhandledExits.load(std::memory_order_relaxed);
   summary.serialOutput = com1_.Captured();
+  summary.firmwareDebugOutput = pcIo_.DebugOutput();
   summary.hostChannelOutput = com2_.Captured();
-  if (!pcIo_.DebugOutput().empty()) {
-    if (!summary.serialOutput.empty()) {
-      summary.serialOutput.append("\n");
-    }
-    summary.serialOutput.append(pcIo_.DebugOutput());
-  }
   summary.ideCommandsIssued = (ide_ ? ide_->CommandsIssued() : 0) +
                               (secondaryIde_ ? secondaryIde_->CommandsIssued()
                                              : 0);

@@ -1822,9 +1822,12 @@ void TestWhpOvmfBootWithIdeDisk() {
               << "  IDE commands: " << summary.ideCommandsIssued << "\n"
               << "  IDE identify: " << summary.ideIdentifyCommands << "\n"
               << "  IDE reads: " << summary.ideReadCommands << "\n";
-    if (!summary.serialOutput.empty()) {
-      std::string preview = summary.serialOutput.substr(
-          0, std::min<size_t>(summary.serialOutput.size(), 512));
+    const std::string &previewSource = summary.firmwareDebugOutput.empty()
+                                           ? summary.serialOutput
+                                           : summary.firmwareDebugOutput;
+    if (!previewSource.empty()) {
+      std::string preview = previewSource.substr(
+          0, std::min<size_t>(previewSource.size(), 512));
       std::replace(preview.begin(), preview.end(), '\r', '\n');
       std::cout << "  serial preview:\n" << preview << "\n";
     }

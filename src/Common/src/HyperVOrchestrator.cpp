@@ -2259,23 +2259,58 @@ void AddImageMilestones(BootSignalSummary *signals,
 
 BootSignalSummary AnalyzeBootSignals(const hv::VmRunSummary &vm) {
   BootSignalSummary signals;
-  const auto &serialOutput = vm.serialOutput;
-  if (ContainsTextNoCase(serialOutput, "BOOTX64.EFI")) {
+  const auto &com1 = vm.serialOutput;
+  const auto &firmware = vm.firmwareDebugOutput;
+  auto anyStream = [&](const char *needle) {
+    return ContainsTextNoCase(com1, needle) ||
+           ContainsTextNoCase(firmware, needle);
+  };
+  if (anyStream("BOOTX64.EFI")) {
     AddMilestone(&signals, "fallback bootloader opened");
   }
-  if (ContainsTextNoCase(serialOutput, "bootmgfw.efi")) {
+  if (anyStream("bootmgfw.efi")) {
     AddMilestone(&signals, "bootmgfw loaded");
   }
-  if (ContainsTextNoCase(serialOutput, "Open 'BCD' Success") ||
-      ContainsTextNoCase(serialOutput, "Open 'BCD'")) {
+  if (anyStream("Open 'BCD' Success") || anyStream("Open 'BCD'")) {
     AddMilestone(&signals, "BCD opened");
   }
-  if (ContainsTextNoCase(serialOutput, "CiPolicies")) {
+  if (anyStream("CiPolicies")) {
     AddMilestone(&signals, "code-integrity policies opened");
   }
-  if (ContainsTextNoCase(serialOutput, "winload.efi") ||
-      ContainsTextNoCase(serialOutput, "winload.exe")) {
+  if (anyStream("winload.efi") || anyStream("winload.exe")) {
     AddMilestone(&signals, "winload opened");
+  }
+  // winload's own debug output (when bootdebug=true) lands on COM1 only;
+  // OslMain is winload's entry into the OS loader phase, OslPrepareTarget
+  // walks the registry/CI/driver gates, and OslArchTransferToKernel is the
+  // last winload milestone before ntoskrnl gets control.
+  if (ContainsTextNoCase(com1, "OslMain")) {
+    AddMilestone(&signals, "winload phase: OslMain");
+  }
+  if (ContainsTextNoCase(com1, "OslPrepareTarget")) {
+    AddMilestone(&signals, "winload phase: OslPrepareTarget");
+  }
+  if (ContainsTextNoCase(com1, "OslArchTransferToKernel")) {
+    AddMilestone(&signals, "winload phase: OslArchTransferToKernel");
+  }
+  if (ContainsTextNoCase(com1, "OslpLoadAllModules")) {
+    AddMilestone(&signals, "winload phase: OslpLoadAllModules");
+  }
+  if (ContainsTextNoCase(com1, "BlImgLoadPEImage")) {
+    AddMilestone(&signals, "winload: BlImgLoadPEImage in flight");
+  }
+  if (ContainsTextNoCase(com1, "BlImgVerifyHash")) {
+    AddMilestone(&signals, "winload: BlImgVerifyHash in flight");
+  }
+  if (ContainsTextNoCase(com1, "BlBdInitialize")) {
+    AddMilestone(&signals, "winload: BlBdInitialize (boot debugger init)");
+  }
+  if (ContainsTextNoCase(com1, "Status: 0x") ||
+      ContainsTextNoCase(com1, "NTSTATUS 0x")) {
+    AddMilestone(&signals, "winload reported a status code");
+  }
+  if (ContainsTextNoCase(com1, "FATAL") || ContainsTextNoCase(com1, "fatal")) {
+    AddMilestone(&signals, "winload emitted FATAL");
   }
   AddImageMilestones(&signals, vm.fatalRipImage);
   for (const auto &image : vm.fatalStackReturnImage) {
@@ -2290,8 +2325,7 @@ BootSignalSummary AnalyzeBootSignals(const hv::VmRunSummary &vm) {
   for (const auto &image : vm.observedImages) {
     AddImageMilestones(&signals, image);
   }
-  if (ContainsTextNoCase(serialOutput, "ResetSystem2") ||
-      ContainsTextNoCase(serialOutput, "ResetType Shutdown")) {
+  if (anyStream("ResetSystem2") || anyStream("ResetType Shutdown")) {
     AddMilestone(&signals, "firmware reset/shutdown requested");
     if (vm.pm1SleepEnable && !vm.pm1HostStopRequested &&
         vm.pm1SleepType == 0) {
@@ -2771,7 +2805,11 @@ std::string FormatVmDiagnostics(const hv::VmRunSummary &vm) {
     }
     out << "\n";
   };
-  const auto uefiImageLoadNames = ParseUefiImageLoadNames(vm.serialOutput);
+  // "Loading driver at ..." / "Loading PEIM at ..." come from OVMF debugcon,
+  // which after the split lives in firmwareDebugOutput. Fall back to the COM1
+  // stream if firmware output is empty for legacy single-stream runs.
+  const auto uefiImageLoadNames = ParseUefiImageLoadNames(
+      vm.firmwareDebugOutput.empty() ? vm.serialOutput : vm.firmwareDebugOutput);
   auto writeImage = [&uefiImageLoadNames](std::ostringstream &out,
                                           const char *prefix,
                                           const hv::VmGuestImageInfo &image) {
@@ -3595,6 +3633,8 @@ DetonationResult InHouseOrchestrator::PrepareAndRun(
     result.dynamicSummary.status = "booting";
 
     const auto serialLogPath = result.runDir / "serial.log";
+    const auto firmwareLogPath = result.runDir / "serial-firmware.log";
+    const auto mergedLogPath = result.runDir / "serial-merged.log";
     const auto vmSummaryPath = result.runDir / "vm-summary.json";
     const auto vmDiagnosticsPath = result.runDir / "vm-diagnostics.txt";
     try {
@@ -3887,6 +3927,17 @@ DetonationResult InHouseOrchestrator::PrepareAndRun(
           AnalyzeBootReadTargets(vmSummary, bootReadTargets);
       fireProgress("finishing", "VM run loop returned; writing diagnostics");
       WriteTextFile(serialLogPath, vmSummary.serialOutput);
+      WriteTextFile(firmwareLogPath, vmSummary.firmwareDebugOutput);
+      {
+        std::string merged = vmSummary.serialOutput;
+        if (!vmSummary.firmwareDebugOutput.empty()) {
+          if (!merged.empty()) {
+            merged.append("\n");
+          }
+          merged.append(vmSummary.firmwareDebugOutput);
+        }
+        WriteTextFile(mergedLogPath, merged);
+      }
       WriteTextFile(vmDiagnosticsPath,
                     FormatVmDiagnostics(vmSummary) +
                         FormatBootReadObservations(bootReadObservations));
