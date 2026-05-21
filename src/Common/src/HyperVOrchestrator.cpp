@@ -2128,6 +2128,9 @@ BootSignalSummary AnalyzeBootSignals(const hv::VmRunSummary &vm) {
   for (const auto &image : vm.fatalStackReturnImage) {
     AddImageMilestones(&signals, image);
   }
+  for (const auto &hotspot : vm.ripHotspotImages) {
+    AddImageMilestones(&signals, hotspot.image);
+  }
   if (ContainsTextNoCase(serialOutput, "ResetSystem2") ||
       ContainsTextNoCase(serialOutput, "ResetType Shutdown")) {
     AddMilestone(&signals, "firmware reset/shutdown requested");
@@ -2886,6 +2889,20 @@ std::string FormatVmDiagnostics(const hv::VmRunSummary &vm) {
                   static_cast<unsigned int>(acc.index),
                   static_cast<unsigned int>(acc.value));
       out << line << "\n";
+    }
+  }
+  if (!vm.ripHotspotImages.empty()) {
+    out << "\nTop BSP RIP hotspot guest images:\n";
+    for (size_t i = 0; i < vm.ripHotspotImages.size(); ++i) {
+      const auto &hotspot = vm.ripHotspotImages[i];
+      if (!hotspot.image.valid) {
+        continue;
+      }
+      out << "hotspot" << i << "RipBucket: 0x" << std::hex
+          << std::uppercase << hotspot.ripBucket << std::dec << "\n";
+      out << "hotspot" << i << "Hits: " << hotspot.hits << "\n";
+      const auto prefix = "hotspot" + std::to_string(i);
+      writeImage(out, prefix.c_str(), hotspot.image);
     }
   }
   return out.str();

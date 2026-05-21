@@ -1529,6 +1529,26 @@ VmRunSummary VirtualMachine::RunLoop(
     }
   }
   summary.ripHotspots = std::move(ripHotspots);
+  {
+    std::vector<std::pair<uint64_t, uint64_t>> topRipHotspots(
+        summary.ripHotspots.begin(), summary.ripHotspots.end());
+    std::sort(topRipHotspots.begin(), topRipHotspots.end(),
+              [](const auto &a, const auto &b) {
+                return a.second > b.second;
+              });
+    constexpr size_t kMaxHotspotImageSamples = 16;
+    if (topRipHotspots.size() > kMaxHotspotImageSamples) {
+      topRipHotspots.resize(kMaxHotspotImageSamples);
+    }
+    summary.ripHotspotImages.reserve(topRipHotspots.size());
+    for (const auto &[ripBucket, hits] : topRipHotspots) {
+      VmRipHotspotImageInfo sample{};
+      sample.ripBucket = ripBucket;
+      sample.hits = hits;
+      (void)IdentifyGuestImage(ripBucket, &sample.image);
+      summary.ripHotspotImages.push_back(std::move(sample));
+    }
+  }
   summary.recentCmosAccesses = pcIo_.RecentCmosAccesses();
   for (const uint8_t irq : {uint8_t{0}, uint8_t{3}, uint8_t{4}, uint8_t{8},
                             uint8_t{14}, uint8_t{15}}) {

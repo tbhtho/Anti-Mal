@@ -49,6 +49,12 @@ struct VmGuestImageInfo {
   std::string pdbPath;
 };
 
+struct VmRipHotspotImageInfo {
+  uint64_t ripBucket = 0;
+  uint64_t hits = 0;
+  VmGuestImageInfo image;
+};
+
 struct VmApRunState {
   uint32_t index = 0;
   uint64_t rip = 0;
@@ -190,6 +196,10 @@ struct VmRunSummary {
   // same instruction sequence coalesce. Top entries identify the hottest
   // loop body even when the firmware/kernel relocates code each run.
   std::map<uint64_t, uint64_t> ripHotspots;
+  // End-of-run guest image attribution for the hottest BSP RIP buckets.
+  // This catches a loader image that owned a busy loop even when the final
+  // RIP alone lands in firmware UI code after a boot handoff failure.
+  std::vector<VmRipHotspotImageInfo> ripHotspotImages;
   // Snapshot of the most recent CMOS / RTC port accesses (oldest first).
   // Mirrors PcIoDevices::RecentCmosAccesses(); duplicated into the summary
   // so the host-side diagnostics writer doesn't need to keep the live VM
