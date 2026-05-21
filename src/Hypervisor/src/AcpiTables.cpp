@@ -215,6 +215,43 @@ void AppendMemory32FixedDescriptor(std::vector<uint8_t> &out, uint32_t base,
   PutLe32(out, length);
 }
 
+void AppendWordAddressSpaceDescriptor(std::vector<uint8_t> &out,
+                                      uint8_t resourceType,
+                                      uint16_t granularity,
+                                      uint16_t minimum, uint16_t maximum,
+                                      uint16_t translation,
+                                      uint16_t length) {
+  out.push_back(0x88); // Word address-space descriptor.
+  PutLe16(out, 13);
+  out.push_back(resourceType);
+  out.push_back(0x0D); // ResourceProducer, MinFixed, MaxFixed, PosDecode.
+  out.push_back(0x00);
+  PutLe16(out, granularity);
+  PutLe16(out, minimum);
+  PutLe16(out, maximum);
+  PutLe16(out, translation);
+  PutLe16(out, length);
+}
+
+void AppendDwordAddressSpaceDescriptor(std::vector<uint8_t> &out,
+                                       uint8_t resourceType,
+                                       uint32_t granularity,
+                                       uint32_t minimum, uint32_t maximum,
+                                       uint32_t translation,
+                                       uint32_t length,
+                                       uint8_t typeFlags = 0x00) {
+  out.push_back(0x87); // DWord address-space descriptor.
+  PutLe16(out, 23);
+  out.push_back(resourceType);
+  out.push_back(0x0D); // ResourceProducer, MinFixed, MaxFixed, PosDecode.
+  out.push_back(typeFlags);
+  PutLe32(out, granularity);
+  PutLe32(out, minimum);
+  PutLe32(out, maximum);
+  PutLe32(out, translation);
+  PutLe32(out, length);
+}
+
 void AppendIrqDescriptor(std::vector<uint8_t> &out, uint8_t irq) {
   out.push_back(0x22); // IRQ descriptor, 2 bytes.
   PutLe16(out, static_cast<uint16_t>(1u << irq));
@@ -281,6 +318,14 @@ std::vector<uint8_t> DeviceWithResources(std::string_view name,
   return DeviceObject(name, terms);
 }
 
+std::vector<uint8_t> PciRoutingEntry(uint8_t device, uint8_t pin,
+                                     uint8_t irq) {
+  const uint32_t address =
+      (static_cast<uint32_t>(device) << 16u) | 0xFFFFu;
+  return PackageObject({IntegerObject(address), IntegerObject(pin),
+                        IntegerObject(0), IntegerObject(irq)});
+}
+
 std::vector<uint8_t> BuildDsdtAml(uint32_t processorCount) {
   std::vector<uint8_t> rootTerms;
   AppendName(rootTerms, "_S5",
@@ -307,8 +352,20 @@ std::vector<uint8_t> BuildDsdtAml(uint32_t processorCount) {
   AppendName(pciTerms, "_BBN", IntegerObject(0));
   AppendName(pciTerms, "_ADR", IntegerObject(0));
   std::vector<uint8_t> pciResources;
+  AppendWordAddressSpaceDescriptor(pciResources, 0x02, 0, 0x0000, 0x00FF,
+                                   0, 0x0100);
+  AppendDwordAddressSpaceDescriptor(pciResources, 0x01, 0, 0x00000000,
+                                    0x0000CFFF, 0, 0x0000D000);
+  AppendDwordAddressSpaceDescriptor(pciResources, 0x01, 0, 0x0000D000,
+                                    0x0000FFFF, 0, 0x00003000);
+  AppendDwordAddressSpaceDescriptor(pciResources, 0x00, 0, 0x80000000,
+                                    0xFEBFFFFF, 0, 0x7EC00000, 0x01);
   AppendEndTag(pciResources);
   AppendName(pciTerms, "_CRS", ResourceTemplate(pciResources));
+  AppendName(pciTerms, "_PRT",
+             PackageObject({PciRoutingEntry(1, 0, 14),
+                            PciRoutingEntry(1, 1, 15),
+                            PciRoutingEntry(2, 0, 10)}));
 
   std::vector<uint8_t> isaTerms;
   AppendName(isaTerms, "_ADR", IntegerObject(0x00010000u));

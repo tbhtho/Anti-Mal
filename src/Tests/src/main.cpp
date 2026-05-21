@@ -466,6 +466,8 @@ void TestAcpiTables() {
   Expect(contains("_SB_"), "ACPI: DSDT exposes _SB scope");
   Expect(contains("_S5_"), "ACPI: DSDT exposes S5 shutdown package");
   Expect(contains("PCI0"), "ACPI: DSDT exposes PCI0");
+  Expect(contains("_CRS"), "ACPI: DSDT exposes PCI root resources");
+  Expect(contains("_PRT"), "ACPI: DSDT exposes PCI interrupt routing");
   Expect(contains("RTC0"), "ACPI: DSDT exposes RTC device");
   Expect(contains("HPET"), "ACPI: DSDT exposes HPET device");
   Expect(contains("PMRS"), "ACPI: DSDT exposes PM IO reservation");
@@ -2033,6 +2035,7 @@ void TestReportRoundtripAndFramePaths() {
   report.dynamicSummary.slavePicVectorBase = 0x28;
   report.dynamicSummary.masterPicMask = 0xFE;
   report.dynamicSummary.slavePicMask = 0xFD;
+  report.dynamicSummary.bootStage = "winload-pre-kernel";
   report.dynamicSummary.bootMilestones.push_back("bootmgfw loaded");
   report.dynamicSummary.bootMilestones.push_back("BCD opened");
   report.dynamicSummary.interruptDiagnostics.push_back(
@@ -2061,6 +2064,8 @@ void TestReportRoundtripAndFramePaths() {
          "report load: event details preserved");
   Expect(loaded.dynamicSummary.bootMilestones.size() == 2,
          "report load: boot milestones preserved");
+  Expect(loaded.dynamicSummary.bootStage == "winload-pre-kernel",
+         "report load: boot stage preserved");
   Expect(loaded.dynamicSummary.ideInterruptsRequested == 7,
          "report load: IDE IRQ counters preserved");
   Expect(loaded.dynamicSummary.interruptDiagnostics.size() == 1,
@@ -2073,6 +2078,8 @@ void TestReportRoundtripAndFramePaths() {
       loaded, {std::filesystem::path("screenshots") / "frame-000001.png"});
   Expect(html.find("screenshots/frame-000001.png") != std::string::npos,
          "report html: frame path includes screenshots directory");
+  Expect(html.find("winload-pre-kernel") != std::string::npos,
+         "report html: boot stage rendered");
 }
 
 void TestIntelLookupOffline() {

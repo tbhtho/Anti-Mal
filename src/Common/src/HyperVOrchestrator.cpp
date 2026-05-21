@@ -609,6 +609,7 @@ class NtfsBootFileLocator {
 public:
   struct RunOwnerMatch {
     std::string name;
+    std::string path;
     uint64_t fileRecord = 0;
     uint32_t attributeType = 0;
     LbaRangeLite ownerRange;
@@ -620,6 +621,12 @@ public:
     uint64_t recordsScanned = 0;
     bool truncated = false;
     std::vector<RunOwnerMatch> matches;
+  };
+
+  struct FileRecordIdentity {
+    std::string name;
+    uint64_t parentRecord = 0;
+    bool hasParent = false;
   };
 
   NtfsBootFileLocator(hv::IBlockDevice &disk, uint64_t firstLba)
@@ -732,6 +739,7 @@ public:
     scan.recordsAvailable = mftDataSize_ / fileRecordBytes_;
     scan.recordsScanned = std::min(scan.recordsAvailable, maxRecords);
     scan.truncated = scan.recordsScanned < scan.recordsAvailable;
+    std::map<uint64_t, FileRecordIdentity> identities;
     std::vector<uint8_t> record;
     for (uint64_t fileRecord = 0; fileRecord < scan.recordsScanned;
          ++fileRecord) {
@@ -740,7 +748,9 @@ public:
         continue;
       }
       const auto attrs = Attributes(record);
+      identities[fileRecord] = FileRecordIdentityFromAttrs(attrs, fileRecord);
       const std::string name = FileRecordName(attrs, fileRecord);
+      const std::string path = ReconstructFileRecordPath(fileRecord, identities);
       // $BadClus has a sparse DATA run covering the volume, not a concrete
       // owner for the residual sectors the boot probe just touched.
       if (fileRecord == 8) {
@@ -770,7 +780,7 @@ public:
               continue;
             }
             scan.matches.push_back(
-                {name, fileRecord, attr.type, ownerRange,
+                {name, path, fileRecord, attr.type, ownerRange,
                  {overlapFirst, overlapLast}});
           }
         }
@@ -1078,6 +1088,68 @@ private:
     return "$RECORD:" + std::to_string(fileRecord);
   }
 
+  static FileRecordIdentity
+  FileRecordIdentityFromAttrs(const std::vector<Attribute> &attrs,
+                              uint64_t fileRecord) {
+    FileRecordIdentity dosIdentity;
+    for (const auto &attr : attrs) {
+      if (attr.type != 0x30 || attr.nonResident ||
+          attr.residentData.size() < 66) {
+        continue;
+      }
+      const auto name =
+          NtfsFileNameToAscii(attr.residentData.data(), attr.residentData.size());
+      if (name.empty()) {
+        continue;
+      }
+      FileRecordIdentity identity;
+      identity.name = name;
+      identity.parentRecord = FileReferenceToRecord(
+          ReadLe64(attr.residentData.data()));
+      identity.hasParent = identity.parentRecord != fileRecord;
+      if (attr.residentData[65] != 2) {
+        return identity;
+      }
+      if (dosIdentity.name.empty()) {
+        dosIdentity = std::move(identity);
+      }
+    }
+    if (!dosIdentity.name.empty()) {
+      return dosIdentity;
+    }
+    return {"$RECORD:" + std::to_string(fileRecord), 0, false};
+  }
+
+  static std::string ReconstructFileRecordPath(
+      uint64_t fileRecord,
+      const std::map<uint64_t, FileRecordIdentity> &identities) {
+    if (fileRecord == 5) {
+      return "\\";
+    }
+
+    std::vector<std::string> parts;
+    uint64_t current = fileRecord;
+    for (size_t depth = 0; depth < 64 && current != 5; ++depth) {
+      const auto it = identities.find(current);
+      if (it == identities.end() || it->second.name.empty()) {
+        if (parts.empty()) {
+          return "$RECORD:" + std::to_string(fileRecord);
+        }
+        break;
+      }
+      parts.push_back(it->second.name);
+      if (!it->second.hasParent || it->second.parentRecord == current) {
+        break;
+      }
+      current = it->second.parentRecord;
+    }
+    if (parts.empty()) {
+      return "$RECORD:" + std::to_string(fileRecord);
+    }
+    std::reverse(parts.begin(), parts.end());
+    return "\\" + JoinStrings(parts, "\\");
+  }
+
   std::vector<DirectoryEntry> ParseIndexEntries(const uint8_t *data,
                                                 size_t bytes) const {
     std::vector<DirectoryEntry> entries;
@@ -1257,15 +1329,25 @@ std::vector<BootReadTarget> DiscoverBootReadTargets(hv::IBlockDevice &disk) {
   }
   const char *paths[] = {
       "Windows\\System32\\winload.efi",
+      "Windows\\System32\\en-US\\winload.efi.mui",
       "Windows\\System32\\mcupdate_GenuineIntel.dll",
       "Windows\\System32\\mcupdate_AuthenticAMD.dll",
       "Windows\\Boot\\Resources\\bootres.dll",
       "Windows\\Boot\\Fonts\\segoe_slboot.ttf",
       "Windows\\Boot\\Fonts\\segmono_boot.ttf",
+      "Windows\\System32\\CodeIntegrity\\DriverSiPolicy.p7b",
+      "Windows\\System32\\CodeIntegrity\\VbsSiPolicy.p7b",
+      "Windows\\System32\\CodeIntegrity\\driver.stl",
+      "Windows\\System32\\CodeIntegrity\\previous.driver.stl",
+      "Windows\\System32\\CodeIntegrity\\CiPolicies\\Active\\{1283AC0F-FFF1-49AE-ADA1-8A933130CAD6}.cip",
+      "Windows\\System32\\CodeIntegrity\\CiPolicies\\Active\\{784C4414-79F4-4C32-A6A5-F0FB42A51D0D}.cip",
       "Windows\\System32\\ntoskrnl.exe",
+      "Windows\\System32\\securekernel.exe",
       "Windows\\System32\\hal.dll",
       "Windows\\System32\\kdcom.dll",
       "Windows\\System32\\ci.dll",
+      "Windows\\System32\\skci.dll",
+      "Windows\\System32\\bootvid.dll",
       "Windows\\System32\\config\\SYSTEM",
       "Windows\\System32\\config\\SOFTWARE",
       "Windows\\System32\\drivers\\acpi.sys",
@@ -1363,17 +1445,37 @@ void AddBootReadMilestones(
       continue;
     }
     if (ContainsTextNoCase(observation.target.name, "winload.efi")) {
-      AddMilestone(signals, "winload.efi data read");
+      if (ContainsTextNoCase(observation.target.name, ".mui")) {
+        AddMilestone(signals, "winload MUI data read");
+      } else {
+        AddMilestone(signals, "winload.efi data read");
+      }
     } else if (ContainsTextNoCase(observation.target.name, "mcupdate_")) {
       AddMilestone(signals, "CPU microcode image data read");
     } else if (ContainsTextNoCase(observation.target.name, "bootres.dll")) {
       AddMilestone(signals, "Windows boot resources data read");
     } else if (ContainsTextNoCase(observation.target.name, "\\Boot\\Fonts\\")) {
       AddMilestone(signals, "Windows boot font data read");
+    } else if (ContainsTextNoCase(observation.target.name, ".p7b") ||
+               ContainsTextNoCase(observation.target.name, ".cip")) {
+      AddMilestone(signals, "code-integrity policy data read");
+    } else if (ContainsTextNoCase(observation.target.name, "driver.stl")) {
+      AddMilestone(signals, "driver signing policy data read");
     } else if (ContainsTextNoCase(observation.target.name, "ntoskrnl.exe")) {
       AddMilestone(signals, "ntoskrnl.exe data read");
+    } else if (ContainsTextNoCase(observation.target.name,
+                                  "securekernel.exe")) {
+      AddMilestone(signals, "secure kernel image data read");
     } else if (ContainsTextNoCase(observation.target.name, "hal.dll")) {
       AddMilestone(signals, "HAL data read");
+    } else if (ContainsTextNoCase(observation.target.name, "kdcom.dll")) {
+      AddMilestone(signals, "KD transport data read");
+    } else if (ContainsTextNoCase(observation.target.name, "ci.dll")) {
+      AddMilestone(signals, "CI image data read");
+    } else if (ContainsTextNoCase(observation.target.name, "skci.dll")) {
+      AddMilestone(signals, "secure kernel CI image data read");
+    } else if (ContainsTextNoCase(observation.target.name, "bootvid.dll")) {
+      AddMilestone(signals, "boot video driver data read");
     } else if (ContainsTextNoCase(observation.target.name, "\\drivers\\")) {
       AddMilestone(signals,
                    "boot driver data read: " +
@@ -1395,6 +1497,48 @@ std::string BootReadDetails(
          << "-" << observation.target.lastLba
          << " readCommands=" << observation.readCommands
          << " sectorsRead=" << observation.sectorsRead;
+    parts.push_back(item.str());
+  }
+  return JoinStrings(parts, "; ");
+}
+
+bool BootReadObserved(const BootReadObservation &observation) {
+  return observation.readCommands != 0 || observation.sectorsRead != 0;
+}
+
+bool IsKernelReadGateTarget(std::string_view path) {
+  return ContainsTextNoCase(path, "ntoskrnl.exe") ||
+         ContainsTextNoCase(path, "securekernel.exe") ||
+         ContainsTextNoCase(path, "hal.dll") ||
+         ContainsTextNoCase(path, "kdcom.dll") ||
+         ContainsTextNoCase(path, "ci.dll") ||
+         ContainsTextNoCase(path, "skci.dll") ||
+         ContainsTextNoCase(path, "bootvid.dll") ||
+         ContainsTextNoCase(path, "System32\\config\\SOFTWARE") ||
+         ContainsTextNoCase(path, "\\drivers\\");
+}
+
+bool WindowsKernelReadGateReached(
+    const std::vector<BootReadObservation> &observations) {
+  return std::any_of(observations.begin(), observations.end(),
+                     [](const BootReadObservation &observation) {
+                       return BootReadObserved(observation) &&
+                              IsKernelReadGateTarget(observation.target.name);
+                     });
+}
+
+std::string WindowsKernelReadGateDetails(
+    const std::vector<BootReadObservation> &observations) {
+  std::vector<std::string> parts;
+  for (const auto &observation : observations) {
+    if (!BootReadObserved(observation) ||
+        !IsKernelReadGateTarget(observation.target.name)) {
+      continue;
+    }
+    std::ostringstream item;
+    item << observation.target.name << " readCommands="
+         << observation.readCommands << " sectorsRead="
+         << observation.sectorsRead;
     parts.push_back(item.str());
   }
   return JoinStrings(parts, "; ");
@@ -2053,10 +2197,18 @@ EspBootstatSnapshot CaptureEspBootstatSnapshot(hv::IBlockDevice &disk) {
 
 const char *KnownNtStatusName(uint32_t value) {
   switch (value) {
+  case 0xC0000000u:
+    return "STATUS_UNSUCCESSFUL";
   case 0xC000008Fu:
     return "STATUS_FLOAT_INEXACT_RESULT";
+  case 0xC000009Eu:
+    return "STATUS_DEVICE_POWER_FAILURE";
+  case 0xC000009Fu:
+    return "STATUS_FREE_VM_NOT_AT_BASE";
   case 0xC00000A0u:
     return "STATUS_MEMORY_NOT_ALLOCATED";
+  case 0xC00000A2u:
+    return "STATUS_MEDIA_WRITE_PROTECTED";
   case 0xC000010Fu:
     return "STATUS_ABIOS_NOT_PRESENT";
   case 0xC0000225u:
@@ -2134,7 +2286,8 @@ std::string FormatEspBootstatSnapshot(const EspBootstatSnapshot &snapshot) {
         << " value=0x" << value << std::dec << "\n";
   }
   out << "  lateRepeatedNtStatusCandidates="
-      << snapshot.lateStatusCandidates.size() << "\n";
+      << snapshot.lateStatusCandidates.size()
+      << " (format clues only; visible/reported status still wins)\n";
   for (size_t i = 0; i < snapshot.lateStatusCandidates.size(); ++i) {
     out << "    [" << i << "] "
         << BootstatStatusCandidateText(snapshot.lateStatusCandidates[i], true)
@@ -2157,7 +2310,8 @@ std::string EspBootstatDetails(const EspBootstatSnapshot &snapshot) {
   }
   out << " statusLikeDwords=" << snapshot.statusLikeDwords.size();
   out << " lateRepeatedNtStatusCandidates="
-      << snapshot.lateStatusCandidates.size();
+      << snapshot.lateStatusCandidates.size()
+      << " formatCluesOnly=true";
   const size_t candidateLimit =
       std::min<size_t>(snapshot.lateStatusCandidates.size(), 4);
   for (size_t i = 0; i < candidateLimit; ++i) {
@@ -2183,6 +2337,32 @@ std::string NtfsOwnerAttributeName(uint32_t attributeType) {
     return "BITMAP";
   default:
     return "ATTR_0x" + std::to_string(attributeType);
+  }
+}
+
+std::string NtfsOwnerDisplayName(
+    const NtfsBootFileLocator::RunOwnerMatch &match) {
+  return match.path.empty() ? match.name : match.path;
+}
+
+void AddResidualOwnerMilestones(
+    BootSignalSummary *signals,
+    const NtfsBootFileLocator::RunOwnerScan &scan) {
+  if (!signals) {
+    return;
+  }
+  for (const auto &match : scan.matches) {
+    const auto name = NtfsOwnerDisplayName(match);
+    if (ContainsTextNoCase(name, ".p7b") ||
+        ContainsTextNoCase(name, ".cip")) {
+      AddMilestone(signals, "code-integrity policy data read");
+    } else if (ContainsTextNoCase(name, "driver.stl")) {
+      AddMilestone(signals, "driver signing policy data read");
+    } else if (ContainsTextNoCase(name, "winload.efi.mui")) {
+      AddMilestone(signals, "winload MUI data read");
+    } else if (ContainsTextNoCase(name, "bootres.dll")) {
+      AddMilestone(signals, "Windows boot resources data read");
+    }
   }
 }
 
@@ -2218,8 +2398,10 @@ SortedNtfsRunOwnerMatches(const NtfsBootFileLocator::RunOwnerScan &scan) {
               if (lhsSectors != rhsSectors) {
                 return lhsSectors > rhsSectors;
               }
-              if (lhs.name != rhs.name) {
-                return lhs.name < rhs.name;
+              const auto lhsName = NtfsOwnerDisplayName(lhs);
+              const auto rhsName = NtfsOwnerDisplayName(rhs);
+              if (lhsName != rhsName) {
+                return lhsName < rhsName;
               }
               if (lhs.fileRecord != rhs.fileRecord) {
                 return lhs.fileRecord < rhs.fileRecord;
@@ -2244,7 +2426,7 @@ std::string FormatWindowsResidualRunOwners(
   const size_t limit = std::min<size_t>(matches.size(), 48);
   for (size_t i = 0; i < limit; ++i) {
     const auto &match = matches[i];
-    out << "  [" << i << "] " << match.name << " record="
+    out << "  [" << i << "] " << NtfsOwnerDisplayName(match) << " record="
         << match.fileRecord << " attr="
         << NtfsOwnerAttributeName(match.attributeType) << " ownerLba="
         << match.ownerRange.firstLba << "-" << match.ownerRange.lastLba
@@ -2269,7 +2451,8 @@ std::string WindowsResidualRunOwnerDetails(
   const size_t limit = std::min<size_t>(matches.size(), 12);
   for (size_t i = 0; i < limit; ++i) {
     const auto &match = matches[i];
-    out << "; " << match.name << " record=" << match.fileRecord
+    out << "; " << NtfsOwnerDisplayName(match)
+        << " record=" << match.fileRecord
         << " attr=" << NtfsOwnerAttributeName(match.attributeType)
         << " sectors=" << LbaRangeSectors(match.overlapRange);
   }
@@ -2331,7 +2514,7 @@ std::vector<std::string> IdeAccessTailLabels(
         continue;
       }
       AddUniqueIdeTailLabel(
-          &labels, "owner: " + match.name + " " +
+          &labels, "owner: " + NtfsOwnerDisplayName(match) + " " +
                        NtfsOwnerAttributeName(match.attributeType));
     }
   }
@@ -2587,6 +2770,24 @@ public:
     WriteLe16(bytes_.data() + data + 16, 0x1u);
     std::memcpy(bytes_.data() + data + 20, name.data(), name.size());
     return AppendValue(keyIndex, *valueIndex);
+  }
+
+  bool UpsertBinaryValueSameSize(uint32_t keyIndex, const std::string &name,
+                                 uint32_t valueType,
+                                 const std::vector<uint8_t> &valueBytes) {
+    if (const auto existing = FindValue(keyIndex, name)) {
+      if (existing->type != valueType ||
+          existing->dataLength != valueBytes.size() ||
+          existing->dataAbsolute + valueBytes.size() > bytes_.size()) {
+        return false;
+      }
+      if (!valueBytes.empty()) {
+        std::memcpy(bytes_.data() + existing->dataAbsolute, valueBytes.data(),
+                    valueBytes.size());
+      }
+      return true;
+    }
+    return SetBinaryValue(keyIndex, name, valueType, valueBytes);
   }
 
   bool SetAsciiStringValue(uint32_t keyIndex, const std::string &name,
@@ -2875,6 +3076,124 @@ std::string BcdElementString(MutableHiveView &hive, uint32_t objectKey,
   return Utf16LeAsciiString(hive.ValueBytes(*value));
 }
 
+std::string BcdElementValueText(MutableHiveView &hive, uint32_t objectKey,
+                                const std::string &elementId) {
+  const auto elements = hive.FindSubkey(objectKey, "Elements");
+  if (!elements) {
+    return "missing";
+  }
+  const auto elementKey = hive.FindSubkey(*elements, elementId);
+  if (!elementKey) {
+    return "missing";
+  }
+  const auto value = hive.FindValue(*elementKey, "Element");
+  if (!value) {
+    return "missing";
+  }
+  const auto bytes = hive.ValueBytes(*value);
+  if (value->type == 1) {
+    return Utf16LeAsciiString(bytes);
+  }
+  if (bytes.empty()) {
+    return "empty";
+  }
+  if (bytes.size() == 1) {
+    return bytes[0] ? "true" : "false";
+  }
+  if (bytes.size() >= sizeof(uint64_t)) {
+    return std::to_string(ReadLe64(bytes.data()));
+  }
+  return HexBytes(bytes);
+}
+
+std::optional<uint32_t> BcdObjectKey(MutableHiveView &hive,
+                                     const std::string &guid) {
+  const auto root = hive.RootIndex();
+  const auto objects = root ? hive.FindSubkey(*root, "Objects") : std::nullopt;
+  return objects ? hive.FindSubkey(*objects, guid) : std::nullopt;
+}
+
+std::string CaptureOverlayBcdSummary(hv::IBlockDevice &disk) {
+  const auto partitions = ReadGptPartitionsLite(disk);
+  const auto esp = std::find_if(partitions.begin(), partitions.end(),
+                                [](const GptPartitionLite &partition) {
+                                  return IsEspGuid(partition.typeGuid);
+                                });
+  if (esp == partitions.end()) {
+    return "\nFinal overlay BCD summary:\n  unavailable: ESP not found\n";
+  }
+  Fat32OverlayEditor fat(disk, esp->firstLba);
+  if (!fat.Init()) {
+    return "\nFinal overlay BCD summary:\n  unavailable: ESP FAT32 unreadable\n";
+  }
+  const auto bcd = fat.FindPath("EFI\\Microsoft\\Boot\\BCD");
+  if (!bcd) {
+    return "\nFinal overlay BCD summary:\n  unavailable: BCD not found\n";
+  }
+  auto bytes = fat.ReadFile(*bcd, 4u * 1024u * 1024u);
+  MutableHiveView hive(bytes);
+  if (bytes.empty() || !hive.IsValid()) {
+    return "\nFinal overlay BCD summary:\n  unavailable: BCD hive unreadable\n";
+  }
+
+  std::ostringstream out;
+  out << "\nFinal overlay BCD summary:\n";
+  const auto bootmgr =
+      BcdObjectKey(hive, "{9dea862c-5cdd-4e70-acc1-f32b344d4795}");
+  if (!bootmgr) {
+    out << "  {bootmgr}: missing\n";
+    return out.str();
+  }
+  const std::string defaultGuid =
+      BcdElementString(hive, *bootmgr, "23000003");
+  out << "  {bootmgr}: path=" << BcdElementValueText(hive, *bootmgr, "12000002")
+      << " default=" << (defaultGuid.empty() ? "missing" : defaultGuid)
+      << " bootdebug=" << BcdElementValueText(hive, *bootmgr, "16000010")
+      << "\n";
+  const auto defaultObject =
+      defaultGuid.empty() ? std::nullopt : BcdObjectKey(hive, defaultGuid);
+  if (defaultObject) {
+    out << "  {default}: path="
+        << BcdElementValueText(hive, *defaultObject, "12000002")
+        << " systemroot="
+        << BcdElementValueText(hive, *defaultObject, "22000002")
+        << " isolatedcontext="
+        << BcdElementValueText(hive, *defaultObject, "16000060")
+        << " nx=" << BcdElementValueText(hive, *defaultObject, "25000020")
+        << " bootmenupolicy="
+        << BcdElementValueText(hive, *defaultObject, "250000C2")
+        << " recoveryenabled="
+        << BcdElementValueText(hive, *defaultObject, "16000009")
+        << " bootstatuspolicy="
+        << BcdElementValueText(hive, *defaultObject, "250000E0")
+        << " bootdebug="
+        << BcdElementValueText(hive, *defaultObject, "16000010")
+        << " debugtype="
+        << BcdElementValueText(hive, *defaultObject, "25000022")
+        << " debugport="
+        << BcdElementValueText(hive, *defaultObject, "25000023")
+        << " baudrate="
+        << BcdElementValueText(hive, *defaultObject, "25000024")
+        << " nointegritychecks="
+        << BcdElementValueText(hive, *defaultObject, "26000048") << "\n";
+  } else {
+    out << "  {default}: missing\n";
+  }
+  const auto dbgsettings =
+      BcdObjectKey(hive, "{4636856e-540f-4170-a130-a84776f4c654}");
+  if (dbgsettings) {
+    out << "  {dbgsettings}: debugtype="
+        << BcdElementValueText(hive, *dbgsettings, "25000022")
+        << " debugport="
+        << BcdElementValueText(hive, *dbgsettings, "25000023")
+        << " baudrate="
+        << BcdElementValueText(hive, *dbgsettings, "25000024") << "\n";
+  } else {
+    out << "  {dbgsettings}: missing\n";
+  }
+  return out.str();
+}
+
 struct BootOverlayPatchResult {
   bool attempted = false;
   bool espFound = false;
@@ -2895,6 +3214,10 @@ struct BootOverlayPatchResult {
   bool bootmgrBootDebugPatched = false;
   bool noIntegrityChecksProbeEnabled = false;
   bool noIntegrityChecksPatched = false;
+  bool legacyBootContextProbeEnabled = false;
+  bool isolatedContextPatched = false;
+  bool systemLegacySecurityProbeEnabled = false;
+  bool systemLegacySecurityPatched = false;
   std::vector<std::string> notes;
 };
 
@@ -2904,6 +3227,9 @@ bool PatchOverlaySystemBootStorage(hv::IBlockDevice &disk,
 bool AddBcdElementRaw(MutableHiveView &hive, uint32_t elementsKey,
                       const std::string &elementId, uint32_t valueType,
                       const std::vector<uint8_t> &valueBytes);
+bool UpsertBcdElementRaw(MutableHiveView &hive, uint32_t elementsKey,
+                         const std::string &elementId, uint32_t valueType,
+                         const std::vector<uint8_t> &valueBytes);
 std::vector<uint8_t> BcdU64Bytes(uint64_t value);
 
 bool PatchBcdBootPolicy(std::vector<uint8_t> &bcd,
@@ -2960,6 +3286,20 @@ bool AddBcdElementRaw(MutableHiveView &hive, uint32_t elementsKey,
                       const std::vector<uint8_t> &valueBytes) {
   if (hive.FindSubkey(elementsKey, elementId)) {
     return false;
+  }
+  const auto child = hive.CreateAsciiKey(elementsKey, elementId);
+  if (!child) {
+    return false;
+  }
+  return hive.SetBinaryValue(*child, "Element", valueType, valueBytes);
+}
+
+bool UpsertBcdElementRaw(MutableHiveView &hive, uint32_t elementsKey,
+                         const std::string &elementId, uint32_t valueType,
+                         const std::vector<uint8_t> &valueBytes) {
+  if (const auto existing = hive.FindSubkey(elementsKey, elementId)) {
+    return hive.UpsertBinaryValueSameSize(*existing, "Element", valueType,
+                                          valueBytes);
   }
   const auto child = hive.CreateAsciiKey(elementsKey, elementId);
   if (!child) {
@@ -3170,6 +3510,47 @@ bool PatchBcdNoIntegrityChecksProbe(std::vector<uint8_t> &bcd,
   return false;
 }
 
+bool PatchBcdLegacyBootContextProbe(std::vector<uint8_t> &bcd,
+                                    BootOverlayPatchResult *result) {
+  MutableHiveView hive(bcd);
+  if (!hive.IsValid()) {
+    return false;
+  }
+  const auto root = hive.RootIndex();
+  const auto objects = root ? hive.FindSubkey(*root, "Objects") : std::nullopt;
+  const auto bootmgr =
+      objects ? hive.FindSubkey(*objects,
+                                "{9dea862c-5cdd-4e70-acc1-f32b344d4795}")
+              : std::nullopt;
+  const std::string defaultGuid =
+      bootmgr ? BcdElementString(hive, *bootmgr, "23000003") : std::string{};
+  const auto defaultObject =
+      !defaultGuid.empty() && objects ? hive.FindSubkey(*objects, defaultGuid)
+                                      : std::nullopt;
+  const auto elements =
+      defaultObject ? hive.FindSubkey(*defaultObject, "Elements") : std::nullopt;
+  if (!elements) {
+    if (result) {
+      result->notes.push_back(
+          "BCD legacy-context probe: default loader Elements key not found");
+    }
+    return false;
+  }
+
+  if (UpsertBcdElementRaw(hive, *elements, "16000060", 3,
+                          std::vector<uint8_t>{0})) {
+    if (result) {
+      result->isolatedContextPatched = true;
+    }
+    return true;
+  }
+  if (result) {
+    result->notes.push_back(
+        "BCD legacy-context probe failed to clear isolatedcontext");
+  }
+  return false;
+}
+
 bool BootOverlayPatchDisabled() {
   char buf[16]{};
   size_t needed = 0;
@@ -3191,6 +3572,22 @@ bool NoIntegrityChecksProbeEnabled() {
   size_t needed = 0;
   return getenv_s(&needed, buf, sizeof(buf),
                   "ANTIMAL_PROBE_BCD_NOINTEGRITYCHECKS") == 0 &&
+         needed > 1 && buf[0] != '\0' && std::atoi(buf) != 0;
+}
+
+bool LegacyBootContextProbeEnabled() {
+  char buf[16]{};
+  size_t needed = 0;
+  return getenv_s(&needed, buf, sizeof(buf),
+                  "ANTIMAL_PROBE_BCD_LEGACY_CONTEXT") == 0 &&
+         needed > 1 && buf[0] != '\0' && std::atoi(buf) != 0;
+}
+
+bool SystemLegacySecurityProbeEnabled() {
+  char buf[16]{};
+  size_t needed = 0;
+  return getenv_s(&needed, buf, sizeof(buf),
+                  "ANTIMAL_PROBE_SYSTEM_LEGACY_SECURITY") == 0 &&
          needed > 1 && buf[0] != '\0' && std::atoi(buf) != 0;
 }
 
@@ -3225,6 +3622,7 @@ BootOverlayPatchResult ApplyEphemeralBootOverlay(hv::IBlockDevice &disk) {
       const bool policyChanged = PatchBcdBootPolicy(bytes, &result);
       bool transportChanged = false;
       bool noIntegrityChanged = false;
+      bool legacyContextChanged = false;
       if (WinloadDebugPatchDisabled()) {
         result.notes.push_back(
             "winload debug patch disabled by ANTIMAL_DISABLE_WINLOAD_DEBUG");
@@ -3241,7 +3639,15 @@ BootOverlayPatchResult ApplyEphemeralBootOverlay(hv::IBlockDevice &disk) {
             "ANTIMAL_PROBE_BCD_NOINTEGRITYCHECKS");
         noIntegrityChanged = PatchBcdNoIntegrityChecksProbe(bytes, &result);
       }
-      if ((policyChanged || transportChanged || noIntegrityChanged) &&
+      result.legacyBootContextProbeEnabled = LegacyBootContextProbeEnabled();
+      if (result.legacyBootContextProbeEnabled) {
+        result.notes.push_back(
+            "BCD legacy boot-context probe enabled by "
+            "ANTIMAL_PROBE_BCD_LEGACY_CONTEXT");
+        legacyContextChanged = PatchBcdLegacyBootContextProbe(bytes, &result);
+      }
+      if ((policyChanged || transportChanged || noIntegrityChanged ||
+           legacyContextChanged) &&
           !fat.WriteFileSameSize(*bcd, bytes)) {
         result.bcdPolicyPatched = false;
         result.recoveryPatched = false;
@@ -3254,6 +3660,7 @@ BootOverlayPatchResult ApplyEphemeralBootOverlay(hv::IBlockDevice &disk) {
         result.dbgSettingsBaudRatePatched = false;
         result.bootmgrBootDebugPatched = false;
         result.noIntegrityChecksPatched = false;
+        result.isolatedContextPatched = false;
         result.notes.push_back("failed to write patched BCD to overlay");
       }
     }
@@ -3302,6 +3709,14 @@ BootOverlayPatchDetails(const BootOverlayPatchResult &patch) {
        patch.noIntegrityChecksProbeEnabled ? "true" : "false"},
       {"noIntegrityChecksPatched",
        patch.noIntegrityChecksPatched ? "true" : "false"},
+      {"legacyBootContextProbeEnabled",
+       patch.legacyBootContextProbeEnabled ? "true" : "false"},
+      {"isolatedContextPatched",
+       patch.isolatedContextPatched ? "true" : "false"},
+      {"systemLegacySecurityProbeEnabled",
+       patch.systemLegacySecurityProbeEnabled ? "true" : "false"},
+      {"systemLegacySecurityPatched",
+       patch.systemLegacySecurityPatched ? "true" : "false"},
       {"scope", "overlay-only"}};
   if (!patch.notes.empty()) {
     details["notes"] = JoinStrings(patch.notes, "; ");
@@ -3312,6 +3727,11 @@ BootOverlayPatchDetails(const BootOverlayPatchResult &patch) {
 struct BaseBootStorageInspection {
   bool inspected = false;
   bool ready = false;
+  std::string details;
+};
+
+struct SystemBootSecurityInspection {
+  bool inspected = false;
   std::string details;
 };
 
@@ -3342,6 +3762,16 @@ std::optional<uint32_t> HiveDwordValue(MutableHiveView &hive, uint32_t key,
     return std::nullopt;
   }
   return ReadLe32(bytes.data());
+}
+
+std::string HiveDwordText(std::optional<uint32_t> value) {
+  return value ? std::to_string(*value) : "missing";
+}
+
+std::vector<uint8_t> HiveDwordBytes(uint32_t value) {
+  std::vector<uint8_t> bytes(4, 0);
+  WriteLe32(bytes.data(), value);
+  return bytes;
 }
 
 std::string HiveStringValue(MutableHiveView &hive, uint32_t key,
@@ -3380,6 +3810,48 @@ std::optional<std::string> SelectOfflineControlSet(MutableHiveView &hive) {
     return FormatControlSetName(*def);
   }
   return FormatControlSetName(1);
+}
+
+SystemBootSecurityInspection InspectSystemBootSecurity(MutableHiveView &hive) {
+  SystemBootSecurityInspection inspection;
+  inspection.inspected = true;
+  const auto controlSet = SelectOfflineControlSet(hive);
+  if (!controlSet) {
+    inspection.details = "SYSTEM Select key is missing";
+    return inspection;
+  }
+
+  std::vector<std::string> parts;
+  parts.push_back("controlSet=" + *controlSet);
+  auto addDword = [&](std::initializer_list<std::string> path,
+                      const std::string &name, const std::string &label) {
+    const auto key = FindHivePath(hive, path);
+    parts.push_back(label + "=" +
+                    (key ? HiveDwordText(HiveDwordValue(hive, *key, name))
+                         : "missing-key"));
+  };
+
+  addDword({*controlSet, "Control", "DeviceGuard"},
+           "EnableVirtualizationBasedSecurity", "DeviceGuard.VBS");
+  addDword({*controlSet, "Control", "DeviceGuard"},
+           "RequirePlatformSecurityFeatures", "DeviceGuard.RequirePlatform");
+  addDword({*controlSet, "Control", "DeviceGuard"}, "Locked",
+           "DeviceGuard.Locked");
+  addDword({*controlSet, "Control", "DeviceGuard", "Scenarios",
+            "HypervisorEnforcedCodeIntegrity"},
+           "Enabled", "HVCI.Enabled");
+  addDword({*controlSet, "Control", "DeviceGuard", "Scenarios",
+            "SystemGuard"},
+           "Enabled", "SystemGuard.Enabled");
+  addDword({*controlSet, "Control", "Lsa"}, "LsaCfgFlags",
+           "Lsa.LsaCfgFlags");
+  addDword({*controlSet, "Control", "Lsa"}, "RunAsPPL", "Lsa.RunAsPPL");
+  addDword({*controlSet, "Control", "Lsa"}, "RunAsPPLBoot",
+           "Lsa.RunAsPPLBoot");
+  addDword({*controlSet, "Control", "CI", "Config"},
+           "VulnerableDriverBlocklistEnable", "CI.VulnDriverBlocklist");
+  inspection.details = JoinStrings(parts, ";");
+  return inspection;
 }
 
 bool ServiceBootStartReady(MutableHiveView &hive,
@@ -3478,6 +3950,75 @@ BaseBootStorageInspection InspectBaseBootStorage(hv::IBlockDevice &disk) {
   return inspection;
 }
 
+SystemBootSecurityInspection InspectSystemBootSecurity(hv::IBlockDevice &disk) {
+  SystemBootSecurityInspection inspection;
+  inspection.inspected = true;
+
+  const auto partitions = ReadGptPartitionsLite(disk);
+  const auto windows =
+      std::find_if(partitions.begin(), partitions.end(),
+                   [](const GptPartitionLite &partition) {
+                     return IsWindowsBasicDataGuid(partition.typeGuid);
+                   });
+  if (windows == partitions.end()) {
+    inspection.details = "Windows/basic-data partition not found";
+    return inspection;
+  }
+
+  NtfsBootFileLocator ntfs(disk, windows->firstLba);
+  if (!ntfs.Init()) {
+    inspection.details = "Windows partition is not readable NTFS";
+    return inspection;
+  }
+  const auto system = ntfs.FindPath("Windows\\System32\\config\\SYSTEM");
+  if (!system) {
+    inspection.details = "SYSTEM hive not found";
+    return inspection;
+  }
+  auto bytes = ntfs.ReadFile(*system, 64u * 1024u * 1024u);
+  MutableHiveView hive(bytes);
+  if (bytes.empty() || !hive.IsValid()) {
+    inspection.details = "SYSTEM hive is unreadable";
+    return inspection;
+  }
+  return InspectSystemBootSecurity(hive);
+}
+
+std::string FormatOverlayBootStorageInspection(
+    const BaseBootStorageInspection &inspection) {
+  if (!inspection.inspected) {
+    return {};
+  }
+  std::ostringstream out;
+  out << "\nFinal overlay SYSTEM boot-storage verdict:\n"
+      << "  ready=" << (inspection.ready ? "true" : "false")
+      << " details=" << inspection.details << "\n";
+  return out.str();
+}
+
+std::string FormatOverlaySystemBootSecurityInspection(
+    const SystemBootSecurityInspection &inspection) {
+  if (!inspection.inspected) {
+    return {};
+  }
+  std::ostringstream out;
+  out << "\nFinal overlay SYSTEM boot-security snapshot:\n"
+      << "  " << inspection.details << "\n";
+  return out.str();
+}
+
+std::string FormatAcpiPciContractDiagnostics() {
+  std::ostringstream out;
+  out << "\nACPI PCI root contract:\n"
+      << "  PCI0._CRS bus=0-255 io=0x0000-0xFFFF "
+         "mmio=0x80000000-0xFEBFFFFF\n"
+      << "  PCI0._PRT dev=1 INT[A]->IRQ14 dev=1 INT[B]->IRQ15 "
+         "dev=2 INT[A]->IRQ10\n"
+      << "  ISA resources COM1=IRQ4 COM2=IRQ3 PS2K=IRQ1 PS2M=IRQ12 "
+         "IDE primary=IRQ14 secondary=IRQ15\n";
+  return out.str();
+}
+
 std::optional<uint32_t> EnsureHivePath(MutableHiveView &hive,
                                        std::initializer_list<std::string> path) {
   auto current = hive.RootIndex();
@@ -3495,6 +4036,63 @@ std::optional<uint32_t> EnsureHivePath(MutableHiveView &hive,
     }
   }
   return current;
+}
+
+bool UpsertHiveDword(MutableHiveView &hive, uint32_t key,
+                     const std::string &name, uint32_t value) {
+  return hive.UpsertBinaryValueSameSize(key, name, REG_DWORD,
+                                        HiveDwordBytes(value));
+}
+
+bool PatchSystemHiveLegacySecurityProbe(std::vector<uint8_t> &bytes,
+                                        BootOverlayPatchResult *result) {
+  MutableHiveView hive(bytes);
+  const auto controlSet =
+      !bytes.empty() && hive.IsValid() ? SelectOfflineControlSet(hive)
+                                       : std::nullopt;
+  if (!controlSet) {
+    if (result) {
+      result->notes.push_back(
+          "SYSTEM control set not found for legacy security probe");
+    }
+    return false;
+  }
+
+  bool ok = true;
+  auto setDword = [&](std::initializer_list<std::string> path,
+                      const std::string &name) {
+    const auto key = EnsureHivePath(hive, path);
+    if (!key || !UpsertHiveDword(hive, *key, name, 0)) {
+      ok = false;
+    }
+  };
+
+  setDword({*controlSet, "Control", "DeviceGuard"},
+           "EnableVirtualizationBasedSecurity");
+  setDword({*controlSet, "Control", "DeviceGuard"},
+           "RequirePlatformSecurityFeatures");
+  setDword({*controlSet, "Control", "DeviceGuard"}, "Locked");
+  setDword({*controlSet, "Control", "DeviceGuard", "Scenarios",
+            "HypervisorEnforcedCodeIntegrity"},
+           "Enabled");
+  setDword({*controlSet, "Control", "DeviceGuard", "Scenarios",
+            "SystemGuard"},
+           "Enabled");
+  setDword({*controlSet, "Control", "Lsa"}, "LsaCfgFlags");
+  setDword({*controlSet, "Control", "Lsa"}, "RunAsPPL");
+  setDword({*controlSet, "Control", "Lsa"}, "RunAsPPLBoot");
+  setDword({*controlSet, "Control", "CI", "Config"},
+           "VulnerableDriverBlocklistEnable");
+
+  if (result) {
+    if (ok) {
+      result->systemLegacySecurityPatched = true;
+    } else {
+      result->notes.push_back(
+          "SYSTEM legacy security probe failed to write one or more DWORDs");
+    }
+  }
+  return ok;
 }
 
 bool PatchSystemHivePiixCriticalDevices(std::vector<uint8_t> &bytes,
@@ -3581,8 +4179,22 @@ bool PatchOverlaySystemBootStorage(hv::IBlockDevice &disk,
   if (!PatchSystemHivePiixCriticalDevices(bytes, result)) {
     return false;
   }
+  if (result) {
+    result->systemLegacySecurityProbeEnabled =
+        SystemLegacySecurityProbeEnabled();
+  }
+  if (result && result->systemLegacySecurityProbeEnabled) {
+    result->notes.push_back(
+        "SYSTEM legacy security probe enabled by "
+        "ANTIMAL_PROBE_SYSTEM_LEGACY_SECURITY");
+  }
+  if (SystemLegacySecurityProbeEnabled() &&
+      !PatchSystemHiveLegacySecurityProbe(bytes, result)) {
+    return false;
+  }
   if (!ntfs.WriteFileSameSize(*system, bytes)) {
     if (result) {
+      result->systemLegacySecurityPatched = false;
       result->notes.push_back("failed to write SYSTEM hive patch to overlay");
     }
     return false;
@@ -3678,6 +4290,9 @@ BootSignalSummary AnalyzeBootSignals(const hv::VmRunSummary &vm) {
         vm.pm1SleepType == 0) {
       AddMilestone(&signals,
                    "ResetSystem shutdown ignored as non-host-stop S0");
+      if (vm.timedOut) {
+        AddMilestone(&signals, "firmware S0 reset loop observed");
+      }
     }
   }
 
@@ -4011,6 +4626,44 @@ hv::VmNetworkMode ToHvNetworkMode(NetworkMode mode) {
     return hv::VmNetworkMode::Nat;
   }
   return hv::VmNetworkMode::Disabled;
+}
+
+bool HasMilestoneContaining(const std::vector<std::string> &milestones,
+                            std::string_view needle) {
+  return std::any_of(milestones.begin(), milestones.end(),
+                     [&](const std::string &milestone) {
+                       return ContainsTextNoCase(milestone, needle);
+                     });
+}
+
+std::string ClassifyBootStage(const DynamicRunSummary &summary) {
+  const auto &milestones = summary.bootMilestones;
+  if (HasMilestoneContaining(milestones, "GuestAgent hello") &&
+      HasMilestoneContaining(milestones, "GuestAgent heartbeat")) {
+    return "guest-agent-heartbeat";
+  }
+  if (HasMilestoneContaining(milestones, "boot driver data read")) {
+    return "boot-drivers-read";
+  }
+  if (HasMilestoneContaining(milestones, "ntoskrnl.exe data read") ||
+      HasMilestoneContaining(milestones, "secure kernel image data read") ||
+      HasMilestoneContaining(milestones, "HAL data read") ||
+      HasMilestoneContaining(milestones, "KD transport data read") ||
+      HasMilestoneContaining(milestones, "CI image data read") ||
+      HasMilestoneContaining(milestones, "secure kernel CI image data read") ||
+      HasMilestoneContaining(milestones, "boot video driver data read") ||
+      HasMilestoneContaining(milestones, "SOFTWARE hive data read")) {
+    return "kernel-image-read";
+  }
+  if (HasMilestoneContaining(milestones, "winload")) {
+    return "winload-pre-kernel";
+  }
+  if (HasMilestoneContaining(milestones, "bootmgfw") ||
+      HasMilestoneContaining(milestones, "fallback bootloader") ||
+      HasMilestoneContaining(milestones, "BCD opened")) {
+    return "bootmgr";
+  }
+  return summary.started ? "firmware" : "not-started";
 }
 
 DynamicRunSummary ToDynamicSummary(const hv::VmRunSummary &vm,
@@ -5281,11 +5934,17 @@ DetonationResult InHouseOrchestrator::PrepareAndRun(
           AnalyzeIdeWriteAttribution(vmSummary, readAttributionCatalog);
       NtfsBootFileLocator::RunOwnerScan windowsResidualOwners;
       EspBootstatSnapshot bootstatSnapshot;
+      BaseBootStorageInspection overlayBootStorageInspection;
+      SystemBootSecurityInspection overlaySystemBootSecurityInspection;
+      std::string overlayBcdSummary;
       try {
         if (preflight.rawBaseReady) {
           auto cow = hv::CowRawBlockDevice::Open(config_.baseDiskPath,
                                                  result.overlayDiskPath);
           bootstatSnapshot = CaptureEspBootstatSnapshot(cow);
+          overlayBootStorageInspection = InspectBaseBootStorage(cow);
+          overlaySystemBootSecurityInspection = InspectSystemBootSecurity(cow);
+          overlayBcdSummary = CaptureOverlayBcdSummary(cow);
           if (!readAttribution.windowsResidualRanges.empty()) {
             windowsResidualOwners = DiscoverWindowsResidualRunOwners(
                 cow, readAttribution.windowsResidualRanges);
@@ -5295,6 +5954,9 @@ DetonationResult InHouseOrchestrator::PrepareAndRun(
           auto cow =
               hv::CowOverlayBlockDevice::Open(&base, result.overlayDiskPath);
           bootstatSnapshot = CaptureEspBootstatSnapshot(cow);
+          overlayBootStorageInspection = InspectBaseBootStorage(cow);
+          overlaySystemBootSecurityInspection = InspectSystemBootSecurity(cow);
+          overlayBcdSummary = CaptureOverlayBcdSummary(cow);
           if (!readAttribution.windowsResidualRanges.empty()) {
             windowsResidualOwners = DiscoverWindowsResidualRunOwners(
                 cow, readAttribution.windowsResidualRanges);
@@ -5325,11 +5987,18 @@ DetonationResult InHouseOrchestrator::PrepareAndRun(
                         FormatIdeWriteAttribution(writeAttribution) +
                         FormatWindowsResidualRunOwners(windowsResidualOwners) +
                         FormatIdeAccessTailAttribution(accessTailAttribution) +
-                        FormatEspBootstatSnapshot(bootstatSnapshot));
+                        FormatEspBootstatSnapshot(bootstatSnapshot) +
+                        FormatOverlayBootStorageInspection(
+                            overlayBootStorageInspection) +
+                        FormatOverlaySystemBootSecurityInspection(
+                            overlaySystemBootSecurityInspection) +
+                        overlayBcdSummary +
+                        FormatAcpiPciContractDiagnostics());
       result.dynamicSummary =
           ToDynamicSummary(vmSummary, networkMode, serialLogPath, vmSummaryPath);
       auto bootSignals = AnalyzeBootSignals(vmSummary);
       AddBootReadMilestones(&bootSignals, bootReadObservations);
+      AddResidualOwnerMilestones(&bootSignals, windowsResidualOwners);
       const auto hostCapture =
           ProcessHostChannelOutput(vmSummary.hostChannelOutput, result.journalPath,
                                    result.artifactsDir, &events);
@@ -5339,6 +6008,7 @@ DetonationResult InHouseOrchestrator::PrepareAndRun(
       }
       result.dynamicSummary.guestAgentConnected =
           hostCapture.guestAgentConnected;
+      result.dynamicSummary.bootStage = ClassifyBootStage(result.dynamicSummary);
       returnedArtifacts.insert(returnedArtifacts.end(),
                                hostCapture.artifacts.begin(),
                                hostCapture.artifacts.end());
@@ -5411,6 +6081,7 @@ DetonationResult InHouseOrchestrator::PrepareAndRun(
            std::to_string(result.dynamicSummary.slavePicVectorBase)},
           {"masterPicMask", std::to_string(result.dynamicSummary.masterPicMask)},
           {"slavePicMask", std::to_string(result.dynamicSummary.slavePicMask)},
+          {"bootStage", result.dynamicSummary.bootStage},
           {"bootMilestones",
            JoinStrings(result.dynamicSummary.bootMilestones, ", ")},
           {"firmwareIdle", result.dynamicSummary.firmwareIdle ? "true" : "false"},
@@ -5441,6 +6112,14 @@ DetonationResult InHouseOrchestrator::PrepareAndRun(
       }
       if (!bootReadObservations.empty()) {
         details["bootFileReads"] = BootReadDetails(bootReadObservations);
+        const bool kernelReadGate =
+            WindowsKernelReadGateReached(bootReadObservations);
+        details["windowsKernelReadGate"] =
+            kernelReadGate ? "reached" : "not-reached";
+        if (kernelReadGate) {
+          details["windowsKernelReadTargets"] =
+              WindowsKernelReadGateDetails(bootReadObservations);
+        }
       }
       if (readAttribution.readCommands != 0) {
         details["ideReadAttribution"] =
@@ -5465,6 +6144,16 @@ DetonationResult InHouseOrchestrator::PrepareAndRun(
       }
       if (bootstatSnapshot.found) {
         details["espBootstatPostRun"] = EspBootstatDetails(bootstatSnapshot);
+      }
+      if (overlayBootStorageInspection.inspected) {
+        details["overlayBootStorageReady"] =
+            overlayBootStorageInspection.ready ? "true" : "false";
+        details["overlayBootStorageDetails"] =
+            overlayBootStorageInspection.details;
+      }
+      if (overlaySystemBootSecurityInspection.inspected) {
+        details["overlaySystemBootSecurity"] =
+            overlaySystemBootSecurityInspection.details;
       }
       if (vmSummary.timedOut) {
         details["reason"] = "timeout";

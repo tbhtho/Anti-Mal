@@ -192,6 +192,7 @@ struct DynamicRunSummary {
   uint32_t pm1SleepType = 0;
   uint32_t pm1ControlValue = 0;
   uint64_t pm1SleepRequests = 0;
+  std::string bootStage;
   std::vector<std::string> bootMilestones;
   std::vector<std::string> interruptDiagnostics;
   std::filesystem::path serialLogPath;

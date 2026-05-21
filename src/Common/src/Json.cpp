@@ -227,6 +227,7 @@ std::string ToJson(const DynamicRunSummary &summary) {
   obj.AddNumber("pm1SleepType", summary.pm1SleepType);
   obj.AddNumber("pm1ControlValue", summary.pm1ControlValue);
   obj.AddNumber("pm1SleepRequests", summary.pm1SleepRequests);
+  obj.AddString("bootStage", summary.bootStage);
   obj.AddRaw("bootMilestones", JsonStringArray(summary.bootMilestones));
   obj.AddRaw("interruptDiagnostics",
              JsonStringArray(summary.interruptDiagnostics));

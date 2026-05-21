@@ -486,6 +486,7 @@ DynamicRunSummary ParseDynamicSummary(const JsonValue *value) {
       static_cast<uint32_t>(IntValue(Member(*value, "pm1ControlValue")));
   summary.pm1SleepRequests =
       static_cast<uint64_t>(IntValue(Member(*value, "pm1SleepRequests")));
+  summary.bootStage = StringValue(Member(*value, "bootStage"));
   summary.bootMilestones = StringArrayValue(Member(*value, "bootMilestones"));
   summary.interruptDiagnostics =
       StringArrayValue(Member(*value, "interruptDiagnostics"));
@@ -932,6 +933,10 @@ std::string BuildHtmlReportWithFrames(const AnalysisReport &report,
          << ", guest agent "
          << (report.dynamicSummary.guestAgentConnected ? "connected" : "not connected")
          << "</div>";
+    if (!report.dynamicSummary.bootStage.empty()) {
+      html << "<div class=\"k\">boot stage</div><div class=\"mono\">"
+           << HtmlEscape(report.dynamicSummary.bootStage) << "</div>";
+    }
     html << "<div class=\"k\">vCPU exits</div><div class=\"mono\">"
          << report.dynamicSummary.vcpuExits << "</div>";
     html << "<div class=\"k\">IDE commands</div><div class=\"mono\">"
