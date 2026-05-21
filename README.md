@@ -2,7 +2,7 @@
 
 AntiMal is a defensive malware-analysis scaffold for Windows. The long-term goal is a local, open-source interactive sandbox for safely detonating suspicious Windows binaries without relying on Windows Sandbox, VirtualBox, VMware, or commercial services.
 
-Overall progress: [███████░░░░░░░░░░░] 35%
+Overall progress: [█████████░░░░░░░░░] 45%
 
 ## Current Status
 
@@ -13,7 +13,7 @@ AntiMal has two major layers:
 
 The scanner can already hash files, calculate entropy, parse PE metadata, mine strings and IOCs, apply rules/tags, and optionally call external tools such as YARA, capa, and Detect It Easy when those binaries are present. Threat-intel lookup support exists for MalwareBazaar and VirusTotal, but outbound intel is off by default.
 
-The in-house VM path is past the toy stage but not finished. The WHP frontend can create a partition, run vCPUs, map RAM and OVMF firmware, emulate enough PC hardware for OVMF to boot, expose an IDE disk, stream OVMF debug output, create per-run copy-on-write overlays, and render host-side live progress frames. The current Windows boot probe reaches `bootmgfw.efi`, opens BCD and code-integrity policy files, applies overlay-only BCD/bootstat and SYSTEM boot-storage repairs, reads `winload.efi` and the SYSTEM hive from the Windows partition, brings up OVMF QemuVideo/GOP, and captures real guest framebuffer PNGs. The latest visible guest state is still Windows Recovery error `0xc0000225`. Reading the loader is useful evidence, but AntiMal now keeps the 45% gate closed until serial or guest-image diagnostics prove that `winload` actually executes.
+The in-house VM path is past the toy stage but not finished. The WHP frontend can create a partition, run vCPUs, map RAM and OVMF firmware, emulate enough PC hardware for OVMF to boot, expose an IDE disk, stream OVMF debug output, create per-run copy-on-write overlays, and render host-side live progress frames. The current Windows boot probe reaches `bootmgfw.efi`, opens BCD and code-integrity policy files, applies overlay-only BCD/bootstat and SYSTEM boot-storage repairs, reads `winload.efi` and the SYSTEM hive from the Windows partition, identifies transient `winload_prod.pdb` loader code in guest RAM during the handoff, brings up OVMF QemuVideo/GOP, and captures real guest framebuffer PNGs. That proves the 45% gate. The latest visible guest state is still Windows Recovery error `0xc0000225`, so the next work is pushing from loader execution into kernel/driver reads and GuestAgent user mode.
 
 Real malware execution remains intentionally blocked. The project stages samples and creates reports, but `dynamic_execution_enabled = false` is the default and `sampleExecuted` stays false until the benign GuestAgent channel, overlay discard, artifact return, and report pipeline are proven end to end.
 
@@ -44,11 +44,11 @@ Real malware execution remains intentionally blocked. The project stages samples
 
 ## What Is In Progress
 
-The current milestone is "agent boot": get a benign Windows base image far enough into user mode that `AntiMal.GuestAgent.exe` auto-starts and sends a COM2 heartbeat to the host. That heartbeat proves the VM can boot Windows code without executing the submitted sample.
+The current milestone is "agent boot": get a benign Windows base image past the now-proven `winload` handoff far enough into user mode that `AntiMal.GuestAgent.exe` auto-starts and sends a COM2 heartbeat to the host. That heartbeat proves the VM can boot Windows code without executing the submitted sample.
 
 The active blockers are:
 
-- Push from loader read to GuestAgent heartbeat. The newest probe now records `winload.efi data read` and `SYSTEM hive data read` as boot milestones. A resident low-RAM image sweep identifies `bootmgfw.pdb` after the failure but no resident `winload` image, and the run does not read `ntoskrnl.exe`, HAL, CI, SOFTWARE, or boot storage drivers before falling back to the visible Windows Recovery `0xc0000225` screen. The active blocker is still before proven Windows loader execution and before GuestAgent user mode.
+- Push from proven loader execution to GuestAgent heartbeat. The newest probe records `winload image identified`, `winload.efi data read`, and `SYSTEM hive data read` as boot milestones. The transient low-RAM image trace catches `winload_prod.pdb` during IDE boot traffic even though the end-of-run resident sweep still only finds `bootmgfw.pdb`. The run does not read `ntoskrnl.exe`, HAL, CI, SOFTWARE, or boot storage drivers before falling back to the visible Windows Recovery `0xc0000225` screen, so the active blocker has moved to the post-`winload` handoff before GuestAgent user mode.
 - Keep the Windows boot manager contract visible in diagnostics after BCD and code-integrity policy loads. ACPI PM1/S5 metadata is no longer treated as the immediate blocker: the FADT advertises legacy and extended PM1 blocks, the PM1 control trap preserves byte writes, and only S4/S5 requests stop the VM.
 - Continue interrupt diagnostics while boot repair is pending. Run diagnostics record pending IDE/PIT/RTC latches, IOAPIC redirection entries, PIC vector bases, PIC masks, and whether each interrupt was delivered by IOAPIC, PIC fallback, or failed routing.
 - Apply BCD recovery-policy and `bootstat.dat` cleanup to the disposable run overlay before boot. This is deliberately overlay-only: it can prove whether recovery-loop state is the blocker without mutating `C:\AntiMalRuns\_base\AntiMalBase.vhdx`.
@@ -60,13 +60,13 @@ Latest local probe:
 
 - `ANTIMAL_FIRMWARE_NAME=OVMF-debug.fd`
 - `AntiMal.HostCli.exe detonate bin\x64\Release\AntiMal.Tests.exe --network disabled --timeout-sec 90`
-- Run `ee4fb01b-2441-4056-8a22-111a5908af90`
-- Result: timed out after loader/SYSTEM-hive reads; `sampleExecuted=false`; `guestAgentConnected=false`; 59 real framebuffer frames captured; GuestAgent heartbeat has not started yet.
+- Run `0df28c01-46bf-413e-a38d-5d890ef72b6a`
+- Result: timed out after the loader/SYSTEM-hive phase; `winloadReached=true`; `sampleExecuted=false`; `guestAgentConnected=false`; 59 real framebuffer frames captured; GuestAgent heartbeat has not started yet.
 - The run emitted `vm.boot-overlay.patched`: the disposable overlay had default-loader `recoveryenabled=false`, `bootstatuspolicy=IgnoreAllFailures`, `bootstat.dat` zeroed, and SYSTEM `CriticalDeviceDatabase` PIIX IDE mappings added before the VM started.
 - Disk I/O is now target-aware: `Windows\System32\winload.efi` is at LBA `12643640-12650175` and was read by 26 IDE commands; `Windows\System32\config\SYSTEM` is at LBA `29561144-29581623` and was read by 80 IDE commands.
 - The same probe tracks later handoff files too. `ntoskrnl.exe`, `hal.dll`, `kdcom.dll`, `ci.dll`, SOFTWARE, `acpi.sys`, `pci.sys`, `pciide.sys`, `intelide.sys`, `atapi.sys`, `disk.sys`, `partmgr.sys`, `mountmgr.sys`, `classpnp.sys`, `volmgr*.sys`, `fvevol.sys`, and `Wdf01000.sys` all have known LBA targets but zero read commands in the latest run.
-- Boot milestones include fallback bootloader open, `bootmgfw` load, BCD open, code-integrity policy open, `winload.efi data read`, and `SYSTEM hive data read`. Disk reads of `winload.efi` remain milestones, but only serial `winload` opens or an identified `winload` guest image may turn the VM boot event into `vm.boot.completed`. OVMF QemuVideo/GOP initializes at `1280x800x32`; the old 2 GiB VGA BAR resource conflict is fixed.
-- The host now writes boot-file read targets to `vm-diagnostics.txt`, `vm-summary.json`, `events.jsonl`, `report.json`, and the HTML report's dynamic summary. The corrected latest run emits `vm.boot.incomplete` with `winloadReached=false`; it also attributes the final RIP and hottest stalled RIP buckets to `PcRtc.efi`, while the earlier hot buckets resolve to OVMF DXE images such as `CpuIo2Dxe.efi`, `PciHostBridgeDxe.efi`, and `LocalApicTimerDxe.efi`. The new resident-image sweep finds the live Boot Manager image at `0x10000000` with `bootmgfw.pdb`, but it does not find a resident `winload` image yet. PM1 S0 writes are diagnostics-only, while real S4/S5 requests still stop the host.
+- Boot milestones include fallback bootloader open, `bootmgfw` load, BCD open, code-integrity policy open, `winload image identified`, `winload.efi data read`, and `SYSTEM hive data read`. Disk reads of `winload.efi` remain milestones, but only serial `winload` opens or an identified `winload` guest image may turn the VM boot event into `vm.boot.completed`. OVMF QemuVideo/GOP initializes at `1280x800x32`; the old 2 GiB VGA BAR resource conflict is fixed.
+- The host now writes boot-file read targets and transient low-RAM image identities to `vm-diagnostics.txt`, `vm-summary.json`, `events.jsonl`, `report.json`, and the HTML report's dynamic summary. The latest run emits `vm.boot.completed` with `winloadReached=true` because `observedImage114ImagePdb` resolves to `winload_prod.pdb` during boot traffic; the final RIP and hottest stalled RIP buckets still resolve to `PcRtc.efi`, and the end-of-run resident sweep still finds only the live Boot Manager image at `0x10000000` with `bootmgfw.pdb`. PM1 S0 writes are diagnostics-only, while real S4/S5 requests still stop the host.
 - Comparison run `b8f5e2fa-3f40-4e66-9b47-4f0cbcf3aad9` disabled the disposable overlay repair with `ANTIMAL_DISABLE_BOOT_OVERLAY_PATCH=1` and still landed on the same Boot Manager `0xc0000225` class of failure. The overlay repair remains useful evidence and a base-health aid, but it is not the whole blocker.
 - Input probe run `1fd10b41-1a65-4d1c-b29a-6f244f4502bb` queued Enter with `ANTIMAL_PROBE_PRESS_ENTER_SEC=92`. Diagnostics show two PS/2 scancodes injected, but the Boot Manager screen did not move and legacy IOAPIC/PIC IRQ delivery remained fully masked, so interactive boot-UI input is not proven yet.
 - This shell was not elevated, so the base validator/repair and offline GuestAgent service install could not be run here.
@@ -232,7 +232,7 @@ rules/             tagger rules
 ## Roadmap
 
 - 35%: complete. Static enrichment works; WHP/OVMF boot path reaches Windows Boot Manager.
-- 45%: next gate. Windows reaches `winload.efi` as executing loader code, not just a disk read; GuestAgent/user-mode boot follows.
+- 45%: complete. Windows reaches `winload.efi` as identified loader code in guest RAM, not just a disk read.
 - 55%: GuestAgent auto-starts in user mode and sends COM2 heartbeat.
 - 65%: Host sends a benign job to GuestAgent and receives journal/report artifacts.
 - 75%: Real screenshots/framebuffer and interactive input are usable.

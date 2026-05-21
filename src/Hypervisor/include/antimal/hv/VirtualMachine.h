@@ -205,6 +205,11 @@ struct VmRunSummary {
   // loader handoff, so final RIP and hotspot attribution are not enough by
   // themselves to prove whether a loader image was present.
   std::vector<VmGuestImageInfo> residentImages;
+  // Low-RAM PE images observed while boot storage traffic advances. A failed
+  // Boot Manager handoff can unload winload before the end-of-run resident
+  // snapshot, so the run loop keeps the first identity found for each image
+  // base as IDE commands make progress.
+  std::vector<VmGuestImageInfo> observedImages;
   // Snapshot of the most recent CMOS / RTC port accesses (oldest first).
   // Mirrors PcIoDevices::RecentCmosAccesses(); duplicated into the summary
   // so the host-side diagnostics writer doesn't need to keep the live VM

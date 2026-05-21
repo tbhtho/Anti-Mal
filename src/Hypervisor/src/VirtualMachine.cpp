@@ -875,6 +875,33 @@ VmRunSummary VirtualMachine::RunLoop(
   size_t ripRingHead = 0;
   size_t ripRingCount = 0;
   std::map<uint64_t, uint64_t> ripHotspots;
+  auto captureLowRamImages = [&](std::vector<VmGuestImageInfo> *images,
+                                 size_t limit) {
+    if (!images || images->size() >= limit) {
+      return;
+    }
+    const auto *lowBytes = lowRam_.HostPtr();
+    for (uint64_t gpa = 0;
+         lowBytes && gpa + kPageSize <= lowRam_.Size() &&
+         images->size() < limit;
+         gpa += kPageSize) {
+      const auto offset = static_cast<size_t>(gpa);
+      if (lowBytes[offset] != 'M' || lowBytes[offset + 1] != 'Z') {
+        continue;
+      }
+      const bool duplicate = std::any_of(
+          images->begin(), images->end(),
+          [&](const VmGuestImageInfo &seen) { return seen.base == gpa; });
+      if (duplicate) {
+        continue;
+      }
+      VmGuestImageInfo image{};
+      if (IdentifyGuestImage(gpa, &image) && image.valid &&
+          image.base == gpa) {
+        images->push_back(std::move(image));
+      }
+    }
+  };
   auto captureFatalState = [&]() {
     try {
       const auto state = vcpu_.ReadDiagState();
@@ -1181,6 +1208,7 @@ VmRunSummary VirtualMachine::RunLoop(
         (secondaryIde_ ? secondaryIde_->CommandsIssued() : 0);
     if (totalIdeCommands != lastIdeCommands) {
       lastIdeCommands = totalIdeCommands;
+      captureLowRamImages(&summary.observedImages, 256);
       madeProgress = true;
     }
 
@@ -1549,33 +1577,11 @@ VmRunSummary VirtualMachine::RunLoop(
       summary.ripHotspotImages.push_back(std::move(sample));
     }
   }
-  {
-    // UEFI loads PE images on page boundaries while Boot Manager still uses
-    // firmware services. Sweep identity-mapped low RAM for resident images so
-    // a short loader handoff remains visible after recovery UI takes over.
-    constexpr size_t kMaxResidentImageSamples = 128;
-    const auto *lowBytes = lowRam_.HostPtr();
-    for (uint64_t gpa = 0;
-         lowBytes && gpa + kPageSize <= lowRam_.Size() &&
-         summary.residentImages.size() < kMaxResidentImageSamples;
-         gpa += kPageSize) {
-      const auto offset = static_cast<size_t>(gpa);
-      if (lowBytes[offset] != 'M' || lowBytes[offset + 1] != 'Z') {
-        continue;
-      }
-      VmGuestImageInfo image{};
-      if (!IdentifyGuestImage(gpa, &image) || !image.valid ||
-          image.base != gpa) {
-        continue;
-      }
-      const bool duplicate = std::any_of(
-          summary.residentImages.begin(), summary.residentImages.end(),
-          [&](const VmGuestImageInfo &seen) { return seen.base == image.base; });
-      if (!duplicate) {
-        summary.residentImages.push_back(std::move(image));
-      }
-    }
-  }
+  // UEFI loads PE images on page boundaries while Boot Manager still uses
+  // firmware services. The observed set covers transient images; this final
+  // sweep reports the smaller resident set that survived until shutdown.
+  captureLowRamImages(&summary.observedImages, 256);
+  captureLowRamImages(&summary.residentImages, 128);
   summary.recentCmosAccesses = pcIo_.RecentCmosAccesses();
   for (const uint8_t irq : {uint8_t{0}, uint8_t{3}, uint8_t{4}, uint8_t{8},
                             uint8_t{14}, uint8_t{15}}) {

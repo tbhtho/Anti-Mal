@@ -2134,6 +2134,9 @@ BootSignalSummary AnalyzeBootSignals(const hv::VmRunSummary &vm) {
   for (const auto &image : vm.residentImages) {
     AddImageMilestones(&signals, image);
   }
+  for (const auto &image : vm.observedImages) {
+    AddImageMilestones(&signals, image);
+  }
   if (ContainsTextNoCase(serialOutput, "ResetSystem2") ||
       ContainsTextNoCase(serialOutput, "ResetType Shutdown")) {
     AddMilestone(&signals, "firmware reset/shutdown requested");
@@ -2957,6 +2960,16 @@ std::string FormatVmDiagnostics(const hv::VmRunSummary &vm) {
       }
       const auto prefix = "residentImage" + std::to_string(i);
       writeImage(out, prefix.c_str(), vm.residentImages[i]);
+    }
+  }
+  if (!vm.observedImages.empty()) {
+    out << "\nObserved low-RAM guest images during boot traffic:\n";
+    for (size_t i = 0; i < vm.observedImages.size(); ++i) {
+      if (!vm.observedImages[i].valid) {
+        continue;
+      }
+      const auto prefix = "observedImage" + std::to_string(i);
+      writeImage(out, prefix.c_str(), vm.observedImages[i]);
     }
   }
   return out.str();
