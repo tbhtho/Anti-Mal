@@ -293,6 +293,11 @@ struct GptPartitionLite {
   uint64_t lastLba = 0;
 };
 
+struct LbaRangeLite {
+  uint64_t firstLba = 0;
+  uint64_t lastLba = 0;
+};
+
 std::string GuidFromGptBytes(const uint8_t *p) {
   char out[64]{};
   _snprintf_s(out, sizeof(out), _TRUNCATE,
@@ -348,6 +353,11 @@ public:
     uint8_t attributes = 0;
     uint32_t firstCluster = 0;
     uint32_t size = 0;
+  };
+
+  struct LbaRange {
+    uint64_t firstLba = 0;
+    uint64_t lastLba = 0;
   };
 
   Fat32OverlayEditor(hv::IBlockDevice &disk, uint64_t firstLba)
@@ -461,6 +471,40 @@ public:
     return WriteFileSameSize(entry, zeros);
   }
 
+  std::optional<LbaRange> MetadataRange() const {
+    if (dataStartLba_ <= firstLba_) {
+      return std::nullopt;
+    }
+    return LbaRange{firstLba_, dataStartLba_ - 1};
+  }
+
+  std::vector<LbaRange> FileDataRanges(const Entry &entry) {
+    std::vector<LbaRange> ranges;
+    if (entry.size == 0 || entry.firstCluster < 2 ||
+        (entry.attributes & 0x10u) != 0) {
+      return ranges;
+    }
+
+    uint32_t cluster = entry.firstCluster;
+    size_t bytesCovered = 0;
+    size_t guard = 0;
+    while (cluster >= 2 && !IsEoc(cluster) && bytesCovered < entry.size &&
+           guard++ < 65536) {
+      const uint64_t first =
+          dataStartLba_ +
+          static_cast<uint64_t>(cluster - 2) * sectorsPerCluster_;
+      const uint64_t last = first + sectorsPerCluster_ - 1;
+      if (!ranges.empty() && ranges.back().lastLba + 1 == first) {
+        ranges.back().lastLba = last;
+      } else {
+        ranges.push_back({first, last});
+      }
+      bytesCovered += ClusterBytes();
+      cluster = NextCluster(cluster);
+    }
+    return ranges;
+  }
+
 private:
   size_t ClusterBytes() const noexcept {
     return static_cast<size_t>(bytesPerSector_) * sectorsPerCluster_;
@@ -563,6 +607,21 @@ struct NtfsEntryLite {
 
 class NtfsBootFileLocator {
 public:
+  struct RunOwnerMatch {
+    std::string name;
+    uint64_t fileRecord = 0;
+    uint32_t attributeType = 0;
+    LbaRangeLite ownerRange;
+    LbaRangeLite overlapRange;
+  };
+
+  struct RunOwnerScan {
+    uint64_t recordsAvailable = 0;
+    uint64_t recordsScanned = 0;
+    bool truncated = false;
+    std::vector<RunOwnerMatch> matches;
+  };
+
   NtfsBootFileLocator(hv::IBlockDevice &disk, uint64_t firstLba)
       : disk_(disk), firstLba_(firstLba) {}
 
@@ -658,6 +717,67 @@ public:
   }
 
   uint8_t SectorsPerCluster() const noexcept { return sectorsPerCluster_; }
+  const std::vector<NtfsRunLite> &MftRuns() const noexcept {
+    return mftRuns_;
+  }
+
+  RunOwnerScan FindRunOwners(const std::vector<LbaRangeLite> &lbaRanges,
+                             uint64_t maxRecords) {
+    RunOwnerScan scan;
+    if (fileRecordBytes_ == 0 || sectorsPerCluster_ == 0 ||
+        lbaRanges.empty() || maxRecords == 0) {
+      return scan;
+    }
+
+    scan.recordsAvailable = mftDataSize_ / fileRecordBytes_;
+    scan.recordsScanned = std::min(scan.recordsAvailable, maxRecords);
+    scan.truncated = scan.recordsScanned < scan.recordsAvailable;
+    std::vector<uint8_t> record;
+    for (uint64_t fileRecord = 0; fileRecord < scan.recordsScanned;
+         ++fileRecord) {
+      if (!ReadFileRecord(fileRecord, record) || record.size() < 24 ||
+          (ReadLe16(record.data() + 22) & 0x1u) == 0) {
+        continue;
+      }
+      const auto attrs = Attributes(record);
+      const std::string name = FileRecordName(attrs, fileRecord);
+      // $BadClus has a sparse DATA run covering the volume, not a concrete
+      // owner for the residual sectors the boot probe just touched.
+      if (fileRecord == 8) {
+        continue;
+      }
+      for (const auto &attr : attrs) {
+        if (!attr.nonResident || attr.runs.empty() ||
+            (attr.type != 0x80 && attr.type != 0xA0 && attr.type != 0xB0)) {
+          continue;
+        }
+        for (const auto &run : attr.runs) {
+          const uint64_t sectors =
+              run.clusters * static_cast<uint64_t>(sectorsPerCluster_);
+          if (sectors == 0) {
+            continue;
+          }
+          const uint64_t first =
+              firstLba_ +
+              run.lcn * static_cast<uint64_t>(sectorsPerCluster_);
+          const LbaRangeLite ownerRange{first, first + sectors - 1};
+          for (const auto &lbaRange : lbaRanges) {
+            const uint64_t overlapFirst =
+                std::max(ownerRange.firstLba, lbaRange.firstLba);
+            const uint64_t overlapLast =
+                std::min(ownerRange.lastLba, lbaRange.lastLba);
+            if (overlapLast < overlapFirst) {
+              continue;
+            }
+            scan.matches.push_back(
+                {name, fileRecord, attr.type, ownerRange,
+                 {overlapFirst, overlapLast}});
+          }
+        }
+      }
+    }
+    return scan;
+  }
 
   std::vector<uint8_t> ReadFile(const NtfsEntryLite &entry, size_t maxBytes) {
     if (entry.directory || entry.dataRuns.empty() || entry.size == 0) {
@@ -932,6 +1052,32 @@ private:
     return ToUpperAsciiLocal(Utf16LeAsciiName(p + 66, nameBytes));
   }
 
+  static std::string FileRecordName(const std::vector<Attribute> &attrs,
+                                    uint64_t fileRecord) {
+    std::string dosName;
+    for (const auto &attr : attrs) {
+      if (attr.type != 0x30 || attr.nonResident ||
+          attr.residentData.size() < 66) {
+        continue;
+      }
+      const auto name =
+          NtfsFileNameToAscii(attr.residentData.data(), attr.residentData.size());
+      if (name.empty()) {
+        continue;
+      }
+      if (attr.residentData[65] != 2) {
+        return name;
+      }
+      if (dosName.empty()) {
+        dosName = name;
+      }
+    }
+    if (!dosName.empty()) {
+      return dosName;
+    }
+    return "$RECORD:" + std::to_string(fileRecord);
+  }
+
   std::vector<DirectoryEntry> ParseIndexEntries(const uint8_t *data,
                                                 size_t bytes) const {
     std::vector<DirectoryEntry> entries;
@@ -1051,6 +1197,48 @@ struct BootReadObservation {
   uint64_t sectorsRead = 0;
 };
 
+uint64_t LbaRangeSectors(const LbaRangeLite &range) {
+  return range.lastLba >= range.firstLba
+             ? range.lastLba - range.firstLba + 1
+             : 0;
+}
+
+std::optional<LbaRangeLite> IntersectLbaRanges(const LbaRangeLite &lhs,
+                                               const LbaRangeLite &rhs) {
+  const uint64_t first = std::max(lhs.firstLba, rhs.firstLba);
+  const uint64_t last = std::min(lhs.lastLba, rhs.lastLba);
+  if (last < first) {
+    return std::nullopt;
+  }
+  return LbaRangeLite{first, last};
+}
+
+std::vector<LbaRangeLite> MergeLbaRanges(std::vector<LbaRangeLite> ranges) {
+  ranges.erase(std::remove_if(ranges.begin(), ranges.end(),
+                              [](const LbaRangeLite &range) {
+                                return LbaRangeSectors(range) == 0;
+                              }),
+               ranges.end());
+  std::sort(ranges.begin(), ranges.end(),
+            [](const LbaRangeLite &lhs, const LbaRangeLite &rhs) {
+              return lhs.firstLba < rhs.firstLba ||
+                     (lhs.firstLba == rhs.firstLba &&
+                      lhs.lastLba < rhs.lastLba);
+            });
+  std::vector<LbaRangeLite> merged;
+  for (const auto &range : ranges) {
+    if (!merged.empty() &&
+        (range.firstLba <= merged.back().lastLba ||
+         (merged.back().lastLba != std::numeric_limits<uint64_t>::max() &&
+          range.firstLba == merged.back().lastLba + 1))) {
+      merged.back().lastLba = std::max(merged.back().lastLba, range.lastLba);
+      continue;
+    }
+    merged.push_back(range);
+  }
+  return merged;
+}
+
 std::vector<BootReadTarget> DiscoverBootReadTargets(hv::IBlockDevice &disk) {
   std::vector<BootReadTarget> targets;
   const auto partitions = ReadGptPartitionsLite(disk);
@@ -1069,6 +1257,11 @@ std::vector<BootReadTarget> DiscoverBootReadTargets(hv::IBlockDevice &disk) {
   }
   const char *paths[] = {
       "Windows\\System32\\winload.efi",
+      "Windows\\System32\\mcupdate_GenuineIntel.dll",
+      "Windows\\System32\\mcupdate_AuthenticAMD.dll",
+      "Windows\\Boot\\Resources\\bootres.dll",
+      "Windows\\Boot\\Fonts\\segoe_slboot.ttf",
+      "Windows\\Boot\\Fonts\\segmono_boot.ttf",
       "Windows\\System32\\ntoskrnl.exe",
       "Windows\\System32\\hal.dll",
       "Windows\\System32\\kdcom.dll",
@@ -1171,6 +1364,12 @@ void AddBootReadMilestones(
     }
     if (ContainsTextNoCase(observation.target.name, "winload.efi")) {
       AddMilestone(signals, "winload.efi data read");
+    } else if (ContainsTextNoCase(observation.target.name, "mcupdate_")) {
+      AddMilestone(signals, "CPU microcode image data read");
+    } else if (ContainsTextNoCase(observation.target.name, "bootres.dll")) {
+      AddMilestone(signals, "Windows boot resources data read");
+    } else if (ContainsTextNoCase(observation.target.name, "\\Boot\\Fonts\\")) {
+      AddMilestone(signals, "Windows boot font data read");
     } else if (ContainsTextNoCase(observation.target.name, "ntoskrnl.exe")) {
       AddMilestone(signals, "ntoskrnl.exe data read");
     } else if (ContainsTextNoCase(observation.target.name, "hal.dll")) {
@@ -1199,6 +1398,1008 @@ std::string BootReadDetails(
     parts.push_back(item.str());
   }
   return JoinStrings(parts, "; ");
+}
+
+enum class IdeReadSpecificity : uint8_t {
+  KnownFile = 0,
+  FilesystemMetadata = 1,
+  PartitionResidual = 2,
+  DiskMetadata = 3,
+};
+
+struct IdeReadAttributionTarget {
+  std::string bucket;
+  LbaRangeLite range;
+  IdeReadSpecificity specificity = IdeReadSpecificity::DiskMetadata;
+};
+
+struct IdeReadAttributionCatalog {
+  std::vector<GptPartitionLite> partitions;
+  std::vector<IdeReadAttributionTarget> knownFileTargets;
+  std::vector<IdeReadAttributionTarget> filesystemMetadataTargets;
+  std::vector<BootReadTarget> windowsBootReadTargets;
+};
+
+struct IdeReadAttributionBucket {
+  std::string name;
+  IdeReadSpecificity specificity = IdeReadSpecificity::DiskMetadata;
+  uint64_t primaryReadCommands = 0;
+  uint64_t sectorsRead = 0;
+};
+
+struct IdeReadAttributionSummary {
+  uint64_t readCommands = 0;
+  uint64_t sectorsRead = 0;
+  uint64_t classifiedSectors = 0;
+  uint64_t splitReadCommands = 0;
+  std::vector<IdeReadAttributionBucket> buckets;
+  std::vector<LbaRangeLite> windowsResidualRanges;
+};
+
+void AddAttributionTarget(std::vector<IdeReadAttributionTarget> *targets,
+                          std::string bucket, uint64_t firstLba,
+                          uint64_t lastLba, IdeReadSpecificity specificity) {
+  if (!targets || lastLba < firstLba) {
+    return;
+  }
+  targets->push_back(
+      {std::move(bucket), {firstLba, lastLba}, specificity});
+}
+
+std::string PartitionResidualBucket(const GptPartitionLite &partition) {
+  if (IsEspGuid(partition.typeGuid)) {
+    return "ESP residual";
+  }
+  if (IsWindowsBasicDataGuid(partition.typeGuid)) {
+    return "Windows partition residual";
+  }
+  return "other partition residual";
+}
+
+IdeReadAttributionCatalog
+DiscoverIdeReadAttributionCatalog(hv::IBlockDevice &disk) {
+  IdeReadAttributionCatalog catalog;
+  catalog.partitions = ReadGptPartitionsLite(disk);
+  catalog.windowsBootReadTargets = DiscoverBootReadTargets(disk);
+  for (const auto &target : catalog.windowsBootReadTargets) {
+    AddAttributionTarget(&catalog.knownFileTargets,
+                         "Windows file: " + target.name, target.firstLba,
+                         target.lastLba, IdeReadSpecificity::KnownFile);
+  }
+
+  for (const auto &partition : catalog.partitions) {
+    if (IsEspGuid(partition.typeGuid)) {
+      Fat32OverlayEditor fat(disk, partition.firstLba);
+      if (!fat.Init()) {
+        continue;
+      }
+      const auto metadata = fat.MetadataRange();
+      if (metadata) {
+        AddAttributionTarget(&catalog.filesystemMetadataTargets,
+                             "ESP FAT32 metadata", metadata->firstLba,
+                             metadata->lastLba,
+                             IdeReadSpecificity::FilesystemMetadata);
+      }
+      const char *paths[] = {
+          "EFI\\BOOT\\BOOTX64.EFI",
+          "EFI\\Microsoft\\Boot\\bootmgfw.efi",
+          "EFI\\Microsoft\\Boot\\BCD",
+          "EFI\\Microsoft\\Boot\\bootstat.dat",
+          "EFI\\Microsoft\\Boot\\Fonts\\wgl4_boot.ttf",
+      };
+      for (const char *path : paths) {
+        const auto entry = fat.FindPath(path);
+        if (!entry) {
+          continue;
+        }
+        for (const auto &range : fat.FileDataRanges(*entry)) {
+          AddAttributionTarget(&catalog.knownFileTargets,
+                               "ESP file: " + std::string(path),
+                               range.firstLba, range.lastLba,
+                               IdeReadSpecificity::KnownFile);
+        }
+      }
+      continue;
+    }
+
+    if (!IsWindowsBasicDataGuid(partition.typeGuid)) {
+      continue;
+    }
+    NtfsBootFileLocator ntfs(disk, partition.firstLba);
+    if (!ntfs.Init()) {
+      continue;
+    }
+    AddAttributionTarget(&catalog.filesystemMetadataTargets,
+                         "Windows NTFS boot metadata", partition.firstLba,
+                         partition.firstLba,
+                         IdeReadSpecificity::FilesystemMetadata);
+    for (const auto &run : ntfs.MftRuns()) {
+      const uint64_t sectors =
+          run.clusters * static_cast<uint64_t>(ntfs.SectorsPerCluster());
+      if (sectors == 0) {
+        continue;
+      }
+      const uint64_t first =
+          partition.firstLba +
+          run.lcn * static_cast<uint64_t>(ntfs.SectorsPerCluster());
+      AddAttributionTarget(&catalog.filesystemMetadataTargets,
+                           "Windows NTFS MFT", first, first + sectors - 1,
+                           IdeReadSpecificity::FilesystemMetadata);
+    }
+  }
+  return catalog;
+}
+
+IdeReadAttributionSummary
+AnalyzeIdeReadAttribution(const hv::VmRunSummary &vm,
+                          const IdeReadAttributionCatalog &catalog) {
+  struct BucketAccumulator {
+    IdeReadAttributionBucket bucket;
+  };
+  struct CommandBucketShare {
+    uint64_t sectors = 0;
+    IdeReadSpecificity specificity = IdeReadSpecificity::DiskMetadata;
+  };
+
+  std::map<std::string, BucketAccumulator> accumulators;
+  IdeReadAttributionSummary summary;
+
+  for (const auto &access : vm.ideRecentAccesses) {
+    if (access.write || access.count == 0) {
+      continue;
+    }
+
+    ++summary.readCommands;
+    summary.sectorsRead += access.count;
+    std::vector<LbaRangeLite> pending{
+        {access.lba, access.lba + access.count - 1}};
+    std::map<std::string, CommandBucketShare> commandShares;
+
+    const auto assignRange =
+        [&](const std::string &bucketName, IdeReadSpecificity specificity,
+            const LbaRangeLite &range) {
+          const uint64_t sectors = LbaRangeSectors(range);
+          if (sectors == 0) {
+            return;
+          }
+          auto &accumulator = accumulators[bucketName];
+          if (accumulator.bucket.name.empty()) {
+            accumulator.bucket.name = bucketName;
+            accumulator.bucket.specificity = specificity;
+          } else if (static_cast<uint8_t>(specificity) <
+                     static_cast<uint8_t>(accumulator.bucket.specificity)) {
+            accumulator.bucket.specificity = specificity;
+          }
+          accumulator.bucket.sectorsRead += sectors;
+          auto &share = commandShares[bucketName];
+          share.sectors += sectors;
+          if (static_cast<uint8_t>(specificity) <
+              static_cast<uint8_t>(share.specificity)) {
+            share.specificity = specificity;
+          }
+          summary.classifiedSectors += sectors;
+          if (bucketName == "Windows partition residual") {
+            summary.windowsResidualRanges.push_back(range);
+          }
+        };
+
+    const auto consumeTargets =
+        [&](const std::vector<IdeReadAttributionTarget> &targets) {
+          for (const auto &target : targets) {
+            std::vector<LbaRangeLite> nextPending;
+            for (const auto &segment : pending) {
+              const auto overlap = IntersectLbaRanges(segment, target.range);
+              if (!overlap) {
+                nextPending.push_back(segment);
+                continue;
+              }
+              assignRange(target.bucket, target.specificity, *overlap);
+              if (segment.firstLba < overlap->firstLba) {
+                nextPending.push_back({segment.firstLba, overlap->firstLba - 1});
+              }
+              if (overlap->lastLba < segment.lastLba) {
+                nextPending.push_back({overlap->lastLba + 1, segment.lastLba});
+              }
+            }
+            pending = std::move(nextPending);
+            if (pending.empty()) {
+              break;
+            }
+          }
+        };
+
+    consumeTargets(catalog.knownFileTargets);
+    consumeTargets(catalog.filesystemMetadataTargets);
+
+    for (const auto &partition : catalog.partitions) {
+      std::vector<LbaRangeLite> nextPending;
+      const IdeReadAttributionTarget residual{
+          PartitionResidualBucket(partition),
+          {partition.firstLba, partition.lastLba},
+          IdeReadSpecificity::PartitionResidual};
+      for (const auto &segment : pending) {
+        const auto overlap = IntersectLbaRanges(segment, residual.range);
+        if (!overlap) {
+          nextPending.push_back(segment);
+          continue;
+        }
+        assignRange(residual.bucket, residual.specificity, *overlap);
+        if (segment.firstLba < overlap->firstLba) {
+          nextPending.push_back({segment.firstLba, overlap->firstLba - 1});
+        }
+        if (overlap->lastLba < segment.lastLba) {
+          nextPending.push_back({overlap->lastLba + 1, segment.lastLba});
+        }
+      }
+      pending = std::move(nextPending);
+      if (pending.empty()) {
+        break;
+      }
+    }
+    for (const auto &segment : pending) {
+      assignRange("disk/GPT metadata", IdeReadSpecificity::DiskMetadata,
+                  segment);
+    }
+
+    if (commandShares.size() > 1) {
+      ++summary.splitReadCommands;
+    }
+    auto primary = commandShares.end();
+    for (auto it = commandShares.begin(); it != commandShares.end(); ++it) {
+      if (primary == commandShares.end() ||
+          it->second.sectors > primary->second.sectors ||
+          (it->second.sectors == primary->second.sectors &&
+           static_cast<uint8_t>(it->second.specificity) <
+               static_cast<uint8_t>(primary->second.specificity))) {
+        primary = it;
+      }
+    }
+    if (primary != commandShares.end()) {
+      ++accumulators[primary->first].bucket.primaryReadCommands;
+    }
+  }
+
+  for (const auto &[name, accumulator] : accumulators) {
+    (void)name;
+    summary.buckets.push_back(accumulator.bucket);
+  }
+  std::sort(summary.buckets.begin(), summary.buckets.end(),
+            [](const IdeReadAttributionBucket &lhs,
+               const IdeReadAttributionBucket &rhs) {
+              if (lhs.specificity != rhs.specificity) {
+                return static_cast<uint8_t>(lhs.specificity) <
+                       static_cast<uint8_t>(rhs.specificity);
+              }
+              if (lhs.sectorsRead != rhs.sectorsRead) {
+                return lhs.sectorsRead > rhs.sectorsRead;
+              }
+              return lhs.name < rhs.name;
+            });
+  summary.windowsResidualRanges =
+      MergeLbaRanges(std::move(summary.windowsResidualRanges));
+  return summary;
+}
+
+std::string FormatIdeReadAttribution(
+    const IdeReadAttributionSummary &summary) {
+  if (summary.readCommands == 0) {
+    return {};
+  }
+  std::ostringstream out;
+  out << "\nIDE read attribution:\n"
+      << "  capturedReadCommands=" << summary.readCommands
+      << " capturedSectors=" << summary.sectorsRead
+      << " classifiedSectors=" << summary.classifiedSectors
+      << " splitReadCommands=" << summary.splitReadCommands << "\n"
+      << "  bucket commands use the largest classified overlap per IDE read; "
+         "sectors split at LBA intersections.\n";
+  for (const auto &bucket : summary.buckets) {
+    out << "  " << bucket.name << " primaryCommands="
+        << bucket.primaryReadCommands << " sectors=" << bucket.sectorsRead
+        << "\n";
+  }
+  out << "  Windows partition residual ranges: "
+      << summary.windowsResidualRanges.size() << "\n";
+  const size_t rangeLimit =
+      std::min<size_t>(summary.windowsResidualRanges.size(), 32);
+  for (size_t i = 0; i < rangeLimit; ++i) {
+    const auto &range = summary.windowsResidualRanges[i];
+    out << "    [" << i << "] lba=" << range.firstLba << "-"
+        << range.lastLba << " sectors=" << LbaRangeSectors(range) << "\n";
+  }
+  if (summary.windowsResidualRanges.size() > rangeLimit) {
+    out << "    ... "
+        << (summary.windowsResidualRanges.size() - rangeLimit)
+        << " more range(s)\n";
+  }
+  return out.str();
+}
+
+std::string IdeReadAttributionDetails(
+    const IdeReadAttributionSummary &summary) {
+  std::vector<std::string> parts;
+  {
+    std::ostringstream totals;
+    totals << "capturedReadCommands=" << summary.readCommands
+           << " capturedSectors=" << summary.sectorsRead
+           << " classifiedSectors=" << summary.classifiedSectors
+           << " splitReadCommands=" << summary.splitReadCommands;
+    parts.push_back(totals.str());
+  }
+  for (const auto &bucket : summary.buckets) {
+    std::ostringstream item;
+    item << bucket.name << " primaryCommands=" << bucket.primaryReadCommands
+         << " sectors=" << bucket.sectorsRead;
+    parts.push_back(item.str());
+  }
+  return JoinStrings(parts, "; ");
+}
+
+struct IdeWriteAttributionBucket {
+  std::string name;
+  IdeReadSpecificity specificity = IdeReadSpecificity::DiskMetadata;
+  uint64_t primaryWriteCommands = 0;
+  uint64_t sectorsWritten = 0;
+};
+
+struct IdeWriteAttributionSummary {
+  uint64_t writeCommands = 0;
+  uint64_t sectorsWritten = 0;
+  uint64_t classifiedSectors = 0;
+  uint64_t splitWriteCommands = 0;
+  std::vector<IdeWriteAttributionBucket> buckets;
+  std::vector<LbaRangeLite> espResidualRanges;
+  std::vector<LbaRangeLite> windowsResidualRanges;
+};
+
+IdeWriteAttributionSummary
+AnalyzeIdeWriteAttribution(const hv::VmRunSummary &vm,
+                           const IdeReadAttributionCatalog &catalog) {
+  struct BucketAccumulator {
+    IdeWriteAttributionBucket bucket;
+  };
+  struct CommandBucketShare {
+    uint64_t sectors = 0;
+    IdeReadSpecificity specificity = IdeReadSpecificity::DiskMetadata;
+  };
+
+  std::map<std::string, BucketAccumulator> accumulators;
+  IdeWriteAttributionSummary summary;
+
+  for (const auto &access : vm.ideRecentAccesses) {
+    if (!access.write || access.count == 0) {
+      continue;
+    }
+
+    ++summary.writeCommands;
+    summary.sectorsWritten += access.count;
+    std::vector<LbaRangeLite> pending{
+        {access.lba, access.lba + access.count - 1}};
+    std::map<std::string, CommandBucketShare> commandShares;
+
+    const auto assignRange =
+        [&](const std::string &bucketName, IdeReadSpecificity specificity,
+            const LbaRangeLite &range) {
+          const uint64_t sectors = LbaRangeSectors(range);
+          if (sectors == 0) {
+            return;
+          }
+          auto &accumulator = accumulators[bucketName];
+          if (accumulator.bucket.name.empty()) {
+            accumulator.bucket.name = bucketName;
+            accumulator.bucket.specificity = specificity;
+          } else if (static_cast<uint8_t>(specificity) <
+                     static_cast<uint8_t>(accumulator.bucket.specificity)) {
+            accumulator.bucket.specificity = specificity;
+          }
+          accumulator.bucket.sectorsWritten += sectors;
+          auto &share = commandShares[bucketName];
+          share.sectors += sectors;
+          if (static_cast<uint8_t>(specificity) <
+              static_cast<uint8_t>(share.specificity)) {
+            share.specificity = specificity;
+          }
+          summary.classifiedSectors += sectors;
+          if (bucketName == "ESP residual") {
+            summary.espResidualRanges.push_back(range);
+          } else if (bucketName == "Windows partition residual") {
+            summary.windowsResidualRanges.push_back(range);
+          }
+        };
+
+    const auto consumeTargets =
+        [&](const std::vector<IdeReadAttributionTarget> &targets) {
+          for (const auto &target : targets) {
+            std::vector<LbaRangeLite> nextPending;
+            for (const auto &segment : pending) {
+              const auto overlap = IntersectLbaRanges(segment, target.range);
+              if (!overlap) {
+                nextPending.push_back(segment);
+                continue;
+              }
+              assignRange(target.bucket, target.specificity, *overlap);
+              if (segment.firstLba < overlap->firstLba) {
+                nextPending.push_back({segment.firstLba, overlap->firstLba - 1});
+              }
+              if (overlap->lastLba < segment.lastLba) {
+                nextPending.push_back({overlap->lastLba + 1, segment.lastLba});
+              }
+            }
+            pending = std::move(nextPending);
+            if (pending.empty()) {
+              break;
+            }
+          }
+        };
+
+    consumeTargets(catalog.knownFileTargets);
+    consumeTargets(catalog.filesystemMetadataTargets);
+
+    for (const auto &partition : catalog.partitions) {
+      std::vector<LbaRangeLite> nextPending;
+      const IdeReadAttributionTarget residual{
+          PartitionResidualBucket(partition),
+          {partition.firstLba, partition.lastLba},
+          IdeReadSpecificity::PartitionResidual};
+      for (const auto &segment : pending) {
+        const auto overlap = IntersectLbaRanges(segment, residual.range);
+        if (!overlap) {
+          nextPending.push_back(segment);
+          continue;
+        }
+        assignRange(residual.bucket, residual.specificity, *overlap);
+        if (segment.firstLba < overlap->firstLba) {
+          nextPending.push_back({segment.firstLba, overlap->firstLba - 1});
+        }
+        if (overlap->lastLba < segment.lastLba) {
+          nextPending.push_back({overlap->lastLba + 1, segment.lastLba});
+        }
+      }
+      pending = std::move(nextPending);
+      if (pending.empty()) {
+        break;
+      }
+    }
+    for (const auto &segment : pending) {
+      assignRange("disk/GPT metadata", IdeReadSpecificity::DiskMetadata,
+                  segment);
+    }
+
+    if (commandShares.size() > 1) {
+      ++summary.splitWriteCommands;
+    }
+    auto primary = commandShares.end();
+    for (auto it = commandShares.begin(); it != commandShares.end(); ++it) {
+      if (primary == commandShares.end() ||
+          it->second.sectors > primary->second.sectors ||
+          (it->second.sectors == primary->second.sectors &&
+           static_cast<uint8_t>(it->second.specificity) <
+               static_cast<uint8_t>(primary->second.specificity))) {
+        primary = it;
+      }
+    }
+    if (primary != commandShares.end()) {
+      ++accumulators[primary->first].bucket.primaryWriteCommands;
+    }
+  }
+
+  for (const auto &[name, accumulator] : accumulators) {
+    (void)name;
+    summary.buckets.push_back(accumulator.bucket);
+  }
+  std::sort(summary.buckets.begin(), summary.buckets.end(),
+            [](const IdeWriteAttributionBucket &lhs,
+               const IdeWriteAttributionBucket &rhs) {
+              if (lhs.specificity != rhs.specificity) {
+                return static_cast<uint8_t>(lhs.specificity) <
+                       static_cast<uint8_t>(rhs.specificity);
+              }
+              if (lhs.sectorsWritten != rhs.sectorsWritten) {
+                return lhs.sectorsWritten > rhs.sectorsWritten;
+              }
+              return lhs.name < rhs.name;
+            });
+  summary.espResidualRanges =
+      MergeLbaRanges(std::move(summary.espResidualRanges));
+  summary.windowsResidualRanges =
+      MergeLbaRanges(std::move(summary.windowsResidualRanges));
+  return summary;
+}
+
+void FormatIdeResidualRanges(std::ostringstream &out, const char *name,
+                             const std::vector<LbaRangeLite> &ranges) {
+  if (ranges.empty()) {
+    return;
+  }
+  out << "  " << name << ": " << ranges.size() << "\n";
+  const size_t limit = std::min<size_t>(ranges.size(), 16);
+  for (size_t i = 0; i < limit; ++i) {
+    const auto &range = ranges[i];
+    out << "    [" << i << "] lba=" << range.firstLba << "-"
+        << range.lastLba << " sectors=" << LbaRangeSectors(range) << "\n";
+  }
+  if (ranges.size() > limit) {
+    out << "    ... " << (ranges.size() - limit) << " more range(s)\n";
+  }
+}
+
+std::string FormatIdeWriteAttribution(
+    const IdeWriteAttributionSummary &summary) {
+  if (summary.writeCommands == 0) {
+    return {};
+  }
+  std::ostringstream out;
+  out << "\nIDE write attribution:\n"
+      << "  capturedWriteCommands=" << summary.writeCommands
+      << " capturedSectors=" << summary.sectorsWritten
+      << " classifiedSectors=" << summary.classifiedSectors
+      << " splitWriteCommands=" << summary.splitWriteCommands << "\n"
+      << "  bucket commands use the largest classified overlap per IDE write; "
+         "sectors split at LBA intersections.\n";
+  for (const auto &bucket : summary.buckets) {
+    out << "  " << bucket.name << " primaryCommands="
+        << bucket.primaryWriteCommands << " sectors=" << bucket.sectorsWritten
+        << "\n";
+  }
+  FormatIdeResidualRanges(out, "ESP residual ranges",
+                          summary.espResidualRanges);
+  FormatIdeResidualRanges(out, "Windows partition residual ranges",
+                          summary.windowsResidualRanges);
+  return out.str();
+}
+
+std::string IdeWriteAttributionDetails(
+    const IdeWriteAttributionSummary &summary) {
+  std::vector<std::string> parts;
+  {
+    std::ostringstream totals;
+    totals << "capturedWriteCommands=" << summary.writeCommands
+           << " capturedSectors=" << summary.sectorsWritten
+           << " classifiedSectors=" << summary.classifiedSectors
+           << " splitWriteCommands=" << summary.splitWriteCommands;
+    parts.push_back(totals.str());
+  }
+  for (const auto &bucket : summary.buckets) {
+    std::ostringstream item;
+    item << bucket.name << " primaryCommands="
+         << bucket.primaryWriteCommands << " sectors=" << bucket.sectorsWritten;
+    parts.push_back(item.str());
+  }
+  return JoinStrings(parts, "; ");
+}
+
+struct EspBootstatSnapshot {
+  struct StatusCandidate {
+    uint32_t value = 0;
+    std::vector<size_t> offsets;
+  };
+
+  bool found = false;
+  uint64_t fileBytes = 0;
+  size_t bytesRead = 0;
+  size_t nonZeroBytes = 0;
+  std::optional<size_t> firstNonZeroOffset;
+  std::optional<size_t> lastNonZeroOffset;
+  std::vector<uint8_t> headBytes;
+  std::vector<std::pair<size_t, uint32_t>> statusLikeDwords;
+  std::vector<StatusCandidate> lateStatusCandidates;
+};
+
+EspBootstatSnapshot CaptureEspBootstatSnapshot(hv::IBlockDevice &disk) {
+  EspBootstatSnapshot snapshot;
+  const auto partitions = ReadGptPartitionsLite(disk);
+  const auto esp = std::find_if(partitions.begin(), partitions.end(),
+                                [](const GptPartitionLite &partition) {
+                                  return IsEspGuid(partition.typeGuid);
+                                });
+  if (esp == partitions.end()) {
+    return snapshot;
+  }
+  Fat32OverlayEditor fat(disk, esp->firstLba);
+  if (!fat.Init()) {
+    return snapshot;
+  }
+  const auto bootstat = fat.FindPath("EFI\\Microsoft\\Boot\\bootstat.dat");
+  if (!bootstat) {
+    return snapshot;
+  }
+  snapshot.found = true;
+  snapshot.fileBytes = bootstat->size;
+  const auto bytes = fat.ReadFile(*bootstat, 1024ull * 1024ull);
+  snapshot.bytesRead = bytes.size();
+  const size_t headBytes = std::min<size_t>(bytes.size(), 256);
+  snapshot.headBytes.assign(bytes.begin(), bytes.begin() + headBytes);
+  for (size_t i = 0; i < bytes.size(); ++i) {
+    if (bytes[i] == 0) {
+      continue;
+    }
+    ++snapshot.nonZeroBytes;
+    if (!snapshot.firstNonZeroOffset) {
+      snapshot.firstNonZeroOffset = i;
+    }
+    snapshot.lastNonZeroOffset = i;
+  }
+  std::map<uint32_t, std::vector<size_t>> lateStatusOffsets;
+  for (size_t i = 0; i + sizeof(uint32_t) <= bytes.size(); i += 4) {
+    const uint32_t value = ReadLe32(bytes.data() + i);
+    if ((value & 0xC0000000u) != 0xC0000000u ||
+        value == 0xFFFFFFFFu) {
+      continue;
+    }
+    if (snapshot.statusLikeDwords.size() < 32) {
+      snapshot.statusLikeDwords.push_back({i, value});
+    }
+    if (i >= 0x400 && (value & 0xFFF00000u) == 0xC0000000u) {
+      lateStatusOffsets[value].push_back(i);
+    }
+  }
+  for (auto &[value, offsets] : lateStatusOffsets) {
+    if (offsets.size() < 2) {
+      continue;
+    }
+    snapshot.lateStatusCandidates.push_back({value, std::move(offsets)});
+  }
+  std::sort(snapshot.lateStatusCandidates.begin(),
+            snapshot.lateStatusCandidates.end(),
+            [](const EspBootstatSnapshot::StatusCandidate &lhs,
+               const EspBootstatSnapshot::StatusCandidate &rhs) {
+              if (lhs.offsets.size() != rhs.offsets.size()) {
+                return lhs.offsets.size() > rhs.offsets.size();
+              }
+              return lhs.offsets.front() < rhs.offsets.front();
+            });
+  return snapshot;
+}
+
+const char *KnownNtStatusName(uint32_t value) {
+  switch (value) {
+  case 0xC000008Fu:
+    return "STATUS_FLOAT_INEXACT_RESULT";
+  case 0xC00000A0u:
+    return "STATUS_MEMORY_NOT_ALLOCATED";
+  case 0xC000010Fu:
+    return "STATUS_ABIOS_NOT_PRESENT";
+  case 0xC0000225u:
+    return "STATUS_NOT_FOUND";
+  default:
+    return nullptr;
+  }
+}
+
+std::string HexDword(uint32_t value) {
+  char hex[16]{};
+  _snprintf_s(hex, sizeof(hex), _TRUNCATE, "0x%08X", value);
+  return hex;
+}
+
+std::string BootstatStatusCandidateText(
+    const EspBootstatSnapshot::StatusCandidate &candidate,
+    bool includeOffsets) {
+  std::ostringstream out;
+  out << HexDword(candidate.value);
+  if (const auto *name = KnownNtStatusName(candidate.value)) {
+    out << " " << name;
+  }
+  out << " occurrences=" << candidate.offsets.size();
+  if (includeOffsets) {
+    out << " offsets=";
+    const size_t limit = std::min<size_t>(candidate.offsets.size(), 8);
+    for (size_t i = 0; i < limit; ++i) {
+      if (i) {
+        out << ",";
+      }
+      out << "0x" << std::hex << std::uppercase << candidate.offsets[i]
+          << std::dec;
+    }
+    if (candidate.offsets.size() > limit) {
+      out << ",...";
+    }
+  }
+  return out.str();
+}
+
+std::string HexBytes(const std::vector<uint8_t> &bytes) {
+  std::ostringstream out;
+  for (size_t i = 0; i < bytes.size(); ++i) {
+    if (i) {
+      out << " ";
+    }
+    char hex[8]{};
+    _snprintf_s(hex, sizeof(hex), _TRUNCATE, "%02X", bytes[i]);
+    out << hex;
+  }
+  return out.str();
+}
+
+std::string FormatEspBootstatSnapshot(const EspBootstatSnapshot &snapshot) {
+  if (!snapshot.found) {
+    return {};
+  }
+  std::ostringstream out;
+  out << "\nESP bootstat.dat post-run snapshot:\n"
+      << "  fileBytes=" << snapshot.fileBytes
+      << " bytesRead=" << snapshot.bytesRead
+      << " nonZeroBytes=" << snapshot.nonZeroBytes << "\n";
+  if (snapshot.firstNonZeroOffset && snapshot.lastNonZeroOffset) {
+    out << "  nonZeroOffsetRange=" << *snapshot.firstNonZeroOffset << "-"
+        << *snapshot.lastNonZeroOffset << "\n";
+  }
+  if (!snapshot.headBytes.empty()) {
+    out << "  headBytes[0.." << (snapshot.headBytes.size() - 1)
+        << "]=" << HexBytes(snapshot.headBytes) << "\n";
+  }
+  out << "  statusLikeDwords=" << snapshot.statusLikeDwords.size() << "\n";
+  for (const auto &[offset, value] : snapshot.statusLikeDwords) {
+    out << "    offset=0x" << std::hex << std::uppercase << offset
+        << " value=0x" << value << std::dec << "\n";
+  }
+  out << "  lateRepeatedNtStatusCandidates="
+      << snapshot.lateStatusCandidates.size() << "\n";
+  for (size_t i = 0; i < snapshot.lateStatusCandidates.size(); ++i) {
+    out << "    [" << i << "] "
+        << BootstatStatusCandidateText(snapshot.lateStatusCandidates[i], true)
+        << "\n";
+  }
+  return out.str();
+}
+
+std::string EspBootstatDetails(const EspBootstatSnapshot &snapshot) {
+  if (!snapshot.found) {
+    return {};
+  }
+  std::ostringstream out;
+  out << "fileBytes=" << snapshot.fileBytes
+      << " bytesRead=" << snapshot.bytesRead
+      << " nonZeroBytes=" << snapshot.nonZeroBytes;
+  if (snapshot.firstNonZeroOffset && snapshot.lastNonZeroOffset) {
+    out << " nonZeroOffsetRange=" << *snapshot.firstNonZeroOffset << "-"
+        << *snapshot.lastNonZeroOffset;
+  }
+  out << " statusLikeDwords=" << snapshot.statusLikeDwords.size();
+  out << " lateRepeatedNtStatusCandidates="
+      << snapshot.lateStatusCandidates.size();
+  const size_t candidateLimit =
+      std::min<size_t>(snapshot.lateStatusCandidates.size(), 4);
+  for (size_t i = 0; i < candidateLimit; ++i) {
+    out << "; candidate="
+        << BootstatStatusCandidateText(snapshot.lateStatusCandidates[i], false);
+  }
+  const size_t limit = std::min<size_t>(snapshot.statusLikeDwords.size(), 2);
+  for (size_t i = 0; i < limit; ++i) {
+    out << "; offset=0x" << std::hex << std::uppercase
+        << snapshot.statusLikeDwords[i].first << " value=0x"
+        << snapshot.statusLikeDwords[i].second << std::dec;
+  }
+  return out.str();
+}
+
+std::string NtfsOwnerAttributeName(uint32_t attributeType) {
+  switch (attributeType) {
+  case 0x80:
+    return "DATA";
+  case 0xA0:
+    return "INDEX_ALLOCATION";
+  case 0xB0:
+    return "BITMAP";
+  default:
+    return "ATTR_0x" + std::to_string(attributeType);
+  }
+}
+
+NtfsBootFileLocator::RunOwnerScan
+DiscoverWindowsResidualRunOwners(hv::IBlockDevice &disk,
+                                 const std::vector<LbaRangeLite> &ranges) {
+  const auto partitions = ReadGptPartitionsLite(disk);
+  const auto windows =
+      std::find_if(partitions.begin(), partitions.end(),
+                   [](const GptPartitionLite &partition) {
+                     return IsWindowsBasicDataGuid(partition.typeGuid);
+                   });
+  if (windows == partitions.end() || ranges.empty()) {
+    return {};
+  }
+
+  NtfsBootFileLocator ntfs(disk, windows->firstLba);
+  if (!ntfs.Init()) {
+    return {};
+  }
+  constexpr uint64_t kMaxMftOwnerRecords = 200000;
+  return ntfs.FindRunOwners(ranges, kMaxMftOwnerRecords);
+}
+
+std::vector<NtfsBootFileLocator::RunOwnerMatch>
+SortedNtfsRunOwnerMatches(const NtfsBootFileLocator::RunOwnerScan &scan) {
+  auto matches = scan.matches;
+  std::sort(matches.begin(), matches.end(),
+            [](const NtfsBootFileLocator::RunOwnerMatch &lhs,
+               const NtfsBootFileLocator::RunOwnerMatch &rhs) {
+              const uint64_t lhsSectors = LbaRangeSectors(lhs.overlapRange);
+              const uint64_t rhsSectors = LbaRangeSectors(rhs.overlapRange);
+              if (lhsSectors != rhsSectors) {
+                return lhsSectors > rhsSectors;
+              }
+              if (lhs.name != rhs.name) {
+                return lhs.name < rhs.name;
+              }
+              if (lhs.fileRecord != rhs.fileRecord) {
+                return lhs.fileRecord < rhs.fileRecord;
+              }
+              return lhs.overlapRange.firstLba < rhs.overlapRange.firstLba;
+            });
+  return matches;
+}
+
+std::string FormatWindowsResidualRunOwners(
+    const NtfsBootFileLocator::RunOwnerScan &scan) {
+  if (scan.recordsScanned == 0 && scan.matches.empty()) {
+    return {};
+  }
+  std::ostringstream out;
+  out << "\nWindows NTFS residual run owners:\n"
+      << "  mftRecordsScanned=" << scan.recordsScanned
+      << " mftRecordsAvailable=" << scan.recordsAvailable
+      << " truncated=" << (scan.truncated ? "true" : "false")
+      << " matchingRuns=" << scan.matches.size() << "\n";
+  const auto matches = SortedNtfsRunOwnerMatches(scan);
+  const size_t limit = std::min<size_t>(matches.size(), 48);
+  for (size_t i = 0; i < limit; ++i) {
+    const auto &match = matches[i];
+    out << "  [" << i << "] " << match.name << " record="
+        << match.fileRecord << " attr="
+        << NtfsOwnerAttributeName(match.attributeType) << " ownerLba="
+        << match.ownerRange.firstLba << "-" << match.ownerRange.lastLba
+        << " residualLba=" << match.overlapRange.firstLba << "-"
+        << match.overlapRange.lastLba
+        << " sectors=" << LbaRangeSectors(match.overlapRange) << "\n";
+  }
+  if (matches.size() > limit) {
+    out << "    ... " << (matches.size() - limit) << " more match(es)\n";
+  }
+  return out.str();
+}
+
+std::string WindowsResidualRunOwnerDetails(
+    const NtfsBootFileLocator::RunOwnerScan &scan) {
+  std::ostringstream out;
+  out << "mftRecordsScanned=" << scan.recordsScanned
+      << " mftRecordsAvailable=" << scan.recordsAvailable
+      << " truncated=" << (scan.truncated ? "true" : "false")
+      << " matchingRuns=" << scan.matches.size();
+  const auto matches = SortedNtfsRunOwnerMatches(scan);
+  const size_t limit = std::min<size_t>(matches.size(), 12);
+  for (size_t i = 0; i < limit; ++i) {
+    const auto &match = matches[i];
+    out << "; " << match.name << " record=" << match.fileRecord
+        << " attr=" << NtfsOwnerAttributeName(match.attributeType)
+        << " sectors=" << LbaRangeSectors(match.overlapRange);
+  }
+  return out.str();
+}
+
+struct IdeAccessTailEntry {
+  bool write = false;
+  uint64_t lba = 0;
+  uint32_t sectors = 0;
+  std::vector<std::string> labels;
+};
+
+void AddUniqueIdeTailLabel(std::vector<std::string> *labels,
+                           const std::string &label) {
+  if (!labels || label.empty() ||
+      std::find(labels->begin(), labels->end(), label) != labels->end()) {
+    return;
+  }
+  labels->push_back(label);
+}
+
+std::vector<std::string> IdeAccessTailLabels(
+    const LbaRangeLite &range, const IdeReadAttributionCatalog &catalog,
+    const NtfsBootFileLocator::RunOwnerScan &windowsResidualOwners) {
+  std::vector<std::string> labels;
+  for (const auto &target : catalog.knownFileTargets) {
+    if (IntersectLbaRanges(range, target.range)) {
+      AddUniqueIdeTailLabel(&labels, target.bucket);
+    }
+  }
+  if (!labels.empty()) {
+    return labels;
+  }
+
+  for (const auto &target : catalog.filesystemMetadataTargets) {
+    if (IntersectLbaRanges(range, target.range)) {
+      AddUniqueIdeTailLabel(&labels, target.bucket);
+    }
+  }
+  if (!labels.empty()) {
+    return labels;
+  }
+
+  bool windowsResidual = false;
+  for (const auto &partition : catalog.partitions) {
+    if (!IntersectLbaRanges(range,
+                            {partition.firstLba, partition.lastLba})) {
+      continue;
+    }
+    const auto residual = PartitionResidualBucket(partition);
+    AddUniqueIdeTailLabel(&labels, residual);
+    windowsResidual = windowsResidual ||
+                      residual == "Windows partition residual";
+  }
+  if (windowsResidual) {
+    for (const auto &match : windowsResidualOwners.matches) {
+      if (!IntersectLbaRanges(range, match.overlapRange)) {
+        continue;
+      }
+      AddUniqueIdeTailLabel(
+          &labels, "owner: " + match.name + " " +
+                       NtfsOwnerAttributeName(match.attributeType));
+    }
+  }
+  if (labels.empty()) {
+    labels.push_back("disk/GPT metadata");
+  }
+  return labels;
+}
+
+std::vector<IdeAccessTailEntry> AnalyzeIdeAccessTailAttribution(
+    const hv::VmRunSummary &vm, const IdeReadAttributionCatalog &catalog,
+    const NtfsBootFileLocator::RunOwnerScan &windowsResidualOwners,
+    size_t limit) {
+  std::vector<IdeAccessTailEntry> entries;
+  if (limit == 0 || vm.ideRecentAccesses.empty()) {
+    return entries;
+  }
+  const size_t first =
+      vm.ideRecentAccesses.size() > limit ? vm.ideRecentAccesses.size() - limit
+                                          : 0;
+  entries.reserve(vm.ideRecentAccesses.size() - first);
+  for (size_t i = first; i < vm.ideRecentAccesses.size(); ++i) {
+    const auto &access = vm.ideRecentAccesses[i];
+    if (access.count == 0) {
+      continue;
+    }
+    const LbaRangeLite range{access.lba, access.lba + access.count - 1};
+    entries.push_back({access.write, access.lba, access.count,
+                       IdeAccessTailLabels(range, catalog,
+                                           windowsResidualOwners)});
+  }
+  return entries;
+}
+
+std::string IdeAccessTailLine(const IdeAccessTailEntry &entry) {
+  std::ostringstream out;
+  out << (entry.write ? "write" : "read") << " lba=" << entry.lba
+      << "-" << (entry.lba + entry.sectors - 1)
+      << " sectors=" << entry.sectors << " -> "
+      << JoinStrings(entry.labels, ", ");
+  return out.str();
+}
+
+std::string FormatIdeAccessTailAttribution(
+    const std::vector<IdeAccessTailEntry> &entries) {
+  if (entries.empty()) {
+    return {};
+  }
+  std::ostringstream out;
+  out << "\nIDE access tail attribution:\n"
+      << "  oldest-to-newest final accesses=" << entries.size() << "\n";
+  for (size_t i = 0; i < entries.size(); ++i) {
+    out << "  [" << i << "] " << IdeAccessTailLine(entries[i]) << "\n";
+  }
+  return out.str();
+}
+
+std::string IdeAccessTailDetails(
+    const std::vector<IdeAccessTailEntry> &entries) {
+  if (entries.empty()) {
+    return {};
+  }
+  std::vector<std::string> lines;
+  const size_t first = entries.size() > 8 ? entries.size() - 8 : 0;
+  for (size_t i = first; i < entries.size(); ++i) {
+    lines.push_back(IdeAccessTailLine(entries[i]));
+  }
+  return JoinStrings(lines, "; ");
 }
 
 struct BcdValueLocation {
@@ -1692,49 +2893,18 @@ struct BootOverlayPatchResult {
   bool dbgSettingsDebugPortPatched = false;
   bool dbgSettingsBaudRatePatched = false;
   bool bootmgrBootDebugPatched = false;
+  bool noIntegrityChecksProbeEnabled = false;
+  bool noIntegrityChecksPatched = false;
   std::vector<std::string> notes;
 };
 
 bool PatchOverlaySystemBootStorage(hv::IBlockDevice &disk,
                                    BootOverlayPatchResult *result);
 
-bool PatchBcdDonorElement(MutableHiveView &hive, std::vector<uint8_t> &bcd,
-                          uint32_t elementsKey, const std::string &targetId,
-                          const std::string &donorId,
-                          uint64_t replacementValue,
-                          bool oneByteValue) {
-  if (hive.FindSubkey(elementsKey, targetId)) {
-    return false;
-  }
-  const auto donorIndex = hive.FindSubkey(elementsKey, donorId);
-  if (!donorIndex) {
-    return false;
-  }
-  const auto donorKey = hive.ReadKey(*donorIndex);
-  if (!donorKey || donorKey->name.size() != targetId.size() ||
-      donorKey->nameAbsolute + targetId.size() > bcd.size()) {
-    return false;
-  }
-  const auto value = hive.FindValue(*donorIndex, "Element");
-  if (!value || value->type != 3) {
-    return false;
-  }
-  if (oneByteValue) {
-    if (value->dataLength < 1 || value->dataAbsolute + 4 > bcd.size()) {
-      return false;
-    }
-    WriteLe32(bcd.data() + value->dataAbsolute,
-              static_cast<uint32_t>(replacementValue != 0 ? 1 : 0));
-  } else {
-    if (value->dataLength < 8 || value->dataAbsolute + 8 > bcd.size()) {
-      return false;
-    }
-    WriteLe64(bcd.data() + value->dataAbsolute, replacementValue);
-  }
-  std::memcpy(bcd.data() + donorKey->nameAbsolute, targetId.data(),
-              targetId.size());
-  return true;
-}
+bool AddBcdElementRaw(MutableHiveView &hive, uint32_t elementsKey,
+                      const std::string &elementId, uint32_t valueType,
+                      const std::vector<uint8_t> &valueBytes);
+std::vector<uint8_t> BcdU64Bytes(uint64_t value);
 
 bool PatchBcdBootPolicy(std::vector<uint8_t> &bcd,
                         BootOverlayPatchResult *result) {
@@ -1766,23 +2936,21 @@ bool PatchBcdBootPolicy(std::vector<uint8_t> &bcd,
   }
 
   bool changed = false;
-  if (PatchBcdDonorElement(hive, bcd, *elements, "16000009", "16000060", 0,
-                           true)) {
+  if (AddBcdElementRaw(hive, *elements, "16000009", 3,
+                       std::vector<uint8_t>{0})) {
     changed = true;
     if (result) {
       result->recoveryPatched = true;
     }
   }
-  if (PatchBcdDonorElement(hive, bcd, *elements, "250000E0", "25000020", 1,
-                           false)) {
+  if (AddBcdElementRaw(hive, *elements, "250000E0", 3, BcdU64Bytes(1))) {
     changed = true;
     if (result) {
       result->bcdPolicyPatched = true;
     }
   }
   if (!changed && result) {
-    result->notes.push_back("BCD boot policy elements already present or donor "
-                            "elements unavailable");
+    result->notes.push_back("BCD boot policy elements already present");
   }
   return changed;
 }
@@ -1963,6 +3131,45 @@ bool PatchBcdDbgSettings(std::vector<uint8_t> &bcd,
   return changed;
 }
 
+bool PatchBcdNoIntegrityChecksProbe(std::vector<uint8_t> &bcd,
+                                    BootOverlayPatchResult *result) {
+  MutableHiveView hive(bcd);
+  if (!hive.IsValid()) {
+    return false;
+  }
+  const auto root = hive.RootIndex();
+  const auto objects = root ? hive.FindSubkey(*root, "Objects") : std::nullopt;
+  const auto bootmgr =
+      objects ? hive.FindSubkey(*objects,
+                                "{9dea862c-5cdd-4e70-acc1-f32b344d4795}")
+              : std::nullopt;
+  const std::string defaultGuid =
+      bootmgr ? BcdElementString(hive, *bootmgr, "23000003") : std::string{};
+  const auto defaultObject =
+      !defaultGuid.empty() && objects ? hive.FindSubkey(*objects, defaultGuid)
+                                      : std::nullopt;
+  const auto elements =
+      defaultObject ? hive.FindSubkey(*defaultObject, "Elements") : std::nullopt;
+  if (!elements) {
+    if (result) {
+      result->notes.push_back(
+          "BCD nointegritychecks probe: default loader Elements key not found");
+    }
+    return false;
+  }
+  if (AddBcdElementRaw(hive, *elements, "26000048", 3,
+                       std::vector<uint8_t>{1})) {
+    if (result) {
+      result->noIntegrityChecksPatched = true;
+    }
+    return true;
+  }
+  if (result) {
+    result->notes.push_back("BCD nointegritychecks probe element already present");
+  }
+  return false;
+}
+
 bool BootOverlayPatchDisabled() {
   char buf[16]{};
   size_t needed = 0;
@@ -1976,6 +3183,14 @@ bool WinloadDebugPatchDisabled() {
   size_t needed = 0;
   return getenv_s(&needed, buf, sizeof(buf),
                   "ANTIMAL_DISABLE_WINLOAD_DEBUG") == 0 &&
+         needed > 1 && buf[0] != '\0' && std::atoi(buf) != 0;
+}
+
+bool NoIntegrityChecksProbeEnabled() {
+  char buf[16]{};
+  size_t needed = 0;
+  return getenv_s(&needed, buf, sizeof(buf),
+                  "ANTIMAL_PROBE_BCD_NOINTEGRITYCHECKS") == 0 &&
          needed > 1 && buf[0] != '\0' && std::atoi(buf) != 0;
 }
 
@@ -2009,6 +3224,7 @@ BootOverlayPatchResult ApplyEphemeralBootOverlay(hv::IBlockDevice &disk) {
     if (bytes.size() == bcd->size) {
       const bool policyChanged = PatchBcdBootPolicy(bytes, &result);
       bool transportChanged = false;
+      bool noIntegrityChanged = false;
       if (WinloadDebugPatchDisabled()) {
         result.notes.push_back(
             "winload debug patch disabled by ANTIMAL_DISABLE_WINLOAD_DEBUG");
@@ -2018,7 +3234,14 @@ BootOverlayPatchResult ApplyEphemeralBootOverlay(hv::IBlockDevice &disk) {
         const bool bootmgrChanged = PatchBcdBootmgrDebug(bytes, &result);
         transportChanged = loaderChanged || dbgChanged || bootmgrChanged;
       }
-      if ((policyChanged || transportChanged) &&
+      result.noIntegrityChecksProbeEnabled = NoIntegrityChecksProbeEnabled();
+      if (result.noIntegrityChecksProbeEnabled) {
+        result.notes.push_back(
+            "BCD nointegritychecks probe enabled by "
+            "ANTIMAL_PROBE_BCD_NOINTEGRITYCHECKS");
+        noIntegrityChanged = PatchBcdNoIntegrityChecksProbe(bytes, &result);
+      }
+      if ((policyChanged || transportChanged || noIntegrityChanged) &&
           !fat.WriteFileSameSize(*bcd, bytes)) {
         result.bcdPolicyPatched = false;
         result.recoveryPatched = false;
@@ -2030,6 +3253,7 @@ BootOverlayPatchResult ApplyEphemeralBootOverlay(hv::IBlockDevice &disk) {
         result.dbgSettingsDebugPortPatched = false;
         result.dbgSettingsBaudRatePatched = false;
         result.bootmgrBootDebugPatched = false;
+        result.noIntegrityChecksPatched = false;
         result.notes.push_back("failed to write patched BCD to overlay");
       }
     }
@@ -2074,6 +3298,10 @@ BootOverlayPatchDetails(const BootOverlayPatchResult &patch) {
        patch.dbgSettingsBaudRatePatched ? "true" : "false"},
       {"bootmgrBootDebugPatched",
        patch.bootmgrBootDebugPatched ? "true" : "false"},
+      {"noIntegrityChecksProbeEnabled",
+       patch.noIntegrityChecksProbeEnabled ? "true" : "false"},
+      {"noIntegrityChecksPatched",
+       patch.noIntegrityChecksPatched ? "true" : "false"},
       {"scope", "overlay-only"}};
   if (!patch.notes.empty()) {
     details["notes"] = JoinStrings(patch.notes, "; ");
@@ -3994,6 +5222,7 @@ DetonationResult InHouseOrchestrator::PrepareAndRun(
       fireProgress("booting", "Booting VM (firmware -> guest)");
       hv::VmRunSummary vmSummary;
       std::vector<BootReadTarget> bootReadTargets;
+      IdeReadAttributionCatalog readAttributionCatalog;
       hv::VirtualMachineOptions vmOptions;
       vmOptions.processorCount = 2;
       // ANTIMAL_VCPU_COUNT lets us test single-CPU vs multi-CPU boot paths
@@ -4015,7 +5244,8 @@ DetonationResult InHouseOrchestrator::PrepareAndRun(
         auto cow = hv::CowRawBlockDevice::Open(config_.baseDiskPath,
                                                result.overlayDiskPath);
         const auto bootPatch = ApplyEphemeralBootOverlay(cow);
-        bootReadTargets = DiscoverBootReadTargets(cow);
+        readAttributionCatalog = DiscoverIdeReadAttributionCatalog(cow);
+        bootReadTargets = readAttributionCatalog.windowsBootReadTargets;
         AppendJournalEvent(
             result.journalPath,
             MakeSandboxEvent("vm.boot-overlay.patched", result.overlayDiskPath,
@@ -4028,7 +5258,8 @@ DetonationResult InHouseOrchestrator::PrepareAndRun(
         auto base = hv::VhdxBlockDevice::Open(config_.baseVhdxPath);
         auto cow = hv::CowOverlayBlockDevice::Open(&base, result.overlayDiskPath);
         const auto bootPatch = ApplyEphemeralBootOverlay(cow);
-        bootReadTargets = DiscoverBootReadTargets(cow);
+        readAttributionCatalog = DiscoverIdeReadAttributionCatalog(cow);
+        bootReadTargets = readAttributionCatalog.windowsBootReadTargets;
         AppendJournalEvent(
             result.journalPath,
             MakeSandboxEvent("vm.boot-overlay.patched", result.overlayDiskPath,
@@ -4044,6 +5275,36 @@ DetonationResult InHouseOrchestrator::PrepareAndRun(
           realFrameCounter->load(std::memory_order_relaxed);
       const auto bootReadObservations =
           AnalyzeBootReadTargets(vmSummary, bootReadTargets);
+      const auto readAttribution =
+          AnalyzeIdeReadAttribution(vmSummary, readAttributionCatalog);
+      const auto writeAttribution =
+          AnalyzeIdeWriteAttribution(vmSummary, readAttributionCatalog);
+      NtfsBootFileLocator::RunOwnerScan windowsResidualOwners;
+      EspBootstatSnapshot bootstatSnapshot;
+      try {
+        if (preflight.rawBaseReady) {
+          auto cow = hv::CowRawBlockDevice::Open(config_.baseDiskPath,
+                                                 result.overlayDiskPath);
+          bootstatSnapshot = CaptureEspBootstatSnapshot(cow);
+          if (!readAttribution.windowsResidualRanges.empty()) {
+            windowsResidualOwners = DiscoverWindowsResidualRunOwners(
+                cow, readAttribution.windowsResidualRanges);
+          }
+        } else if (preflight.baseVhdxReadable) {
+          auto base = hv::VhdxBlockDevice::Open(config_.baseVhdxPath);
+          auto cow =
+              hv::CowOverlayBlockDevice::Open(&base, result.overlayDiskPath);
+          bootstatSnapshot = CaptureEspBootstatSnapshot(cow);
+          if (!readAttribution.windowsResidualRanges.empty()) {
+            windowsResidualOwners = DiscoverWindowsResidualRunOwners(
+                cow, readAttribution.windowsResidualRanges);
+          }
+        }
+      } catch (...) {
+        // Best-effort overlay inspection; the IDE trace remains useful.
+      }
+      const auto accessTailAttribution = AnalyzeIdeAccessTailAttribution(
+          vmSummary, readAttributionCatalog, windowsResidualOwners, 24);
       fireProgress("finishing", "VM run loop returned; writing diagnostics");
       WriteTextFile(serialLogPath, vmSummary.serialOutput);
       WriteTextFile(firmwareLogPath, vmSummary.firmwareDebugOutput);
@@ -4059,7 +5320,12 @@ DetonationResult InHouseOrchestrator::PrepareAndRun(
       }
       WriteTextFile(vmDiagnosticsPath,
                     FormatVmDiagnostics(vmSummary) +
-                        FormatBootReadObservations(bootReadObservations));
+                        FormatBootReadObservations(bootReadObservations) +
+                        FormatIdeReadAttribution(readAttribution) +
+                        FormatIdeWriteAttribution(writeAttribution) +
+                        FormatWindowsResidualRunOwners(windowsResidualOwners) +
+                        FormatIdeAccessTailAttribution(accessTailAttribution) +
+                        FormatEspBootstatSnapshot(bootstatSnapshot));
       result.dynamicSummary =
           ToDynamicSummary(vmSummary, networkMode, serialLogPath, vmSummaryPath);
       auto bootSignals = AnalyzeBootSignals(vmSummary);
@@ -4175,6 +5441,30 @@ DetonationResult InHouseOrchestrator::PrepareAndRun(
       }
       if (!bootReadObservations.empty()) {
         details["bootFileReads"] = BootReadDetails(bootReadObservations);
+      }
+      if (readAttribution.readCommands != 0) {
+        details["ideReadAttribution"] =
+            IdeReadAttributionDetails(readAttribution);
+        details["ideWindowsResidualRangeCount"] =
+            std::to_string(readAttribution.windowsResidualRanges.size());
+      }
+      if (writeAttribution.writeCommands != 0) {
+        details["ideWriteAttribution"] =
+            IdeWriteAttributionDetails(writeAttribution);
+      }
+      if (windowsResidualOwners.recordsScanned != 0 ||
+          !windowsResidualOwners.matches.empty()) {
+        details["ideWindowsResidualOwners"] =
+            WindowsResidualRunOwnerDetails(windowsResidualOwners);
+        details["ideWindowsResidualOwnerMatchCount"] =
+            std::to_string(windowsResidualOwners.matches.size());
+      }
+      if (!accessTailAttribution.empty()) {
+        details["ideAccessTailAttribution"] =
+            IdeAccessTailDetails(accessTailAttribution);
+      }
+      if (bootstatSnapshot.found) {
+        details["espBootstatPostRun"] = EspBootstatDetails(bootstatSnapshot);
       }
       if (vmSummary.timedOut) {
         details["reason"] = "timeout";
