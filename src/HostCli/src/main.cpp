@@ -1109,6 +1109,24 @@ std::string BcdObjectAlias(const std::string &guid) {
   if (upper == "{B2721D73-1DB4-4C62-BF78-C548A880142D}") {
     return "{memdiag}";
   }
+  if (upper == "{4636856E-540F-4170-A130-A84776F4C654}") {
+    return "{dbgsettings}";
+  }
+  if (upper == "{7EA2E1AC-2E61-4728-AAA3-896D9D0A9F0E}") {
+    return "{globalsettings}";
+  }
+  if (upper == "{6EFB52BF-1766-41DB-A6B3-0EE5EFF72BD7}") {
+    return "{bootloadersettings}";
+  }
+  if (upper == "{0CE4991B-E6B3-4B16-B23C-5E0D9250E5D9}") {
+    return "{emssettings}";
+  }
+  if (upper == "{1AFA9C49-16AB-4A5C-901B-212802DA9460}") {
+    return "{resumeloadersettings}";
+  }
+  if (upper == "{1CAE1EB7-A0DF-4D4D-9851-4860E34EF535}") {
+    return "{defaultbootentry}";
+  }
   return guid;
 }
 
@@ -2000,6 +2018,25 @@ void PrintBcdDecodedSummary(const std::vector<uint8_t> &bcdBytes,
     std::cout << "  MISSING default loader object " << defaultGuid << "\n";
   } else {
     std::cout << "  MISSING {bootmgr} default object reference\n";
+  }
+
+  // Walk the rest of the Objects key so settings objects (dbgsettings,
+  // globalsettings, bootloadersettings, emssettings, etc.) show up too.
+  // Skipping {bootmgr} and the {default} loader since they were already
+  // printed above.
+  const auto allObjects = hive.SubkeyIndexes(*objects);
+  std::cout << "BCD other objects (" << allObjects.size() << " total under Objects):\n";
+  for (const auto child : allObjects) {
+    const auto key = hive.ReadKey(child);
+    if (!key) {
+      continue;
+    }
+    if (EqualNoCase(key->name, bootmgrGuid) ||
+        (!defaultGuid.empty() && EqualNoCase(key->name, defaultGuid))) {
+      continue;
+    }
+    PrintBcdObjectLine(hive, child, key->name, partitions, {});
+    PrintBcdAllElements(hive, child, partitions);
   }
 
   const bool bootmgrOnEsp =

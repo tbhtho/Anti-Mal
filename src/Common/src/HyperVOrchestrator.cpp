@@ -1687,6 +1687,10 @@ struct BootOverlayPatchResult {
   bool debugTypePatched = false;
   bool debugPortPatched = false;
   bool baudRatePatched = false;
+  bool dbgSettingsFound = false;
+  bool dbgSettingsDebugTypePatched = false;
+  bool dbgSettingsDebugPortPatched = false;
+  bool dbgSettingsBaudRatePatched = false;
   std::vector<std::string> notes;
 };
 
@@ -1860,6 +1864,68 @@ bool PatchBcdDebugTransport(std::vector<uint8_t> &bcd,
   return changed;
 }
 
+// {dbgsettings} GUID per Microsoft BCD docs. winload reads bootdebug=true on
+// the loader, then pulls debugtype / debugport / baudrate from {dbgsettings}
+// via inheritance. Without these elements present somewhere readable,
+// bootdebug has no transport to attach to and winload stays silent on COM1.
+bool PatchBcdDbgSettings(std::vector<uint8_t> &bcd,
+                         BootOverlayPatchResult *result) {
+  MutableHiveView hive(bcd);
+  if (!hive.IsValid()) {
+    return false;
+  }
+  const auto root = hive.RootIndex();
+  const auto objects = root ? hive.FindSubkey(*root, "Objects") : std::nullopt;
+  if (!objects) {
+    return false;
+  }
+  const auto dbg =
+      hive.FindSubkey(*objects, "{4636856e-540f-4170-a130-a84776f4c654}");
+  if (!dbg) {
+    if (result) {
+      result->notes.push_back(
+          "BCD dbgsettings object not present; winload transport remains "
+          "loader-only");
+    }
+    return false;
+  }
+  if (result) {
+    result->dbgSettingsFound = true;
+  }
+  const auto elements = hive.FindSubkey(*dbg, "Elements");
+  if (!elements) {
+    if (result) {
+      result->notes.push_back("BCD dbgsettings Elements key missing");
+    }
+    return false;
+  }
+
+  bool changed = false;
+  if (AddBcdElementRaw(hive, *elements, "25000022", 3, BcdU64Bytes(0))) {
+    changed = true;
+    if (result) {
+      result->dbgSettingsDebugTypePatched = true;
+    }
+  }
+  if (AddBcdElementRaw(hive, *elements, "25000023", 3, BcdU64Bytes(1))) {
+    changed = true;
+    if (result) {
+      result->dbgSettingsDebugPortPatched = true;
+    }
+  }
+  if (AddBcdElementRaw(hive, *elements, "25000024", 3, BcdU64Bytes(115200))) {
+    changed = true;
+    if (result) {
+      result->dbgSettingsBaudRatePatched = true;
+    }
+  }
+  if (!changed && result) {
+    result->notes.push_back(
+        "BCD dbgsettings transport elements already present");
+  }
+  return changed;
+}
+
 bool BootOverlayPatchDisabled() {
   char buf[16]{};
   size_t needed = 0;
@@ -1910,7 +1976,9 @@ BootOverlayPatchResult ApplyEphemeralBootOverlay(hv::IBlockDevice &disk) {
         result.notes.push_back(
             "winload debug patch disabled by ANTIMAL_DISABLE_WINLOAD_DEBUG");
       } else {
-        transportChanged = PatchBcdDebugTransport(bytes, &result);
+        const bool loaderChanged = PatchBcdDebugTransport(bytes, &result);
+        const bool dbgChanged = PatchBcdDbgSettings(bytes, &result);
+        transportChanged = loaderChanged || dbgChanged;
       }
       if ((policyChanged || transportChanged) &&
           !fat.WriteFileSameSize(*bcd, bytes)) {
@@ -1920,6 +1988,9 @@ BootOverlayPatchResult ApplyEphemeralBootOverlay(hv::IBlockDevice &disk) {
         result.debugTypePatched = false;
         result.debugPortPatched = false;
         result.baudRatePatched = false;
+        result.dbgSettingsDebugTypePatched = false;
+        result.dbgSettingsDebugPortPatched = false;
+        result.dbgSettingsBaudRatePatched = false;
         result.notes.push_back("failed to write patched BCD to overlay");
       }
     }
@@ -1955,6 +2026,13 @@ BootOverlayPatchDetails(const BootOverlayPatchResult &patch) {
       {"debugTypePatched", patch.debugTypePatched ? "true" : "false"},
       {"debugPortPatched", patch.debugPortPatched ? "true" : "false"},
       {"baudRatePatched", patch.baudRatePatched ? "true" : "false"},
+      {"dbgSettingsFound", patch.dbgSettingsFound ? "true" : "false"},
+      {"dbgSettingsDebugTypePatched",
+       patch.dbgSettingsDebugTypePatched ? "true" : "false"},
+      {"dbgSettingsDebugPortPatched",
+       patch.dbgSettingsDebugPortPatched ? "true" : "false"},
+      {"dbgSettingsBaudRatePatched",
+       patch.dbgSettingsBaudRatePatched ? "true" : "false"},
       {"scope", "overlay-only"}};
   if (!patch.notes.empty()) {
     details["notes"] = JoinStrings(patch.notes, "; ");
