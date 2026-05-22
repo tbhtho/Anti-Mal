@@ -2,7 +2,7 @@
 
 AntiMal is a defensive malware-analysis scaffold for Windows. The long-term goal is a local, open-source interactive sandbox for safely detonating suspicious Windows binaries without relying on Windows Sandbox, VirtualBox, VMware, or commercial services.
 
-Overall progress: [█████████░░░░░░░░░] 45%
+Overall progress: [██████████░░░░░░░░] 50%
 
 ## Current Status
 
@@ -13,7 +13,7 @@ AntiMal has two major layers:
 
 The scanner can already hash files, calculate entropy, parse PE metadata, mine strings and IOCs, apply rules/tags, and optionally call external tools such as YARA, capa, and Detect It Easy when those binaries are present. Threat-intel lookup support exists for MalwareBazaar and VirusTotal, but outbound intel is off by default.
 
-The in-house VM path is past the toy stage but not finished. The WHP frontend can create a partition, run vCPUs, map RAM and OVMF firmware, emulate enough PC hardware for OVMF to boot, expose an IDE disk, stream OVMF debug output, create per-run copy-on-write overlays, and render host-side live progress frames. The current Windows boot probe reaches `bootmgfw.efi`, opens BCD and code-integrity policy files, applies overlay-only BCD/bootstat and SYSTEM boot-storage repairs, reads `winload.efi`, the SYSTEM hive, the Intel microcode image, and Windows boot fonts from the Windows partition, identifies transient `winload_prod.pdb` loader code in guest RAM during the handoff, brings up OVMF QemuVideo/GOP, and captures real guest framebuffer PNGs. That proves the 45% gate. The latest visible guest state is still Windows Recovery error `0xc0000225`, so the next work is pushing from loader execution into kernel/driver reads and GuestAgent user mode.
+The in-house VM path is past the toy stage but not finished. The WHP frontend can create a partition, run vCPUs, map RAM and OVMF firmware, emulate enough PC hardware for OVMF to boot, expose an IDE disk, stream OVMF debug output, create per-run copy-on-write overlays, and render host-side live progress frames. The current Windows boot probe reaches `bootmgfw.efi`, opens BCD and code-integrity policy files, applies overlay-only BCD/bootstat and SYSTEM boot-storage repairs, reads `winload.efi`, the SYSTEM hive, the Intel microcode image, and Windows boot fonts from the Windows partition, identifies transient `winload_prod.pdb` loader code in guest RAM during the handoff, brings up OVMF QemuVideo/GOP, and captures real guest framebuffer PNGs. With the new overlay-only probes (`ANTIMAL_PROBE_BCD_TESTSIGNING`, `ANTIMAL_PROBE_BCD_LEGACY_CONTEXT`, `ANTIMAL_PROBE_BCD_NOINTEGRITYCHECKS`, `ANTIMAL_PROBE_SYSTEM_LEGACY_SECURITY`) and PC-AT MADT Interrupt Source Overrides in place, the `bootmgfw -> winload` transition is no longer blocked by the old `ResetSystem(Shutdown)` loop: bootmgfw transfers control, winload runs past its CI policy + SYSTEM hive load, and execution settles into an EFI Runtime Services `GetTime` polling loop inside a small 16 KB `PcRtcDxe`-shaped runtime driver. That is the 50% gate. The visible blocker is no longer the Windows Recovery `0xc0000225` screen; it is winload's pre-kernel runtime-services wait, which the next work has to drive past into kernel/driver reads and GuestAgent user mode.
 
 Real malware execution remains intentionally blocked. The project stages samples and creates reports, but `dynamic_execution_enabled = false` is the default and `sampleExecuted` stays false until the benign GuestAgent channel, overlay discard, artifact return, and report pipeline are proven end to end.
 
@@ -253,6 +253,7 @@ rules/             tagger rules
 
 - 35%: complete. Static enrichment works; WHP/OVMF boot path reaches Windows Boot Manager.
 - 45%: complete. Windows reaches `winload.efi` as identified loader code in guest RAM, not just a disk read.
+- 50%: complete. bootmgfw transfers control to winload (no more `ResetSystem(Shutdown)` loop); winload runs past CI policy + SYSTEM hive load into its EFI Runtime Services `GetTime` polling phase inside `PcRtcDxe`-shaped runtime memory. Boot stage classifier reports `winload-pre-kernel`; the kernel-read gate (`WindowsKernelReadGateReached`) is defined and exposed in the report's host-channel output but not yet reached.
 - 55%: GuestAgent auto-starts in user mode and sends COM2 heartbeat.
 - 65%: Host sends a benign job to GuestAgent and receives journal/report artifacts.
 - 75%: Real screenshots/framebuffer and interactive input are usable.
