@@ -2118,6 +2118,16 @@ struct EspBootstatSnapshot {
     std::vector<size_t> offsets;
   };
 
+  struct DecodedRecord {
+    uint64_t offset = 0;
+    uint64_t length = 0;
+    std::string guid;
+    std::string guidAlias;
+    std::vector<std::string> embeddedAscii;
+    uint32_t dominantStatus = 0;
+    size_t dominantStatusCount = 0;
+  };
+
   bool found = false;
   uint64_t fileBytes = 0;
   size_t bytesRead = 0;
@@ -2127,7 +2137,125 @@ struct EspBootstatSnapshot {
   std::vector<uint8_t> headBytes;
   std::vector<std::pair<size_t, uint32_t>> statusLikeDwords;
   std::vector<StatusCandidate> lateStatusCandidates;
+  bool headerValid = false;
+  uint32_t headerVersion = 0;
+  uint32_t headerSize = 0;
+  uint32_t allocatedSize = 0;
+  uint32_t usedSize = 0;
+  std::vector<DecodedRecord> decodedRecords;
 };
+
+std::string BootstatFormatGuidLe(const uint8_t *bytes) {
+  char out[40]{};
+  _snprintf_s(out, sizeof(out), _TRUNCATE,
+              "{%02x%02x%02x%02x-%02x%02x-%02x%02x-%02x%02x-"
+              "%02x%02x%02x%02x%02x%02x}",
+              bytes[3], bytes[2], bytes[1], bytes[0], bytes[5], bytes[4],
+              bytes[7], bytes[6], bytes[8], bytes[9], bytes[10], bytes[11],
+              bytes[12], bytes[13], bytes[14], bytes[15]);
+  return out;
+}
+
+std::string BootstatGuidAlias(const std::string &guid) {
+  // Well-known BCD object GUIDs we may see recorded in bootstat.dat.
+  if (guid == "{9dea862c-5cdd-4e70-acc1-f32b344d4795}") {
+    return "{bootmgr}";
+  }
+  if (guid == "{4636856e-540f-4170-a130-a84776f4c654}") {
+    return "{dbgsettings}";
+  }
+  if (guid == "{7ea2e1ac-2e61-4728-aaa3-896d9d0a9f0e}") {
+    return "{globalsettings}";
+  }
+  if (guid == "{6efb52bf-1766-41db-a6b3-0ee5eff72bd7}") {
+    return "{bootloadersettings}";
+  }
+  if (guid == "{0ce4991b-e6b3-4b16-b23c-5e0d9250e5d9}") {
+    return "{emssettings}";
+  }
+  if (guid == "{1afa9c49-16ab-4a5c-901b-212802da9460}") {
+    return "{resumeloadersettings}";
+  }
+  return {};
+}
+
+std::vector<std::string> BootstatExtractAscii(const uint8_t *data, size_t size,
+                                              size_t minLen, size_t maxStrings) {
+  std::vector<std::string> out;
+  std::string current;
+  for (size_t i = 0; i < size && out.size() < maxStrings; ++i) {
+    const uint8_t byte = data[i];
+    const bool printable = byte >= 0x20 && byte < 0x7F;
+    if (printable) {
+      current.push_back(static_cast<char>(byte));
+      continue;
+    }
+    if (current.size() >= minLen) {
+      out.push_back(current);
+    }
+    current.clear();
+  }
+  if (current.size() >= minLen && out.size() < maxStrings) {
+    out.push_back(current);
+  }
+  return out;
+}
+
+void DecodeBootstatRecords(EspBootstatSnapshot &snapshot,
+                           const std::vector<uint8_t> &bytes) {
+  if (bytes.size() < 16) {
+    return;
+  }
+  snapshot.headerVersion = ReadLe32(bytes.data());
+  snapshot.headerSize = ReadLe32(bytes.data() + 4);
+  snapshot.allocatedSize = ReadLe32(bytes.data() + 8);
+  snapshot.usedSize = ReadLe32(bytes.data() + 12);
+  if (snapshot.headerSize < 16 || snapshot.headerSize > bytes.size() ||
+      snapshot.usedSize > bytes.size() || snapshot.usedSize == 0) {
+    return;
+  }
+  snapshot.headerValid = true;
+
+  const size_t walkLimit =
+      std::min<size_t>(snapshot.usedSize, bytes.size());
+  size_t offset = snapshot.headerSize;
+  const size_t maxRecords = 16;
+  while (offset + 24 <= walkLimit && snapshot.decodedRecords.size() < maxRecords) {
+    const uint64_t length = ReadLe64(bytes.data() + offset);
+    if (length < 24 || length > walkLimit - offset) {
+      break;
+    }
+    EspBootstatSnapshot::DecodedRecord record;
+    record.offset = offset;
+    record.length = length;
+    record.guid = BootstatFormatGuidLe(bytes.data() + offset + 8);
+    record.guidAlias = BootstatGuidAlias(record.guid);
+
+    const size_t payloadStart = offset + 24;
+    const size_t payloadSize = static_cast<size_t>(length) - 24;
+    record.embeddedAscii =
+        BootstatExtractAscii(bytes.data() + payloadStart, payloadSize, 8, 6);
+
+    std::map<uint32_t, size_t> statusCounts;
+    for (size_t i = payloadStart;
+         i + sizeof(uint32_t) <= payloadStart + payloadSize; i += 4) {
+      const uint32_t value = ReadLe32(bytes.data() + i);
+      if ((value & 0xFFF00000u) != 0xC0000000u || value == 0xFFFFFFFFu) {
+        continue;
+      }
+      ++statusCounts[value];
+    }
+    for (const auto &[value, count] : statusCounts) {
+      if (count > record.dominantStatusCount) {
+        record.dominantStatus = value;
+        record.dominantStatusCount = count;
+      }
+    }
+
+    snapshot.decodedRecords.push_back(std::move(record));
+    offset += static_cast<size_t>(length);
+  }
+}
 
 EspBootstatSnapshot CaptureEspBootstatSnapshot(hv::IBlockDevice &disk) {
   EspBootstatSnapshot snapshot;
@@ -2192,6 +2320,7 @@ EspBootstatSnapshot CaptureEspBootstatSnapshot(hv::IBlockDevice &disk) {
               }
               return lhs.offsets.front() < rhs.offsets.front();
             });
+  DecodeBootstatRecords(snapshot, bytes);
   return snapshot;
 }
 
@@ -2293,6 +2422,44 @@ std::string FormatEspBootstatSnapshot(const EspBootstatSnapshot &snapshot) {
         << BootstatStatusCandidateText(snapshot.lateStatusCandidates[i], true)
         << "\n";
   }
+  out << "  decodedHeader: valid=" << (snapshot.headerValid ? "true" : "false");
+  if (snapshot.headerValid) {
+    out << " version=" << snapshot.headerVersion
+        << " headerSize=" << snapshot.headerSize
+        << " allocatedSize=" << snapshot.allocatedSize
+        << " usedSize=" << snapshot.usedSize;
+  }
+  out << " records=" << snapshot.decodedRecords.size() << "\n";
+  for (size_t i = 0; i < snapshot.decodedRecords.size(); ++i) {
+    const auto &record = snapshot.decodedRecords[i];
+    out << "    [" << i << "] offset=" << record.offset
+        << " length=" << record.length << " guid=" << record.guid;
+    if (!record.guidAlias.empty()) {
+      out << " alias=" << record.guidAlias;
+    }
+    if (record.dominantStatusCount != 0) {
+      out << " dominantStatus=" << HexDword(record.dominantStatus);
+      if (const auto *name = KnownNtStatusName(record.dominantStatus)) {
+        out << " " << name;
+      }
+      out << " x" << record.dominantStatusCount;
+    }
+    if (!record.embeddedAscii.empty()) {
+      out << " ascii=[";
+      const size_t cap = std::min<size_t>(record.embeddedAscii.size(), 4);
+      for (size_t j = 0; j < cap; ++j) {
+        if (j) {
+          out << ", ";
+        }
+        out << "\"" << record.embeddedAscii[j] << "\"";
+      }
+      if (record.embeddedAscii.size() > cap) {
+        out << ", ...";
+      }
+      out << "]";
+    }
+    out << "\n";
+  }
   return out.str();
 }
 
@@ -2323,6 +2490,23 @@ std::string EspBootstatDetails(const EspBootstatSnapshot &snapshot) {
     out << "; offset=0x" << std::hex << std::uppercase
         << snapshot.statusLikeDwords[i].first << " value=0x"
         << snapshot.statusLikeDwords[i].second << std::dec;
+  }
+  out << "; decodedHeaderValid="
+      << (snapshot.headerValid ? "true" : "false")
+      << " decodedRecords=" << snapshot.decodedRecords.size();
+  const size_t recordLimit =
+      std::min<size_t>(snapshot.decodedRecords.size(), 3);
+  for (size_t i = 0; i < recordLimit; ++i) {
+    const auto &record = snapshot.decodedRecords[i];
+    out << "; record[" << i << "]="
+        << (record.guidAlias.empty() ? record.guid : record.guidAlias);
+    if (record.dominantStatusCount != 0) {
+      out << " status=" << HexDword(record.dominantStatus) << "x"
+          << record.dominantStatusCount;
+    }
+    if (!record.embeddedAscii.empty()) {
+      out << " name=" << record.embeddedAscii.front();
+    }
   }
   return out.str();
 }
