@@ -5389,6 +5389,16 @@ std::string FormatVmDiagnostics(const hv::VmRunSummary &vm) {
       out << "hotspot" << i << "Hits: " << hotspot.hits << "\n";
       const auto prefix = "hotspot" + std::to_string(i);
       writeImage(out, prefix.c_str(), hotspot.image);
+      if (hotspot.ripBytesValid) {
+        out << prefix << "Bytes:";
+        for (size_t b = 0; b < sizeof(hotspot.ripBytes); ++b) {
+          char hex[8]{};
+          _snprintf_s(hex, sizeof(hex), _TRUNCATE, " %02X",
+                      static_cast<unsigned int>(hotspot.ripBytes[b]));
+          out << hex;
+        }
+        out << "\n";
+      }
     }
   }
   if (!vm.residentImages.empty()) {

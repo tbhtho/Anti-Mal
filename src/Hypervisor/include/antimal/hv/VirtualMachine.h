@@ -53,6 +53,13 @@ struct VmRipHotspotImageInfo {
   uint64_t ripBucket = 0;
   uint64_t hits = 0;
   VmGuestImageInfo image;
+  // 32 bytes captured at ripBucket so the host-side diagnostics can render a
+  // raw disassembly window for the hottest loops without re-attaching to the
+  // VM. ripBytesValid stays false when the guest mapping was gone by the time
+  // the post-run summary collected the hotspots (e.g. transient firmware
+  // images that have already been freed).
+  bool ripBytesValid = false;
+  uint8_t ripBytes[32]{};
 };
 
 struct VmApRunState {

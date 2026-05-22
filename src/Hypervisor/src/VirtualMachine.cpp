@@ -1569,6 +1569,8 @@ VmRunSummary VirtualMachine::RunLoop(
       sample.ripBucket = ripBucket;
       sample.hits = hits;
       (void)IdentifyGuestImage(ripBucket, &sample.image);
+      sample.ripBytesValid =
+          ReadGuestMemory(ripBucket, sample.ripBytes, sizeof(sample.ripBytes));
       summary.ripHotspotImages.push_back(std::move(sample));
     }
   }
