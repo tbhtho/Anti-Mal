@@ -3175,7 +3175,9 @@ std::string CaptureOverlayBcdSummary(hv::IBlockDevice &disk) {
         << " baudrate="
         << BcdElementValueText(hive, *defaultObject, "25000024")
         << " nointegritychecks="
-        << BcdElementValueText(hive, *defaultObject, "26000048") << "\n";
+        << BcdElementValueText(hive, *defaultObject, "26000048")
+        << " testsigning="
+        << BcdElementValueText(hive, *defaultObject, "26000049") << "\n";
   } else {
     out << "  {default}: missing\n";
   }
@@ -3216,6 +3218,8 @@ struct BootOverlayPatchResult {
   bool noIntegrityChecksPatched = false;
   bool legacyBootContextProbeEnabled = false;
   bool isolatedContextPatched = false;
+  bool testSigningProbeEnabled = false;
+  bool testSigningPatched = false;
   bool systemLegacySecurityProbeEnabled = false;
   bool systemLegacySecurityPatched = false;
   std::vector<std::string> notes;
@@ -3551,6 +3555,46 @@ bool PatchBcdLegacyBootContextProbe(std::vector<uint8_t> &bcd,
   return false;
 }
 
+bool PatchBcdTestSigningProbe(std::vector<uint8_t> &bcd,
+                              BootOverlayPatchResult *result) {
+  MutableHiveView hive(bcd);
+  if (!hive.IsValid()) {
+    return false;
+  }
+  const auto root = hive.RootIndex();
+  const auto objects = root ? hive.FindSubkey(*root, "Objects") : std::nullopt;
+  const auto bootmgr =
+      objects ? hive.FindSubkey(*objects,
+                                "{9dea862c-5cdd-4e70-acc1-f32b344d4795}")
+              : std::nullopt;
+  const std::string defaultGuid =
+      bootmgr ? BcdElementString(hive, *bootmgr, "23000003") : std::string{};
+  const auto defaultObject =
+      !defaultGuid.empty() && objects ? hive.FindSubkey(*objects, defaultGuid)
+                                      : std::nullopt;
+  const auto elements =
+      defaultObject ? hive.FindSubkey(*defaultObject, "Elements") : std::nullopt;
+  if (!elements) {
+    if (result) {
+      result->notes.push_back(
+          "BCD testsigning probe: default loader Elements key not found");
+    }
+    return false;
+  }
+
+  if (UpsertBcdElementRaw(hive, *elements, "26000049", 3,
+                          std::vector<uint8_t>{1})) {
+    if (result) {
+      result->testSigningPatched = true;
+    }
+    return true;
+  }
+  if (result) {
+    result->notes.push_back("BCD testsigning probe failed to set element");
+  }
+  return false;
+}
+
 bool BootOverlayPatchDisabled() {
   char buf[16]{};
   size_t needed = 0;
@@ -3580,6 +3624,14 @@ bool LegacyBootContextProbeEnabled() {
   size_t needed = 0;
   return getenv_s(&needed, buf, sizeof(buf),
                   "ANTIMAL_PROBE_BCD_LEGACY_CONTEXT") == 0 &&
+         needed > 1 && buf[0] != '\0' && std::atoi(buf) != 0;
+}
+
+bool TestSigningProbeEnabled() {
+  char buf[16]{};
+  size_t needed = 0;
+  return getenv_s(&needed, buf, sizeof(buf),
+                  "ANTIMAL_PROBE_BCD_TESTSIGNING") == 0 &&
          needed > 1 && buf[0] != '\0' && std::atoi(buf) != 0;
 }
 
@@ -3646,8 +3698,15 @@ BootOverlayPatchResult ApplyEphemeralBootOverlay(hv::IBlockDevice &disk) {
             "ANTIMAL_PROBE_BCD_LEGACY_CONTEXT");
         legacyContextChanged = PatchBcdLegacyBootContextProbe(bytes, &result);
       }
+      bool testSigningChanged = false;
+      result.testSigningProbeEnabled = TestSigningProbeEnabled();
+      if (result.testSigningProbeEnabled) {
+        result.notes.push_back(
+            "BCD testsigning probe enabled by ANTIMAL_PROBE_BCD_TESTSIGNING");
+        testSigningChanged = PatchBcdTestSigningProbe(bytes, &result);
+      }
       if ((policyChanged || transportChanged || noIntegrityChanged ||
-           legacyContextChanged) &&
+           legacyContextChanged || testSigningChanged) &&
           !fat.WriteFileSameSize(*bcd, bytes)) {
         result.bcdPolicyPatched = false;
         result.recoveryPatched = false;
@@ -3661,6 +3720,7 @@ BootOverlayPatchResult ApplyEphemeralBootOverlay(hv::IBlockDevice &disk) {
         result.bootmgrBootDebugPatched = false;
         result.noIntegrityChecksPatched = false;
         result.isolatedContextPatched = false;
+        result.testSigningPatched = false;
         result.notes.push_back("failed to write patched BCD to overlay");
       }
     }
@@ -3713,6 +3773,10 @@ BootOverlayPatchDetails(const BootOverlayPatchResult &patch) {
        patch.legacyBootContextProbeEnabled ? "true" : "false"},
       {"isolatedContextPatched",
        patch.isolatedContextPatched ? "true" : "false"},
+      {"testSigningProbeEnabled",
+       patch.testSigningProbeEnabled ? "true" : "false"},
+      {"testSigningPatched",
+       patch.testSigningPatched ? "true" : "false"},
       {"systemLegacySecurityProbeEnabled",
        patch.systemLegacySecurityProbeEnabled ? "true" : "false"},
       {"systemLegacySecurityPatched",
