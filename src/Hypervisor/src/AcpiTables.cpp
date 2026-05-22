@@ -565,6 +565,29 @@ uint32_t AppendMadt(std::vector<uint8_t> &out, uint32_t processorCount) {
   PutLe32(out, 0xFEC00000u);
   PutLe32(out, 0); // GSI base.
 
+  // Interrupt Source Override entries. Without these the guest assumes
+  // identity mapping (ISA IRQ N -> GSI N) and inherits the ISA defaults
+  // (edge / active high) for every line. The standard PC-AT topology that
+  // bootmgfw/winload/the Windows kernel actually expect on a PIIX4 board
+  // remaps the legacy PIT off IRQ0 onto GSI 2 (because GSI 0 is wired to
+  // LINT0 for SMP NMI delivery) and rewires the SCI on IRQ 9 as
+  // active-low / level-triggered. We emit both so the guest's ACPI
+  // initialisation does not fall back to "8259 only" mode and start
+  // masking everything.
+  out.push_back(2); // Interrupt Source Override (PIT IRQ0 -> GSI 2).
+  out.push_back(10);
+  out.push_back(0);    // Bus: ISA.
+  out.push_back(0);    // Source: ISA IRQ 0.
+  PutLe32(out, 2);     // Global system interrupt.
+  PutLe16(out, 0x0000); // Flags: conforms (defaults to edge / high on ISA).
+
+  out.push_back(2); // Interrupt Source Override (SCI IRQ9 -> GSI 9, lvl/low).
+  out.push_back(10);
+  out.push_back(0);     // Bus: ISA.
+  out.push_back(9);     // Source: ISA IRQ 9.
+  PutLe32(out, 9);      // Global system interrupt.
+  PutLe16(out, 0x000D); // Active-low (11b), level-triggered (11b).
+
   out.push_back(4); // Local APIC NMI.
   out.push_back(6);
   out.push_back(0xFF); // All processors.

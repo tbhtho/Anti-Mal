@@ -448,6 +448,21 @@ void TestAcpiTables() {
          "ACPI: MADT first LAPIC enabled");
   Expect(ReadLe32(acpi.tables, acpi.offsets.madt + 56) == 0xFEC00000u,
          "ACPI: MADT IOAPIC address");
+  Expect(acpi.tables[acpi.offsets.madt + 64] == 2,
+         "ACPI: MADT first ISO entry is Interrupt Source Override type");
+  Expect(acpi.tables[acpi.offsets.madt + 67] == 0,
+         "ACPI: MADT ISO #1 sources ISA IRQ 0");
+  Expect(ReadLe32(acpi.tables, acpi.offsets.madt + 68) == 2,
+         "ACPI: MADT ISO #1 remaps PIT to GSI 2");
+  Expect(acpi.tables[acpi.offsets.madt + 74] == 2,
+         "ACPI: MADT second ISO entry is Interrupt Source Override type");
+  Expect(acpi.tables[acpi.offsets.madt + 77] == 9,
+         "ACPI: MADT ISO #2 sources ISA IRQ 9");
+  Expect(ReadLe32(acpi.tables, acpi.offsets.madt + 78) == 9,
+         "ACPI: MADT ISO #2 keeps SCI on GSI 9");
+  Expect(acpi.tables[acpi.offsets.madt + 82] == 0x0D &&
+             acpi.tables[acpi.offsets.madt + 83] == 0x00,
+         "ACPI: MADT ISO #2 marks SCI active-low / level-triggered");
   Expect(ReadLe32(acpi.tables, acpi.offsets.hpet + 36) ==
              antimal::hv::HpetDevice::kEventTimerBlockId,
          "ACPI: HPET event timer block ID");
