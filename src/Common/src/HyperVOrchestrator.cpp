@@ -3812,6 +3812,18 @@ bool LegacyBootContextProbeEnabled() {
 }
 
 bool TestSigningProbeEnabled() {
+  // WARNING: integration runs c9f4aa7d-... and 9335e90e-... both with this
+  // probe enabled regressed the visible guest UI from the modern blue WinRE
+  // "Recovery / Press Enter to try again" screen back to the legacy black
+  // bootmgr "Windows failed to start ... Status: 0xc0000225" screen, and
+  // suppressed all 1900 lines of OVMF debugcon output that the runs without
+  // testsigning still produce. Comparison run 27ec53da-... with the same
+  // overlay state but testsigning OFF restored both the blue UI and the
+  // expected firmware log. Probe stays in the codebase because it is the
+  // right place to wire a future test-signed loader chain, but leave the
+  // env var unset until that scenario actually applies; setting it against
+  // a production-signed Windows install makes the failure point earlier
+  // and the diagnostics blinder.
   char buf[16]{};
   size_t needed = 0;
   return getenv_s(&needed, buf, sizeof(buf),
