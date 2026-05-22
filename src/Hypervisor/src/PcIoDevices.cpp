@@ -271,6 +271,19 @@ void PcIoDevices::OnWrite(uint16_t port, uint32_t value, uint8_t accessSize) {
             lastSleepType_ == 4 || lastSleepType_ == 5;
         if (lastPm1HostStopRequested_) {
           shutdownRequested_ = true;
+        } else {
+          // PIIX4 SLP_EN is auto-clear once the sleep transition is
+          // observed. For S0 (working state) the transition is instant; we
+          // never actually park the CPU. Leaving SLP_EN asserted in
+          // pm1Control_ traps the guest into polling pm1Control until the
+          // bit clears, which never happens. Run 6c8c7e7d-... showed
+          // winload spinning ~4.4M EFI GetTime calls in this exact state
+          // after writing 0x2001 (SCI_EN + SLP_EN, SLP_TYP=0). Clearing
+          // SLP_EN here matches the silicon contract: the level remains
+          // set only long enough for the host to observe the request.
+          pm1Control_ =
+              static_cast<uint16_t>(pm1Control_ & ~0x2000u);
+          lastPm1SleepEnable_ = false;
         }
       } else {
         lastPm1HostStopRequested_ = false;

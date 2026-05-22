@@ -520,12 +520,12 @@ void TestPcIoPmSleepByteWrites() {
          "PM1 control: S0 sleep enable does not request host shutdown");
   Expect(pc.LastSleepType() == 0,
          "PM1 control: S0 sleep type is recorded");
-  Expect(pc.LastPm1SleepEnable(),
-         "PM1 control: S0 sleep enable is recorded");
+  Expect(!pc.LastPm1SleepEnable(),
+         "PM1 control: SLP_EN auto-clears for S0 per PIIX4 contract");
   Expect(!pc.LastPm1HostStopRequested(),
          "PM1 control: S0 sleep enable is diagnostic only");
-  Expect(pc.LastPm1ControlValue() == 0x2001,
-         "PM1 control: raw S0 value is recorded");
+  Expect(pc.LastPm1ControlValue() == 0x0001,
+         "PM1 control: S0 write keeps SCI_EN set after SLP_EN auto-clears");
 
   antimal::hv::PcIoDevices pcS5;
   pcS5.OnWrite(0xB004, 0x00, 1);
