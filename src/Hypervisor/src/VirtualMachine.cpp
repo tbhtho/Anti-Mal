@@ -1,4 +1,4 @@
-#include "antimal/hv/VirtualMachine.h"
+﻿#include "antimal/hv/VirtualMachine.h"
 
 #include <Windows.h>
 
@@ -73,6 +73,23 @@ std::string FormatLegacyIrqState(const IoApic &ioApic,
       << static_cast<int>(picMask) << std::dec
       << " picMasked=" << (picMasked ? "true" : "false");
   return out.str();
+}
+
+void RecordCpuidSample(VmRunSummary &summary,
+                       const CpuidExitResult &sample) {
+  for (auto &existing : summary.cpuidSamples) {
+    if (existing.vcpuIndex == sample.vcpuIndex && existing.leaf == sample.leaf &&
+        existing.subleaf == sample.subleaf) {
+      if (sample.overridden && !existing.overridden) {
+        existing = sample;
+      }
+      return;
+    }
+  }
+  constexpr size_t kMaxCpuidSamples = 128;
+  if (summary.cpuidSamples.size() < kMaxCpuidSamples) {
+    summary.cpuidSamples.push_back(sample);
+  }
 }
 
 std::string ExtractCodeViewPath(const uint8_t *bytes, size_t length,
@@ -158,16 +175,10 @@ VirtualMachine::VirtualMachine(const std::filesystem::path &firmwarePath,
       std::memset(firmwareUpperScratch_->HostPtr(), 0, upperSize);
     }
   }
-  // Map the IOAPIC and HPET MMIO ranges as read-only traps. WHP rejects
-  // zero-permission mappings (E_INVALIDARG), but read-only is accepted and
-  // causes guest *writes* to these addresses to trigger EPT write-violation
-  // exits (WHvRunVpExitReasonMemoryAccess). Guest reads hit the zero-filled
-  // host buffer — the MMIO exit handler patches in the correct device-model
-  // value before resuming.
-  ioApicTrap_ = std::make_unique<GuestMemoryRegion>(
-      host_, IoApic::kDefaultMmioBase, kPageSize, GuestMemoryProt::ReadOnly);
-  hpetTrap_ = std::make_unique<GuestMemoryRegion>(
-      host_, HpetDevice::kDefaultMmioBase, kPageSize, GuestMemoryProt::ReadOnly);
+  // Leave IOAPIC and HPET GPA pages unmapped so both reads and writes produce
+  // WHP memory-access exits and flow through the MMIO emulator. Read-only trap
+  // pages catch writes only; reads would see zeros and make the advertised
+  // ACPI/APIC devices look absent or malformed to firmware and winload.
 
   PcIoMemoryLayout layout{};
   layout.lowRamBytes =
@@ -186,6 +197,7 @@ VirtualMachine::VirtualMachine(const std::filesystem::path &firmwarePath,
   ioApic_.SetDeliveryCallback(&VirtualMachine::DeliverIoApicVector, this);
   mmioBus_.Attach(&ioApic_);
   mmioBus_.Attach(&hpet_);
+  mmioBus_.Attach(&tpm_);
   AttachDefaultDevices();
   if (ideDisk) {
     AttachIdeDisk(ideDisk);
@@ -704,7 +716,8 @@ VmRunSummary VirtualMachine::Run(const VmRunRequest &request) {
                          std::chrono::steady_clock::now() + timeout,
                          request.progressCallback, request.progressInterval,
                          request.cancelRequested, request.keyboardScancodes,
-                         request.keyboardInjectAfter);
+                         request.keyboardInjectAfter,
+                         request.keyboardBursts);
   summary.networkMode = request.networkMode;
   return summary;
 }
@@ -715,7 +728,8 @@ VmRunSummary VirtualMachine::RunLoop(
     std::chrono::milliseconds progressInterval,
     std::shared_ptr<std::atomic_bool> cancelRequested,
     std::vector<uint8_t> keyboardScancodes,
-    std::chrono::milliseconds keyboardInjectAfter) {
+    std::chrono::milliseconds keyboardInjectAfter,
+    std::vector<VmRunRequest::KeyboardBurst> keyboardBursts) {
   VmRunSummary summary;
   summary.started = true;
   summary.processorCount = host_.ProcessorCount();
@@ -864,6 +878,20 @@ VmRunSummary VirtualMachine::RunLoop(
   const auto runStarted = std::chrono::steady_clock::now();
   auto lastProgressFire = runStarted;
   bool keyboardInjected = keyboardScancodes.empty();
+  KdSerialDebugger kdDebugger;
+  size_t kdCom1Cursor = 0;
+  auto queueKdHostReset = [&](const char *reason) {
+    kdDebugger.QueueHostReset(reason);
+    const auto replies = kdDebugger.PullReplies();
+    if (!replies.empty()) {
+      com1_.QueueRxBytes(replies);
+    }
+  };
+  queueKdHostReset("initial host KD reset/resync probe");
+  auto lastKdHostReset = runStarted;
+  uint32_t kdHostResetBursts = 1;
+  constexpr uint32_t kKdHostResetBurstLimit = 60;
+  constexpr auto kKdHostResetInterval = std::chrono::milliseconds(500);
 
   // Per-BSP RIP-at-exit ring + 16-byte-bucket hotspot histogram. Both are
   // free observability: we already have the exit context in hand, no extra
@@ -1077,7 +1105,7 @@ VmRunSummary VirtualMachine::RunLoop(
       madeProgress = true;
       summary.cpuidLeafHistogram[
           static_cast<uint32_t>(ctx.CpuidAccess.Rax)]++;
-      vcpu_.EmulateCpuidExit();
+      RecordCpuidSample(summary, vcpu_.EmulateCpuidExit());
       break;
     case WHvRunVpExitReasonException: {
       const auto &ex = ctx.VpException;
@@ -1191,7 +1219,7 @@ VmRunSummary VirtualMachine::RunLoop(
       }
       if (sameCanceledRipStreak >= 32) {
         // The vCPU is wedged at the same RIP across many cancellations even
-        // though it isn't sitting on a HLT — give up.
+        // though it isn't sitting on a HLT â€” give up.
         summary.idleLoop = true;
       }
       break;
@@ -1210,6 +1238,30 @@ VmRunSummary VirtualMachine::RunLoop(
       lastIdeCommands = totalIdeCommands;
       captureLowRamImages(&summary.observedImages, 256);
       madeProgress = true;
+    }
+
+    const auto kdBytes = com1_.PullSince(kdCom1Cursor);
+    kdCom1Cursor = com1_.CapturedBytes();
+    if (!kdBytes.empty()) {
+      const auto beforePackets = kdDebugger.Summary().packetsReceived;
+      kdDebugger.PushBytes(kdBytes);
+      const auto replies = kdDebugger.PullReplies();
+      if (!replies.empty()) {
+        com1_.QueueRxBytes(replies);
+        madeProgress = true;
+      }
+      if (kdDebugger.Summary().packetsReceived != beforePackets) {
+        madeProgress = true;
+      }
+    }
+    const auto nowForKd = std::chrono::steady_clock::now();
+    if (kdDebugger.Summary().bytesObserved == 0 &&
+        kdHostResetBursts < kKdHostResetBurstLimit &&
+        nowForKd - lastKdHostReset >= kKdHostResetInterval &&
+        !com1_.RxDataReady()) {
+      queueKdHostReset("periodic host KD reset/resync probe");
+      lastKdHostReset = nowForKd;
+      ++kdHostResetBursts;
     }
 
     // After each guest exit, look at the IDE channels for a pending IRQ and
@@ -1314,6 +1366,16 @@ VmRunSummary VirtualMachine::RunLoop(
       keyboardInjected = true;
       madeProgress = true;
     }
+    for (auto &burst : keyboardBursts) {
+      if (!burst.scancodes.empty() && now - runStarted >= burst.delay) {
+        ps2_.InjectKeyboardScancodes(burst.scancodes.data(),
+                                     burst.scancodes.size());
+        summary.keyboardScancodesInjected +=
+            static_cast<int>(burst.scancodes.size());
+        burst.scancodes.clear();
+        madeProgress = true;
+      }
+    }
     if (progressCallback && now - lastProgressFire >= progressInterval) {
       VmProgressSnapshot snapshot{};
       snapshot.steps = summary.steps;
@@ -1398,7 +1460,7 @@ VmRunSummary VirtualMachine::RunLoop(
       try {
         progressCallback(snapshot);
       } catch (...) {
-        // Progress is best-effort — the VM must not be derailed by a buggy
+        // Progress is best-effort â€” the VM must not be derailed by a buggy
         // callback. Swallow.
       }
       lastProgressFire = now;
@@ -1456,6 +1518,36 @@ VmRunSummary VirtualMachine::RunLoop(
   summary.serialOutput = com1_.Captured();
   summary.firmwareDebugOutput = pcIo_.DebugOutput();
   summary.hostChannelOutput = com2_.Captured();
+  const auto com1Stats = com1_.Stats();
+  summary.com1RegisterReads = com1Stats.registerReads;
+  summary.com1RegisterWrites = com1Stats.registerWrites;
+  summary.com1DataReads = com1Stats.dataReads;
+  summary.com1DataWrites = com1Stats.dataWrites;
+  summary.com1RxBytesQueued = com1Stats.rxBytesQueued;
+  summary.com1RxBytesRead = com1Stats.rxBytesRead;
+  summary.com1RxBytesCleared = com1Stats.rxBytesCleared;
+  summary.com1IerWrites = com1Stats.ierWrites;
+  summary.com1FcrWrites = com1Stats.fcrWrites;
+  summary.com1LcrWrites = com1Stats.lcrWrites;
+  summary.com1McrWrites = com1Stats.mcrWrites;
+  summary.com1DllWrites = com1Stats.dllWrites;
+  summary.com1DlmWrites = com1Stats.dlmWrites;
+  summary.com1IirReads = com1Stats.iirReads;
+  summary.com1LsrReads = com1Stats.lsrReads;
+  summary.com1Ier = com1Stats.ier;
+  summary.com1Fcr = com1Stats.fcr;
+  summary.com1Lcr = com1Stats.lcr;
+  summary.com1Mcr = com1Stats.mcr;
+  summary.com1Dll = com1Stats.dll;
+  summary.com1Dlm = com1Stats.dlm;
+  summary.com1Dlab = com1Stats.dlab;
+  summary.com1RxInterruptEnabled = com1Stats.rxInterruptEnabled;
+  summary.com1RxDataReady = com1Stats.rxDataReady;
+  summary.kdCom1RxQueuedBytes = com1_.RxQueuedBytes();
+  summary.kdSummary = kdDebugger.Summary();
+  summary.kdEvents = kdDebugger.Events();
+  summary.kdTranscript = kdDebugger.Transcript();
+  summary.kdPacketsJsonl = kdDebugger.PacketsJsonl();
   summary.ideCommandsIssued = (ide_ ? ide_->CommandsIssued() : 0) +
                               (secondaryIde_ ? secondaryIde_->CommandsIssued()
                                              : 0);
@@ -1528,6 +1620,17 @@ VmRunSummary VirtualMachine::RunLoop(
   summary.hpetWrites = hpet_.Writes();
   summary.pitInterruptsPending = pcIo_.PitInterruptPending() ? 1 : 0;
   summary.rtcInterruptsPending = pcIo_.RtcInterruptPending() ? 1 : 0;
+  summary.ps2StatusReads = ps2_.StatusReads();
+  summary.ps2DataReads = ps2_.DataReads();
+  summary.ps2CommandWrites = ps2_.CommandWrites();
+  summary.ps2DataWrites = ps2_.DataWrites();
+  summary.ps2KeyboardBytesQueued = ps2_.KeyboardBytesQueued();
+  summary.ps2KeyboardBytesRead = ps2_.KeyboardBytesRead();
+  summary.ps2MouseBytesQueued = ps2_.MouseBytesQueued();
+  summary.ps2MouseBytesRead = ps2_.MouseBytesRead();
+  summary.ps2KeyboardPortEnabled = ps2_.KeyboardPortEnabled();
+  summary.ps2MousePortEnabled = ps2_.MousePortEnabled();
+  summary.ps2KeyboardScanningEnabled = ps2_.KeyboardScanningEnabled();
   summary.pitIrqsDelivered = pcIo_.PitIrqCount();
   summary.rtcIrqsDelivered = pcIo_.RtcIrqCount();
   summary.fwCfgFileDirBytesRead = pcIo_.FwCfgFileDirBytesRead();
@@ -1535,6 +1638,8 @@ VmRunSummary VirtualMachine::RunLoop(
   summary.fwCfgAcpiTableBytesRead = pcIo_.FwCfgAcpiTableBytesRead();
   summary.fwCfgTableLoaderBytesRead = pcIo_.FwCfgTableLoaderBytesRead();
   summary.fwCfgRsdpBytesRead = pcIo_.FwCfgRsdpBytesRead();
+  summary.fwCfgSmbiosTableBytesRead = pcIo_.FwCfgSmbiosTableBytesRead();
+  summary.fwCfgSmbiosAnchorBytesRead = pcIo_.FwCfgSmbiosAnchorBytesRead();
   const auto &cmos = pcIo_.CmosReadHistogram();
   for (size_t i = 0; i < cmos.size(); ++i) {
     if (cmos[i] != 0) {
@@ -1580,8 +1685,9 @@ VmRunSummary VirtualMachine::RunLoop(
   captureLowRamImages(&summary.observedImages, 256);
   captureLowRamImages(&summary.residentImages, 128);
   summary.recentCmosAccesses = pcIo_.RecentCmosAccesses();
-  for (const uint8_t irq : {uint8_t{0}, uint8_t{3}, uint8_t{4}, uint8_t{8},
-                            uint8_t{14}, uint8_t{15}}) {
+  for (const uint8_t irq : {uint8_t{0}, uint8_t{1}, uint8_t{3}, uint8_t{4},
+                            uint8_t{8}, uint8_t{12}, uint8_t{14},
+                            uint8_t{15}}) {
     summary.legacyIrqDiagnostics.push_back(
         FormatLegacyIrqState(ioApic_, pcIo_, irq));
   }

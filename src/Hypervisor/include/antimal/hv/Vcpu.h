@@ -21,6 +21,21 @@ struct ResetState16BitRealMode {
   uint64_t rip = 0;
 };
 
+struct CpuidExitResult {
+  uint32_t vcpuIndex = 0;
+  uint32_t leaf = 0;
+  uint32_t subleaf = 0;
+  uint32_t eax = 0;
+  uint32_t ebx = 0;
+  uint32_t ecx = 0;
+  uint32_t edx = 0;
+  uint32_t defaultEax = 0;
+  uint32_t defaultEbx = 0;
+  uint32_t defaultEcx = 0;
+  uint32_t defaultEdx = 0;
+  bool overridden = false;
+};
+
 class Vcpu {
 public:
   // Creates virtual processor `index` on `host`. Index must be < host's
@@ -112,7 +127,7 @@ public:
 
   // Handles a WHvRunVpExitReasonX64Cpuid exit using WHP's default CPUID
   // values as a base and applying AntiMal's VM-visible overrides.
-  void EmulateCpuidExit();
+  CpuidExitResult EmulateCpuidExit();
 
   // Enters the guest and runs until any exit. Returns the exit reason
   // (cached in LastExit() too). Throws WhpError on hypervisor call failure.

@@ -486,12 +486,135 @@ DynamicRunSummary ParseDynamicSummary(const JsonValue *value) {
       static_cast<uint32_t>(IntValue(Member(*value, "pm1ControlValue")));
   summary.pm1SleepRequests =
       static_cast<uint64_t>(IntValue(Member(*value, "pm1SleepRequests")));
+  summary.kdPacketsReceived =
+      static_cast<uint64_t>(IntValue(Member(*value, "kdPacketsReceived")));
+  summary.kdControlPacketsReceived = static_cast<uint64_t>(
+      IntValue(Member(*value, "kdControlPacketsReceived")));
+  summary.kdDataPacketsReceived =
+      static_cast<uint64_t>(IntValue(Member(*value, "kdDataPacketsReceived")));
+  summary.kdAckPacketsSent =
+      static_cast<uint64_t>(IntValue(Member(*value, "kdAckPacketsSent")));
+  summary.kdResendPacketsSent =
+      static_cast<uint64_t>(IntValue(Member(*value, "kdResendPacketsSent")));
+  summary.kdResetPacketsReceived =
+      static_cast<uint64_t>(IntValue(Member(*value, "kdResetPacketsReceived")));
+  summary.kdResetPacketsSent =
+      static_cast<uint64_t>(IntValue(Member(*value, "kdResetPacketsSent")));
+  summary.kdCom1RxQueuedBytes =
+      static_cast<uint64_t>(IntValue(Member(*value, "kdCom1RxQueuedBytes")));
+  summary.kdTargetAcksReceived =
+      static_cast<uint64_t>(IntValue(Member(*value, "kdTargetAcksReceived")));
+  summary.kdDebugPrintBytes =
+      static_cast<uint64_t>(IntValue(Member(*value, "kdDebugPrintBytes")));
+  summary.kdDebugPrintPackets =
+      static_cast<uint64_t>(IntValue(Member(*value, "kdDebugPrintPackets")));
+  summary.kdStateChangePackets =
+      static_cast<uint64_t>(IntValue(Member(*value, "kdStateChangePackets")));
+  summary.kdLoadSymbolPackets =
+      static_cast<uint64_t>(IntValue(Member(*value, "kdLoadSymbolPackets")));
+  summary.kdStatusPackets =
+      static_cast<uint64_t>(IntValue(Member(*value, "kdStatusPackets")));
+  summary.kdAutoContinuesSent =
+      static_cast<uint64_t>(IntValue(Member(*value, "kdAutoContinuesSent")));
+  summary.kdChecksumFailures =
+      static_cast<uint64_t>(IntValue(Member(*value, "kdChecksumFailures")));
+  summary.kdTrailingByteFailures =
+      static_cast<uint64_t>(IntValue(Member(*value, "kdTrailingByteFailures")));
+  summary.kdLastPacketType =
+      static_cast<uint32_t>(IntValue(Member(*value, "kdLastPacketType")));
+  summary.kdLastApiNumber =
+      static_cast<uint32_t>(IntValue(Member(*value, "kdLastApiNumber")));
+  summary.kdLastStatus =
+      static_cast<uint32_t>(IntValue(Member(*value, "kdLastStatus")));
+  summary.kdLastStatusText = StringValue(Member(*value, "kdLastStatusText"));
+  summary.kdCom1Status = StringValue(Member(*value, "kdCom1Status"));
+  summary.com1RegisterReads =
+      static_cast<uint64_t>(IntValue(Member(*value, "com1RegisterReads")));
+  summary.com1RegisterWrites =
+      static_cast<uint64_t>(IntValue(Member(*value, "com1RegisterWrites")));
+  summary.com1DataReads =
+      static_cast<uint64_t>(IntValue(Member(*value, "com1DataReads")));
+  summary.com1DataWrites =
+      static_cast<uint64_t>(IntValue(Member(*value, "com1DataWrites")));
+  summary.com1RxBytesQueued =
+      static_cast<uint64_t>(IntValue(Member(*value, "com1RxBytesQueued")));
+  summary.com1RxBytesRead =
+      static_cast<uint64_t>(IntValue(Member(*value, "com1RxBytesRead")));
+  summary.com1RxBytesCleared =
+      static_cast<uint64_t>(IntValue(Member(*value, "com1RxBytesCleared")));
+  summary.com1IerWrites =
+      static_cast<uint64_t>(IntValue(Member(*value, "com1IerWrites")));
+  summary.com1FcrWrites =
+      static_cast<uint64_t>(IntValue(Member(*value, "com1FcrWrites")));
+  summary.com1LcrWrites =
+      static_cast<uint64_t>(IntValue(Member(*value, "com1LcrWrites")));
+  summary.com1McrWrites =
+      static_cast<uint64_t>(IntValue(Member(*value, "com1McrWrites")));
+  summary.com1DllWrites =
+      static_cast<uint64_t>(IntValue(Member(*value, "com1DllWrites")));
+  summary.com1DlmWrites =
+      static_cast<uint64_t>(IntValue(Member(*value, "com1DlmWrites")));
+  summary.com1IirReads =
+      static_cast<uint64_t>(IntValue(Member(*value, "com1IirReads")));
+  summary.com1LsrReads =
+      static_cast<uint64_t>(IntValue(Member(*value, "com1LsrReads")));
+  summary.com1Ier = static_cast<uint32_t>(IntValue(Member(*value, "com1Ier")));
+  summary.com1Fcr = static_cast<uint32_t>(IntValue(Member(*value, "com1Fcr")));
+  summary.com1Lcr = static_cast<uint32_t>(IntValue(Member(*value, "com1Lcr")));
+  summary.com1Mcr = static_cast<uint32_t>(IntValue(Member(*value, "com1Mcr")));
+  summary.com1Dll = static_cast<uint32_t>(IntValue(Member(*value, "com1Dll")));
+  summary.com1Dlm = static_cast<uint32_t>(IntValue(Member(*value, "com1Dlm")));
+  summary.com1Dlab = BoolValue(Member(*value, "com1Dlab"));
+  summary.com1RxInterruptEnabled =
+      BoolValue(Member(*value, "com1RxInterruptEnabled"));
+  summary.com1RxDataReady = BoolValue(Member(*value, "com1RxDataReady"));
+  summary.com1TouchStatus = StringValue(Member(*value, "com1TouchStatus"));
+  summary.fwCfgSmbiosTableBytesRead = static_cast<uint64_t>(
+      IntValue(Member(*value, "fwCfgSmbiosTableBytesRead")));
+  summary.fwCfgSmbiosAnchorBytesRead = static_cast<uint64_t>(
+      IntValue(Member(*value, "fwCfgSmbiosAnchorBytesRead")));
+  summary.keyboardScancodesInjected = static_cast<uint32_t>(
+      IntValue(Member(*value, "keyboardScancodesInjected")));
+  summary.ps2StatusReads =
+      static_cast<uint64_t>(IntValue(Member(*value, "ps2StatusReads")));
+  summary.ps2DataReads =
+      static_cast<uint64_t>(IntValue(Member(*value, "ps2DataReads")));
+  summary.ps2CommandWrites =
+      static_cast<uint64_t>(IntValue(Member(*value, "ps2CommandWrites")));
+  summary.ps2DataWrites =
+      static_cast<uint64_t>(IntValue(Member(*value, "ps2DataWrites")));
+  summary.ps2KeyboardBytesQueued = static_cast<uint64_t>(
+      IntValue(Member(*value, "ps2KeyboardBytesQueued")));
+  summary.ps2KeyboardBytesRead = static_cast<uint64_t>(
+      IntValue(Member(*value, "ps2KeyboardBytesRead")));
+  summary.ps2MouseBytesQueued = static_cast<uint64_t>(
+      IntValue(Member(*value, "ps2MouseBytesQueued")));
+  summary.ps2MouseBytesRead = static_cast<uint64_t>(
+      IntValue(Member(*value, "ps2MouseBytesRead")));
+  summary.ps2KeyboardPortEnabled =
+      BoolValue(Member(*value, "ps2KeyboardPortEnabled"));
+  summary.ps2MousePortEnabled =
+      BoolValue(Member(*value, "ps2MousePortEnabled"));
+  summary.ps2KeyboardScanningEnabled =
+      BoolValue(Member(*value, "ps2KeyboardScanningEnabled"));
+  summary.ps2InputStatus = StringValue(Member(*value, "ps2InputStatus"));
+  summary.windowsKernelReadGateReached =
+      BoolValue(Member(*value, "windowsKernelReadGateReached"));
+  summary.windowsKernelReadGateStatus =
+      StringValue(Member(*value, "windowsKernelReadGateStatus"));
+  summary.windowsKernelReadGateEvidence =
+      StringValue(Member(*value, "windowsKernelReadGateEvidence"));
+  summary.bootBlocker = StringValue(Member(*value, "bootBlocker"));
+  summary.cpuidDiagnostics = StringArrayValue(Member(*value, "cpuidDiagnostics"));
   summary.bootStage = StringValue(Member(*value, "bootStage"));
   summary.bootMilestones = StringArrayValue(Member(*value, "bootMilestones"));
   summary.interruptDiagnostics =
       StringArrayValue(Member(*value, "interruptDiagnostics"));
   summary.serialLogPath =
       Utf8ToWide(StringValue(Member(*value, "serialLogPath")));
+  summary.kdLogPath = Utf8ToWide(StringValue(Member(*value, "kdLogPath")));
+  summary.kdPacketsPath =
+      Utf8ToWide(StringValue(Member(*value, "kdPacketsPath")));
   summary.vmSummaryPath =
       Utf8ToWide(StringValue(Member(*value, "vmSummaryPath")));
   return summary;
@@ -937,6 +1060,20 @@ std::string BuildHtmlReportWithFrames(const AnalysisReport &report,
       html << "<div class=\"k\">boot stage</div><div class=\"mono\">"
            << HtmlEscape(report.dynamicSummary.bootStage) << "</div>";
     }
+    if (!report.dynamicSummary.windowsKernelReadGateStatus.empty()) {
+      html << "<div class=\"k\">kernel gate</div><div class=\"mono\">"
+           << HtmlEscape(report.dynamicSummary.windowsKernelReadGateStatus)
+           << "</div>";
+    }
+    if (!report.dynamicSummary.windowsKernelReadGateEvidence.empty()) {
+      html << "<div class=\"k\">kernel evidence</div><div>"
+           << HtmlEscape(report.dynamicSummary.windowsKernelReadGateEvidence)
+           << "</div>";
+    }
+    if (!report.dynamicSummary.bootBlocker.empty()) {
+      html << "<div class=\"k\">boot blocker</div><div>"
+           << HtmlEscape(report.dynamicSummary.bootBlocker) << "</div>";
+    }
     html << "<div class=\"k\">vCPU exits</div><div class=\"mono\">"
          << report.dynamicSummary.vcpuExits << "</div>";
     html << "<div class=\"k\">IDE commands</div><div class=\"mono\">"
@@ -980,6 +1117,82 @@ std::string BuildHtmlReportWithFrames(const AnalysisReport &report,
            << ", stop "
            << (report.dynamicSummary.pm1HostStopRequested ? "yes" : "no")
            << "</div>";
+    }
+    if (report.dynamicSummary.fwCfgSmbiosAnchorBytesRead != 0 ||
+        report.dynamicSummary.fwCfgSmbiosTableBytesRead != 0) {
+      html << "<div class=\"k\">SMBIOS fw_cfg</div><div class=\"mono\">"
+           << report.dynamicSummary.fwCfgSmbiosAnchorBytesRead
+           << " anchor byte(s), "
+           << report.dynamicSummary.fwCfgSmbiosTableBytesRead
+           << " table byte(s)</div>";
+    }
+    if (report.dynamicSummary.kdPacketsReceived != 0 ||
+        report.dynamicSummary.kdAckPacketsSent != 0 ||
+        report.dynamicSummary.kdResendPacketsSent != 0 ||
+        report.dynamicSummary.kdResetPacketsSent != 0) {
+      html << "<div class=\"k\">KD COM1</div><div class=\"mono\">"
+           << report.dynamicSummary.kdPacketsReceived << " packet(s), "
+           << report.dynamicSummary.kdAckPacketsSent << " ACK, "
+           << report.dynamicSummary.kdResetPacketsSent << " reset, "
+           << report.dynamicSummary.kdCom1RxQueuedBytes << " queued RX byte(s), "
+           << report.dynamicSummary.kdDebugPrintPackets << " print, "
+           << report.dynamicSummary.kdLoadSymbolPackets << " symbols, "
+           << report.dynamicSummary.kdAutoContinuesSent
+           << " continue</div>";
+      if (!report.dynamicSummary.kdLastStatusText.empty()) {
+        html << "<div class=\"k\">KD status</div><div class=\"mono\">"
+             << HtmlEscape(report.dynamicSummary.kdLastStatusText)
+             << "</div>";
+      }
+    }
+    if (!report.dynamicSummary.kdCom1Status.empty()) {
+      html << "<div class=\"k\">KD COM1 state</div><div class=\"mono\">"
+           << HtmlEscape(report.dynamicSummary.kdCom1Status) << "</div>";
+    }
+    if (!report.dynamicSummary.com1TouchStatus.empty() ||
+        report.dynamicSummary.com1RegisterReads != 0 ||
+        report.dynamicSummary.com1RegisterWrites != 0 ||
+        report.dynamicSummary.com1RxBytesQueued != 0) {
+      html << "<div class=\"k\">COM1 UART</div><div class=\"mono\">"
+           << HtmlEscape(report.dynamicSummary.com1TouchStatus.empty()
+                             ? "observed"
+                             : report.dynamicSummary.com1TouchStatus)
+           << ", regs r/w " << report.dynamicSummary.com1RegisterReads << "/"
+           << report.dynamicSummary.com1RegisterWrites
+           << ", data r/w " << report.dynamicSummary.com1DataReads << "/"
+           << report.dynamicSummary.com1DataWrites
+           << ", rx queued/read "
+           << report.dynamicSummary.com1RxBytesQueued << "/"
+           << report.dynamicSummary.com1RxBytesRead
+           << ", IER 0x" << std::hex << std::uppercase
+           << report.dynamicSummary.com1Ier << std::dec << "</div>";
+    }
+    if (report.dynamicSummary.keyboardScancodesInjected != 0 ||
+        report.dynamicSummary.ps2StatusReads != 0 ||
+        report.dynamicSummary.ps2DataReads != 0 ||
+        !report.dynamicSummary.ps2InputStatus.empty()) {
+      html << "<div class=\"k\">PS/2 input</div><div class=\"mono\">"
+           << HtmlEscape(report.dynamicSummary.ps2InputStatus.empty()
+                             ? "observed"
+                             : report.dynamicSummary.ps2InputStatus)
+           << ", injected "
+           << report.dynamicSummary.keyboardScancodesInjected
+           << ", queued/read "
+           << report.dynamicSummary.ps2KeyboardBytesQueued << "/"
+           << report.dynamicSummary.ps2KeyboardBytesRead
+           << ", port reads "
+           << report.dynamicSummary.ps2StatusReads << "/"
+           << report.dynamicSummary.ps2DataReads << "</div>";
+    }
+    if (!report.dynamicSummary.cpuidDiagnostics.empty()) {
+      html << "<div class=\"k\">CPUID</div><div class=\"mono\">";
+      for (size_t i = 0; i < report.dynamicSummary.cpuidDiagnostics.size(); ++i) {
+        if (i) {
+          html << "<br>";
+        }
+        html << HtmlEscape(report.dynamicSummary.cpuidDiagnostics[i]);
+      }
+      html << "</div>";
     }
     if (!report.dynamicSummary.bootMilestones.empty()) {
       html << "<div class=\"k\">boot</div><div>";

@@ -12,10 +12,8 @@
 namespace antimal::hv {
 
 enum class GuestMemoryProt : uint32_t {
-  // No-access trap: mapping exists but all accesses generate memory-access
-  // VM-exits. Use this for MMIO device ranges (IOAPIC, HPET) so the host
-  // can emulate reads/writes without leaving the GPA unmapped (which WHP
-  // may handle internally via #PF instead of exiting).
+  // Zero-permission mappings are useful in theory but WHP rejects them on
+  // current hosts. Use an unmapped GPA hole for read/write MMIO traps instead.
   None = WHvMapGpaRangeFlagNone,
   ReadOnly = WHvMapGpaRangeFlagRead,
   ReadWrite = WHvMapGpaRangeFlagRead | WHvMapGpaRangeFlagWrite,

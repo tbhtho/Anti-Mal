@@ -35,6 +35,19 @@ public:
   void InjectKeyboardScancode(uint8_t scancode);
   void InjectKeyboardScancodes(const uint8_t *data, size_t size);
   void InjectMousePacket(uint8_t buttons, int8_t dx, int8_t dy);
+  uint64_t StatusReads() const noexcept { return statusReads_; }
+  uint64_t DataReads() const noexcept { return dataReads_; }
+  uint64_t CommandWrites() const noexcept { return commandWrites_; }
+  uint64_t DataWrites() const noexcept { return dataWrites_; }
+  uint64_t KeyboardBytesQueued() const noexcept { return keyboardBytesQueued_; }
+  uint64_t KeyboardBytesRead() const noexcept { return keyboardBytesRead_; }
+  uint64_t MouseBytesQueued() const noexcept { return mouseBytesQueued_; }
+  uint64_t MouseBytesRead() const noexcept { return mouseBytesRead_; }
+  bool KeyboardPortEnabled() const noexcept { return keyboardPortEnabled_; }
+  bool MousePortEnabled() const noexcept { return mousePortEnabled_; }
+  bool KeyboardScanningEnabled() const noexcept {
+    return keyboardScanningEnabled_;
+  }
 
 private:
   struct OutputByte {
@@ -48,11 +61,27 @@ private:
   void HandleDataWrite(uint8_t value);
 
   std::deque<OutputByte> outputQueue_;
-  uint8_t configurationByte_ = 0x65; // IRQ1 + IRQ12 enabled, translate on.
+  uint8_t configurationByte_ = 0x67; // IRQ1 + IRQ12 enabled, translate on.
   uint8_t status_ = 0x14; // System flag set, command/data not pending, no data.
   uint8_t lastCommand_ = 0;
   bool expectingConfigByte_ = false;
-  bool expectingAuxOutByte_ = false;
+  bool expectingOutputPortByte_ = false;
+  bool expectingKeyboardOutByte_ = false;
+  bool expectingMouseOutByte_ = false;
+  bool expectingMouseCommandByte_ = false;
+  uint8_t pendingKeyboardCommand_ = 0;
+  bool keyboardPortEnabled_ = true;
+  bool mousePortEnabled_ = true;
+  bool keyboardScanningEnabled_ = true;
+  uint8_t keyboardScanCodeSet_ = 1;
+  uint64_t statusReads_ = 0;
+  uint64_t dataReads_ = 0;
+  uint64_t commandWrites_ = 0;
+  uint64_t dataWrites_ = 0;
+  uint64_t keyboardBytesQueued_ = 0;
+  uint64_t keyboardBytesRead_ = 0;
+  uint64_t mouseBytesQueued_ = 0;
+  uint64_t mouseBytesRead_ = 0;
 };
 
 } // namespace antimal::hv

@@ -10,7 +10,9 @@
 #include "antimal/hv/GuestMemory.h"
 #include "antimal/hv/Hpet.h"
 #include "antimal/hv/IoApic.h"
+#include "antimal/hv/Tpm2CrbDevice.h"
 #include "antimal/hv/IoBus.h"
+#include "antimal/hv/KdSerialDebugger.h"
 #include "antimal/hv/MmioBus.h"
 #include "antimal/hv/MmioEmulator.h"
 #include "antimal/hv/PcIoDevices.h"
@@ -116,6 +118,17 @@ struct VmRunSummary {
   int rtcInterruptsIoApic = 0;
   int rtcInterruptsPicFallback = 0;
   int rtcInterruptsPending = 0;
+  uint64_t ps2StatusReads = 0;
+  uint64_t ps2DataReads = 0;
+  uint64_t ps2CommandWrites = 0;
+  uint64_t ps2DataWrites = 0;
+  uint64_t ps2KeyboardBytesQueued = 0;
+  uint64_t ps2KeyboardBytesRead = 0;
+  uint64_t ps2MouseBytesQueued = 0;
+  uint64_t ps2MouseBytesRead = 0;
+  bool ps2KeyboardPortEnabled = true;
+  bool ps2MousePortEnabled = true;
+  bool ps2KeyboardScanningEnabled = true;
   int irqIoApicDeliveries = 0;
   int irqPicFallbackDeliveries = 0;
   int irqDeliveryFailures = 0;
@@ -137,6 +150,8 @@ struct VmRunSummary {
   uint64_t fwCfgAcpiTableBytesRead = 0;
   uint64_t fwCfgTableLoaderBytesRead = 0;
   uint64_t fwCfgRsdpBytesRead = 0;
+  uint64_t fwCfgSmbiosTableBytesRead = 0;
+  uint64_t fwCfgSmbiosAnchorBytesRead = 0;
   uint64_t pageFaultAssists = 0;
   uint64_t lastPageFaultAssistGva = 0;
   uint64_t lastPageFaultAssistGpa = 0;
@@ -192,6 +207,7 @@ struct VmRunSummary {
   WHV_RUN_VP_EXIT_REASON fatalReason = WHvRunVpExitReasonNone;
   std::map<int, int> exitHistogram;
   std::map<uint32_t, int> cpuidLeafHistogram;
+  std::vector<CpuidExitResult> cpuidSamples;
   std::map<uint16_t, int> ioPortHistogram;
   std::map<int, int> ideCommandHistogram;
   std::map<int, int> cmosReadHistogram;
@@ -233,6 +249,35 @@ struct VmRunSummary {
   std::string serialOutput;
   std::string firmwareDebugOutput;
   std::string hostChannelOutput;
+  uint64_t com1RegisterReads = 0;
+  uint64_t com1RegisterWrites = 0;
+  uint64_t com1DataReads = 0;
+  uint64_t com1DataWrites = 0;
+  uint64_t com1RxBytesQueued = 0;
+  uint64_t com1RxBytesRead = 0;
+  uint64_t com1RxBytesCleared = 0;
+  uint64_t com1IerWrites = 0;
+  uint64_t com1FcrWrites = 0;
+  uint64_t com1LcrWrites = 0;
+  uint64_t com1McrWrites = 0;
+  uint64_t com1DllWrites = 0;
+  uint64_t com1DlmWrites = 0;
+  uint64_t com1IirReads = 0;
+  uint64_t com1LsrReads = 0;
+  uint8_t com1Ier = 0;
+  uint8_t com1Fcr = 0;
+  uint8_t com1Lcr = 0;
+  uint8_t com1Mcr = 0;
+  uint8_t com1Dll = 0;
+  uint8_t com1Dlm = 0;
+  bool com1Dlab = false;
+  bool com1RxInterruptEnabled = false;
+  bool com1RxDataReady = false;
+  uint64_t kdCom1RxQueuedBytes = 0;
+  KdSerialSummary kdSummary;
+  std::vector<KdSerialEvent> kdEvents;
+  std::string kdTranscript;
+  std::string kdPacketsJsonl;
   uint32_t ideCommandsIssued = 0;
   uint32_t ideIdentifyCommands = 0;
   uint32_t ideReadCommands = 0;
@@ -344,6 +389,15 @@ struct VmRunRequest {
   // Enter on Windows Recovery, not for general interactive control.
   std::vector<uint8_t> keyboardScancodes;
   std::chrono::milliseconds keyboardInjectAfter{0};
+  // Sequenced keyboard bursts beyond the single-shot above. Each burst is
+  // fired exactly once when its delay (relative to run start) has elapsed.
+  // Use this to step through multi-screen boot UIs (e.g. recovery screen
+  // F8 -> Startup Settings 7 -> disable driver signature enforcement).
+  struct KeyboardBurst {
+    std::chrono::milliseconds delay{0};
+    std::vector<uint8_t> scancodes;
+  };
+  std::vector<KeyboardBurst> keyboardBursts;
 };
 
 class VirtualMachine {
@@ -374,7 +428,9 @@ private:
                        std::shared_ptr<std::atomic_bool> cancelRequested = {},
                        std::vector<uint8_t> keyboardScancodes = {},
                        std::chrono::milliseconds keyboardInjectAfter =
-                           std::chrono::milliseconds{0});
+                           std::chrono::milliseconds{0},
+                       std::vector<VmRunRequest::KeyboardBurst>
+                           keyboardBursts = {});
   void AttachDefaultDevices();
   void AttachIdeDisk(IBlockDevice *disk);
   uint8_t *HostPointerForGpa(uint64_t gpa, size_t length) noexcept;
@@ -397,8 +453,6 @@ private:
   std::unique_ptr<GuestMemoryRegion> highRam_;
   std::unique_ptr<GuestMemoryRegion> firmwareLowScratch_;
   std::unique_ptr<GuestMemoryRegion> firmwareUpperScratch_;
-  std::unique_ptr<GuestMemoryRegion> ioApicTrap_;
-  std::unique_ptr<GuestMemoryRegion> hpetTrap_;
   std::unique_ptr<GuestMemoryRegion> framebuffer_;
   Firmware firmware_;
   Vcpu vcpu_;
@@ -409,6 +463,7 @@ private:
   Ps2Controller ps2_;
   IoApic ioApic_;
   HpetDevice hpet_;
+  Tpm2CrbDevice tpm_;
   BochsVbeDevice vbe_;
   IoBus bus_;
   MmioBus mmioBus_;

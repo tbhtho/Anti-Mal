@@ -7,6 +7,7 @@
 #include <ctime>
 #include <iterator>
 #include <string_view>
+#include <utility>
 
 namespace antimal::hv {
 
@@ -24,6 +25,11 @@ constexpr uint16_t kPic2Command = 0xA0;
 constexpr uint16_t kPic2Data = 0xA1;
 constexpr uint16_t kPciConfigAddress = 0xCF8;
 constexpr uint16_t kPciConfigData = 0xCFC;
+constexpr uint32_t kIdePrimaryCommandBar = 0x000001F1u;
+constexpr uint32_t kIdePrimaryControlBar = 0x000003F5u;
+constexpr uint32_t kIdeSecondaryCommandBar = 0x00000171u;
+constexpr uint32_t kIdeSecondaryControlBar = 0x00000375u;
+constexpr uint32_t kIdeBusMasterBar = 0x0000C001u;
 constexpr uint16_t kVgaLegacyBase = 0x3C0;
 constexpr uint16_t kVgaLegacyLast = 0x3DF;
 constexpr uint16_t kDebugConPort = 0x402;
@@ -44,6 +50,8 @@ constexpr uint16_t kFwCfgEtcE820 = kFwCfgFileFirst;
 constexpr uint16_t kFwCfgAcpiTables = kFwCfgFileFirst + 1;
 constexpr uint16_t kFwCfgTableLoader = kFwCfgFileFirst + 2;
 constexpr uint16_t kFwCfgAcpiRsdp = kFwCfgFileFirst + 3;
+constexpr uint16_t kFwCfgSmbiosTables = kFwCfgFileFirst + 4;
+constexpr uint16_t kFwCfgSmbiosAnchor = kFwCfgFileFirst + 5;
 
 // Returns a wallclock-derived std::tm whose value is guaranteed STABLE
 // across consecutive calls within the same wall-clock second. Each call
@@ -99,6 +107,24 @@ uint32_t AccessMask(uint8_t accessSize) {
   }
 }
 
+uint32_t IdeBarSizeMask(size_t index) {
+  // PCI IO BAR sizing returns all address bits set except the decoded window.
+  // Legacy IDE command blocks decode 8 ports, control blocks decode 4, and the
+  // bus-master IDE register block decodes 16.
+  switch (index) {
+  case 0:
+  case 2:
+    return 0xFFFFFFF9u;
+  case 1:
+  case 3:
+    return 0xFFFFFFFDu;
+  case 4:
+    return 0xFFFFFFF1u;
+  default:
+    return 0xFFFFFFFFu;
+  }
+}
+
 uint8_t Le16Byte(uint16_t value, size_t offset) {
   if (offset >= 2) {
     return 0;
@@ -134,13 +160,227 @@ uint8_t Be32Byte(uint32_t value, size_t offset) {
   return static_cast<uint8_t>((value >> ((3 - offset) * 8)) & 0xFFu);
 }
 
+void PutLe16(std::vector<uint8_t> &out, uint16_t value) {
+  out.push_back(static_cast<uint8_t>(value & 0xFFu));
+  out.push_back(static_cast<uint8_t>((value >> 8) & 0xFFu));
+}
+
+void PutLe32(std::vector<uint8_t> &out, uint32_t value) {
+  for (int i = 0; i < 4; ++i) {
+    out.push_back(static_cast<uint8_t>((value >> (i * 8)) & 0xFFu));
+  }
+}
+
+void PutLe64(std::vector<uint8_t> &out, uint64_t value) {
+  for (int i = 0; i < 8; ++i) {
+    out.push_back(static_cast<uint8_t>((value >> (i * 8)) & 0xFFu));
+  }
+}
+
+void StoreLe16(std::vector<uint8_t> &out, size_t offset, uint16_t value) {
+  if (offset + 2 > out.size()) {
+    return;
+  }
+  out[offset] = static_cast<uint8_t>(value & 0xFFu);
+  out[offset + 1] = static_cast<uint8_t>((value >> 8) & 0xFFu);
+}
+
+void StoreLe32(std::vector<uint8_t> &out, size_t offset, uint32_t value) {
+  if (offset + 4 > out.size()) {
+    return;
+  }
+  for (int i = 0; i < 4; ++i) {
+    out[offset + static_cast<size_t>(i)] =
+        static_cast<uint8_t>((value >> (i * 8)) & 0xFFu);
+  }
+}
+
+uint8_t Checksum8(const uint8_t *bytes, size_t size) {
+  uint8_t sum = 0;
+  for (size_t i = 0; i < size; ++i) {
+    sum = static_cast<uint8_t>(sum + bytes[i]);
+  }
+  return static_cast<uint8_t>(0u - sum);
+}
+
+void AppendAscii(std::vector<uint8_t> &out, std::string_view text) {
+  out.insert(out.end(), text.begin(), text.end());
+}
+
+void FinishSmbiosRecord(std::vector<uint8_t> &record,
+                        std::initializer_list<std::string_view> strings) {
+  if (strings.size() == 0) {
+    record.push_back(0);
+    record.push_back(0);
+    return;
+  }
+  for (std::string_view text : strings) {
+    AppendAscii(record, text);
+    record.push_back(0);
+  }
+  record.push_back(0);
+}
+
+std::vector<uint8_t> BeginSmbiosRecord(uint8_t type, uint8_t length,
+                                       uint16_t handle) {
+  std::vector<uint8_t> record;
+  record.reserve(length + 64);
+  record.push_back(type);
+  record.push_back(length);
+  PutLe16(record, handle);
+  return record;
+}
+
+std::vector<uint8_t> BuildSmbiosEntryPoint(uint16_t tableLength,
+                                           uint16_t maxStructureSize,
+                                           uint16_t structureCount) {
+  // OVMF validates the fw_cfg anchor before it reads
+  // etc/smbios/smbios-tables. Keep this as a standard SMBIOS 2.8 entry point:
+  // DetectSmbiosVersionLib checks the anchors, major version, and table length,
+  // while SmbiosDxe later publishes its own relocated EFI configuration table.
+  std::vector<uint8_t> anchor(0x1F, 0);
+  std::copy_n("_SM_", 4, anchor.begin());
+  anchor[0x05] = 0x1F;
+  anchor[0x06] = 2;
+  anchor[0x07] = 8;
+  StoreLe16(anchor, 0x08, maxStructureSize);
+  anchor[0x0A] = 0;
+  std::copy_n("_DMI_", 5, anchor.begin() + 0x10);
+  StoreLe16(anchor, 0x16, tableLength);
+  StoreLe32(anchor, 0x18, 0);
+  StoreLe16(anchor, 0x1C, structureCount);
+  anchor[0x1E] = 0x28;
+  anchor[0x15] = Checksum8(anchor.data() + 0x10, 0x0F);
+  anchor[0x04] = Checksum8(anchor.data(), anchor.size());
+  return anchor;
+}
+
+void AppendSmbiosRecord(std::vector<uint8_t> &tables,
+                        std::vector<uint8_t> record,
+                        uint16_t *structureCount,
+                        uint16_t *maxStructureSize) {
+  if (record.size() > *maxStructureSize) {
+    *maxStructureSize = static_cast<uint16_t>(record.size());
+  }
+  tables.insert(tables.end(), record.begin(), record.end());
+  ++(*structureCount);
+}
+
+void BuildPcSmbiosTables(std::vector<uint8_t> *tables,
+                         std::vector<uint8_t> *anchor) {
+  tables->clear();
+  anchor->clear();
+
+  uint16_t count = 0;
+  uint16_t maxStructure = 0;
+
+  {
+    auto record = BeginSmbiosRecord(0, 0x18, 0x0000);
+    record.push_back(1); // Vendor
+    record.push_back(2); // BIOS version
+    PutLe16(record, 0xE800);
+    record.push_back(3); // BIOS release date
+    record.push_back(0); // BIOS size, unknown.
+    PutLe64(record, 0x0000000000000008ull);
+    record.push_back(0x00);
+    record.push_back(0x1C); // VM, UEFI, targeted-content distribution.
+    record.push_back(1);
+    record.push_back(18);
+    record.push_back(0xFF);
+    record.push_back(0xFF);
+    FinishSmbiosRecord(record,
+                       {"Dell Inc.", "1.18.0", "09/12/2023"});
+    AppendSmbiosRecord(*tables, std::move(record), &count, &maxStructure);
+  }
+
+  {
+    auto record = BeginSmbiosRecord(1, 0x1B, 0x0001);
+    record.push_back(1); // Manufacturer
+    record.push_back(2); // Product name
+    record.push_back(3); // Version
+    record.push_back(4); // Serial number
+    constexpr uint8_t kUuid[16] = {0x4F, 0x84, 0x37, 0x7B, 0x33, 0x11,
+                                   0x4E, 0x72, 0x95, 0x52, 0xC8, 0x71,
+                                   0xD9, 0x44, 0x8C, 0x42};
+    record.insert(record.end(), std::begin(kUuid), std::end(kUuid));
+    record.push_back(0x06); // Power switch wake-up.
+    record.push_back(5);    // SKU
+    record.push_back(6);    // Family
+    FinishSmbiosRecord(record,
+                       {"Dell Inc.", "OptiPlex 7080", "Not Specified",
+                        "9V7J3R3", "09A1", "OptiPlex"});
+    AppendSmbiosRecord(*tables, std::move(record), &count, &maxStructure);
+  }
+
+  {
+    auto record = BeginSmbiosRecord(2, 0x0F, 0x0002);
+    record.push_back(1); // Manufacturer
+    record.push_back(2); // Product
+    record.push_back(3); // Version
+    record.push_back(4); // Serial
+    record.push_back(5); // Asset tag
+    record.push_back(0x0A);
+    record.push_back(6); // Location in chassis
+    PutLe16(record, 0x0003);
+    record.push_back(0x0A); // Motherboard.
+    record.push_back(0);
+    FinishSmbiosRecord(record,
+                       {"Dell Inc.", "0T1D10", "A02", "CN09V7J3R3",
+                        "Not Specified", "Not Specified"});
+    AppendSmbiosRecord(*tables, std::move(record), &count, &maxStructure);
+  }
+
+  {
+    auto record = BeginSmbiosRecord(3, 0x15, 0x0003);
+    record.push_back(1);    // Manufacturer
+    record.push_back(0x03); // Desktop chassis.
+    record.push_back(2);    // Version
+    record.push_back(3);    // Serial
+    record.push_back(4);    // Asset tag
+    record.push_back(0x03); // Boot-up state: safe.
+    record.push_back(0x03); // Power supply state: safe.
+    record.push_back(0x03); // Thermal state: safe.
+    record.push_back(0x03); // Security status: none.
+    PutLe32(record, 0);
+    record.push_back(0);
+    record.push_back(1);
+    record.push_back(0);
+    record.push_back(0);
+    FinishSmbiosRecord(record,
+                       {"Dell Inc.", "Not Specified", "9V7J3R3",
+                        "Not Specified"});
+    AppendSmbiosRecord(*tables, std::move(record), &count, &maxStructure);
+  }
+
+  {
+    auto record = BeginSmbiosRecord(32, 0x0B, 0x0020);
+    for (int i = 0; i < 6; ++i) {
+      record.push_back(0);
+    }
+    record.push_back(0); // No boot error detected.
+    FinishSmbiosRecord(record, {});
+    AppendSmbiosRecord(*tables, std::move(record), &count, &maxStructure);
+  }
+
+  {
+    auto record = BeginSmbiosRecord(127, 0x04, 0x7F00);
+    FinishSmbiosRecord(record, {});
+    AppendSmbiosRecord(*tables, std::move(record), &count, &maxStructure);
+  }
+
+  *anchor = BuildSmbiosEntryPoint(static_cast<uint16_t>(tables->size()),
+                                  maxStructure, count);
+}
+
 uint8_t Bcd(uint8_t value) {
   return static_cast<uint8_t>(((value / 10u) << 4u) | (value % 10u));
 }
 
 } // namespace
 
-PcIoDevices::PcIoDevices() : acpi_(BuildPcAcpiTables()) {}
+PcIoDevices::PcIoDevices() : acpi_(BuildPcAcpiTables()) {
+  BuildPcSmbiosTables(&smbiosTables_, &smbiosAnchor_);
+}
 
 uint8_t PcIoDevices::FwCfgFileDirByte(size_t offset) const {
   struct Entry {
@@ -156,6 +396,10 @@ uint8_t PcIoDevices::FwCfgFileDirByte(size_t offset) const {
        "etc/table-loader"},
       {static_cast<uint32_t>(acpi_.rsdp.size()), kFwCfgAcpiRsdp,
        "etc/acpi/rsdp"},
+      {static_cast<uint32_t>(smbiosTables_.size()), kFwCfgSmbiosTables,
+       "etc/smbios/smbios-tables"},
+      {static_cast<uint32_t>(smbiosAnchor_.size()), kFwCfgSmbiosAnchor,
+       "etc/smbios/smbios-anchor"},
   };
   const size_t entryCount = acpiTablesEnabled_ ? std::size(entries) : 1u;
 
@@ -622,6 +866,8 @@ uint8_t PcIoDevices::ReadFwCfgByte() {
   case kFwCfgAcpiTables:
   case kFwCfgTableLoader:
   case kFwCfgAcpiRsdp:
+  case kFwCfgSmbiosTables:
+  case kFwCfgSmbiosAnchor:
     if (!acpiTablesEnabled_) {
       return 0;
     }
@@ -642,6 +888,12 @@ uint8_t PcIoDevices::FwCfgFileDataByte(uint16_t selector, size_t offset) {
   } else if (selector == kFwCfgAcpiRsdp) {
     ++fwCfgRsdpBytesRead_;
     data = &acpi_.rsdp;
+  } else if (selector == kFwCfgSmbiosTables) {
+    ++fwCfgSmbiosTableBytesRead_;
+    data = &smbiosTables_;
+  } else if (selector == kFwCfgSmbiosAnchor) {
+    ++fwCfgSmbiosAnchorBytesRead_;
+    data = &smbiosAnchor_;
   }
   if (!data || offset >= data->size()) {
     return 0;
@@ -711,6 +963,25 @@ void PcIoDevices::WritePciConfigData(uint16_t port, uint32_t value,
   const uint8_t shift = static_cast<uint8_t>((port - kPciConfigData) * 8u);
   const uint32_t mask = AccessMask(accessSize) << shift;
 
+  if (ideControllerPresent_ && bus == 0 && device == 1 && function == 1) {
+    if (reg == 0x04) {
+      const uint32_t current = ideCommand_;
+      ideCommand_ = static_cast<uint16_t>(
+          ((current & ~mask) | ((value << shift) & mask)) & 0x0005u);
+      return;
+    }
+    if (reg >= 0x10 && reg <= 0x20) {
+      const size_t index = static_cast<size_t>((reg - 0x10) / 4u);
+      if (index < ideBarWriteValues_.size()) {
+        ideBarWriteValues_[index] =
+            (ideBarWriteValues_[index] & ~mask) | ((value << shift) & mask);
+        ideBarSizing_[index] =
+            (ideBarWriteValues_[index] & 0xFFFFFFFCu) == 0xFFFFFFFCu;
+      }
+      return;
+    }
+  }
+
   if (vgaControllerPresent_ && bus == 0 && device == 2 && function == 0 &&
       reg == 0x10) {
     vgaBar0WriteValue_ =
@@ -759,7 +1030,7 @@ uint32_t PcIoDevices::ReadPciConfigDword() const {
   if (device == 1 && function == 0) {
     switch (reg) {
     case 0x00:
-      return 0x70008086u; // Intel PIIX3 ISA bridge.
+      return 0x71108086u; // Intel PIIX4 ISA bridge.
     case 0x08:
       return 0x06010000u; // ISA bridge class code.
     case 0x0C:
@@ -774,11 +1045,23 @@ uint32_t PcIoDevices::ReadPciConfigDword() const {
     case 0x00:
       return 0x71118086u; // Intel PIIX4 IDE controller.
     case 0x04:
-      return 0x00000005u; // IO + bus master enabled.
+      return ideCommand_; // IO enabled; BMDMA stays off until emulated.
     case 0x08:
       return 0x01018A01u; // IDE storage class, legacy/native capable.
     case 0x0C:
       return 0x00000000u; // Type-0 header.
+    case 0x10:
+      return ideBarSizing_[0] ? IdeBarSizeMask(0) : kIdePrimaryCommandBar;
+    case 0x14:
+      return ideBarSizing_[1] ? IdeBarSizeMask(1) : kIdePrimaryControlBar;
+    case 0x18:
+      return ideBarSizing_[2] ? IdeBarSizeMask(2) : kIdeSecondaryCommandBar;
+    case 0x1C:
+      return ideBarSizing_[3] ? IdeBarSizeMask(3) : kIdeSecondaryControlBar;
+    case 0x20:
+      return ideBarSizing_[4] ? IdeBarSizeMask(4) : kIdeBusMasterBar;
+    case 0x3C:
+      return 0x0000010Eu; // INT line 14, INTA#.
     default:
       return 0;
     }

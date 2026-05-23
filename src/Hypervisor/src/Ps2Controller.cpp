@@ -23,11 +23,13 @@ Ps2Controller::Ps2Controller() = default;
 
 void Ps2Controller::QueueKeyboardByte(uint8_t value) {
   outputQueue_.push_back({value, false});
+  ++keyboardBytesQueued_;
   status_ = static_cast<uint8_t>(status_ | kStatusOutputBufferFull);
 }
 
 void Ps2Controller::QueueMouseByte(uint8_t value) {
   outputQueue_.push_back({value, true});
+  ++mouseBytesQueued_;
   status_ = static_cast<uint8_t>(status_ | kStatusOutputBufferFull);
 }
 
@@ -35,7 +37,13 @@ uint8_t Ps2Controller::PendingIrqLine() const noexcept {
   if (outputQueue_.empty()) {
     return 0;
   }
-  return outputQueue_.front().aux ? 12 : 1;
+  if (outputQueue_.front().aux) {
+    return (mousePortEnabled_ && (configurationByte_ & 0x02u) != 0) ? 12 : 0;
+  }
+  return (keyboardPortEnabled_ && keyboardScanningEnabled_ &&
+          (configurationByte_ & 0x01u) != 0)
+             ? 1
+             : 0;
 }
 
 void Ps2Controller::InjectKeyboardScancode(uint8_t scancode) {
@@ -65,6 +73,7 @@ void Ps2Controller::InjectMousePacket(uint8_t buttons, int8_t dx, int8_t dy) {
 }
 
 void Ps2Controller::HandleCommand(uint8_t command) {
+  ++commandWrites_;
   lastCommand_ = command;
   status_ = static_cast<uint8_t>(status_ | kStatusCommandLast);
   status_ = static_cast<uint8_t>(status_ & ~kStatusInputBufferFull);
@@ -79,9 +88,16 @@ void Ps2Controller::HandleCommand(uint8_t command) {
     QueueKeyboardByte(0x00);
     break;
   case 0xA7: // Disable mouse port.
+    mousePortEnabled_ = false;
+    break;
   case 0xA8: // Enable mouse port.
+    mousePortEnabled_ = true;
+    break;
   case 0xAD: // Disable keyboard port.
+    keyboardPortEnabled_ = false;
+    break;
   case 0xAE: // Enable keyboard port.
+    keyboardPortEnabled_ = true;
     break;
   case 0xA9: // Test mouse port.
   case 0xAB: // Test keyboard port.
@@ -97,10 +113,16 @@ void Ps2Controller::HandleCommand(uint8_t command) {
     QueueKeyboardByte(0x01); // A20 enabled.
     break;
   case 0xD1: // Write output port.
+    expectingOutputPortByte_ = true;
+    break;
   case 0xD2: // Write keyboard output buffer.
+    expectingKeyboardOutByte_ = true;
+    break;
   case 0xD3: // Write mouse output buffer.
+    expectingMouseOutByte_ = true;
+    break;
   case 0xD4: // Write next byte to mouse.
-    expectingAuxOutByte_ = true;
+    expectingMouseCommandByte_ = true;
     break;
   case 0xFE: // Pulse output line / CPU reset. No-op in the stub.
     break;
@@ -110,14 +132,41 @@ void Ps2Controller::HandleCommand(uint8_t command) {
 }
 
 void Ps2Controller::HandleDataWrite(uint8_t value) {
+  ++dataWrites_;
   status_ = static_cast<uint8_t>(status_ & ~kStatusInputBufferFull);
   if (expectingConfigByte_) {
     configurationByte_ = value;
     expectingConfigByte_ = false;
     return;
   }
-  if (expectingAuxOutByte_) {
-    expectingAuxOutByte_ = false;
+  if (expectingOutputPortByte_) {
+    expectingOutputPortByte_ = false;
+    return;
+  }
+  if (expectingKeyboardOutByte_) {
+    expectingKeyboardOutByte_ = false;
+    QueueKeyboardByte(value);
+    return;
+  }
+  if (expectingMouseOutByte_) {
+    expectingMouseOutByte_ = false;
+    QueueMouseByte(value);
+    return;
+  }
+  if (expectingMouseCommandByte_) {
+    expectingMouseCommandByte_ = false;
+    QueueMouseByte(kReplyAck);
+    return;
+  }
+  if (pendingKeyboardCommand_ != 0) {
+    const uint8_t command = pendingKeyboardCommand_;
+    pendingKeyboardCommand_ = 0;
+    QueueKeyboardByte(kReplyAck);
+    if (command == 0xF0 && value == 0) {
+      QueueKeyboardByte(keyboardScanCodeSet_);
+    } else if (command == 0xF0 && value >= 1 && value <= 3) {
+      keyboardScanCodeSet_ = value;
+    }
     return;
   }
   status_ = static_cast<uint8_t>(status_ & ~kStatusCommandLast);
@@ -126,6 +175,7 @@ void Ps2Controller::HandleDataWrite(uint8_t value) {
   case 0xF0: // Get/set scan code set (next byte is sub-command).
   case 0xF3: // Set typematic rate/delay (next byte is rate value).
     QueueKeyboardByte(kReplyAck);
+    pendingKeyboardCommand_ = value;
     break;
   case 0xF2: // Read keyboard ID.
     QueueKeyboardByte(kReplyAck);
@@ -133,7 +183,13 @@ void Ps2Controller::HandleDataWrite(uint8_t value) {
     QueueKeyboardByte(kReplyKeyboardId1);
     break;
   case 0xF4: // Enable scanning.
+    keyboardScanningEnabled_ = true;
+    QueueKeyboardByte(kReplyAck);
+    break;
   case 0xF5: // Disable scanning.
+    keyboardScanningEnabled_ = false;
+    QueueKeyboardByte(kReplyAck);
+    break;
   case 0xFA: // ACK echo.
     QueueKeyboardByte(kReplyAck);
     break;
@@ -161,16 +217,23 @@ void Ps2Controller::OnWrite(uint16_t port, uint32_t value,
 
 uint32_t Ps2Controller::OnRead(uint16_t port, uint8_t /*accessSize*/) {
   if (port == kStatusCommandPort) {
+    ++statusReads_;
     return static_cast<uint8_t>(
         (status_ & ~kStatusAuxData) |
         (!outputQueue_.empty() && outputQueue_.front().aux ? kStatusAuxData
                                                            : 0));
   }
   if (port == kDataPort) {
+    ++dataReads_;
     if (outputQueue_.empty()) {
       return 0;
     }
     const uint8_t value = outputQueue_.front().value;
+    if (outputQueue_.front().aux) {
+      ++mouseBytesRead_;
+    } else {
+      ++keyboardBytesRead_;
+    }
     outputQueue_.pop_front();
     if (outputQueue_.empty()) {
       status_ = static_cast<uint8_t>(status_ & ~kStatusOutputBufferFull);

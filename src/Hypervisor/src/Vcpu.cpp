@@ -146,7 +146,7 @@ void Vcpu::AdvanceRip(uint64_t bytes) {
   SetRegisters(partition_, index_, &name, &value, 1);
 }
 
-void Vcpu::EmulateCpuidExit() {
+CpuidExitResult Vcpu::EmulateCpuidExit() {
   const auto &cpuid = lastExit_.CpuidAccess;
   const uint32_t leaf = static_cast<uint32_t>(cpuid.Rax);
   const uint32_t subleaf = static_cast<uint32_t>(cpuid.Rcx);
@@ -155,6 +155,14 @@ void Vcpu::EmulateCpuidExit() {
   uint32_t rbx = static_cast<uint32_t>(cpuid.DefaultResultRbx);
   uint32_t rcx = static_cast<uint32_t>(cpuid.DefaultResultRcx);
   uint32_t rdx = static_cast<uint32_t>(cpuid.DefaultResultRdx);
+  CpuidExitResult result{};
+  result.vcpuIndex = index_;
+  result.leaf = leaf;
+  result.subleaf = subleaf;
+  result.defaultEax = rax;
+  result.defaultEbx = rbx;
+  result.defaultEcx = rcx;
+  result.defaultEdx = rdx;
 
   switch (leaf) {
   case 0x00000001u:
@@ -235,6 +243,15 @@ void Vcpu::EmulateCpuidExit() {
   AdvanceRip(lastExit_.VpContext.InstructionLength != 0
                  ? lastExit_.VpContext.InstructionLength
                  : 2);
+  result.eax = rax;
+  result.ebx = rbx;
+  result.ecx = rcx;
+  result.edx = rdx;
+  result.overridden = result.eax != result.defaultEax ||
+                      result.ebx != result.defaultEbx ||
+                      result.ecx != result.defaultEcx ||
+                      result.edx != result.defaultEdx;
+  return result;
 }
 
 Vcpu::DiagState Vcpu::ReadDiagState() {

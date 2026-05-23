@@ -156,6 +156,35 @@ void WriteLe64(uint8_t *p, uint64_t value) {
   WriteLe32(p + 4, static_cast<uint32_t>((value >> 32) & 0xFFFFFFFFull));
 }
 
+bool IsRegistryHiveBytes(const std::vector<uint8_t> &bytes) {
+  return bytes.size() >= 0x200 && std::memcmp(bytes.data(), "regf", 4) == 0;
+}
+
+uint32_t RegistryHiveHeaderChecksum(const std::vector<uint8_t> &bytes) {
+  uint32_t checksum = 0;
+  const size_t limit = std::min<size_t>(bytes.size(), 0x1FC);
+  for (size_t offset = 0; offset + sizeof(uint32_t) <= limit;
+       offset += sizeof(uint32_t)) {
+    checksum ^= ReadLe32(bytes.data() + offset);
+  }
+  return checksum;
+}
+
+bool RefreshRegistryHiveHeader(std::vector<uint8_t> &bytes) {
+  if (!IsRegistryHiveBytes(bytes)) {
+    return false;
+  }
+
+  const uint32_t primarySeq = ReadLe32(bytes.data() + 4);
+  const uint32_t secondarySeq = ReadLe32(bytes.data() + 8);
+  uint32_t nextSeq = std::max(primarySeq, secondarySeq);
+  nextSeq = nextSeq == 0xFFFFFFFFu ? 1u : nextSeq + 1u;
+  WriteLe32(bytes.data() + 4, nextSeq);
+  WriteLe32(bytes.data() + 8, nextSeq);
+  WriteLe32(bytes.data() + 0x1FC, RegistryHiveHeaderChecksum(bytes));
+  return true;
+}
+
 std::string ToUpperAsciiLocal(std::string value) {
   std::transform(value.begin(), value.end(), value.begin(),
                  [](unsigned char c) {
@@ -288,9 +317,12 @@ std::string FatShortName(const uint8_t *entry) {
 }
 
 struct GptPartitionLite {
+  uint32_t index = 0;
   std::string typeGuid;
+  std::string uniqueGuid;
   uint64_t firstLba = 0;
   uint64_t lastLba = 0;
+  std::string name;
 };
 
 struct LbaRangeLite {
@@ -336,8 +368,15 @@ std::vector<GptPartitionLite> ReadGptPartitionsLite(hv::IBlockDevice &disk) {
     if (empty) {
       continue;
     }
-    out.push_back({GuidFromGptBytes(entry.data()), ReadLe64(entry.data() + 32),
-                   ReadLe64(entry.data() + 40)});
+    GptPartitionLite part;
+    part.index = i + 1;
+    part.typeGuid = GuidFromGptBytes(entry.data());
+    part.uniqueGuid = GuidFromGptBytes(entry.data() + 16);
+    part.firstLba = ReadLe64(entry.data() + 32);
+    part.lastLba = ReadLe64(entry.data() + 40);
+    part.name =
+        Utf16LeAsciiName(entry.data() + 56, std::min<size_t>(72, entry.size() - 56));
+    out.push_back(std::move(part));
   }
   return out;
 }
@@ -1255,6 +1294,37 @@ private:
 
 bool IsWindowsBasicDataGuid(const std::string &guid) {
   return EqualNoCaseLocal(guid, "EBD0A0A2-B9E5-4433-87C0-68B6B72699C7");
+}
+
+std::string PartitionKind(const std::string &guid) {
+  if (IsEspGuid(guid)) {
+    return "ESP";
+  }
+  if (IsWindowsBasicDataGuid(guid)) {
+    return "Windows/basic-data";
+  }
+  if (EqualNoCaseLocal(guid, "E3C9E316-0B5C-4DB8-817D-F92DF00215AE")) {
+    return "MSR";
+  }
+  if (EqualNoCaseLocal(guid, "DE94BBA4-06D1-4D40-A16A-BFD50179D6AC")) {
+    return "Windows-recovery";
+  }
+  return "other";
+}
+
+std::string PartitionLabelForUniqueGuid(
+    const std::vector<GptPartitionLite> &partitions, const std::string &guid) {
+  for (const auto &part : partitions) {
+    if (EqualNoCaseLocal(part.uniqueGuid, guid)) {
+      std::ostringstream out;
+      out << PartitionKind(part.typeGuid) << " partition " << part.index;
+      if (!part.name.empty()) {
+        out << " \"" << part.name << "\"";
+      }
+      return out.str();
+    }
+  }
+  return "not present in GPT";
 }
 
 struct BootReadTarget {
@@ -2328,6 +2398,12 @@ const char *KnownNtStatusName(uint32_t value) {
   switch (value) {
   case 0xC0000000u:
     return "STATUS_UNSUCCESSFUL";
+  case 0xC000008Bu:
+    return "STATUS_RESOURCE_NAME_NOT_FOUND";
+  case 0xC000008Cu:
+    return "STATUS_ARRAY_BOUNDS_EXCEEDED";
+  case 0xC000008Du:
+    return "STATUS_FLOAT_DENORMAL_OPERAND";
   case 0xC000008Fu:
     return "STATUS_FLOAT_INEXACT_RESULT";
   case 0xC000009Eu:
@@ -2342,6 +2418,34 @@ const char *KnownNtStatusName(uint32_t value) {
     return "STATUS_ABIOS_NOT_PRESENT";
   case 0xC0000225u:
     return "STATUS_NOT_FOUND";
+  default:
+    return nullptr;
+  }
+}
+
+const char *BcdDebuggerTypeName(uint64_t value) {
+  switch (value) {
+  case 0:
+    return "serial";
+  case 1:
+    return "1394";
+  case 2:
+    return "usb";
+  case 3:
+    return "net";
+  default:
+    return nullptr;
+  }
+}
+
+const char *BcdDebuggerStartPolicyName(uint64_t value) {
+  switch (value) {
+  case 0:
+    return "active";
+  case 1:
+    return "auto-enable";
+  case 2:
+    return "disable";
   default:
     return nullptr;
   }
@@ -3285,9 +3389,118 @@ std::string BcdElementValueText(MutableHiveView &hive, uint32_t objectKey,
     return bytes[0] ? "true" : "false";
   }
   if (bytes.size() >= sizeof(uint64_t)) {
-    return std::to_string(ReadLe64(bytes.data()));
+    const uint64_t value = ReadLe64(bytes.data());
+    if (elementId == "15000011") {
+      if (const auto *name = BcdDebuggerTypeName(value)) {
+        return std::string(name) + "(" + std::to_string(value) + ")";
+      }
+    }
+    if (elementId == "15000018") {
+      if (const auto *name = BcdDebuggerStartPolicyName(value)) {
+        return std::string(name) + "(" + std::to_string(value) + ")";
+      }
+    }
+    return std::to_string(value);
   }
   return HexBytes(bytes);
+}
+
+std::string BcdElementRawSummary(MutableHiveView &hive, uint32_t objectKey,
+                                 const std::string &elementId) {
+  const auto elements = hive.FindSubkey(objectKey, "Elements");
+  if (!elements) {
+    return "missing";
+  }
+  const auto elementKey = hive.FindSubkey(*elements, elementId);
+  if (!elementKey) {
+    return "missing";
+  }
+  const auto value = hive.FindValue(*elementKey, "Element");
+  if (!value) {
+    return "missing";
+  }
+  const auto bytes = hive.ValueBytes(*value);
+  std::ostringstream out;
+  out << "type=" << value->type << " len=" << bytes.size();
+  if (value->type == 1) {
+    out << " string=" << Utf16LeAsciiString(bytes);
+    return out.str();
+  }
+  if (bytes.size() == 1) {
+    out << " bool=" << (bytes[0] ? "true" : "false");
+  } else if (bytes.size() >= sizeof(uint64_t)) {
+    out << " u64=" << ReadLe64(bytes.data());
+  }
+  const size_t limit = std::min<size_t>(bytes.size(), 32);
+  std::vector<uint8_t> head(bytes.begin(), bytes.begin() + limit);
+  out << " head=" << HexBytes(head);
+  if (bytes.size() > limit) {
+    out << "...";
+  }
+  return out.str();
+}
+
+std::string
+BcdElementDeviceSummary(MutableHiveView &hive, uint32_t objectKey,
+                        const std::string &elementId,
+                        const std::vector<GptPartitionLite> &partitions) {
+  const auto elements = hive.FindSubkey(objectKey, "Elements");
+  if (!elements) {
+    return "missing";
+  }
+  const auto elementKey = hive.FindSubkey(*elements, elementId);
+  if (!elementKey) {
+    return "missing";
+  }
+  const auto value = hive.FindValue(*elementKey, "Element");
+  if (!value) {
+    return "missing";
+  }
+  const auto bytes = hive.ValueBytes(*value);
+  std::ostringstream out;
+  out << "type=" << value->type << " len=" << bytes.size();
+  if (bytes.size() >= 48) {
+    const auto guid = GuidFromGptBytes(bytes.data() + 32);
+    out << " partitionGuid=" << guid << " ("
+        << PartitionLabelForUniqueGuid(partitions, guid) << ")";
+    return out.str();
+  }
+  const size_t limit = std::min<size_t>(bytes.size(), 32);
+  std::vector<uint8_t> head(bytes.begin(), bytes.begin() + limit);
+  out << " head=" << HexBytes(head);
+  if (bytes.size() > limit) {
+    out << "...";
+  }
+  return out.str();
+}
+
+bool BcdDeviceMatchesPartitionKind(
+    MutableHiveView &hive, uint32_t objectKey, const std::string &elementId,
+    const std::vector<GptPartitionLite> &partitions, const std::string &kind) {
+  const auto elements = hive.FindSubkey(objectKey, "Elements");
+  if (!elements) {
+    return false;
+  }
+  const auto elementKey = hive.FindSubkey(*elements, elementId);
+  if (!elementKey) {
+    return false;
+  }
+  const auto value = hive.FindValue(*elementKey, "Element");
+  if (!value) {
+    return false;
+  }
+  const auto bytes = hive.ValueBytes(*value);
+  if (bytes.size() < 48) {
+    return false;
+  }
+  const auto guid = GuidFromGptBytes(bytes.data() + 32);
+  for (const auto &part : partitions) {
+    if (EqualNoCaseLocal(part.uniqueGuid, guid) &&
+        EqualNoCaseLocal(PartitionKind(part.typeGuid), kind)) {
+      return true;
+    }
+  }
+  return false;
 }
 
 std::optional<uint32_t> BcdObjectKey(MutableHiveView &hive,
@@ -3330,7 +3543,9 @@ std::string CaptureOverlayBcdSummary(hv::IBlockDevice &disk) {
   }
   const std::string defaultGuid =
       BcdElementString(hive, *bootmgr, "23000003");
-  out << "  {bootmgr}: path=" << BcdElementValueText(hive, *bootmgr, "12000002")
+  out << "  {bootmgr}: device="
+      << BcdElementDeviceSummary(hive, *bootmgr, "11000001", partitions)
+      << " path=" << BcdElementValueText(hive, *bootmgr, "12000002")
       << " default=" << (defaultGuid.empty() ? "missing" : defaultGuid)
       << " bootdebug=" << BcdElementValueText(hive, *bootmgr, "16000010")
       << "\n";
@@ -3339,8 +3554,21 @@ std::string CaptureOverlayBcdSummary(hv::IBlockDevice &disk) {
   if (defaultObject) {
     out << "  {default}: path="
         << BcdElementValueText(hive, *defaultObject, "12000002")
+        << " device="
+        << BcdElementDeviceSummary(hive, *defaultObject, "11000001",
+                                   partitions)
+        << " osdevice="
+        << BcdElementDeviceSummary(hive, *defaultObject, "21000001",
+                                   partitions)
         << " systemroot="
         << BcdElementValueText(hive, *defaultObject, "22000002")
+        << " kernel="
+        << BcdElementValueText(hive, *defaultObject, "22000011")
+        << " hal=" << BcdElementValueText(hive, *defaultObject, "22000012")
+        << " detecthal="
+        << BcdElementValueText(hive, *defaultObject, "26000010")
+        << " forcelegacyplatform="
+        << BcdElementValueText(hive, *defaultObject, "260000A3")
         << " isolatedcontext="
         << BcdElementValueText(hive, *defaultObject, "16000060")
         << " nx=" << BcdElementValueText(hive, *defaultObject, "25000020")
@@ -3352,16 +3580,23 @@ std::string CaptureOverlayBcdSummary(hv::IBlockDevice &disk) {
         << BcdElementValueText(hive, *defaultObject, "250000E0")
         << " bootdebug="
         << BcdElementValueText(hive, *defaultObject, "16000010")
+        << " debug=" << BcdElementValueText(hive, *defaultObject, "260000A0")
         << " debugtype="
-        << BcdElementValueText(hive, *defaultObject, "25000022")
+        << BcdElementValueText(hive, *defaultObject, "15000011")
+        << " debugportaddress="
+        << BcdElementValueText(hive, *defaultObject, "15000012")
         << " debugport="
-        << BcdElementValueText(hive, *defaultObject, "25000023")
+        << BcdElementValueText(hive, *defaultObject, "15000013")
         << " baudrate="
-        << BcdElementValueText(hive, *defaultObject, "25000024")
+        << BcdElementValueText(hive, *defaultObject, "15000014")
+        << " debugstart="
+        << BcdElementValueText(hive, *defaultObject, "15000018")
+        << " staleDebugtype25000022="
+        << BcdElementValueText(hive, *defaultObject, "25000022")
         << " nointegritychecks="
-        << BcdElementValueText(hive, *defaultObject, "26000048")
+        << BcdElementValueText(hive, *defaultObject, "16000048")
         << " testsigning="
-        << BcdElementValueText(hive, *defaultObject, "26000049") << "\n";
+        << BcdElementValueText(hive, *defaultObject, "16000049") << "\n";
   } else {
     out << "  {default}: missing\n";
   }
@@ -3369,14 +3604,45 @@ std::string CaptureOverlayBcdSummary(hv::IBlockDevice &disk) {
       BcdObjectKey(hive, "{4636856e-540f-4170-a130-a84776f4c654}");
   if (dbgsettings) {
     out << "  {dbgsettings}: debugtype="
-        << BcdElementValueText(hive, *dbgsettings, "25000022")
+        << BcdElementValueText(hive, *dbgsettings, "15000011")
+        << " debugportaddress="
+        << BcdElementValueText(hive, *dbgsettings, "15000012")
         << " debugport="
-        << BcdElementValueText(hive, *dbgsettings, "25000023")
+        << BcdElementValueText(hive, *dbgsettings, "15000013")
         << " baudrate="
-        << BcdElementValueText(hive, *dbgsettings, "25000024") << "\n";
+        << BcdElementValueText(hive, *dbgsettings, "15000014")
+        << " debugstart="
+        << BcdElementValueText(hive, *dbgsettings, "15000018")
+        << " staleDebugtype25000022="
+        << BcdElementValueText(hive, *dbgsettings, "25000022") << "\n";
   } else {
     out << "  {dbgsettings}: missing\n";
   }
+  const bool bootmgrOnEsp =
+      BcdDeviceMatchesPartitionKind(hive, *bootmgr, "11000001", partitions,
+                                    "ESP");
+  const bool defaultPathOk =
+      defaultObject &&
+      EqualNoCaseLocal(BcdElementString(hive, *defaultObject, "12000002"),
+                       "\\Windows\\system32\\winload.efi");
+  const bool systemRootOk =
+      defaultObject &&
+      EqualNoCaseLocal(BcdElementString(hive, *defaultObject, "22000002"),
+                       "\\Windows");
+  const bool loaderDeviceOk =
+      defaultObject &&
+      BcdDeviceMatchesPartitionKind(hive, *defaultObject, "11000001",
+                                    partitions, "Windows/basic-data");
+  const bool osDeviceOk =
+      defaultObject &&
+      BcdDeviceMatchesPartitionKind(hive, *defaultObject, "21000001",
+                                    partitions, "Windows/basic-data");
+  out << "  BCD contract verdict: bootmgrDevice="
+      << (bootmgrOnEsp ? "ok" : "bad")
+      << " defaultPath=" << (defaultPathOk ? "ok" : "bad")
+      << " systemroot=" << (systemRootOk ? "ok" : "bad")
+      << " loaderDevice=" << (loaderDeviceOk ? "ok" : "bad")
+      << " osDevice=" << (osDeviceOk ? "ok" : "bad") << "\n";
   return out.str();
 }
 
@@ -3384,24 +3650,39 @@ struct BootOverlayPatchResult {
   bool attempted = false;
   bool espFound = false;
   bool bcdFound = false;
+  bool bcdHeaderRefreshed = false;
   bool bcdPolicyPatched = false;
   bool recoveryPatched = false;
   bool bootstatReset = false;
   bool systemHiveFound = false;
+  bool systemHiveHeaderRefreshed = false;
   bool bootStoragePatched = false;
   bool bootDebugPatched = false;
+  bool kernelDebugProbeEnabled = false;
+  bool kernelDebugPatched = false;
+  bool debugPortAddressProbeEnabled = false;
   bool debugTypePatched = false;
+  bool debugPortAddressPatched = false;
   bool debugPortPatched = false;
   bool baudRatePatched = false;
+  bool debugStartPolicyPatched = false;
   bool dbgSettingsFound = false;
   bool dbgSettingsDebugTypePatched = false;
+  bool dbgSettingsDebugPortAddressPatched = false;
   bool dbgSettingsDebugPortPatched = false;
   bool dbgSettingsBaudRatePatched = false;
+  bool dbgSettingsDebugStartPolicyPatched = false;
   bool bootmgrBootDebugPatched = false;
   bool noIntegrityChecksProbeEnabled = false;
   bool noIntegrityChecksPatched = false;
   bool legacyBootContextProbeEnabled = false;
   bool isolatedContextPatched = false;
+  bool detectHalProbeEnabled = false;
+  bool detectHalPatched = false;
+  bool forceLegacyPlatformProbeEnabled = false;
+  bool forceLegacyPlatformPatched = false;
+  bool explicitKernelHalProbeEnabled = false;
+  bool explicitKernelHalPatched = false;
   bool testSigningProbeEnabled = false;
   bool testSigningPatched = false;
   bool systemLegacySecurityProbeEnabled = false;
@@ -3502,7 +3783,25 @@ std::vector<uint8_t> BcdU64Bytes(uint64_t value) {
   return bytes;
 }
 
+std::vector<uint8_t> BcdUtf16StringBytes(const wchar_t *value) {
+  std::vector<uint8_t> bytes;
+  if (!value) {
+    return bytes;
+  }
+  for (const wchar_t *p = value;; ++p) {
+    const auto ch = static_cast<uint16_t>(*p);
+    bytes.push_back(static_cast<uint8_t>(ch & 0xFFu));
+    bytes.push_back(static_cast<uint8_t>((ch >> 8) & 0xFFu));
+    if (ch == 0) {
+      break;
+    }
+  }
+  return bytes;
+}
+
 bool PatchBcdDebugTransport(std::vector<uint8_t> &bcd,
+                            bool kernelDebugProbeEnabled,
+                            bool debugPortAddressProbeEnabled,
                             BootOverlayPatchResult *result) {
   MutableHiveView hive(bcd);
   if (!hive.IsValid()) {
@@ -3530,29 +3829,54 @@ bool PatchBcdDebugTransport(std::vector<uint8_t> &bcd,
   }
 
   bool changed = false;
-  if (AddBcdElementRaw(hive, *elements, "16000010", 3,
-                       std::vector<uint8_t>{1})) {
+  if (UpsertBcdElementRaw(hive, *elements, "16000010", 3,
+                          std::vector<uint8_t>{1})) {
     changed = true;
     if (result) {
       result->bootDebugPatched = true;
     }
   }
-  if (AddBcdElementRaw(hive, *elements, "25000022", 3, BcdU64Bytes(0))) {
+  if (UpsertBcdElementRaw(hive, *elements, "15000011", 3, BcdU64Bytes(0))) {
     changed = true;
     if (result) {
       result->debugTypePatched = true;
     }
   }
-  if (AddBcdElementRaw(hive, *elements, "25000023", 3, BcdU64Bytes(1))) {
+  if (debugPortAddressProbeEnabled) {
+    if (UpsertBcdElementRaw(hive, *elements, "15000012", 3,
+                            BcdU64Bytes(0x03F8))) {
+      changed = true;
+      if (result) {
+        result->debugPortAddressPatched = true;
+      }
+    }
+  }
+  if (UpsertBcdElementRaw(hive, *elements, "15000013", 3, BcdU64Bytes(1))) {
     changed = true;
     if (result) {
       result->debugPortPatched = true;
     }
   }
-  if (AddBcdElementRaw(hive, *elements, "25000024", 3, BcdU64Bytes(115200))) {
+  if (UpsertBcdElementRaw(hive, *elements, "15000014", 3,
+                          BcdU64Bytes(115200))) {
     changed = true;
     if (result) {
       result->baudRatePatched = true;
+    }
+  }
+  if (kernelDebugProbeEnabled) {
+    if (UpsertBcdElementRaw(hive, *elements, "260000A0", 3,
+                            std::vector<uint8_t>{1})) {
+      changed = true;
+      if (result) {
+        result->kernelDebugPatched = true;
+      }
+    }
+    if (UpsertBcdElementRaw(hive, *elements, "15000018", 3, BcdU64Bytes(0))) {
+      changed = true;
+      if (result) {
+        result->debugStartPolicyPatched = true;
+      }
     }
   }
   if (!changed && result) {
@@ -3587,8 +3911,8 @@ bool PatchBcdBootmgrDebug(std::vector<uint8_t> &bcd,
   if (!elements) {
     return false;
   }
-  if (AddBcdElementRaw(hive, *elements, "16000010", 3,
-                       std::vector<uint8_t>{1})) {
+  if (UpsertBcdElementRaw(hive, *elements, "16000010", 3,
+                          std::vector<uint8_t>{1})) {
     if (result) {
       result->bootmgrBootDebugPatched = true;
     }
@@ -3598,10 +3922,13 @@ bool PatchBcdBootmgrDebug(std::vector<uint8_t> &bcd,
 }
 
 // {dbgsettings} GUID per Microsoft BCD docs. winload reads bootdebug=true on
-// the loader, then pulls debugtype / debugport / baudrate from {dbgsettings}
-// via inheritance. Without these elements present somewhere readable,
-// bootdebug has no transport to attach to and winload stays silent on COM1.
+// the loader, then pulls the BcdLibrary debugger transport elements
+// (debugtype/debugport/baudrate) from {dbgsettings} via inheritance. Without
+// these elements present somewhere readable, bootdebug has no transport to
+// attach to and winload stays silent on COM1.
 bool PatchBcdDbgSettings(std::vector<uint8_t> &bcd,
+                         bool kernelDebugProbeEnabled,
+                         bool debugPortAddressProbeEnabled,
                          BootOverlayPatchResult *result) {
   MutableHiveView hive(bcd);
   if (!hive.IsValid()) {
@@ -3634,22 +3961,40 @@ bool PatchBcdDbgSettings(std::vector<uint8_t> &bcd,
   }
 
   bool changed = false;
-  if (AddBcdElementRaw(hive, *elements, "25000022", 3, BcdU64Bytes(0))) {
+  if (UpsertBcdElementRaw(hive, *elements, "15000011", 3, BcdU64Bytes(0))) {
     changed = true;
     if (result) {
       result->dbgSettingsDebugTypePatched = true;
     }
   }
-  if (AddBcdElementRaw(hive, *elements, "25000023", 3, BcdU64Bytes(1))) {
+  if (debugPortAddressProbeEnabled) {
+    if (UpsertBcdElementRaw(hive, *elements, "15000012", 3,
+                            BcdU64Bytes(0x03F8))) {
+      changed = true;
+      if (result) {
+        result->dbgSettingsDebugPortAddressPatched = true;
+      }
+    }
+  }
+  if (UpsertBcdElementRaw(hive, *elements, "15000013", 3, BcdU64Bytes(1))) {
     changed = true;
     if (result) {
       result->dbgSettingsDebugPortPatched = true;
     }
   }
-  if (AddBcdElementRaw(hive, *elements, "25000024", 3, BcdU64Bytes(115200))) {
+  if (UpsertBcdElementRaw(hive, *elements, "15000014", 3,
+                          BcdU64Bytes(115200))) {
     changed = true;
     if (result) {
       result->dbgSettingsBaudRatePatched = true;
+    }
+  }
+  if (kernelDebugProbeEnabled) {
+    if (UpsertBcdElementRaw(hive, *elements, "15000018", 3, BcdU64Bytes(0))) {
+      changed = true;
+      if (result) {
+        result->dbgSettingsDebugStartPolicyPatched = true;
+      }
     }
   }
   if (!changed && result) {
@@ -3657,6 +4002,86 @@ bool PatchBcdDbgSettings(std::vector<uint8_t> &bcd,
         "BCD dbgsettings transport elements already present");
   }
   return changed;
+}
+
+// Force-disable boot UX (no boot logo, no spinning dots) via BCD element
+// 0x16000022. When ANTIMAL_PROBE_BCD_BOOTUX_DISABLED=1 is set, winload skips
+// loading bootres.dll + boot fonts and uses a text-only path. Useful when
+// the boot UX rendering itself is the failure point (e.g. GOP Blt deadlocks).
+bool PatchBcdBootUxDisabledProbe(std::vector<uint8_t> &bcd,
+                                 BootOverlayPatchResult *result) {
+  MutableHiveView hive(bcd);
+  if (!hive.IsValid()) {
+    return false;
+  }
+  const auto root = hive.RootIndex();
+  const auto objects = root ? hive.FindSubkey(*root, "Objects") : std::nullopt;
+  const auto bootmgr =
+      objects ? hive.FindSubkey(*objects,
+                                "{9dea862c-5cdd-4e70-acc1-f32b344d4795}")
+              : std::nullopt;
+  const std::string defaultGuid =
+      bootmgr ? BcdElementString(hive, *bootmgr, "23000003") : std::string{};
+  const auto defaultObject =
+      !defaultGuid.empty() && objects ? hive.FindSubkey(*objects, defaultGuid)
+                                      : std::nullopt;
+  const auto elements =
+      defaultObject ? hive.FindSubkey(*defaultObject, "Elements") : std::nullopt;
+  if (!elements) {
+    if (result) {
+      result->notes.push_back(
+          "BCD bootuxdisabled probe: default loader Elements key not found");
+    }
+    return false;
+  }
+  if (UpsertBcdElementRaw(hive, *elements, "16000022", 3,
+                          std::vector<uint8_t>{1})) {
+    if (result) {
+      result->notes.push_back(
+          "BCD bootuxdisabled=true applied via "
+          "ANTIMAL_PROBE_BCD_BOOTUX_DISABLED");
+    }
+    return true;
+  }
+  return false;
+}
+
+// Append a string-typed loadoptions value to the kernel command line. With
+// ANTIMAL_PROBE_BCD_LOADOPTIONS=<string>, winload will pass that text to
+// the kernel via the LOADER_PARAMETER_BLOCK. Useful flags include "/SOS"
+// (verbose boot), "/NOEXECUTE=OPTOUT" (DEP off), or specific kernel-debug
+// flags. Element id is 0x21000022 (LoadOptionsString, type=2 string).
+bool PatchBcdLoadOptionsProbe(std::vector<uint8_t> &bcd,
+                              const std::wstring &value,
+                              BootOverlayPatchResult *result) {
+  MutableHiveView hive(bcd);
+  if (!hive.IsValid() || value.empty()) {
+    return false;
+  }
+  const auto root = hive.RootIndex();
+  const auto objects = root ? hive.FindSubkey(*root, "Objects") : std::nullopt;
+  const auto bootmgr =
+      objects ? hive.FindSubkey(*objects,
+                                "{9dea862c-5cdd-4e70-acc1-f32b344d4795}")
+              : std::nullopt;
+  const std::string defaultGuid =
+      bootmgr ? BcdElementString(hive, *bootmgr, "23000003") : std::string{};
+  const auto defaultObject =
+      !defaultGuid.empty() && objects ? hive.FindSubkey(*objects, defaultGuid)
+                                      : std::nullopt;
+  const auto elements =
+      defaultObject ? hive.FindSubkey(*defaultObject, "Elements") : std::nullopt;
+  if (!elements) {
+    return false;
+  }
+  if (UpsertBcdElementRaw(hive, *elements, "22000022", 2,
+                          BcdUtf16StringBytes(value.c_str()))) {
+    if (result) {
+      result->notes.push_back("BCD loadoptions probe applied");
+    }
+    return true;
+  }
+  return false;
 }
 
 bool PatchBcdNoIntegrityChecksProbe(std::vector<uint8_t> &bcd,
@@ -3685,15 +4110,15 @@ bool PatchBcdNoIntegrityChecksProbe(std::vector<uint8_t> &bcd,
     }
     return false;
   }
-  if (AddBcdElementRaw(hive, *elements, "26000048", 3,
-                       std::vector<uint8_t>{1})) {
+  if (UpsertBcdElementRaw(hive, *elements, "16000048", 3,
+                          std::vector<uint8_t>{1})) {
     if (result) {
       result->noIntegrityChecksPatched = true;
     }
     return true;
   }
   if (result) {
-    result->notes.push_back("BCD nointegritychecks probe element already present");
+    result->notes.push_back("BCD nointegritychecks probe failed to set element");
   }
   return false;
 }
@@ -3739,6 +4164,94 @@ bool PatchBcdLegacyBootContextProbe(std::vector<uint8_t> &bcd,
   return false;
 }
 
+bool PatchBcdLoaderBooleanProbe(std::vector<uint8_t> &bcd,
+                                const std::string &elementId,
+                                bool BootOverlayPatchResult::*patchedField,
+                                const char *missingElementsNote,
+                                const char *failedNote,
+                                BootOverlayPatchResult *result) {
+  MutableHiveView hive(bcd);
+  if (!hive.IsValid()) {
+    return false;
+  }
+  const auto root = hive.RootIndex();
+  const auto objects = root ? hive.FindSubkey(*root, "Objects") : std::nullopt;
+  const auto bootmgr =
+      objects ? hive.FindSubkey(*objects,
+                                "{9dea862c-5cdd-4e70-acc1-f32b344d4795}")
+              : std::nullopt;
+  const std::string defaultGuid =
+      bootmgr ? BcdElementString(hive, *bootmgr, "23000003") : std::string{};
+  const auto defaultObject =
+      !defaultGuid.empty() && objects ? hive.FindSubkey(*objects, defaultGuid)
+                                      : std::nullopt;
+  const auto elements =
+      defaultObject ? hive.FindSubkey(*defaultObject, "Elements") : std::nullopt;
+  if (!elements) {
+    if (result) {
+      result->notes.push_back(missingElementsNote);
+    }
+    return false;
+  }
+
+  if (UpsertBcdElementRaw(hive, *elements, elementId, 3,
+                          std::vector<uint8_t>{1})) {
+    if (result) {
+      result->*patchedField = true;
+    }
+    return true;
+  }
+  if (result) {
+    result->notes.push_back(failedNote);
+  }
+  return false;
+}
+
+bool PatchBcdExplicitKernelHalProbe(std::vector<uint8_t> &bcd,
+                                    BootOverlayPatchResult *result) {
+  MutableHiveView hive(bcd);
+  if (!hive.IsValid()) {
+    return false;
+  }
+  const auto root = hive.RootIndex();
+  const auto objects = root ? hive.FindSubkey(*root, "Objects") : std::nullopt;
+  const auto bootmgr =
+      objects ? hive.FindSubkey(*objects,
+                                "{9dea862c-5cdd-4e70-acc1-f32b344d4795}")
+              : std::nullopt;
+  const std::string defaultGuid =
+      bootmgr ? BcdElementString(hive, *bootmgr, "23000003") : std::string{};
+  const auto defaultObject =
+      !defaultGuid.empty() && objects ? hive.FindSubkey(*objects, defaultGuid)
+                                      : std::nullopt;
+  const auto elements =
+      defaultObject ? hive.FindSubkey(*defaultObject, "Elements") : std::nullopt;
+  if (!elements) {
+    if (result) {
+      result->notes.push_back(
+          "BCD explicit kernel/HAL probe: default loader Elements key not found");
+    }
+    return false;
+  }
+
+  bool ok = true;
+  ok = UpsertBcdElementRaw(hive, *elements, "22000011", 1,
+                           BcdUtf16StringBytes(L"ntoskrnl.exe")) &&
+       ok;
+  ok = UpsertBcdElementRaw(hive, *elements, "22000012", 1,
+                           BcdUtf16StringBytes(L"hal.dll")) &&
+       ok;
+  if (result) {
+    if (ok) {
+      result->explicitKernelHalPatched = true;
+    } else {
+      result->notes.push_back(
+          "BCD explicit kernel/HAL probe failed to set kernel or HAL element");
+    }
+  }
+  return ok;
+}
+
 bool PatchBcdTestSigningProbe(std::vector<uint8_t> &bcd,
                               BootOverlayPatchResult *result) {
   MutableHiveView hive(bcd);
@@ -3766,7 +4279,7 @@ bool PatchBcdTestSigningProbe(std::vector<uint8_t> &bcd,
     return false;
   }
 
-  if (UpsertBcdElementRaw(hive, *elements, "26000049", 3,
+  if (UpsertBcdElementRaw(hive, *elements, "16000049", 3,
                           std::vector<uint8_t>{1})) {
     if (result) {
       result->testSigningPatched = true;
@@ -3787,27 +4300,69 @@ bool BootOverlayPatchDisabled() {
          needed > 1 && buf[0] != '\0' && std::atoi(buf) != 0;
 }
 
-bool WinloadDebugPatchDisabled() {
+bool EnvFlagEnabled(const char *name) {
   char buf[16]{};
   size_t needed = 0;
-  return getenv_s(&needed, buf, sizeof(buf),
-                  "ANTIMAL_DISABLE_WINLOAD_DEBUG") == 0 &&
-         needed > 1 && buf[0] != '\0' && std::atoi(buf) != 0;
+  return getenv_s(&needed, buf, sizeof(buf), name) == 0 && needed > 1 &&
+         buf[0] != '\0' && std::atoi(buf) != 0;
+}
+
+bool WinloadDebugPatchDisabled() {
+  return EnvFlagEnabled("ANTIMAL_DISABLE_WINLOAD_DEBUG");
+}
+
+bool NoIntegrityChecksProbeEnvEnabled() {
+  return EnvFlagEnabled("ANTIMAL_PROBE_BCD_NOINTEGRITYCHECKS");
+}
+
+bool NoIntegrityChecksPatchDisabled() {
+  return EnvFlagEnabled("ANTIMAL_DISABLE_BCD_NOINTEGRITYCHECKS");
 }
 
 bool NoIntegrityChecksProbeEnabled() {
-  char buf[16]{};
-  size_t needed = 0;
-  return getenv_s(&needed, buf, sizeof(buf),
-                  "ANTIMAL_PROBE_BCD_NOINTEGRITYCHECKS") == 0 &&
-         needed > 1 && buf[0] != '\0' && std::atoi(buf) != 0;
+  return !NoIntegrityChecksPatchDisabled();
+}
+
+bool LegacyBootContextProbeEnvEnabled() {
+  return EnvFlagEnabled("ANTIMAL_PROBE_BCD_LEGACY_CONTEXT");
+}
+
+bool LegacyBootContextPatchDisabled() {
+  return EnvFlagEnabled("ANTIMAL_DISABLE_BCD_LEGACY_CONTEXT");
 }
 
 bool LegacyBootContextProbeEnabled() {
+  return !LegacyBootContextPatchDisabled();
+}
+
+bool DetectHalProbeEnabled() {
   char buf[16]{};
   size_t needed = 0;
   return getenv_s(&needed, buf, sizeof(buf),
-                  "ANTIMAL_PROBE_BCD_LEGACY_CONTEXT") == 0 &&
+                  "ANTIMAL_PROBE_BCD_DETECT_HAL") == 0 &&
+         needed > 1 && buf[0] != '\0' && std::atoi(buf) != 0;
+}
+
+bool ForceLegacyPlatformProbeEnabled() {
+  // Microsoft documents forcelegacyplatform as an OS-loader debug option that
+  // makes Windows assume legacy PC devices such as CMOS and keyboard
+  // controllers exist. Keep it opt-in until a run proves it moves the current
+  // winload-pre-kernel 0xc0000225 boundary forward.
+  char buf[16]{};
+  size_t needed = 0;
+  return getenv_s(&needed, buf, sizeof(buf),
+                  "ANTIMAL_PROBE_BCD_FORCE_LEGACY_PLATFORM") == 0 &&
+         needed > 1 && buf[0] != '\0' && std::atoi(buf) != 0;
+}
+
+bool ExplicitKernelHalProbeEnabled() {
+  // If winload is failing during platform/kernel selection, force the normal
+  // Windows x64 loader filenames so the next observable frontier should be
+  // ntoskrnl.exe/hal.dll reads rather than another silent pre-kernel stop.
+  char buf[16]{};
+  size_t needed = 0;
+  return getenv_s(&needed, buf, sizeof(buf),
+                  "ANTIMAL_PROBE_BCD_EXPLICIT_KERNEL_HAL") == 0 &&
          needed > 1 && buf[0] != '\0' && std::atoi(buf) != 0;
 }
 
@@ -3828,6 +4383,35 @@ bool TestSigningProbeEnabled() {
   size_t needed = 0;
   return getenv_s(&needed, buf, sizeof(buf),
                   "ANTIMAL_PROBE_BCD_TESTSIGNING") == 0 &&
+         needed > 1 && buf[0] != '\0' && std::atoi(buf) != 0;
+}
+
+bool KernelDebugProbeEnabled() {
+  // WARNING: integration run 381c117a-... with this probe enabled regressed
+  // the visible guest UI from the modern blue WinRE Recovery screen to the
+  // black bootmgr "Windows failed to start ... Status: 0xc0000225" screen,
+  // while still producing zero COM1/KD bytes. Microsoft documents /debug as
+  // the kernel-debug switch, separate from /bootdebug and /dbgsettings; keep
+  // it as an explicit probe until the platform can boot far enough for kernel
+  // debugging to help rather than moving the failure earlier.
+  char buf[16]{};
+  size_t needed = 0;
+  return getenv_s(&needed, buf, sizeof(buf),
+                  "ANTIMAL_PROBE_BCD_KERNEL_DEBUG") == 0 &&
+         needed > 1 && buf[0] != '\0' && std::atoi(buf) != 0;
+}
+
+bool DebugPortAddressProbeEnabled() {
+  // WARNING: integration run a18847d8-... with this probe enabled, while the
+  // blue WinRE baseline probes were otherwise unchanged, regressed the visible
+  // UI back to the black bootmgr 0xc0000225 screen and still produced zero
+  // COM1/KD bytes. Keep the raw 0x3F8 port-address element as an explicit
+  // compatibility probe; default bootdebug runs use debugtype/debugport/
+  // baudrate plus ACPI SPCR/DBG2 discovery.
+  char buf[16]{};
+  size_t needed = 0;
+  return getenv_s(&needed, buf, sizeof(buf),
+                  "ANTIMAL_PROBE_BCD_DEBUGPORTADDRESS") == 0 &&
          needed > 1 && buf[0] != '\0' && std::atoi(buf) != 0;
 }
 
@@ -3871,28 +4455,90 @@ BootOverlayPatchResult ApplyEphemeralBootOverlay(hv::IBlockDevice &disk) {
       bool transportChanged = false;
       bool noIntegrityChanged = false;
       bool legacyContextChanged = false;
+      bool detectHalChanged = false;
+      bool forceLegacyPlatformChanged = false;
+      bool explicitKernelHalChanged = false;
       if (WinloadDebugPatchDisabled()) {
         result.notes.push_back(
             "winload debug patch disabled by ANTIMAL_DISABLE_WINLOAD_DEBUG");
       } else {
-        const bool loaderChanged = PatchBcdDebugTransport(bytes, &result);
-        const bool dbgChanged = PatchBcdDbgSettings(bytes, &result);
+        result.kernelDebugProbeEnabled = KernelDebugProbeEnabled();
+        if (result.kernelDebugProbeEnabled) {
+          result.notes.push_back(
+              "BCD kernel-debug probe enabled by "
+              "ANTIMAL_PROBE_BCD_KERNEL_DEBUG");
+        }
+        result.debugPortAddressProbeEnabled = DebugPortAddressProbeEnabled();
+        if (result.debugPortAddressProbeEnabled) {
+          result.notes.push_back(
+              "BCD raw debugportaddress probe enabled by "
+              "ANTIMAL_PROBE_BCD_DEBUGPORTADDRESS");
+        }
+        const bool loaderChanged = PatchBcdDebugTransport(
+            bytes, result.kernelDebugProbeEnabled,
+            result.debugPortAddressProbeEnabled, &result);
+        const bool dbgChanged = PatchBcdDbgSettings(
+            bytes, result.kernelDebugProbeEnabled,
+            result.debugPortAddressProbeEnabled, &result);
         const bool bootmgrChanged = PatchBcdBootmgrDebug(bytes, &result);
         transportChanged = loaderChanged || dbgChanged || bootmgrChanged;
       }
       result.noIntegrityChecksProbeEnabled = NoIntegrityChecksProbeEnabled();
       if (result.noIntegrityChecksProbeEnabled) {
         result.notes.push_back(
-            "BCD nointegritychecks probe enabled by "
-            "ANTIMAL_PROBE_BCD_NOINTEGRITYCHECKS");
+            NoIntegrityChecksProbeEnvEnabled()
+                ? "BCD nointegritychecks probe enabled by "
+                  "ANTIMAL_PROBE_BCD_NOINTEGRITYCHECKS"
+                : "BCD nointegritychecks baseline patch enabled; disable "
+                  "with ANTIMAL_DISABLE_BCD_NOINTEGRITYCHECKS=1");
         noIntegrityChanged = PatchBcdNoIntegrityChecksProbe(bytes, &result);
+      } else {
+        result.notes.push_back(
+            "BCD nointegritychecks baseline patch disabled by "
+            "ANTIMAL_DISABLE_BCD_NOINTEGRITYCHECKS");
       }
       result.legacyBootContextProbeEnabled = LegacyBootContextProbeEnabled();
       if (result.legacyBootContextProbeEnabled) {
         result.notes.push_back(
-            "BCD legacy boot-context probe enabled by "
-            "ANTIMAL_PROBE_BCD_LEGACY_CONTEXT");
+            LegacyBootContextProbeEnvEnabled()
+                ? "BCD legacy boot-context probe enabled by "
+                  "ANTIMAL_PROBE_BCD_LEGACY_CONTEXT"
+                : "BCD legacy boot-context baseline patch enabled; disable "
+                  "with ANTIMAL_DISABLE_BCD_LEGACY_CONTEXT=1");
         legacyContextChanged = PatchBcdLegacyBootContextProbe(bytes, &result);
+      } else {
+        result.notes.push_back(
+            "BCD legacy boot-context baseline patch disabled by "
+            "ANTIMAL_DISABLE_BCD_LEGACY_CONTEXT");
+      }
+      result.detectHalProbeEnabled = DetectHalProbeEnabled();
+      if (result.detectHalProbeEnabled) {
+        result.notes.push_back(
+            "BCD detecthal probe enabled by ANTIMAL_PROBE_BCD_DETECT_HAL");
+        detectHalChanged = PatchBcdLoaderBooleanProbe(
+            bytes, "26000010", &BootOverlayPatchResult::detectHalPatched,
+            "BCD detecthal probe: default loader Elements key not found",
+            "BCD detecthal probe failed to set element", &result);
+      }
+      result.forceLegacyPlatformProbeEnabled = ForceLegacyPlatformProbeEnabled();
+      if (result.forceLegacyPlatformProbeEnabled) {
+        result.notes.push_back(
+            "BCD forcelegacyplatform probe enabled by "
+            "ANTIMAL_PROBE_BCD_FORCE_LEGACY_PLATFORM");
+        forceLegacyPlatformChanged = PatchBcdLoaderBooleanProbe(
+            bytes, "260000A3",
+            &BootOverlayPatchResult::forceLegacyPlatformPatched,
+            "BCD forcelegacyplatform probe: default loader Elements key not "
+            "found",
+            "BCD forcelegacyplatform probe failed to set element", &result);
+      }
+      result.explicitKernelHalProbeEnabled = ExplicitKernelHalProbeEnabled();
+      if (result.explicitKernelHalProbeEnabled) {
+        result.notes.push_back(
+            "BCD explicit kernel/HAL probe enabled by "
+            "ANTIMAL_PROBE_BCD_EXPLICIT_KERNEL_HAL");
+        explicitKernelHalChanged =
+            PatchBcdExplicitKernelHalProbe(bytes, &result);
       }
       bool testSigningChanged = false;
       result.testSigningProbeEnabled = TestSigningProbeEnabled();
@@ -3901,21 +4547,66 @@ BootOverlayPatchResult ApplyEphemeralBootOverlay(hv::IBlockDevice &disk) {
             "BCD testsigning probe enabled by ANTIMAL_PROBE_BCD_TESTSIGNING");
         testSigningChanged = PatchBcdTestSigningProbe(bytes, &result);
       }
-      if ((policyChanged || transportChanged || noIntegrityChanged ||
-           legacyContextChanged || testSigningChanged) &&
-          !fat.WriteFileSameSize(*bcd, bytes)) {
+      bool bootUxChanged = false;
+      {
+        char buf[8]{};
+        size_t needed = 0;
+        if (getenv_s(&needed, buf, sizeof(buf),
+                     "ANTIMAL_PROBE_BCD_BOOTUX_DISABLED") == 0 &&
+            needed > 1 && buf[0] != '\0' && buf[0] != '0') {
+          bootUxChanged = PatchBcdBootUxDisabledProbe(bytes, &result);
+        }
+      }
+      bool loadOptionsChanged = false;
+      {
+        char buf[256]{};
+        size_t needed = 0;
+        if (getenv_s(&needed, buf, sizeof(buf),
+                     "ANTIMAL_PROBE_BCD_LOADOPTIONS") == 0 &&
+            needed > 1 && buf[0] != '\0') {
+          std::wstring wide;
+          for (size_t i = 0; buf[i] != '\0' && i < sizeof(buf) - 1; ++i) {
+            wide.push_back(static_cast<wchar_t>(static_cast<unsigned char>(
+                buf[i])));
+          }
+          loadOptionsChanged =
+              PatchBcdLoadOptionsProbe(bytes, wide, &result);
+        }
+      }
+      const bool bcdChanged =
+          policyChanged || transportChanged || noIntegrityChanged ||
+          legacyContextChanged || detectHalChanged ||
+          forceLegacyPlatformChanged || explicitKernelHalChanged ||
+          testSigningChanged || bootUxChanged || loadOptionsChanged;
+      if (bcdChanged) {
+        if (RefreshRegistryHiveHeader(bytes)) {
+          result.bcdHeaderRefreshed = true;
+        } else {
+          result.notes.push_back("failed to refresh BCD hive header");
+        }
+      }
+      if (bcdChanged && !fat.WriteFileSameSize(*bcd, bytes)) {
         result.bcdPolicyPatched = false;
         result.recoveryPatched = false;
+        result.bcdHeaderRefreshed = false;
         result.bootDebugPatched = false;
+        result.kernelDebugPatched = false;
         result.debugTypePatched = false;
+        result.debugPortAddressPatched = false;
         result.debugPortPatched = false;
         result.baudRatePatched = false;
+        result.debugStartPolicyPatched = false;
         result.dbgSettingsDebugTypePatched = false;
+        result.dbgSettingsDebugPortAddressPatched = false;
         result.dbgSettingsDebugPortPatched = false;
         result.dbgSettingsBaudRatePatched = false;
+        result.dbgSettingsDebugStartPolicyPatched = false;
         result.bootmgrBootDebugPatched = false;
         result.noIntegrityChecksPatched = false;
         result.isolatedContextPatched = false;
+        result.detectHalPatched = false;
+        result.forceLegacyPlatformPatched = false;
+        result.explicitKernelHalPatched = false;
         result.testSigningPatched = false;
         result.notes.push_back("failed to write patched BCD to overlay");
       }
@@ -3943,22 +4634,38 @@ BootOverlayPatchDetails(const BootOverlayPatchResult &patch) {
       {"attempted", patch.attempted ? "true" : "false"},
       {"espFound", patch.espFound ? "true" : "false"},
       {"bcdFound", patch.bcdFound ? "true" : "false"},
+      {"bcdHeaderRefreshed", patch.bcdHeaderRefreshed ? "true" : "false"},
       {"bcdPolicyPatched", patch.bcdPolicyPatched ? "true" : "false"},
       {"recoveryPatched", patch.recoveryPatched ? "true" : "false"},
       {"bootstatReset", patch.bootstatReset ? "true" : "false"},
       {"systemHiveFound", patch.systemHiveFound ? "true" : "false"},
+      {"systemHiveHeaderRefreshed",
+       patch.systemHiveHeaderRefreshed ? "true" : "false"},
       {"bootStoragePatched", patch.bootStoragePatched ? "true" : "false"},
       {"bootDebugPatched", patch.bootDebugPatched ? "true" : "false"},
+      {"kernelDebugProbeEnabled",
+       patch.kernelDebugProbeEnabled ? "true" : "false"},
+      {"kernelDebugPatched", patch.kernelDebugPatched ? "true" : "false"},
+      {"debugPortAddressProbeEnabled",
+       patch.debugPortAddressProbeEnabled ? "true" : "false"},
       {"debugTypePatched", patch.debugTypePatched ? "true" : "false"},
+      {"debugPortAddressPatched",
+       patch.debugPortAddressPatched ? "true" : "false"},
       {"debugPortPatched", patch.debugPortPatched ? "true" : "false"},
       {"baudRatePatched", patch.baudRatePatched ? "true" : "false"},
+      {"debugStartPolicyPatched",
+       patch.debugStartPolicyPatched ? "true" : "false"},
       {"dbgSettingsFound", patch.dbgSettingsFound ? "true" : "false"},
       {"dbgSettingsDebugTypePatched",
        patch.dbgSettingsDebugTypePatched ? "true" : "false"},
+      {"dbgSettingsDebugPortAddressPatched",
+       patch.dbgSettingsDebugPortAddressPatched ? "true" : "false"},
       {"dbgSettingsDebugPortPatched",
        patch.dbgSettingsDebugPortPatched ? "true" : "false"},
       {"dbgSettingsBaudRatePatched",
        patch.dbgSettingsBaudRatePatched ? "true" : "false"},
+      {"dbgSettingsDebugStartPolicyPatched",
+       patch.dbgSettingsDebugStartPolicyPatched ? "true" : "false"},
       {"bootmgrBootDebugPatched",
        patch.bootmgrBootDebugPatched ? "true" : "false"},
       {"noIntegrityChecksProbeEnabled",
@@ -3969,6 +4676,16 @@ BootOverlayPatchDetails(const BootOverlayPatchResult &patch) {
        patch.legacyBootContextProbeEnabled ? "true" : "false"},
       {"isolatedContextPatched",
        patch.isolatedContextPatched ? "true" : "false"},
+      {"detectHalProbeEnabled", patch.detectHalProbeEnabled ? "true" : "false"},
+      {"detectHalPatched", patch.detectHalPatched ? "true" : "false"},
+      {"forceLegacyPlatformProbeEnabled",
+       patch.forceLegacyPlatformProbeEnabled ? "true" : "false"},
+      {"forceLegacyPlatformPatched",
+       patch.forceLegacyPlatformPatched ? "true" : "false"},
+      {"explicitKernelHalProbeEnabled",
+       patch.explicitKernelHalProbeEnabled ? "true" : "false"},
+      {"explicitKernelHalPatched",
+       patch.explicitKernelHalPatched ? "true" : "false"},
       {"testSigningProbeEnabled",
        patch.testSigningProbeEnabled ? "true" : "false"},
       {"testSigningPatched",
@@ -4275,7 +4992,10 @@ std::string FormatAcpiPciContractDiagnostics() {
       << "  PCI0._PRT dev=1 INT[A]->IRQ14 dev=1 INT[B]->IRQ15 "
          "dev=2 INT[A]->IRQ10\n"
       << "  ISA resources COM1=IRQ4 COM2=IRQ3 PS2K=IRQ1 PS2M=IRQ12 "
-         "IDE primary=IRQ14 secondary=IRQ15\n";
+         "IDE primary=IRQ14 secondary=IRQ15\n"
+      << "  Serial debug discovery SPCR=COM1 irq=4 gsi=4 baud=115200 "
+         "DBG2=serial/dbgp-compatible namespace=\\_SB_.COM1 "
+         "DBGP=probe-only/off-by-default\n";
   return out.str();
 }
 
@@ -4377,6 +5097,20 @@ bool PatchSystemHivePiixCriticalDevices(std::vector<uint8_t> &bytes,
   }
 
   bool ok = true;
+  for (const auto *service :
+       {"pciide", "intelide", "atapi", "disk", "partmgr", "mountmgr"}) {
+    const auto key = FindHivePath(hive, {*controlSet, "Services", service});
+    if (!key) {
+      ok = false;
+      continue;
+    }
+    ok = UpsertHiveDword(hive, *key, "Start", 0) && ok;
+    ok = UpsertHiveDword(hive, *key, "ErrorControl", 1) && ok;
+    if (const auto startOverride = hive.FindSubkey(*key, "StartOverride")) {
+      ok = UpsertHiveDword(hive, *startOverride, "0", 0) && ok;
+    }
+  }
+
   const std::wstring classGuid =
       L"{4D36E96A-E325-11CE-BFC1-08002BE10318}";
   for (const auto *id : {"pci#ven_8086&dev_7111",
@@ -4452,8 +5186,16 @@ bool PatchOverlaySystemBootStorage(hv::IBlockDevice &disk,
       !PatchSystemHiveLegacySecurityProbe(bytes, result)) {
     return false;
   }
+  if (RefreshRegistryHiveHeader(bytes)) {
+    if (result) {
+      result->systemHiveHeaderRefreshed = true;
+    }
+  } else if (result) {
+    result->notes.push_back("failed to refresh SYSTEM hive header");
+  }
   if (!ntfs.WriteFileSameSize(*system, bytes)) {
     if (result) {
+      result->systemHiveHeaderRefreshed = false;
       result->systemLegacySecurityPatched = false;
       result->notes.push_back("failed to write SYSTEM hive patch to overlay");
     }
@@ -4530,6 +5272,21 @@ BootSignalSummary AnalyzeBootSignals(const hv::VmRunSummary &vm) {
   }
   if (ContainsTextNoCase(com1, "FATAL") || ContainsTextNoCase(com1, "fatal")) {
     AddMilestone(&signals, "winload emitted FATAL");
+  }
+  if (vm.kdSummary.packetsReceived != 0) {
+    AddMilestone(&signals, "KD serial handshake");
+  }
+  if (vm.kdSummary.debugPrintPackets != 0) {
+    AddMilestone(&signals, "KD debug print");
+  }
+  if (vm.kdSummary.loadSymbolPackets != 0) {
+    AddMilestone(&signals, "KD load symbols");
+  }
+  if (vm.kdSummary.statusPackets != 0) {
+    AddMilestone(&signals, "KD status code observed");
+  }
+  if (vm.kdSummary.autoContinuesSent != 0) {
+    AddMilestone(&signals, "KD auto-continue sent");
   }
   AddImageMilestones(&signals, vm.fatalRipImage);
   for (const auto &image : vm.fatalStackReturnImage) {
@@ -4926,9 +5683,210 @@ std::string ClassifyBootStage(const DynamicRunSummary &summary) {
   return summary.started ? "firmware" : "not-started";
 }
 
+std::string ClassifyCom1TouchStatus(const hv::VmRunSummary &vm) {
+  const auto touched = vm.com1RegisterReads + vm.com1RegisterWrites;
+  if (vm.com1DataWrites != 0) {
+    return "guest-tx-observed";
+  }
+  if (touched == 0) {
+    return "untouched-by-guest";
+  }
+  if (vm.com1RxBytesRead != 0) {
+    return "host-rx-consumed-no-guest-tx";
+  }
+  if (vm.com1IerWrites != 0 || vm.com1LcrWrites != 0 ||
+      vm.com1DllWrites != 0 || vm.com1DlmWrites != 0) {
+    return "uart-programmed-no-guest-tx";
+  }
+  if (vm.com1LsrReads != 0 || vm.com1IirReads != 0) {
+    return "uart-polled-no-guest-tx";
+  }
+  return "registers-touched-no-guest-tx";
+}
+
+std::string ClassifyKdCom1Status(const hv::VmRunSummary &vm) {
+  if (vm.kdSummary.packetsReceived != 0) {
+    return "active";
+  }
+  if (vm.kdSummary.resetPacketsSent != 0) {
+    return vm.kdCom1RxQueuedBytes != 0 ? "silent-after-host-reset-queued"
+                                       : "silent-after-host-reset-probes";
+  }
+  return "silent-after-host-parser-active";
+}
+
+std::string ClassifyPs2InputStatus(const hv::VmRunSummary &vm) {
+  if (vm.keyboardScancodesInjected == 0 && vm.ps2StatusReads == 0 &&
+      vm.ps2DataReads == 0 && vm.ps2CommandWrites == 0 &&
+      vm.ps2DataWrites == 0) {
+    return "not-injected";
+  }
+  if (vm.keyboardScancodesInjected != 0 && vm.ps2StatusReads == 0 &&
+      vm.ps2DataReads == 0) {
+    return "queued-not-polled";
+  }
+  if (vm.keyboardScancodesInjected != 0 &&
+      vm.ps2KeyboardBytesRead >=
+          static_cast<uint64_t>(vm.keyboardScancodesInjected)) {
+    return "consumed";
+  }
+  if (vm.keyboardScancodesInjected != 0 &&
+      vm.ps2KeyboardBytesQueued > vm.ps2KeyboardBytesRead) {
+    return "queued-not-drained";
+  }
+  if (vm.ps2CommandWrites != 0 || vm.ps2DataWrites != 0) {
+    return "controller-programmed";
+  }
+  return "observed";
+}
+
+std::string FormatCpuidSampleLine(const hv::CpuidExitResult &sample) {
+  std::ostringstream out;
+  out << "vcpu" << sample.vcpuIndex << " leaf=" << HexDword(sample.leaf)
+      << " sub=" << HexDword(sample.subleaf) << " eax="
+      << HexDword(sample.eax) << " ebx=" << HexDword(sample.ebx)
+      << " ecx=" << HexDword(sample.ecx) << " edx="
+      << HexDword(sample.edx);
+  if (sample.overridden) {
+    out << " overridden";
+  }
+  if (sample.leaf == 0x00000001u) {
+    out << " hypervisorBit="
+        << ((sample.ecx & (1u << 31)) != 0 ? "set" : "clear");
+  } else if (sample.leaf == 0x80000008u) {
+    out << " physBits=" << (sample.eax & 0xFFu)
+        << " linearBits=" << ((sample.eax >> 8) & 0xFFu);
+  } else if (sample.leaf >= 0x40000000u &&
+             sample.leaf <= 0x400000FFu) {
+    out << " syntheticHypervisorLeaf";
+  }
+  return out.str();
+}
+
+bool IsInterestingCpuidSample(const hv::CpuidExitResult &sample) {
+  switch (sample.leaf) {
+  case 0x00000000u:
+  case 0x00000001u:
+  case 0x00000007u:
+  case 0x0000000Bu:
+  case 0x0000001Fu:
+  case 0x80000000u:
+  case 0x80000001u:
+  case 0x80000008u:
+    return true;
+  default:
+    return sample.overridden ||
+           (sample.leaf >= 0x40000000u && sample.leaf <= 0x400000FFu);
+  }
+}
+
+std::vector<std::string> BuildCpuidDiagnostics(const hv::VmRunSummary &vm) {
+  std::vector<std::string> lines;
+  for (const auto &sample : vm.cpuidSamples) {
+    if (!IsInterestingCpuidSample(sample)) {
+      continue;
+    }
+    lines.push_back(FormatCpuidSampleLine(sample));
+    if (lines.size() >= 16) {
+      return lines;
+    }
+  }
+  for (const auto &sample : vm.cpuidSamples) {
+    if (lines.size() >= 16) {
+      break;
+    }
+    const auto line = FormatCpuidSampleLine(sample);
+    if (std::find(lines.begin(), lines.end(), line) == lines.end()) {
+      lines.push_back(line);
+    }
+  }
+  return lines;
+}
+
+std::string WindowsKernelReadGateStatus(
+    const std::vector<BootReadObservation> &observations) {
+  if (observations.empty()) {
+    return "unknown";
+  }
+  return WindowsKernelReadGateReached(observations) ? "reached"
+                                                    : "not-reached";
+}
+
+std::string WindowsKernelReadGateEvidence(
+    const std::vector<BootReadObservation> &observations) {
+  if (observations.empty()) {
+    return {};
+  }
+  if (WindowsKernelReadGateReached(observations)) {
+    return WindowsKernelReadGateDetails(observations);
+  }
+
+  std::vector<std::string> blockedTargets;
+  std::vector<std::string> preGateReads;
+  for (const auto &observation : observations) {
+    if (IsKernelReadGateTarget(observation.target.name)) {
+      if (!BootReadObserved(observation)) {
+        blockedTargets.push_back(FileNameFromBootPath(observation.target.name));
+      }
+      continue;
+    }
+    if (BootReadObserved(observation) && preGateReads.size() < 12) {
+      preGateReads.push_back(FileNameFromBootPath(observation.target.name));
+    }
+  }
+
+  std::ostringstream out;
+  out << "no reads of kernel-gate targets";
+  if (!blockedTargets.empty()) {
+    out << " (" << JoinStrings(blockedTargets, ", ") << ")";
+  }
+  if (!preGateReads.empty()) {
+    out << "; observed pre-gate reads: " << JoinStrings(preGateReads, ", ");
+  }
+  return out.str();
+}
+
+std::string FormatWindowsKernelReadGateSummary(
+    const std::vector<BootReadObservation> &observations) {
+  if (observations.empty()) {
+    return {};
+  }
+  std::ostringstream out;
+  out << "\nWindows kernel-read gate:\n";
+  out << "  status: " << WindowsKernelReadGateStatus(observations) << "\n";
+  const auto evidence = WindowsKernelReadGateEvidence(observations);
+  if (!evidence.empty()) {
+    out << "  evidence: " << evidence << "\n";
+  }
+  return out.str();
+}
+
+std::string ClassifyBootBlocker(const DynamicRunSummary &summary) {
+  if (summary.windowsKernelReadGateReached) {
+    return {};
+  }
+  if (summary.bootStage == "winload-pre-kernel") {
+    if (summary.kdCom1Status.find("silent") != std::string::npos) {
+      return "winload reached pre-kernel work, but the kernel-read gate was not "
+             "reached and COM1/KD stayed silent";
+    }
+    return "winload reached pre-kernel work, but the kernel-read gate was not "
+           "reached";
+  }
+  if (summary.bootStage == "bootmgr") {
+    return "bootmgr did not reach winload/kernel-read evidence";
+  }
+  if (summary.bootStage == "firmware") {
+    return "firmware did not reach Windows boot-manager evidence";
+  }
+  return {};
+}
+
 DynamicRunSummary ToDynamicSummary(const hv::VmRunSummary &vm,
                                    NetworkMode networkMode,
                                    const std::filesystem::path &serialLogPath,
+                                   const std::filesystem::path &kdLogPath,
+                                   const std::filesystem::path &kdPacketsPath,
                                    const std::filesystem::path &summaryPath) {
   DynamicRunSummary summary;
   summary.started = vm.started;
@@ -4993,7 +5951,73 @@ DynamicRunSummary ToDynamicSummary(const hv::VmRunSummary &vm,
   summary.pm1SleepType = vm.pm1SleepType;
   summary.pm1ControlValue = vm.pm1ControlValue;
   summary.pm1SleepRequests = vm.pm1SleepRequests;
+  summary.kdPacketsReceived = vm.kdSummary.packetsReceived;
+  summary.kdControlPacketsReceived = vm.kdSummary.controlPacketsReceived;
+  summary.kdDataPacketsReceived = vm.kdSummary.dataPacketsReceived;
+  summary.kdAckPacketsSent = vm.kdSummary.ackPacketsSent;
+  summary.kdResendPacketsSent = vm.kdSummary.resendPacketsSent;
+  summary.kdResetPacketsReceived = vm.kdSummary.resetPacketsReceived;
+  summary.kdResetPacketsSent = vm.kdSummary.resetPacketsSent;
+  summary.kdCom1RxQueuedBytes = vm.kdCom1RxQueuedBytes;
+  summary.kdTargetAcksReceived = vm.kdSummary.targetAcksReceived;
+  summary.kdDebugPrintBytes = vm.kdSummary.debugPrintBytes;
+  summary.kdDebugPrintPackets = vm.kdSummary.debugPrintPackets;
+  summary.kdStateChangePackets = vm.kdSummary.stateChangePackets;
+  summary.kdLoadSymbolPackets = vm.kdSummary.loadSymbolPackets;
+  summary.kdStatusPackets = vm.kdSummary.statusPackets;
+  summary.kdAutoContinuesSent = vm.kdSummary.autoContinuesSent;
+  summary.kdChecksumFailures = vm.kdSummary.checksumFailures;
+  summary.kdTrailingByteFailures = vm.kdSummary.trailingByteFailures;
+  summary.kdLastPacketType = vm.kdSummary.lastPacketType;
+  summary.kdLastApiNumber = vm.kdSummary.lastApiNumber;
+  summary.kdLastStatus = vm.kdSummary.lastStatus;
+  summary.kdLastStatusText = vm.kdSummary.lastStatusText;
+  summary.kdCom1Status = ClassifyKdCom1Status(vm);
+  summary.com1RegisterReads = vm.com1RegisterReads;
+  summary.com1RegisterWrites = vm.com1RegisterWrites;
+  summary.com1DataReads = vm.com1DataReads;
+  summary.com1DataWrites = vm.com1DataWrites;
+  summary.com1RxBytesQueued = vm.com1RxBytesQueued;
+  summary.com1RxBytesRead = vm.com1RxBytesRead;
+  summary.com1RxBytesCleared = vm.com1RxBytesCleared;
+  summary.com1IerWrites = vm.com1IerWrites;
+  summary.com1FcrWrites = vm.com1FcrWrites;
+  summary.com1LcrWrites = vm.com1LcrWrites;
+  summary.com1McrWrites = vm.com1McrWrites;
+  summary.com1DllWrites = vm.com1DllWrites;
+  summary.com1DlmWrites = vm.com1DlmWrites;
+  summary.com1IirReads = vm.com1IirReads;
+  summary.com1LsrReads = vm.com1LsrReads;
+  summary.com1Ier = vm.com1Ier;
+  summary.com1Fcr = vm.com1Fcr;
+  summary.com1Lcr = vm.com1Lcr;
+  summary.com1Mcr = vm.com1Mcr;
+  summary.com1Dll = vm.com1Dll;
+  summary.com1Dlm = vm.com1Dlm;
+  summary.com1Dlab = vm.com1Dlab;
+  summary.com1RxInterruptEnabled = vm.com1RxInterruptEnabled;
+  summary.com1RxDataReady = vm.com1RxDataReady;
+  summary.com1TouchStatus = ClassifyCom1TouchStatus(vm);
+  summary.fwCfgSmbiosTableBytesRead = vm.fwCfgSmbiosTableBytesRead;
+  summary.fwCfgSmbiosAnchorBytesRead = vm.fwCfgSmbiosAnchorBytesRead;
+  summary.keyboardScancodesInjected =
+      static_cast<uint32_t>(std::max(0, vm.keyboardScancodesInjected));
+  summary.ps2StatusReads = vm.ps2StatusReads;
+  summary.ps2DataReads = vm.ps2DataReads;
+  summary.ps2CommandWrites = vm.ps2CommandWrites;
+  summary.ps2DataWrites = vm.ps2DataWrites;
+  summary.ps2KeyboardBytesQueued = vm.ps2KeyboardBytesQueued;
+  summary.ps2KeyboardBytesRead = vm.ps2KeyboardBytesRead;
+  summary.ps2MouseBytesQueued = vm.ps2MouseBytesQueued;
+  summary.ps2MouseBytesRead = vm.ps2MouseBytesRead;
+  summary.ps2KeyboardPortEnabled = vm.ps2KeyboardPortEnabled;
+  summary.ps2MousePortEnabled = vm.ps2MousePortEnabled;
+  summary.ps2KeyboardScanningEnabled = vm.ps2KeyboardScanningEnabled;
+  summary.ps2InputStatus = ClassifyPs2InputStatus(vm);
+  summary.cpuidDiagnostics = BuildCpuidDiagnostics(vm);
   summary.serialLogPath = serialLogPath;
+  summary.kdLogPath = kdLogPath;
+  summary.kdPacketsPath = kdPacketsPath;
   summary.vmSummaryPath = summaryPath;
   if (summary.timedOut) {
     summary.status = "timed out";
@@ -5225,6 +6249,21 @@ std::string FormatVmDiagnostics(const hv::VmRunSummary &vm) {
   out << "timerInterruptsRequested: " << vm.timerInterruptsRequested << "\n";
   out << "timerInterruptsInjected: " << vm.timerInterruptsInjected << "\n";
   out << "keyboardScancodesInjected: " << vm.keyboardScancodesInjected << "\n";
+  out << "ps2StatusReads: " << vm.ps2StatusReads << "\n";
+  out << "ps2DataReads: " << vm.ps2DataReads << "\n";
+  out << "ps2CommandWrites: " << vm.ps2CommandWrites << "\n";
+  out << "ps2DataWrites: " << vm.ps2DataWrites << "\n";
+  out << "ps2KeyboardBytesQueued: " << vm.ps2KeyboardBytesQueued << "\n";
+  out << "ps2KeyboardBytesRead: " << vm.ps2KeyboardBytesRead << "\n";
+  out << "ps2MouseBytesQueued: " << vm.ps2MouseBytesQueued << "\n";
+  out << "ps2MouseBytesRead: " << vm.ps2MouseBytesRead << "\n";
+  out << "ps2KeyboardPortEnabled: "
+      << (vm.ps2KeyboardPortEnabled ? "true" : "false") << "\n";
+  out << "ps2MousePortEnabled: "
+      << (vm.ps2MousePortEnabled ? "true" : "false") << "\n";
+  out << "ps2KeyboardScanningEnabled: "
+      << (vm.ps2KeyboardScanningEnabled ? "true" : "false") << "\n";
+  out << "ps2InputStatus: " << ClassifyPs2InputStatus(vm) << "\n";
   out << "ideInterruptsRequested: " << vm.ideInterruptsRequested << "\n";
   out << "ideInterruptsInjected: " << vm.ideInterruptsInjected << "\n";
   out << "ideInterruptsFailed: " << vm.ideInterruptsFailed << "\n";
@@ -5300,8 +6339,112 @@ std::string FormatVmDiagnostics(const hv::VmRunSummary &vm) {
   out << "fwCfgAcpiTableBytesRead: " << vm.fwCfgAcpiTableBytesRead << "\n";
   out << "fwCfgTableLoaderBytesRead: " << vm.fwCfgTableLoaderBytesRead << "\n";
   out << "fwCfgRsdpBytesRead: " << vm.fwCfgRsdpBytesRead << "\n";
+  out << "fwCfgSmbiosTableBytesRead: " << vm.fwCfgSmbiosTableBytesRead
+      << "\n";
+  out << "fwCfgSmbiosAnchorBytesRead: " << vm.fwCfgSmbiosAnchorBytesRead
+      << "\n";
   out << "pageFaultAssists: " << vm.pageFaultAssists << "\n";
   out << "hostChannelBytes: " << vm.hostChannelOutput.size() << "\n";
+  out << "com1TouchStatus: " << ClassifyCom1TouchStatus(vm) << "\n";
+  out << "com1RegisterReads: " << vm.com1RegisterReads << "\n";
+  out << "com1RegisterWrites: " << vm.com1RegisterWrites << "\n";
+  out << "com1DataReads: " << vm.com1DataReads << "\n";
+  out << "com1DataWrites: " << vm.com1DataWrites << "\n";
+  out << "com1RxBytesQueued: " << vm.com1RxBytesQueued << "\n";
+  out << "com1RxBytesRead: " << vm.com1RxBytesRead << "\n";
+  out << "com1RxBytesCleared: " << vm.com1RxBytesCleared << "\n";
+  out << "com1IerWrites: " << vm.com1IerWrites << "\n";
+  out << "com1FcrWrites: " << vm.com1FcrWrites << "\n";
+  out << "com1LcrWrites: " << vm.com1LcrWrites << "\n";
+  out << "com1McrWrites: " << vm.com1McrWrites << "\n";
+  out << "com1DllWrites: " << vm.com1DllWrites << "\n";
+  out << "com1DlmWrites: " << vm.com1DlmWrites << "\n";
+  out << "com1IirReads: " << vm.com1IirReads << "\n";
+  out << "com1LsrReads: " << vm.com1LsrReads << "\n";
+  out << "com1Ier: 0x" << std::hex << std::uppercase
+      << static_cast<int>(vm.com1Ier) << std::dec << "\n";
+  out << "com1Fcr: 0x" << std::hex << std::uppercase
+      << static_cast<int>(vm.com1Fcr) << std::dec << "\n";
+  out << "com1Lcr: 0x" << std::hex << std::uppercase
+      << static_cast<int>(vm.com1Lcr) << std::dec << "\n";
+  out << "com1Mcr: 0x" << std::hex << std::uppercase
+      << static_cast<int>(vm.com1Mcr) << std::dec << "\n";
+  out << "com1Dll: 0x" << std::hex << std::uppercase
+      << static_cast<int>(vm.com1Dll) << std::dec << "\n";
+  out << "com1Dlm: 0x" << std::hex << std::uppercase
+      << static_cast<int>(vm.com1Dlm) << std::dec << "\n";
+  out << "com1Dlab: " << (vm.com1Dlab ? "true" : "false") << "\n";
+  out << "com1RxInterruptEnabled: "
+      << (vm.com1RxInterruptEnabled ? "true" : "false") << "\n";
+  out << "com1RxDataReady: " << (vm.com1RxDataReady ? "true" : "false")
+      << "\n";
+  out << "kdCom1BytesObserved: " << vm.kdSummary.bytesObserved << "\n";
+  out << "kdCom1NoiseBytes: " << vm.kdSummary.noiseBytes << "\n";
+  out << "kdPacketsReceived: " << vm.kdSummary.packetsReceived << "\n";
+  out << "kdControlPacketsReceived: "
+      << vm.kdSummary.controlPacketsReceived << "\n";
+  out << "kdDataPacketsReceived: " << vm.kdSummary.dataPacketsReceived << "\n";
+  out << "kdAckPacketsSent: " << vm.kdSummary.ackPacketsSent << "\n";
+  out << "kdResendPacketsSent: " << vm.kdSummary.resendPacketsSent << "\n";
+  out << "kdResetPacketsReceived: " << vm.kdSummary.resetPacketsReceived
+      << "\n";
+  out << "kdResetPacketsSent: " << vm.kdSummary.resetPacketsSent << "\n";
+  out << "kdCom1RxQueuedBytes: " << vm.kdCom1RxQueuedBytes << "\n";
+  out << "kdTargetAcksReceived: " << vm.kdSummary.targetAcksReceived << "\n";
+  out << "kdDebugPrintPackets: " << vm.kdSummary.debugPrintPackets << "\n";
+  out << "kdDebugPrintBytes: " << vm.kdSummary.debugPrintBytes << "\n";
+  out << "kdStateChangePackets: " << vm.kdSummary.stateChangePackets << "\n";
+  out << "kdLoadSymbolPackets: " << vm.kdSummary.loadSymbolPackets << "\n";
+  out << "kdStatusPackets: " << vm.kdSummary.statusPackets << "\n";
+  out << "kdAutoContinuesSent: " << vm.kdSummary.autoContinuesSent << "\n";
+  out << "kdChecksumFailures: " << vm.kdSummary.checksumFailures << "\n";
+  out << "kdTrailingByteFailures: " << vm.kdSummary.trailingByteFailures
+      << "\n";
+  out << "kdLastPacketType: " << vm.kdSummary.lastPacketType << "\n";
+  out << "kdLastApiNumber: 0x" << std::hex << std::uppercase
+      << vm.kdSummary.lastApiNumber << std::dec << "\n";
+  out << "kdLastStatus: " << (vm.kdSummary.lastStatusText.empty()
+                                  ? std::string("none")
+                                  : vm.kdSummary.lastStatusText)
+      << "\n";
+  if (vm.kdSummary.packetsReceived == 0) {
+    out << "kdCom1Status: "
+        << (vm.kdSummary.resetPacketsSent != 0
+                ? (vm.kdCom1RxQueuedBytes != 0
+                       ? "silent-after-host-reset-queued"
+                       : "silent-after-host-reset-probes")
+                : "silent-after-host-parser-active")
+        << "\n";
+  }
+  if (!vm.kdEvents.empty()) {
+    out << "\nKD COM1 events:\n";
+    size_t count = 0;
+    for (const auto &event : vm.kdEvents) {
+      if (count++ >= 32) {
+        out << "  ... " << (vm.kdEvents.size() - 32)
+            << " more KD events in kd-packets.jsonl\n";
+        break;
+      }
+      out << "  " << event.kind << " type=" << event.packetType
+          << " id=0x" << std::hex << std::uppercase << event.packetId
+          << std::dec;
+      if (event.apiNumber != 0) {
+        out << " api=0x" << std::hex << std::uppercase << event.apiNumber
+            << std::dec;
+      }
+      if (event.status != 0) {
+        out << " status=0x" << std::hex << std::uppercase << event.status
+            << std::dec;
+      }
+      if (!event.detail.empty()) {
+        out << " " << event.detail;
+      }
+      if (!event.text.empty()) {
+        out << " text=\"" << event.text.substr(0, 160) << "\"";
+      }
+      out << "\n";
+    }
+  }
   if (vm.pageFaultAssists != 0) {
     out << "lastPageFaultAssistGva: 0x" << std::hex << std::uppercase
         << vm.lastPageFaultAssistGva << std::dec << "\n";
@@ -5355,6 +6498,13 @@ std::string FormatVmDiagnostics(const hv::VmRunSummary &vm) {
     char hex[16]{};
     _snprintf_s(hex, sizeof(hex), _TRUNCATE, "0x%08X", leaf);
     out << "  " << hex << ": " << count << "\n";
+  }
+  const auto cpuidDiagnostics = BuildCpuidDiagnostics(vm);
+  if (!cpuidDiagnostics.empty()) {
+    out << "\nCPUID guest-visible samples:\n";
+    for (const auto &line : cpuidDiagnostics) {
+      out << "  " << line << "\n";
+    }
   }
   if (!vm.ripHotspots.empty()) {
     out << "\nTop BSP RIP hotspots (16-byte bucket, hits across whole run):\n";
@@ -5905,6 +7055,8 @@ DetonationResult InHouseOrchestrator::PrepareAndRun(
     const auto serialLogPath = result.runDir / "serial.log";
     const auto firmwareLogPath = result.runDir / "serial-firmware.log";
     const auto mergedLogPath = result.runDir / "serial-merged.log";
+    const auto kdLogPath = result.runDir / "kd-com1.log";
+    const auto kdPacketsPath = result.runDir / "kd-packets.jsonl";
     const auto vmSummaryPath = result.runDir / "vm-summary.json";
     const auto vmDiagnosticsPath = result.runDir / "vm-diagnostics.txt";
     try {
@@ -5931,6 +7083,34 @@ DetonationResult InHouseOrchestrator::PrepareAndRun(
             // Set-1 Enter make/break. This is a boot UI probe only; it does
             // not authorize sample execution.
             request.keyboardScancodes = {0x1C, 0x9C};
+          }
+        }
+      }
+      // ANTIMAL_PROBE_BYPASS_DRIVER_SIG: at this delay (seconds), the host
+      // injects F8 (recovery -> Startup Settings), then 7 (disable driver
+      // signature enforcement) one second later. This walks the bootmgr
+      // recovery menu when winload returns 0xc0000225 to bootmgr so the
+      // next boot attempt skips CI enforcement. Set 0 to disable.
+      {
+        char buf[16]{};
+        size_t needed = 0;
+        if (getenv_s(&needed, buf, sizeof(buf),
+                     "ANTIMAL_PROBE_BYPASS_DRIVER_SIG") == 0 &&
+            needed > 1 && buf[0] != '\0') {
+          const int seconds = std::atoi(buf);
+          if (seconds > 0 && seconds <= 600) {
+            using namespace std::chrono;
+            const auto base = milliseconds{static_cast<int64_t>(seconds) *
+                                           1000};
+            // F8 make/break to enter Startup Settings.
+            request.keyboardBursts.push_back(
+                {base, std::vector<uint8_t>{0x42, 0xC2}});
+            // '7' make/break to choose option 7 (disable driver sig
+            // enforcement). 1500 ms after F8 to give bootmgr time to render
+            // the next menu.
+            request.keyboardBursts.push_back(
+                {base + milliseconds{1500},
+                 std::vector<uint8_t>{0x08, 0x88}});
           }
         }
       }
@@ -6148,6 +7328,11 @@ DetonationResult InHouseOrchestrator::PrepareAndRun(
       IdeReadAttributionCatalog readAttributionCatalog;
       hv::VirtualMachineOptions vmOptions;
       vmOptions.processorCount = 2;
+      // Windows 11 minimum RAM is 4 GiB. 2 GiB low + 2 GiB high meets that.
+      // bootstat.dat showed winload aborting with STATUS_MEMORY_NOT_ALLOCATED /
+      // STATUS_FREE_VM_NOT_AT_BASE on a 2 GiB-only configuration — winload
+      // could not allocate kernel pool for the Code Integrity driver.
+      vmOptions.highRamBytes = 2048ull * 1024ull * 1024ull;
       // ANTIMAL_VCPU_COUNT lets us test single-CPU vs multi-CPU boot paths
       // without rebuilding. Useful when chasing AP-bringup synchronization
       // hangs in firmware MP init — drop to 1 to side-step the AP sync
@@ -6160,6 +7345,20 @@ DetonationResult InHouseOrchestrator::PrepareAndRun(
           const int requested = std::atoi(buf);
           if (requested >= 1 && requested <= 64) {
             vmOptions.processorCount = static_cast<uint32_t>(requested);
+          }
+        }
+      }
+      // ANTIMAL_HIGH_RAM_MB overrides the above-4G RAM allocation in MiB
+      // for quick experimentation without a rebuild. Set 0 to disable.
+      {
+        char buf[16]{};
+        size_t needed = 0;
+        if (getenv_s(&needed, buf, sizeof(buf), "ANTIMAL_HIGH_RAM_MB") == 0 &&
+            needed > 1 && buf[0] != '\0') {
+          const long long mb = std::atoll(buf);
+          if (mb >= 0 && mb <= 65536) {
+            vmOptions.highRamBytes =
+                static_cast<uint64_t>(mb) * 1024ull * 1024ull;
           }
         }
       }
@@ -6240,6 +7439,8 @@ DetonationResult InHouseOrchestrator::PrepareAndRun(
       fireProgress("finishing", "VM run loop returned; writing diagnostics");
       WriteTextFile(serialLogPath, vmSummary.serialOutput);
       WriteTextFile(firmwareLogPath, vmSummary.firmwareDebugOutput);
+      WriteTextFile(kdLogPath, vmSummary.kdTranscript);
+      WriteTextFile(kdPacketsPath, vmSummary.kdPacketsJsonl);
       {
         std::string merged = vmSummary.serialOutput;
         if (!vmSummary.firmwareDebugOutput.empty()) {
@@ -6253,6 +7454,8 @@ DetonationResult InHouseOrchestrator::PrepareAndRun(
       WriteTextFile(vmDiagnosticsPath,
                     FormatVmDiagnostics(vmSummary) +
                         FormatBootReadObservations(bootReadObservations) +
+                        FormatWindowsKernelReadGateSummary(
+                            bootReadObservations) +
                         FormatIdeReadAttribution(readAttribution) +
                         FormatIdeWriteAttribution(writeAttribution) +
                         FormatWindowsResidualRunOwners(windowsResidualOwners) +
@@ -6265,7 +7468,8 @@ DetonationResult InHouseOrchestrator::PrepareAndRun(
                         overlayBcdSummary +
                         FormatAcpiPciContractDiagnostics());
       result.dynamicSummary =
-          ToDynamicSummary(vmSummary, networkMode, serialLogPath, vmSummaryPath);
+          ToDynamicSummary(vmSummary, networkMode, serialLogPath, kdLogPath,
+                           kdPacketsPath, vmSummaryPath);
       auto bootSignals = AnalyzeBootSignals(vmSummary);
       AddBootReadMilestones(&bootSignals, bootReadObservations);
       AddResidualOwnerMilestones(&bootSignals, windowsResidualOwners);
@@ -6273,12 +7477,25 @@ DetonationResult InHouseOrchestrator::PrepareAndRun(
           ProcessHostChannelOutput(vmSummary.hostChannelOutput, result.journalPath,
                                    result.artifactsDir, &events);
       result.dynamicSummary.bootMilestones = bootSignals.milestones;
+      if (vmSummary.fwCfgSmbiosAnchorBytesRead != 0 ||
+          vmSummary.fwCfgSmbiosTableBytesRead != 0) {
+        AddMilestone(&result.dynamicSummary.bootMilestones,
+                     "SMBIOS fw_cfg consumed");
+      }
       for (const auto &milestone : hostCapture.milestones) {
         AddMilestone(&result.dynamicSummary.bootMilestones, milestone);
       }
       result.dynamicSummary.guestAgentConnected =
           hostCapture.guestAgentConnected;
       result.dynamicSummary.bootStage = ClassifyBootStage(result.dynamicSummary);
+      result.dynamicSummary.windowsKernelReadGateStatus =
+          WindowsKernelReadGateStatus(bootReadObservations);
+      result.dynamicSummary.windowsKernelReadGateReached =
+          result.dynamicSummary.windowsKernelReadGateStatus == "reached";
+      result.dynamicSummary.windowsKernelReadGateEvidence =
+          WindowsKernelReadGateEvidence(bootReadObservations);
+      result.dynamicSummary.bootBlocker =
+          ClassifyBootBlocker(result.dynamicSummary);
       returnedArtifacts.insert(returnedArtifacts.end(),
                                hostCapture.artifacts.begin(),
                                hostCapture.artifacts.end());
@@ -6317,6 +7534,111 @@ DetonationResult InHouseOrchestrator::PrepareAndRun(
                                             result.overlayDiskPath),
                            &events);
       }
+      if (vmSummary.kdSummary.packetsReceived != 0) {
+        AppendJournalEvent(
+            result.journalPath,
+            MakeSandboxEvent("kd.com1.packets", result.overlayDiskPath,
+                             {{"packets",
+                               std::to_string(vmSummary.kdSummary.packetsReceived)},
+                              {"acksSent",
+                               std::to_string(vmSummary.kdSummary.ackPacketsSent)},
+                              {"resetsSent",
+                               std::to_string(
+                                   vmSummary.kdSummary.resetPacketsSent)},
+                              {"rxQueuedBytes",
+                               std::to_string(vmSummary.kdCom1RxQueuedBytes)},
+                              {"debugPrintPackets",
+                               std::to_string(
+                                   vmSummary.kdSummary.debugPrintPackets)},
+                              {"loadSymbolPackets",
+                               std::to_string(
+                                   vmSummary.kdSummary.loadSymbolPackets)},
+                              {"statusPackets",
+                               std::to_string(vmSummary.kdSummary.statusPackets)},
+                              {"autoContinues",
+                               std::to_string(
+                                   vmSummary.kdSummary.autoContinuesSent)}}),
+            &events);
+      } else {
+        AppendJournalEvent(
+            result.journalPath,
+            MakeSandboxEvent("kd.com1.silent", result.overlayDiskPath,
+                             {{"reason",
+                               vmSummary.kdCom1RxQueuedBytes != 0
+                                   ? "host-kd-reset-queued-but-not-drained"
+                                   : vmSummary.kdSummary.resetPacketsSent != 0
+                                   ? "no-kd-packets-after-host-reset-probes"
+                                   : "no-kd-packets-after-host-parser"},
+                              {"bytesObserved",
+                               std::to_string(vmSummary.kdSummary.bytesObserved)},
+                              {"resetsSent",
+                               std::to_string(
+                                   vmSummary.kdSummary.resetPacketsSent)},
+                              {"rxQueuedBytes",
+                               std::to_string(vmSummary.kdCom1RxQueuedBytes)},
+                              {"noiseBytes",
+                               std::to_string(vmSummary.kdSummary.noiseBytes)}}),
+            &events);
+      }
+      AppendJournalEvent(
+          result.journalPath,
+          MakeSandboxEvent(
+              "com1.uart.probe", result.overlayDiskPath,
+              {{"status", result.dynamicSummary.com1TouchStatus},
+               {"registerReads",
+                std::to_string(result.dynamicSummary.com1RegisterReads)},
+               {"registerWrites",
+                std::to_string(result.dynamicSummary.com1RegisterWrites)},
+               {"dataReads",
+                std::to_string(result.dynamicSummary.com1DataReads)},
+               {"dataWrites",
+                std::to_string(result.dynamicSummary.com1DataWrites)},
+               {"rxBytesQueued",
+                std::to_string(result.dynamicSummary.com1RxBytesQueued)},
+               {"rxBytesRead",
+                std::to_string(result.dynamicSummary.com1RxBytesRead)},
+               {"ierWrites",
+                std::to_string(result.dynamicSummary.com1IerWrites)},
+               {"lcrWrites",
+                std::to_string(result.dynamicSummary.com1LcrWrites)},
+               {"rxInterruptEnabled",
+                result.dynamicSummary.com1RxInterruptEnabled ? "true"
+                                                             : "false"}}),
+          &events);
+      if (result.dynamicSummary.keyboardScancodesInjected != 0 ||
+          result.dynamicSummary.ps2StatusReads != 0 ||
+          result.dynamicSummary.ps2DataReads != 0) {
+        AppendJournalEvent(
+            result.journalPath,
+            MakeSandboxEvent("input.ps2.probe", result.overlayDiskPath,
+                             {{"status",
+                               result.dynamicSummary.ps2InputStatus},
+                              {"keyboardScancodesInjected",
+                               std::to_string(result.dynamicSummary
+                                                  .keyboardScancodesInjected)},
+                              {"statusReads",
+                               std::to_string(
+                                   result.dynamicSummary.ps2StatusReads)},
+                              {"dataReads",
+                               std::to_string(
+                                   result.dynamicSummary.ps2DataReads)},
+                              {"keyboardBytesQueued",
+                               std::to_string(result.dynamicSummary
+                                                  .ps2KeyboardBytesQueued)},
+                              {"keyboardBytesRead",
+                               std::to_string(result.dynamicSummary
+                                                  .ps2KeyboardBytesRead)}}),
+            &events);
+      }
+      if (!result.dynamicSummary.cpuidDiagnostics.empty()) {
+        AppendJournalEvent(
+            result.journalPath,
+            MakeSandboxEvent(
+                "vm.cpuid.diagnostics", result.overlayDiskPath,
+                {{"samples",
+                  JoinStrings(result.dynamicSummary.cpuidDiagnostics, "; ")}}),
+            &events);
+      }
 
       std::map<std::string, std::string> details{
           {"status", result.dynamicSummary.status},
@@ -6352,6 +7674,11 @@ DetonationResult InHouseOrchestrator::PrepareAndRun(
           {"masterPicMask", std::to_string(result.dynamicSummary.masterPicMask)},
           {"slavePicMask", std::to_string(result.dynamicSummary.slavePicMask)},
           {"bootStage", result.dynamicSummary.bootStage},
+          {"windowsKernelReadGate",
+           result.dynamicSummary.windowsKernelReadGateStatus},
+          {"windowsKernelReadGateEvidence",
+           result.dynamicSummary.windowsKernelReadGateEvidence},
+          {"bootBlocker", result.dynamicSummary.bootBlocker},
           {"bootMilestones",
            JoinStrings(result.dynamicSummary.bootMilestones, ", ")},
           {"firmwareIdle", result.dynamicSummary.firmwareIdle ? "true" : "false"},
@@ -6365,6 +7692,59 @@ DetonationResult InHouseOrchestrator::PrepareAndRun(
            std::to_string(result.dynamicSummary.pm1SleepRequests)},
           {"pm1HostStopRequested",
            result.dynamicSummary.pm1HostStopRequested ? "true" : "false"},
+          {"fwCfgSmbiosAnchorBytesRead",
+           std::to_string(vmSummary.fwCfgSmbiosAnchorBytesRead)},
+          {"fwCfgSmbiosTableBytesRead",
+           std::to_string(vmSummary.fwCfgSmbiosTableBytesRead)},
+          {"kdPacketsReceived",
+           std::to_string(result.dynamicSummary.kdPacketsReceived)},
+          {"kdAckPacketsSent",
+           std::to_string(result.dynamicSummary.kdAckPacketsSent)},
+          {"kdResetPacketsSent",
+           std::to_string(result.dynamicSummary.kdResetPacketsSent)},
+          {"kdCom1RxQueuedBytes",
+           std::to_string(result.dynamicSummary.kdCom1RxQueuedBytes)},
+          {"kdDebugPrintPackets",
+           std::to_string(result.dynamicSummary.kdDebugPrintPackets)},
+          {"kdLoadSymbolPackets",
+           std::to_string(result.dynamicSummary.kdLoadSymbolPackets)},
+          {"kdStatusPackets",
+           std::to_string(result.dynamicSummary.kdStatusPackets)},
+          {"kdAutoContinuesSent",
+           std::to_string(result.dynamicSummary.kdAutoContinuesSent)},
+          {"kdLastStatus", result.dynamicSummary.kdLastStatusText},
+          {"kdCom1Status", result.dynamicSummary.kdCom1Status},
+          {"com1TouchStatus", result.dynamicSummary.com1TouchStatus},
+          {"com1RegisterReads",
+           std::to_string(result.dynamicSummary.com1RegisterReads)},
+          {"com1RegisterWrites",
+           std::to_string(result.dynamicSummary.com1RegisterWrites)},
+          {"com1DataReads",
+           std::to_string(result.dynamicSummary.com1DataReads)},
+          {"com1DataWrites",
+           std::to_string(result.dynamicSummary.com1DataWrites)},
+          {"com1RxBytesQueued",
+           std::to_string(result.dynamicSummary.com1RxBytesQueued)},
+          {"com1RxBytesRead",
+           std::to_string(result.dynamicSummary.com1RxBytesRead)},
+          {"com1IerWrites",
+           std::to_string(result.dynamicSummary.com1IerWrites)},
+          {"com1LcrWrites",
+           std::to_string(result.dynamicSummary.com1LcrWrites)},
+          {"com1RxInterruptEnabled",
+           result.dynamicSummary.com1RxInterruptEnabled ? "true" : "false"},
+          {"keyboardScancodesInjected",
+           std::to_string(result.dynamicSummary.keyboardScancodesInjected)},
+          {"ps2InputStatus", result.dynamicSummary.ps2InputStatus},
+          {"ps2StatusReads",
+           std::to_string(result.dynamicSummary.ps2StatusReads)},
+          {"ps2DataReads", std::to_string(result.dynamicSummary.ps2DataReads)},
+          {"ps2KeyboardBytesQueued",
+           std::to_string(result.dynamicSummary.ps2KeyboardBytesQueued)},
+          {"ps2KeyboardBytesRead",
+           std::to_string(result.dynamicSummary.ps2KeyboardBytesRead)},
+          {"cpuidDiagnostics",
+           JoinStrings(result.dynamicSummary.cpuidDiagnostics, "; ")},
           {"guestAgentConnected",
            result.dynamicSummary.guestAgentConnected ? "true" : "false"},
           {"artifactsCaptured",
@@ -6382,11 +7762,7 @@ DetonationResult InHouseOrchestrator::PrepareAndRun(
       }
       if (!bootReadObservations.empty()) {
         details["bootFileReads"] = BootReadDetails(bootReadObservations);
-        const bool kernelReadGate =
-            WindowsKernelReadGateReached(bootReadObservations);
-        details["windowsKernelReadGate"] =
-            kernelReadGate ? "reached" : "not-reached";
-        if (kernelReadGate) {
+        if (result.dynamicSummary.windowsKernelReadGateReached) {
           details["windowsKernelReadTargets"] =
               WindowsKernelReadGateDetails(bootReadObservations);
         }
@@ -6456,6 +7832,8 @@ DetonationResult InHouseOrchestrator::PrepareAndRun(
       result.dynamicSummary.crashed = true;
       result.dynamicSummary.networkMode = networkMode;
       result.dynamicSummary.serialLogPath = serialLogPath;
+      result.dynamicSummary.kdLogPath = kdLogPath;
+      result.dynamicSummary.kdPacketsPath = kdPacketsPath;
       result.dynamicSummary.vmSummaryPath = vmSummaryPath;
       WriteTextFile(vmDiagnosticsPath,
                     std::string("VM boot failed before diagnostics: ") +

@@ -14,12 +14,45 @@
 
 #include "antimal/hv/Device.h"
 
+#include <cstddef>
 #include <cstdint>
 #include <deque>
 #include <string>
 #include <vector>
 
 namespace antimal::hv {
+
+struct SerialConsoleStats {
+  uint64_t registerReads = 0;
+  uint64_t registerWrites = 0;
+  uint64_t dataReads = 0;
+  uint64_t dataWrites = 0;
+  uint64_t rxBytesQueued = 0;
+  uint64_t rxBytesRead = 0;
+  uint64_t rxBytesCleared = 0;
+  uint64_t ierWrites = 0;
+  uint64_t fcrWrites = 0;
+  uint64_t lcrWrites = 0;
+  uint64_t mcrWrites = 0;
+  uint64_t scrWrites = 0;
+  uint64_t dllWrites = 0;
+  uint64_t dlmWrites = 0;
+  uint64_t dllReads = 0;
+  uint64_t dlmReads = 0;
+  uint64_t iirReads = 0;
+  uint64_t lsrReads = 0;
+  uint64_t msrReads = 0;
+  uint8_t ier = 0;
+  uint8_t fcr = 0;
+  uint8_t lcr = 0;
+  uint8_t mcr = 0;
+  uint8_t scr = 0;
+  uint8_t dll = 0;
+  uint8_t dlm = 0;
+  bool dlab = false;
+  bool rxInterruptEnabled = false;
+  bool rxDataReady = false;
+};
 
 class SerialConsole : public IIoPortDevice {
 public:
@@ -44,6 +77,7 @@ public:
   void QueueRxBytes(const uint8_t *data, size_t size);
   void QueueRxBytes(const std::vector<uint8_t> &bytes);
   bool RxDataReady() const noexcept { return !rxQueue_.empty(); }
+  size_t RxQueuedBytes() const noexcept { return rxQueue_.size(); }
 
   // True when the guest has enabled received-data interrupts and unread host
   // bytes are waiting in the RX FIFO. The VM loop routes this to IRQ4/IRQ3
@@ -66,6 +100,7 @@ public:
   std::string PullSince(size_t start) const;
 
   size_t CapturedBytes() const noexcept { return captured_.size(); }
+  SerialConsoleStats Stats() const noexcept;
 
 private:
   uint16_t base_;
@@ -79,6 +114,7 @@ private:
   uint8_t scr_ = 0;
   uint8_t dll_ = 0;
   uint8_t dlm_ = 0;
+  SerialConsoleStats stats_;
 };
 
 } // namespace antimal::hv

@@ -92,9 +92,15 @@ public:
     return fwCfgTableLoaderBytesRead_;
   }
   uint64_t FwCfgRsdpBytesRead() const noexcept { return fwCfgRsdpBytesRead_; }
+  uint64_t FwCfgSmbiosTableBytesRead() const noexcept {
+    return fwCfgSmbiosTableBytesRead_;
+  }
+  uint64_t FwCfgSmbiosAnchorBytesRead() const noexcept {
+    return fwCfgSmbiosAnchorBytesRead_;
+  }
   const std::string &DebugOutput() const noexcept { return debugOutput_; }
   size_t FwCfgFileCount() const noexcept {
-    return acpiTablesEnabled_ ? 4 : 1;
+    return acpiTablesEnabled_ ? 6 : 1;
   }
 
   void OnWrite(uint16_t port, uint32_t value, uint8_t accessSize) override;
@@ -168,6 +174,11 @@ private:
   uint8_t slavePicInitStep_ = 0;
   uint8_t port92_ = 0x02; // A20 enabled.
   uint32_t pciConfigAddress_ = 0;
+  uint16_t ideCommand_ = 0x0001; // IO-space enabled; BMDMA not emulated yet.
+  std::array<uint32_t, 5> ideBarWriteValues_{0x000001F1u, 0x000003F5u,
+                                             0x00000171u, 0x00000375u,
+                                             0x0000C001u};
+  std::array<bool, 5> ideBarSizing_{};
   uint32_t vgaBar0_ = 0x80000008u;
   uint32_t vgaBar0WriteValue_ = 0x80000008u;
   bool vgaBar0Sizing_ = false;
@@ -183,11 +194,15 @@ private:
   size_t fwCfgOffset_ = 0;
   PcIoMemoryLayout memory_{};
   AcpiBuildArtifacts acpi_;
+  std::vector<uint8_t> smbiosTables_;
+  std::vector<uint8_t> smbiosAnchor_;
   uint64_t fwCfgFileDirBytesRead_ = 0;
   uint64_t fwCfgE820BytesRead_ = 0;
   uint64_t fwCfgAcpiTableBytesRead_ = 0;
   uint64_t fwCfgTableLoaderBytesRead_ = 0;
   uint64_t fwCfgRsdpBytesRead_ = 0;
+  uint64_t fwCfgSmbiosTableBytesRead_ = 0;
+  uint64_t fwCfgSmbiosAnchorBytesRead_ = 0;
 
 public:
   bool PitInterruptPending() const noexcept;

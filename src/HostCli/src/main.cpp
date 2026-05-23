@@ -64,7 +64,7 @@ void PrintUsage() {
       << "  antimal detonate <sample> --timeout-sec 180 --network disabled|hostonly|nat\n"
       << "  antimal base convert --vhdx <base.vhdx> --raw <AntiMalBase.raw> [--force]\n"
       << "  antimal base inspect --vhdx <base.vhdx> [--overlay <overlay.cow>]\n"
-      << "                       [--dump-bcd <out.bcd>]\n"
+      << "                       [--dump-bcd <out.bcd>] [--dump-system <out.hive>]\n"
       << "  antimal report <run-id-or-report.json> --html\n"
       << "  antimal browser-impact <run-id-or-report.json> --decrypt-browser-secrets\n";
 }
@@ -1186,7 +1186,7 @@ std::string BcdElementName(const std::string &id) {
     return "firstmegabytepolicy";
   }
   if (upper == "16000048") {
-    return "allowedinmemorysettings";
+    return "nointegritychecks";
   }
   if (upper == "16000049") {
     return "testsigning";
@@ -1235,9 +1235,6 @@ std::string BcdElementName(const std::string &id) {
   }
   if (upper == "26000040") {
     return "debug";
-  }
-  if (upper == "26000048") {
-    return "nointegritychecks";
   }
   return upper;
 }
@@ -2129,6 +2126,7 @@ int CommandBaseInspect(int argc, wchar_t **argv,
   const auto vhdxText = OptionValue(argc, argv, "--vhdx");
   const auto overlayText = OptionValue(argc, argv, "--overlay");
   const auto dumpBcdText = OptionValue(argc, argv, "--dump-bcd");
+  const auto dumpSystemText = OptionValue(argc, argv, "--dump-system");
   const std::filesystem::path vhdx =
       vhdxText ? std::filesystem::path(Utf8ToWide(*vhdxText))
                : config.baseVhdxPath;
@@ -2300,6 +2298,56 @@ int CommandBaseInspect(int argc, wchar_t **argv,
           ok = false;
         } else {
           PrintSystemBootStorageSummary(systemBytes);
+          if (dumpSystemText) {
+            const std::filesystem::path outPath(Utf8ToWide(*dumpSystemText));
+            if (!outPath.parent_path().empty()) {
+              antimal::EnsureDirectory(outPath.parent_path());
+            }
+            std::ofstream out(outPath, std::ios::binary | std::ios::trunc);
+            out.write(reinterpret_cast<const char *>(systemBytes.data()),
+                      static_cast<std::streamsize>(systemBytes.size()));
+            if (!out) {
+              std::cerr << "error: failed to write SYSTEM hive dump: "
+                        << antimal::PathToUtf8(outPath) << "\n";
+              return 1;
+            }
+            std::cout << "Wrote SYSTEM hive dump: "
+                      << antimal::PathToUtf8(outPath) << "\n";
+            const std::array<const char *, 2> systemLogPaths = {
+                "Windows\\System32\\config\\SYSTEM.LOG1",
+                "Windows\\System32\\config\\SYSTEM.LOG2",
+            };
+            for (const char *logPath : systemLogPaths) {
+              const auto logEntry = ntfs.FindPath(logPath);
+              if (!logEntry) {
+                std::cout << "MISSING(optional): " << logPath << "\n";
+                continue;
+              }
+              const auto logBytes =
+                  ntfs.ReadFile(*logEntry, 64ull * 1024ull * 1024ull);
+              if (logBytes.empty() && logEntry->size != 0) {
+                std::cout << "UNREADABLE(optional): " << logPath << "\n";
+                continue;
+              }
+              std::filesystem::path logOutPath =
+                  outPath.parent_path() /
+                  (outPath.filename().wstring() +
+                   (std::string(logPath).ends_with("LOG1") ? L".LOG1"
+                                                           : L".LOG2"));
+              std::ofstream logOut(logOutPath,
+                                   std::ios::binary | std::ios::trunc);
+              logOut.write(reinterpret_cast<const char *>(logBytes.data()),
+                           static_cast<std::streamsize>(logBytes.size()));
+              if (!logOut) {
+                std::cerr << "error: failed to write SYSTEM log dump: "
+                          << antimal::PathToUtf8(logOutPath) << "\n";
+                return 1;
+              }
+              std::cout << "Wrote SYSTEM log dump: "
+                        << antimal::PathToUtf8(logOutPath)
+                        << " bytes=" << logBytes.size() << "\n";
+            }
+          }
         }
       } else {
         std::cout << "MISSING: Windows\\System32\\config\\SYSTEM\n";

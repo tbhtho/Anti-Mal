@@ -227,11 +227,90 @@ std::string ToJson(const DynamicRunSummary &summary) {
   obj.AddNumber("pm1SleepType", summary.pm1SleepType);
   obj.AddNumber("pm1ControlValue", summary.pm1ControlValue);
   obj.AddNumber("pm1SleepRequests", summary.pm1SleepRequests);
+  obj.AddNumber("kdPacketsReceived", summary.kdPacketsReceived);
+  obj.AddNumber("kdControlPacketsReceived",
+                summary.kdControlPacketsReceived);
+  obj.AddNumber("kdDataPacketsReceived", summary.kdDataPacketsReceived);
+  obj.AddNumber("kdAckPacketsSent", summary.kdAckPacketsSent);
+  obj.AddNumber("kdResendPacketsSent", summary.kdResendPacketsSent);
+  obj.AddNumber("kdResetPacketsReceived", summary.kdResetPacketsReceived);
+  obj.AddNumber("kdResetPacketsSent", summary.kdResetPacketsSent);
+  obj.AddNumber("kdCom1RxQueuedBytes", summary.kdCom1RxQueuedBytes);
+  obj.AddNumber("kdTargetAcksReceived", summary.kdTargetAcksReceived);
+  obj.AddNumber("kdDebugPrintBytes", summary.kdDebugPrintBytes);
+  obj.AddNumber("kdDebugPrintPackets", summary.kdDebugPrintPackets);
+  obj.AddNumber("kdStateChangePackets", summary.kdStateChangePackets);
+  obj.AddNumber("kdLoadSymbolPackets", summary.kdLoadSymbolPackets);
+  obj.AddNumber("kdStatusPackets", summary.kdStatusPackets);
+  obj.AddNumber("kdAutoContinuesSent", summary.kdAutoContinuesSent);
+  obj.AddNumber("kdChecksumFailures", summary.kdChecksumFailures);
+  obj.AddNumber("kdTrailingByteFailures", summary.kdTrailingByteFailures);
+  obj.AddNumber("kdLastPacketType", summary.kdLastPacketType);
+  obj.AddNumber("kdLastApiNumber", summary.kdLastApiNumber);
+  obj.AddNumber("kdLastStatus", summary.kdLastStatus);
+  obj.AddString("kdLastStatusText", summary.kdLastStatusText);
+  obj.AddString("kdCom1Status", summary.kdCom1Status);
+  obj.AddNumber("com1RegisterReads", summary.com1RegisterReads);
+  obj.AddNumber("com1RegisterWrites", summary.com1RegisterWrites);
+  obj.AddNumber("com1DataReads", summary.com1DataReads);
+  obj.AddNumber("com1DataWrites", summary.com1DataWrites);
+  obj.AddNumber("com1RxBytesQueued", summary.com1RxBytesQueued);
+  obj.AddNumber("com1RxBytesRead", summary.com1RxBytesRead);
+  obj.AddNumber("com1RxBytesCleared", summary.com1RxBytesCleared);
+  obj.AddNumber("com1IerWrites", summary.com1IerWrites);
+  obj.AddNumber("com1FcrWrites", summary.com1FcrWrites);
+  obj.AddNumber("com1LcrWrites", summary.com1LcrWrites);
+  obj.AddNumber("com1McrWrites", summary.com1McrWrites);
+  obj.AddNumber("com1DllWrites", summary.com1DllWrites);
+  obj.AddNumber("com1DlmWrites", summary.com1DlmWrites);
+  obj.AddNumber("com1IirReads", summary.com1IirReads);
+  obj.AddNumber("com1LsrReads", summary.com1LsrReads);
+  obj.AddNumber("com1Ier", summary.com1Ier);
+  obj.AddNumber("com1Fcr", summary.com1Fcr);
+  obj.AddNumber("com1Lcr", summary.com1Lcr);
+  obj.AddNumber("com1Mcr", summary.com1Mcr);
+  obj.AddNumber("com1Dll", summary.com1Dll);
+  obj.AddNumber("com1Dlm", summary.com1Dlm);
+  obj.AddBool("com1Dlab", summary.com1Dlab);
+  obj.AddBool("com1RxInterruptEnabled", summary.com1RxInterruptEnabled);
+  obj.AddBool("com1RxDataReady", summary.com1RxDataReady);
+  obj.AddString("com1TouchStatus", summary.com1TouchStatus);
+  obj.AddNumber("fwCfgSmbiosTableBytesRead",
+                summary.fwCfgSmbiosTableBytesRead);
+  obj.AddNumber("fwCfgSmbiosAnchorBytesRead",
+                summary.fwCfgSmbiosAnchorBytesRead);
+  obj.AddNumber("keyboardScancodesInjected",
+                summary.keyboardScancodesInjected);
+  obj.AddNumber("ps2StatusReads", summary.ps2StatusReads);
+  obj.AddNumber("ps2DataReads", summary.ps2DataReads);
+  obj.AddNumber("ps2CommandWrites", summary.ps2CommandWrites);
+  obj.AddNumber("ps2DataWrites", summary.ps2DataWrites);
+  obj.AddNumber("ps2KeyboardBytesQueued",
+                summary.ps2KeyboardBytesQueued);
+  obj.AddNumber("ps2KeyboardBytesRead", summary.ps2KeyboardBytesRead);
+  obj.AddNumber("ps2MouseBytesQueued", summary.ps2MouseBytesQueued);
+  obj.AddNumber("ps2MouseBytesRead", summary.ps2MouseBytesRead);
+  obj.AddBool("ps2KeyboardPortEnabled",
+              summary.ps2KeyboardPortEnabled);
+  obj.AddBool("ps2MousePortEnabled", summary.ps2MousePortEnabled);
+  obj.AddBool("ps2KeyboardScanningEnabled",
+              summary.ps2KeyboardScanningEnabled);
+  obj.AddString("ps2InputStatus", summary.ps2InputStatus);
+  obj.AddBool("windowsKernelReadGateReached",
+              summary.windowsKernelReadGateReached);
+  obj.AddString("windowsKernelReadGateStatus",
+                summary.windowsKernelReadGateStatus);
+  obj.AddString("windowsKernelReadGateEvidence",
+                summary.windowsKernelReadGateEvidence);
+  obj.AddString("bootBlocker", summary.bootBlocker);
+  obj.AddRaw("cpuidDiagnostics", JsonStringArray(summary.cpuidDiagnostics));
   obj.AddString("bootStage", summary.bootStage);
   obj.AddRaw("bootMilestones", JsonStringArray(summary.bootMilestones));
   obj.AddRaw("interruptDiagnostics",
              JsonStringArray(summary.interruptDiagnostics));
   obj.AddString("serialLogPath", PathToUtf8(summary.serialLogPath));
+  obj.AddString("kdLogPath", PathToUtf8(summary.kdLogPath));
+  obj.AddString("kdPacketsPath", PathToUtf8(summary.kdPacketsPath));
   obj.AddString("vmSummaryPath", PathToUtf8(summary.vmSummaryPath));
   return obj.Finish();
 }

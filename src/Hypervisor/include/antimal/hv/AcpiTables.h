@@ -18,6 +18,10 @@ struct AcpiTableOffsets {
   uint32_t madt = 0;
   uint32_t waet = 0;
   uint32_t hpet = 0;
+  uint32_t dbgp = 0;
+  uint32_t spcr = 0;
+  uint32_t dbg2 = 0;
+  uint32_t tpm2 = 0;
   uint32_t rsdt = 0;
 };
 
@@ -28,7 +32,8 @@ struct AcpiBuildArtifacts {
   AcpiTableOffsets offsets;
 };
 
-AcpiBuildArtifacts BuildPcAcpiTables(uint32_t processorCount = 1);
+AcpiBuildArtifacts BuildPcAcpiTables(uint32_t processorCount = 1,
+                                     bool includeDbgp = false);
 
 bool AcpiChecksumValid(const uint8_t *bytes, size_t size);
 uint32_t AcpiTableLength(const std::vector<uint8_t> &blob, uint32_t offset);

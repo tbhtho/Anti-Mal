@@ -24,6 +24,7 @@
 #include "antimal/hv/HostSerialChannel.h"
 #include "antimal/hv/IoApic.h"
 #include "antimal/hv/IoBus.h"
+#include "antimal/hv/KdSerialDebugger.h"
 #include "antimal/hv/MmioBus.h"
 #include "antimal/hv/PcIoDevices.h"
 #include "antimal/hv/SerialConsole.h"
@@ -319,6 +320,141 @@ void TestCom2UartFrames() {
          "COM2 UART: guest frame type preserved");
 }
 
+void TestKdSerialDebuggerPackets() {
+  using Kd = antimal::hv::KdSerialDebugger;
+  Kd kd;
+  const auto first = Kd::EncodeDebugPrintPacket(
+      "KD hello\n", Kd::kInitialPacketId | Kd::kSyncPacketId);
+  kd.PushBytes(reinterpret_cast<const uint8_t *>("noise"), 5);
+  kd.PushBytes(first.data(), 8);
+  Expect(kd.Summary().packetsReceived == 0,
+         "KD serial: split packet waits for full frame");
+  kd.PushBytes(first.data() + 8, first.size() - 8);
+  Expect(kd.Summary().noiseBytes == 5, "KD serial: noise skipped");
+  Expect(kd.Summary().packetsReceived == 1,
+         "KD serial: complete packet decoded");
+  Expect(kd.Summary().debugPrintPackets == 1,
+         "KD serial: debug print decoded");
+  Expect(kd.Transcript().find("KD hello") != std::string::npos,
+         "KD serial: transcript captures debug text");
+  auto replies = kd.PullReplies();
+  Expect(replies.size() >= 16, "KD serial: ACK queued");
+  Expect(replies[0] == 0x69 && replies[4] == Kd::kPacketTypeAcknowledge,
+         "KD serial: ACK control packet shape");
+
+  const auto second =
+      Kd::EncodeDebugPrintPacket("again", Kd::kInitialPacketId ^ 1u);
+  kd.PushBytes(second.data(), second.size());
+  Expect(kd.Summary().duplicatePacketIds == 0,
+         "KD serial: expected packet ID toggles");
+  (void)kd.PullReplies();
+
+  auto bad = Kd::EncodeDebugPrintPacket("bad", Kd::kInitialPacketId);
+  bad[16] ^= 0x5Au;
+  kd.PushBytes(bad.data(), bad.size());
+  replies = kd.PullReplies();
+  Expect(kd.Summary().checksumFailures == 1,
+         "KD serial: bad checksum rejected");
+  Expect(!replies.empty() && replies[4] == Kd::kPacketTypeResend,
+         "KD serial: bad checksum asks for resend");
+
+  auto missingTrailing =
+      Kd::EncodeDebugPrintPacket("trail", Kd::kInitialPacketId);
+  missingTrailing.pop_back();
+  kd.PushBytes(missingTrailing.data(), missingTrailing.size());
+  Expect(kd.Summary().trailingByteFailures == 0,
+         "KD serial: missing trailing byte waits");
+  const uint8_t wrongTrailing = 0;
+  kd.PushBytes(&wrongTrailing, 1);
+  Expect(kd.Summary().trailingByteFailures == 1,
+         "KD serial: wrong trailing byte rejected");
+
+  const auto reset = Kd::EncodeControlPacket(Kd::kPacketTypeReset, 0);
+  kd.PushBytes(reset.data(), reset.size());
+  Expect(kd.Summary().resetPacketsReceived == 1,
+         "KD serial: reset control decoded");
+  Expect(kd.Summary().resetPacketsSent == 1,
+         "KD serial: reset control echoed");
+  (void)kd.PullReplies();
+  kd.QueueHostReset("unit-test host reset probe");
+  replies = kd.PullReplies();
+  Expect(kd.Summary().resetPacketsSent == 2 && replies.size() == 16,
+         "KD serial: host reset probe queued");
+  Expect(kd.PacketsJsonl().find("host-reset") != std::string::npos,
+         "KD serial: host reset probe logged");
+}
+
+void TestKdSerialDebuggerStatePackets() {
+  using Kd = antimal::hv::KdSerialDebugger;
+  Kd kd;
+  const auto exception = Kd::EncodeStateChange64Packet(
+      Kd::kDbgKdExceptionStateChange, 0x80000003u, "",
+      Kd::kInitialPacketId | Kd::kSyncPacketId);
+  kd.PushBytes(exception.data(), exception.size());
+  Expect(kd.Summary().stateChangePackets == 1,
+         "KD serial: state change decoded");
+  Expect(kd.Summary().statusPackets == 1,
+         "KD serial: exception status captured");
+  Expect(kd.Summary().lastStatus == 0x80000003u,
+         "KD serial: breakpoint status preserved");
+  Expect(kd.Summary().autoContinuesSent == 1,
+         "KD serial: exception auto-continue queued");
+  Expect(kd.PacketsJsonl().find("auto-continue") != std::string::npos,
+         "KD serial: auto-continue logged");
+
+  auto replies = kd.PullReplies();
+  Expect(replies.size() > 16, "KD serial: ACK plus continue queued");
+  const auto ack = Kd::EncodeControlPacket(Kd::kPacketTypeAcknowledge,
+                                           Kd::kInitialPacketId);
+  kd.PushBytes(ack.data(), ack.size());
+  Expect(kd.Summary().targetAcksReceived == 1,
+         "KD serial: target ACK decoded");
+
+  const auto load = Kd::EncodeStateChange64Packet(
+      Kd::kDbgKdLoadSymbolsStateChange, 0x12000u,
+      "\\Windows\\System32\\ntoskrnl.exe", Kd::kInitialPacketId ^ 1u);
+  kd.PushBytes(load.data(), load.size());
+  Expect(kd.Summary().loadSymbolPackets == 1,
+         "KD serial: load-symbol state decoded");
+  Expect(kd.PacketsJsonl().find("ntoskrnl.exe") != std::string::npos,
+         "KD serial: load-symbol path logged");
+}
+
+void TestKdSerialDebuggerCom1Integration() {
+  using Kd = antimal::hv::KdSerialDebugger;
+  antimal::hv::SerialConsole com1;
+  Kd kd;
+  com1.OnWrite(antimal::hv::SerialConsole::kCom1Base + 1, 0x01, 1);
+  const auto packet = Kd::EncodeDebugPrintPacket(
+      "COM1 KD", Kd::kInitialPacketId | Kd::kSyncPacketId);
+  for (uint8_t byte : packet) {
+    com1.OnWrite(antimal::hv::SerialConsole::kCom1Base, byte, 1);
+  }
+  const auto guestTx = com1.PullNew();
+  kd.PushBytes(guestTx);
+  const auto replies = kd.PullReplies();
+  com1.QueueRxBytes(replies);
+  Expect(com1.InterruptPending(),
+         "KD serial COM1: ACK bytes raise RX interrupt when enabled");
+  Expect((com1.OnRead(antimal::hv::SerialConsole::kCom1Base + 5, 1) &
+          0x01u) != 0,
+         "KD serial COM1: ACK byte visible in UART LSR");
+  Expect((com1.OnRead(antimal::hv::SerialConsole::kCom1Base, 1) & 0xFFu) ==
+             0x69u,
+         "KD serial COM1: ACK leader queued into RX FIFO");
+  Expect(com1.Captured() == guestTx,
+         "KD serial COM1: normal TX capture remains intact");
+  const auto stats = com1.Stats();
+  Expect(stats.ierWrites == 1, "KD serial COM1: IER write counted");
+  Expect(stats.dataWrites == packet.size(),
+         "KD serial COM1: guest TX byte writes counted");
+  Expect(stats.lsrReads == 1, "KD serial COM1: LSR read counted");
+  Expect(stats.dataReads == 1, "KD serial COM1: host RX read counted");
+  Expect(stats.rxBytesQueued == replies.size(),
+         "KD serial COM1: queued RX bytes counted");
+  Expect(stats.rxBytesRead == 1, "KD serial COM1: RX drain counted");
+}
+
 void TestPs2QueuedInput() {
   antimal::hv::Ps2Controller ps2;
   ps2.InjectKeyboardScancode(0x1E);
@@ -341,6 +477,41 @@ void TestPs2QueuedInput() {
   Expect((ps2.OnRead(0x60, 1) & 0xFFu) == 0xFDu,
          "PS/2 input: mouse dy drains");
   Expect(!ps2.HasDataPending(), "PS/2 input: mouse queue empty");
+
+  ps2.OnWrite(0x60, 0xF0, 1);
+  Expect((ps2.OnRead(0x60, 1) & 0xFFu) == 0xFAu,
+         "PS/2 input: scan-code command ACKs");
+  ps2.OnWrite(0x60, 0x00, 1);
+  Expect((ps2.OnRead(0x60, 1) & 0xFFu) == 0xFAu,
+         "PS/2 input: scan-code query subcommand ACKs");
+  Expect((ps2.OnRead(0x60, 1) & 0xFFu) == 0x01u,
+         "PS/2 input: scan-code set reported");
+
+  ps2.OnWrite(0x60, 0xF5, 1);
+  Expect((ps2.OnRead(0x60, 1) & 0xFFu) == 0xFAu,
+         "PS/2 input: disable scanning ACKs");
+  Expect(!ps2.KeyboardScanningEnabled(),
+         "PS/2 input: scanning disable tracked");
+  ps2.InjectKeyboardScancode(0x1C);
+  Expect(ps2.PendingIrqLine() == 0,
+         "PS/2 input: disabled scanning blocks IRQ1");
+  ps2.OnWrite(0x60, 0xF4, 1);
+  Expect((ps2.OnRead(0x60, 1) & 0xFFu) == 0x1Cu,
+         "PS/2 input: queued scancode can be polled while disabled");
+  Expect((ps2.OnRead(0x60, 1) & 0xFFu) == 0xFAu,
+         "PS/2 input: enable scanning ACK drains");
+  Expect(ps2.KeyboardScanningEnabled(),
+         "PS/2 input: scanning enable tracked");
+  Expect(ps2.StatusReads() >= 2 && ps2.DataReads() >= 10,
+         "PS/2 input: read diagnostics count port traffic");
+}
+
+uint16_t ReadLe16(const std::vector<uint8_t> &data, size_t offset) {
+  if (offset + 2 > data.size()) {
+    return 0;
+  }
+  return static_cast<uint16_t>(data[offset]) |
+         static_cast<uint16_t>(data[offset + 1] << 8);
 }
 
 uint32_t ReadLe32(const std::vector<uint8_t> &data, size_t offset) {
@@ -410,7 +581,10 @@ void TestAcpiTables() {
   tableOk(acpi.offsets.madt, "APIC");
   tableOk(acpi.offsets.waet, "WAET");
   tableOk(acpi.offsets.hpet, "HPET");
+  tableOk(acpi.offsets.spcr, "SPCR");
+  tableOk(acpi.offsets.dbg2, "DBG2");
   tableOk(acpi.offsets.rsdt, "RSDT");
+  Expect(acpi.offsets.dbgp == 0, "ACPI: DBGP is opt-in by default");
 
   Expect(ReadLe32(acpi.tables, acpi.offsets.fadt + 36) == acpi.offsets.facs,
          "ACPI: FADT firmware control points to FACS offset");
@@ -469,8 +643,61 @@ void TestAcpiTables() {
   Expect(ReadLe64(acpi.tables, acpi.offsets.hpet + 44) ==
              antimal::hv::HpetDevice::kDefaultMmioBase,
          "ACPI: HPET GAS points to MMIO base");
-  Expect(ReadLe32(acpi.tables, acpi.offsets.rsdt + 4) == 52,
-         "ACPI: RSDT includes four table pointers");
+  Expect(acpi.tables[acpi.offsets.spcr + 36] == 0,
+         "ACPI: SPCR advertises full 16550-compatible COM1");
+  Expect(ReadLe64(acpi.tables, acpi.offsets.spcr + 44) == 0x03F8u,
+         "ACPI: SPCR GAS points to COM1");
+  Expect(acpi.tables[acpi.offsets.spcr + 52] == 0x03,
+         "ACPI: SPCR advertises PIC and IOAPIC interrupt delivery");
+  Expect(acpi.tables[acpi.offsets.spcr + 53] == 4,
+         "ACPI: SPCR legacy IRQ is COM1 IRQ4");
+  Expect(ReadLe32(acpi.tables, acpi.offsets.spcr + 54) == 4,
+         "ACPI: SPCR GSI is 4");
+  Expect(acpi.tables[acpi.offsets.spcr + 58] == 7,
+         "ACPI: SPCR baud rate is 115200");
+  Expect(ReadLe16(acpi.tables, acpi.offsets.spcr + 84) == 11 &&
+             ReadLe16(acpi.tables, acpi.offsets.spcr + 86) == 88,
+         "ACPI: SPCR namespace string points to COM1");
+  Expect(ReadLe32(acpi.tables, acpi.offsets.dbg2 + 36) == 44 &&
+             ReadLe32(acpi.tables, acpi.offsets.dbg2 + 40) == 1,
+         "ACPI: DBG2 exposes one debug device");
+  Expect(ReadLe16(acpi.tables, acpi.offsets.dbg2 + 56) == 0x8000 &&
+             ReadLe16(acpi.tables, acpi.offsets.dbg2 + 58) == 0x0001,
+         "ACPI: DBG2 debug port is serial DBGP-compatible");
+  Expect(ReadLe64(acpi.tables, acpi.offsets.dbg2 + 70) == 0x03F8u,
+         "ACPI: DBG2 GAS points to COM1");
+  Expect(ReadLe32(acpi.tables, acpi.offsets.dbg2 + 78) == 8,
+         "ACPI: DBG2 COM1 address size is eight registers");
+  Expect(ReadLe32(acpi.tables, acpi.offsets.rsdt + 4) == 60,
+         "ACPI: RSDT includes six default table pointers");
+  Expect(ReadLe32(acpi.tables, acpi.offsets.rsdt + 52) == acpi.offsets.spcr &&
+             ReadLe32(acpi.tables, acpi.offsets.rsdt + 56) == acpi.offsets.dbg2,
+         "ACPI: RSDT references SPCR and DBG2");
+
+  const auto acpiDbgp = antimal::hv::BuildPcAcpiTables(1, true);
+  const uint32_t dbgpLen =
+      antimal::hv::AcpiTableLength(acpiDbgp.tables, acpiDbgp.offsets.dbgp);
+  Expect(acpiDbgp.offsets.dbgp != 0, "ACPI: DBGP probe table can be enabled");
+  Expect(dbgpLen >= 36 &&
+             std::memcmp(acpiDbgp.tables.data() + acpiDbgp.offsets.dbgp,
+                         "DBGP", 4) == 0,
+         "ACPI: DBGP probe signature");
+  Expect(antimal::hv::AcpiChecksumValid(
+             acpiDbgp.tables.data() + acpiDbgp.offsets.dbgp, dbgpLen),
+         "ACPI: DBGP probe checksum valid before relocation");
+  Expect(acpiDbgp.tables[acpiDbgp.offsets.dbgp + 36] == 0,
+         "ACPI: DBGP probe advertises full 16550-compatible COM1");
+  Expect(ReadLe64(acpiDbgp.tables, acpiDbgp.offsets.dbgp + 44) == 0x03F8u,
+         "ACPI: DBGP probe GAS points to COM1");
+  Expect(ReadLe32(acpiDbgp.tables, acpiDbgp.offsets.rsdt + 4) == 64,
+         "ACPI: DBGP probe RSDT includes seven table pointers");
+  Expect(ReadLe32(acpiDbgp.tables, acpiDbgp.offsets.rsdt + 52) ==
+             acpiDbgp.offsets.dbgp &&
+             ReadLe32(acpiDbgp.tables, acpiDbgp.offsets.rsdt + 56) ==
+                 acpiDbgp.offsets.spcr &&
+             ReadLe32(acpiDbgp.tables, acpiDbgp.offsets.rsdt + 60) ==
+                 acpiDbgp.offsets.dbg2,
+         "ACPI: DBGP probe RSDT references DBGP, SPCR, and DBG2");
 
   const auto dsdtLen = antimal::hv::AcpiTableLength(acpi.tables, acpi.offsets.dsdt);
   const auto dsdtBegin = acpi.tables.begin() + acpi.offsets.dsdt;
@@ -593,18 +820,25 @@ void TestPcIoFwCfgAcpiFiles() {
 
   pc.OnWrite(0x510, 0x0019, 2);
   std::vector<uint8_t> dir;
-  for (size_t i = 0; i < 4 + 4 * 64; ++i) {
+  for (size_t i = 0; i < 4 + 6 * 64; ++i) {
     dir.push_back(static_cast<uint8_t>(pc.OnRead(0x511, 1) & 0xFFu));
   }
-  Expect(ReadBe32(dir, 0) == 4, "fw_cfg: directory exposes four files");
+  Expect(ReadBe32(dir, 0) == 6, "fw_cfg: directory exposes six files");
+  Expect(pc.FwCfgFileCount() == 6, "fw_cfg: file count includes SMBIOS files");
 
   bool sawE820 = false;
   bool sawAcpiTables = false;
   bool sawLoader = false;
   bool sawRsdp = false;
+  bool sawSmbiosTables = false;
+  bool sawSmbiosAnchor = false;
   uint16_t acpiSelector = 0;
   uint32_t acpiSize = 0;
-  for (size_t entry = 0; entry < 4; ++entry) {
+  uint16_t smbiosTablesSelector = 0;
+  uint32_t smbiosTablesSize = 0;
+  uint16_t smbiosAnchorSelector = 0;
+  uint32_t smbiosAnchorSize = 0;
+  for (size_t entry = 0; entry < 6; ++entry) {
     const size_t off = 4 + entry * 64;
     const uint32_t size = ReadBe32(dir, off);
     const uint16_t selector = ReadBe16(dir, off + 4);
@@ -615,6 +849,16 @@ void TestPcIoFwCfgAcpiFiles() {
     sawE820 = sawE820 || name == "etc/e820";
     sawLoader = sawLoader || name == "etc/table-loader";
     sawRsdp = sawRsdp || name == "etc/acpi/rsdp";
+    if (name == "etc/smbios/smbios-tables") {
+      sawSmbiosTables = true;
+      smbiosTablesSelector = selector;
+      smbiosTablesSize = size;
+    }
+    if (name == "etc/smbios/smbios-anchor") {
+      sawSmbiosAnchor = true;
+      smbiosAnchorSelector = selector;
+      smbiosAnchorSize = size;
+    }
     if (name == "etc/acpi/tables") {
       sawAcpiTables = true;
       acpiSelector = selector;
@@ -625,8 +869,14 @@ void TestPcIoFwCfgAcpiFiles() {
   Expect(sawAcpiTables, "fw_cfg: etc/acpi/tables present");
   Expect(sawLoader, "fw_cfg: etc/table-loader present");
   Expect(sawRsdp, "fw_cfg: etc/acpi/rsdp present");
+  Expect(sawSmbiosTables, "fw_cfg: etc/smbios/smbios-tables present");
+  Expect(sawSmbiosAnchor, "fw_cfg: etc/smbios/smbios-anchor present");
   Expect(acpiSelector != 0 && acpiSize > 64,
          "fw_cfg: ACPI tables selector and size plausible");
+  Expect(smbiosTablesSelector != 0 && smbiosTablesSize > 64,
+         "fw_cfg: SMBIOS tables selector and size plausible");
+  Expect(smbiosAnchorSelector != 0 && smbiosAnchorSize == 0x1F,
+         "fw_cfg: SMBIOS anchor selector and size plausible");
 
   pc.OnWrite(0x510, acpiSelector, 2);
   std::vector<uint8_t> header;
@@ -639,6 +889,32 @@ void TestPcIoFwCfgAcpiFiles() {
          "fw_cfg: directory byte counter updated");
   Expect(pc.FwCfgAcpiTableBytesRead() >= header.size(),
          "fw_cfg: ACPI table byte counter updated");
+
+  pc.OnWrite(0x510, smbiosTablesSelector, 2);
+  std::vector<uint8_t> smbiosHeader;
+  for (size_t i = 0; i < 8; ++i) {
+    smbiosHeader.push_back(static_cast<uint8_t>(pc.OnRead(0x511, 1) & 0xFFu));
+  }
+  Expect(smbiosHeader[0] == 0 && smbiosHeader[1] == 0x18,
+         "fw_cfg: SMBIOS tables start with Type 0 BIOS record");
+
+  pc.OnWrite(0x510, smbiosAnchorSelector, 2);
+  std::vector<uint8_t> smbiosAnchor;
+  for (size_t i = 0; i < smbiosAnchorSize; ++i) {
+    smbiosAnchor.push_back(static_cast<uint8_t>(pc.OnRead(0x511, 1) & 0xFFu));
+  }
+  Expect(std::memcmp(smbiosAnchor.data(), "_SM_", 4) == 0,
+         "fw_cfg: SMBIOS 2.x anchor signature");
+  Expect(std::memcmp(smbiosAnchor.data() + 0x10, "_DMI_", 5) == 0,
+         "fw_cfg: SMBIOS DMI anchor signature");
+  Expect(smbiosAnchor[0x06] == 2 && smbiosAnchor[0x07] == 8,
+         "fw_cfg: SMBIOS version is 2.8");
+  Expect(ReadLe16(smbiosAnchor, 0x16) == smbiosTablesSize,
+         "fw_cfg: SMBIOS anchor table length matches tables file");
+  Expect(pc.FwCfgSmbiosTableBytesRead() >= smbiosHeader.size(),
+         "fw_cfg: SMBIOS table byte counter updated");
+  Expect(pc.FwCfgSmbiosAnchorBytesRead() >= smbiosAnchor.size(),
+         "fw_cfg: SMBIOS anchor byte counter updated");
 }
 
 void TestPcIoFwCfgE820MemoryInventory() {
@@ -724,6 +1000,42 @@ void TestPcIoVgaBarSizing() {
   Expect(!pc.VgaBar0Sizing(), "PCI VGA BAR: base write leaves sizing mode");
   Expect(pc.OnRead(0xCFC, 4) == 0x80000008u,
          "PCI VGA BAR: assigned base preserves prefetchable memory bits");
+}
+
+void TestPcIoIdePciResources() {
+  antimal::hv::PcIoDevices pc;
+  pc.SetIdeControllerPresent(true);
+
+  auto select = [&](uint8_t reg) {
+    pc.OnWrite(0xCF8, 0x80000900u | reg, 4); // bus 0, device 1, function 1.
+  };
+
+  select(0x00);
+  Expect(pc.OnRead(0xCFC, 4) == 0x71118086u,
+         "PCI IDE: exposes Intel PIIX4 IDE identifier");
+
+  select(0x08);
+  Expect(pc.OnRead(0xCFC, 4) == 0x01018A01u,
+         "PCI IDE: reports legacy-mode IDE storage class");
+
+  select(0x10);
+  Expect(pc.OnRead(0xCFC, 4) == 0x000001F1u,
+         "PCI IDE: primary command BAR reports legacy 0x1F0 IO window");
+  pc.OnWrite(0xCFC, 0xFFFFFFFFu, 4);
+  Expect(pc.OnRead(0xCFC, 4) == 0xFFFFFFF9u,
+         "PCI IDE: primary command BAR reports 8-port sizing mask");
+  pc.OnWrite(0xCFC, 0x000001F1u, 4);
+
+  select(0x14);
+  Expect(pc.OnRead(0xCFC, 4) == 0x000003F5u,
+         "PCI IDE: primary control BAR reports legacy 0x3F4 IO window");
+  pc.OnWrite(0xCFC, 0xFFFFFFFFu, 4);
+  Expect(pc.OnRead(0xCFC, 4) == 0xFFFFFFFDu,
+         "PCI IDE: control BAR reports 4-port sizing mask");
+
+  select(0x3C);
+  Expect(pc.OnRead(0xCFC, 4) == 0x0000010Eu,
+         "PCI IDE: interrupt line/pin reports IRQ14 INTA");
 }
 
 void TestIdeIdentifyDevice() {
@@ -1131,6 +1443,48 @@ void TestWhpMmioReadOnlyTrapsOnWrite() {
   } catch (const antimal::hv::WhpError &ex) {
     ++g_failed;
     std::cerr << "FAIL: ReadOnly MMIO trap test threw WhpError: " << ex.what()
+              << "\n";
+  }
+}
+
+void TestWhpUnmappedMmioTrapsOnRead() {
+  if (!antimal::hv::WhpHost::IsAvailable()) {
+    std::cout << "SKIP: WHP not available on this host\n";
+    return;
+  }
+
+  try {
+    antimal::hv::WhpHost host(1);
+    antimal::hv::GuestMemoryRegion code(
+        host, 0, 0x1000, antimal::hv::GuestMemoryProt::ReadWriteExecute);
+
+    // DS=0x100 makes [0x0010] resolve to GPA 0x1010, which is intentionally
+    // unmapped. This pins the MMIO-hole pattern used for IOAPIC/HPET reads.
+    static constexpr uint8_t payload[] = {
+        0xBB, 0x00, 0x01, // mov bx, 0x0100
+        0x8E, 0xDB,       // mov ds, bx
+        0xA1, 0x10, 0x00, // mov ax, [0x0010]
+        0xF4,             // hlt
+    };
+    code.Write(0, payload, sizeof(payload));
+
+    antimal::hv::Vcpu vcpu(host, 0);
+    antimal::hv::ResetState16BitRealMode reset{};
+    vcpu.SetRealModeStart(reset);
+
+    const auto reason = vcpu.Run();
+    Expect(reason == WHvRunVpExitReasonMemoryAccess,
+           "Unmapped MMIO: read produces WHvRunVpExitReasonMemoryAccess");
+    if (reason == WHvRunVpExitReasonMemoryAccess) {
+      const auto &mem = vcpu.LastExit().MemoryAccess;
+      Expect((mem.Gpa & ~0xFFFull) == 0x1000ull,
+             "Unmapped MMIO: read reports the trapped page");
+      Expect(mem.AccessInfo.AccessType == 0,
+             "Unmapped MMIO: memory-access exit is reported as a read");
+    }
+  } catch (const antimal::hv::WhpError &ex) {
+    ++g_failed;
+    std::cerr << "FAIL: unmapped MMIO trap test threw WhpError: " << ex.what()
               << "\n";
   }
 }
@@ -2050,6 +2404,43 @@ void TestReportRoundtripAndFramePaths() {
   report.dynamicSummary.slavePicVectorBase = 0x28;
   report.dynamicSummary.masterPicMask = 0xFE;
   report.dynamicSummary.slavePicMask = 0xFD;
+  report.dynamicSummary.kdPacketsReceived = 2;
+  report.dynamicSummary.kdAckPacketsSent = 2;
+  report.dynamicSummary.kdResetPacketsSent = 1;
+  report.dynamicSummary.kdCom1RxQueuedBytes = 4;
+  report.dynamicSummary.kdDebugPrintPackets = 1;
+  report.dynamicSummary.kdLoadSymbolPackets = 1;
+  report.dynamicSummary.kdLastStatus = 0x80000003;
+  report.dynamicSummary.kdLastStatusText = "0x80000003";
+  report.dynamicSummary.kdCom1Status = "active";
+  report.dynamicSummary.com1RegisterReads = 3;
+  report.dynamicSummary.com1RegisterWrites = 12;
+  report.dynamicSummary.com1DataReads = 1;
+  report.dynamicSummary.com1DataWrites = 9;
+  report.dynamicSummary.com1RxBytesQueued = 16;
+  report.dynamicSummary.com1RxBytesRead = 1;
+  report.dynamicSummary.com1IerWrites = 1;
+  report.dynamicSummary.com1LcrWrites = 2;
+  report.dynamicSummary.com1Ier = 1;
+  report.dynamicSummary.com1RxInterruptEnabled = true;
+  report.dynamicSummary.com1TouchStatus = "guest-tx-observed";
+  report.dynamicSummary.fwCfgSmbiosAnchorBytesRead = 31;
+  report.dynamicSummary.fwCfgSmbiosTableBytesRead = 304;
+  report.dynamicSummary.keyboardScancodesInjected = 2;
+  report.dynamicSummary.ps2StatusReads = 0;
+  report.dynamicSummary.ps2DataReads = 0;
+  report.dynamicSummary.ps2KeyboardBytesQueued = 2;
+  report.dynamicSummary.ps2KeyboardBytesRead = 0;
+  report.dynamicSummary.ps2KeyboardPortEnabled = true;
+  report.dynamicSummary.ps2KeyboardScanningEnabled = true;
+  report.dynamicSummary.ps2InputStatus = "queued-not-polled";
+  report.dynamicSummary.windowsKernelReadGateReached = false;
+  report.dynamicSummary.windowsKernelReadGateStatus = "not-reached";
+  report.dynamicSummary.windowsKernelReadGateEvidence =
+      "no reads of kernel-gate targets";
+  report.dynamicSummary.bootBlocker = "winload reached pre-kernel work";
+  report.dynamicSummary.cpuidDiagnostics.push_back(
+      "vcpu0 leaf=0x00000001 sub=0x00000000 ecx=0x00000000 hypervisorBit=clear");
   report.dynamicSummary.bootStage = "winload-pre-kernel";
   report.dynamicSummary.bootMilestones.push_back("bootmgfw loaded");
   report.dynamicSummary.bootMilestones.push_back("BCD opened");
@@ -2085,6 +2476,31 @@ void TestReportRoundtripAndFramePaths() {
          "report load: IDE IRQ counters preserved");
   Expect(loaded.dynamicSummary.interruptDiagnostics.size() == 1,
          "report load: interrupt diagnostics preserved");
+  Expect(loaded.dynamicSummary.kdPacketsReceived == 2 &&
+             loaded.dynamicSummary.kdResetPacketsSent == 1 &&
+             loaded.dynamicSummary.kdCom1RxQueuedBytes == 4 &&
+             loaded.dynamicSummary.kdLastStatusText == "0x80000003" &&
+             loaded.dynamicSummary.kdCom1Status == "active",
+         "report load: KD counters preserved");
+  Expect(loaded.dynamicSummary.com1RegisterWrites == 12 &&
+             loaded.dynamicSummary.com1DataWrites == 9 &&
+             loaded.dynamicSummary.com1RxBytesQueued == 16 &&
+             loaded.dynamicSummary.com1RxInterruptEnabled &&
+             loaded.dynamicSummary.com1TouchStatus == "guest-tx-observed",
+         "report load: COM1 UART diagnostics preserved");
+  Expect(loaded.dynamicSummary.fwCfgSmbiosAnchorBytesRead == 31 &&
+             loaded.dynamicSummary.fwCfgSmbiosTableBytesRead == 304,
+         "report load: SMBIOS fw_cfg counters preserved");
+  Expect(loaded.dynamicSummary.keyboardScancodesInjected == 2 &&
+             loaded.dynamicSummary.ps2KeyboardBytesQueued == 2 &&
+             loaded.dynamicSummary.ps2InputStatus == "queued-not-polled",
+         "report load: PS/2 diagnostics preserved");
+  Expect(!loaded.dynamicSummary.windowsKernelReadGateReached &&
+             loaded.dynamicSummary.windowsKernelReadGateStatus == "not-reached" &&
+             loaded.dynamicSummary.bootBlocker == "winload reached pre-kernel work",
+         "report load: kernel gate summary preserved");
+  Expect(loaded.dynamicSummary.cpuidDiagnostics.size() == 1,
+         "report load: CPUID diagnostics preserved");
   Expect(loaded.artifacts.size() == 1, "report load: artifacts preserved");
   Expect(loaded.networkDomains.size() == 1, "report load: network preserved");
   Expect(loaded.errors.size() == 1, "report load: errors preserved");
@@ -2095,6 +2511,18 @@ void TestReportRoundtripAndFramePaths() {
          "report html: frame path includes screenshots directory");
   Expect(html.find("winload-pre-kernel") != std::string::npos,
          "report html: boot stage rendered");
+  Expect(html.find("kernel gate") != std::string::npos &&
+             html.find("not-reached") != std::string::npos,
+         "report html: kernel gate rendered");
+  Expect(html.find("PS/2 input") != std::string::npos &&
+             html.find("queued-not-polled") != std::string::npos,
+         "report html: PS/2 diagnostics rendered");
+  Expect(html.find("COM1 UART") != std::string::npos &&
+             html.find("guest-tx-observed") != std::string::npos,
+         "report html: COM1 UART diagnostics rendered");
+  Expect(html.find("CPUID") != std::string::npos &&
+             html.find("hypervisorBit=clear") != std::string::npos,
+         "report html: CPUID diagnostics rendered");
 }
 
 void TestIntelLookupOffline() {
@@ -2371,6 +2799,7 @@ int main() {
     TestPcIoFwCfgE820MemoryInventory();
     TestBochsVbeDataPortAliases();
     TestPcIoVgaBarSizing();
+    TestPcIoIdePciResources();
     TestHpetMmioCounter();
     TestIdeIdentifyDevice();
     TestIdeReadWriteSectors();
@@ -2388,12 +2817,16 @@ int main() {
     TestSubprocessEcho();
     TestSubprocessToolMissing();
     TestEventJournalRoundtrip();
+    TestKdSerialDebuggerPackets();
+    TestKdSerialDebuggerStatePackets();
+    TestKdSerialDebuggerCom1Integration();
     TestReportRoundtripAndFramePaths();
     TestIntelLookupOffline();
     TestHttpUrlEncode();
     TestScreenshotCaptureBestEffort();
     TestWhpHelloPartition();
     TestWhpMmioReadOnlyTrapsOnWrite();
+    TestWhpUnmappedMmioTrapsOnRead();
     TestWhpSerialConsole();
     TestWhpFirmwareMapping();
     TestWhpOvmfBoot();

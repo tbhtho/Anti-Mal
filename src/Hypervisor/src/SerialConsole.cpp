@@ -31,42 +31,55 @@ void SerialConsole::OnWrite(uint16_t port, uint32_t value, uint8_t /*accessSize*
   const uint16_t offset = static_cast<uint16_t>(port - base_);
   const uint8_t byte = static_cast<uint8_t>(value & 0xFFu);
   const bool dlab = (lcr_ & kLcrDlab) != 0;
+  ++stats_.registerWrites;
   switch (offset) {
   case kThr:
     if (dlab) {
       dll_ = byte;
+      ++stats_.dllWrites;
     } else {
       captured_.push_back(byte);
+      ++stats_.dataWrites;
     }
     break;
   case kIer:
     if (dlab) {
       dlm_ = byte;
+      ++stats_.dlmWrites;
     } else {
       ier_ = byte;
+      ++stats_.ierWrites;
     }
     break;
   case kFcr:
     fcr_ = byte;
+    ++stats_.fcrWrites;
     if ((byte & (1u << 1)) != 0) {
+      stats_.rxBytesCleared += rxQueue_.size();
       rxQueue_.clear();
     }
     break;
   case kLcr:
     lcr_ = byte;
+    ++stats_.lcrWrites;
     break;
   case kMcr:
     mcr_ = byte;
+    ++stats_.mcrWrites;
     break;
   case kScr:
     scr_ = byte;
+    ++stats_.scrWrites;
     break;
   default:
     break;
   }
 }
 
-void SerialConsole::QueueRxByte(uint8_t value) { rxQueue_.push_back(value); }
+void SerialConsole::QueueRxByte(uint8_t value) {
+  rxQueue_.push_back(value);
+  ++stats_.rxBytesQueued;
+}
 
 void SerialConsole::QueueRxBytes(const uint8_t *data, size_t size) {
   if (!data || size == 0) {
@@ -83,6 +96,21 @@ void SerialConsole::QueueRxBytes(const std::vector<uint8_t> &bytes) {
 
 bool SerialConsole::InterruptPending() const noexcept {
   return !rxQueue_.empty() && ((ier_ & kIerReceivedDataAvailable) != 0);
+}
+
+SerialConsoleStats SerialConsole::Stats() const noexcept {
+  SerialConsoleStats out = stats_;
+  out.ier = ier_;
+  out.fcr = fcr_;
+  out.lcr = lcr_;
+  out.mcr = mcr_;
+  out.scr = scr_;
+  out.dll = dll_;
+  out.dlm = dlm_;
+  out.dlab = (lcr_ & kLcrDlab) != 0;
+  out.rxInterruptEnabled = (ier_ & kIerReceivedDataAvailable) != 0;
+  out.rxDataReady = !rxQueue_.empty();
+  return out;
 }
 
 std::string SerialConsole::PullNew() {
@@ -104,9 +132,11 @@ std::string SerialConsole::PullSince(size_t start) const {
 uint32_t SerialConsole::OnRead(uint16_t port, uint8_t /*accessSize*/) {
   const uint16_t offset = static_cast<uint16_t>(port - base_);
   const bool dlab = (lcr_ & kLcrDlab) != 0;
+  ++stats_.registerReads;
   switch (offset) {
   case kThr: {
     if (dlab) {
+      ++stats_.dllReads;
       return dll_;
     }
     if (rxQueue_.empty()) {
@@ -114,11 +144,18 @@ uint32_t SerialConsole::OnRead(uint16_t port, uint8_t /*accessSize*/) {
     }
     const uint8_t byte = rxQueue_.front();
     rxQueue_.pop_front();
+    ++stats_.dataReads;
+    ++stats_.rxBytesRead;
     return byte;
   }
   case kIer:
-    return dlab ? dlm_ : ier_;
+    if (dlab) {
+      ++stats_.dlmReads;
+      return dlm_;
+    }
+    return ier_;
   case kFcr:
+    ++stats_.iirReads;
     return InterruptPending() ? kIirReceivedDataAvailable
                               : kIirNoInterruptPending;
   case kLcr:
@@ -126,9 +163,11 @@ uint32_t SerialConsole::OnRead(uint16_t port, uint8_t /*accessSize*/) {
   case kMcr:
     return mcr_;
   case kLsr:
+    ++stats_.lsrReads;
     // Always report ready-to-transmit so guest drivers don't busy-wait.
     return kLsrThrEmptyReady | (rxQueue_.empty() ? 0 : kLsrDataReady);
   case kMsr:
+    ++stats_.msrReads;
     return kMsrCarrierReady;
   case kScr:
     return scr_;

@@ -1,10 +1,11 @@
 #include "antimal/hv/AcpiTables.h"
 
 #include "antimal/hv/Hpet.h"
+#include "antimal/hv/Tpm2CrbDevice.h"
 
 #include <algorithm>
-#include <array>
 #include <cstring>
+#include <initializer_list>
 #include <stdexcept>
 #include <string_view>
 
@@ -36,6 +37,16 @@ void PutLe64(std::vector<uint8_t> &out, uint64_t value) {
   for (int i = 0; i < 8; ++i) {
     out.push_back(static_cast<uint8_t>((value >> (i * 8)) & 0xFFu));
   }
+}
+
+void AppendGas(std::vector<uint8_t> &out, uint8_t addressSpace,
+               uint8_t bitWidth, uint8_t bitOffset, uint8_t accessSize,
+               uint64_t address) {
+  out.push_back(addressSpace);
+  out.push_back(bitWidth);
+  out.push_back(bitOffset);
+  out.push_back(accessSize);
+  PutLe64(out, address);
 }
 
 void WriteLe32(std::vector<uint8_t> &out, size_t offset, uint32_t value) {
@@ -478,16 +489,6 @@ uint32_t AppendDsdt(std::vector<uint8_t> &out, uint32_t processorCount) {
 
 uint32_t AppendFadt(std::vector<uint8_t> &out, uint32_t facsOffset,
                     uint32_t dsdtOffset) {
-  auto appendGas = [&](uint8_t addressSpace, uint8_t bitWidth,
-                       uint8_t bitOffset, uint8_t accessSize,
-                       uint64_t address) {
-    out.push_back(addressSpace);
-    out.push_back(bitWidth);
-    out.push_back(bitOffset);
-    out.push_back(accessSize);
-    PutLe64(out, address);
-  };
-
   const auto offset = BeginSdt(out, "FACP", 3);
   PutLe32(out, facsOffset); // FirmwareCtrl, adjusted by table-loader.
   PutLe32(out, dsdtOffset); // DSDT, adjusted by table-loader.
@@ -527,19 +528,19 @@ uint32_t AppendFadt(std::vector<uint8_t> &out, uint32_t facsOffset,
   PutLe16(out, 0x0003);  // Legacy devices + 8042 present.
   out.push_back(0);      // Reserved.
   PutLe32(out, 0x000004A5);
-  appendGas(1, 8, 0, 1, 0xCF9); // Reset register (I/O port).
+  AppendGas(out, 1, 8, 0, 1, 0xCF9); // Reset register (I/O port).
   out.push_back(0x06);          // Reset value.
   out.insert(out.end(), 3, 0);  // Reserved.
   PutLe64(out, facsOffset);     // X_FirmwareCtrl.
   PutLe64(out, dsdtOffset);     // X_Dsdt.
-  appendGas(1, 32, 0, 3, kPm1EventBlock);
-  appendGas(1, 0, 0, 0, 0);
-  appendGas(1, 16, 0, 2, kPm1ControlBlock);
-  appendGas(1, 0, 0, 0, 0);
-  appendGas(1, 0, 0, 0, 0);
-  appendGas(1, 32, 0, 3, kPmTimerBlock);
-  appendGas(1, 0, 0, 0, 0);
-  appendGas(1, 0, 0, 0, 0);
+  AppendGas(out, 1, 32, 0, 3, kPm1EventBlock);
+  AppendGas(out, 1, 0, 0, 0, 0);
+  AppendGas(out, 1, 16, 0, 2, kPm1ControlBlock);
+  AppendGas(out, 1, 0, 0, 0, 0);
+  AppendGas(out, 1, 0, 0, 0, 0);
+  AppendGas(out, 1, 32, 0, 3, kPmTimerBlock);
+  AppendGas(out, 1, 0, 0, 0, 0);
+  AppendGas(out, 1, 0, 0, 0, 0);
   EndSdt(out, offset);
   return offset;
 }
@@ -608,11 +609,7 @@ uint32_t AppendWaet(std::vector<uint8_t> &out) {
 uint32_t AppendHpet(std::vector<uint8_t> &out) {
   const auto offset = BeginSdt(out, "HPET", 1);
   PutLe32(out, HpetDevice::kEventTimerBlockId);
-  out.push_back(0);  // GAS address space: system memory.
-  out.push_back(64); // Register bit width.
-  out.push_back(0);  // Register bit offset.
-  out.push_back(0);  // Access size: undefined/legacy.
-  PutLe64(out, HpetDevice::kDefaultMmioBase);
+  AppendGas(out, 0, 64, 0, 0, HpetDevice::kDefaultMmioBase);
   out.push_back(0);   // HPET sequence number.
   PutLe16(out, 0x80); // Minimum clock tick.
   out.push_back(0);   // Page protection: no guarantee.
@@ -620,8 +617,110 @@ uint32_t AppendHpet(std::vector<uint8_t> &out) {
   return offset;
 }
 
+uint32_t AppendDbgp(std::vector<uint8_t> &out) {
+  const auto offset = BeginSdt(out, "DBGP", 1);
+  out.push_back(0); // Full 16550.
+  out.insert(out.end(), 3, 0); // Reserved.
+  AppendGas(out, 1, 8, 0, 0, 0x03F8);
+  EndSdt(out, offset);
+  return offset;
+}
+
+// TCG ACPI TPM2 table — published so OVMF's Tcg2Pei / Tcg2Dxe discovers the
+// CRB MMIO control area at 0xFED40040 and exposes the EFI TCG2 protocol.
+// Per TCG ACPI specification 1.4 §7 the layout after the standard ACPI
+// header is:
+//   uint16_t  PlatformClass       (0 = Client)
+//   uint16_t  Reserved
+//   uint64_t  AddressOfControlArea
+//   uint32_t  StartMethod         (7 = CRB w/ ACPI Start)
+//   uint8_t[] StartMethodSpecificParameters (12 bytes when StartMethod == 7)
+//   uint32_t  LAML (log area min length)
+//   uint64_t  LASA (log area start address)
+uint32_t AppendTpm2(std::vector<uint8_t> &out, uint64_t controlAreaGpa) {
+  const auto offset = BeginSdt(out, "TPM2", 4);
+  PutLe16(out, 0);              // Platform Class: Client.
+  PutLe16(out, 0);              // Reserved.
+  PutLe64(out, controlAreaGpa); // Address of Control Area.
+  PutLe32(out, 7);              // Start Method: CRB with ACPI Start.
+  // Start-method-specific parameters (12 bytes for Start Method 7). All zero
+  // for a vanilla CRB device — no special ACPI handoff bytes required.
+  out.insert(out.end(), 12, 0);
+  PutLe32(out, 0);              // LAML — no event log advertised.
+  PutLe64(out, 0);              // LASA.
+  EndSdt(out, offset);
+  return offset;
+}
+
+uint32_t AppendSpcr(std::vector<uint8_t> &out) {
+  constexpr char kCom1Namespace[] = "\\_SB_.COM1";
+  constexpr uint16_t kNamespaceOffset = 88;
+
+  const auto offset = BeginSdt(out, "SPCR", 4);
+  out.push_back(0); // Full 16550 / legacy COM-port compatible.
+  out.insert(out.end(), 3, 0); // Reserved.
+  AppendGas(out, 1, 8, 0, 0, 0x03F8); // System I/O COM1, per SPCR examples.
+  out.push_back(0x03); // PC-AT IRQ + IOAPIC GSI.
+  out.push_back(4);    // COM1 legacy IRQ.
+  PutLe32(out, 4);     // COM1 GSI.
+  out.push_back(7);    // 115200 baud.
+  out.push_back(0);    // No parity.
+  out.push_back(1);    // One stop bit.
+  out.push_back(0);    // No flow control.
+  out.push_back(2);    // VT-UTF8.
+  out.push_back(0);    // Language.
+  PutLe16(out, 0xFFFF); // Not PCI-backed.
+  PutLe16(out, 0xFFFF); // Not PCI-backed.
+  out.push_back(0);     // PCI bus.
+  out.push_back(0);     // PCI device.
+  out.push_back(0);     // PCI function.
+  PutLe32(out, 0);      // PCI flags.
+  out.push_back(0);     // PCI segment.
+  PutLe32(out, 0);      // UART clock indeterminate.
+  PutLe32(out, 0);      // Use configured baud enum.
+  PutLe16(out, static_cast<uint16_t>(sizeof(kCom1Namespace)));
+  PutLe16(out, kNamespaceOffset);
+  out.insert(out.end(), kCom1Namespace,
+             kCom1Namespace + sizeof(kCom1Namespace));
+  EndSdt(out, offset);
+  return offset;
+}
+
+uint32_t AppendDbg2(std::vector<uint8_t> &out) {
+  constexpr char kCom1Namespace[] = "\\_SB_.COM1";
+  constexpr uint32_t kDeviceInfoOffset = 44;
+  constexpr uint16_t kBaseAddressOffset = 22;
+  constexpr uint16_t kAddressSizeOffset = kBaseAddressOffset + 12;
+  constexpr uint16_t kNamespaceOffset = kAddressSizeOffset + 4;
+  constexpr uint16_t kDeviceInfoLength =
+      kNamespaceOffset + static_cast<uint16_t>(sizeof(kCom1Namespace));
+
+  const auto offset = BeginSdt(out, "DBG2", 0);
+  PutLe32(out, kDeviceInfoOffset);
+  PutLe32(out, 1); // One debug device: COM1.
+
+  out.push_back(0); // Debug Device Information revision.
+  PutLe16(out, kDeviceInfoLength);
+  out.push_back(1); // One GAS register.
+  PutLe16(out, static_cast<uint16_t>(sizeof(kCom1Namespace)));
+  PutLe16(out, kNamespaceOffset);
+  PutLe16(out, 0); // OEM data length.
+  PutLe16(out, 0); // OEM data offset.
+  PutLe16(out, 0x8000); // Serial debug port.
+  PutLe16(out, 0x0001); // DBGP-compatible 16550 subset.
+  PutLe16(out, 0);      // Reserved.
+  PutLe16(out, kBaseAddressOffset);
+  PutLe16(out, kAddressSizeOffset);
+  AppendGas(out, 1, 8, 0, 1, 0x03F8);
+  PutLe32(out, 8); // COM1 register window size.
+  out.insert(out.end(), kCom1Namespace,
+             kCom1Namespace + sizeof(kCom1Namespace));
+  EndSdt(out, offset);
+  return offset;
+}
+
 uint32_t AppendRsdt(std::vector<uint8_t> &out,
-                    const std::array<uint32_t, 4> &tableOffsets) {
+                    std::initializer_list<uint32_t> tableOffsets) {
   const auto offset = BeginSdt(out, "RSDT", 1);
   for (uint32_t tableOffset : tableOffsets) {
     PutLe32(out, tableOffset);
@@ -699,10 +798,12 @@ std::vector<uint8_t> BuildTableLoader(const AcpiTableOffsets &offsets,
   LoaderAddPointer(out, kRsdpFile, kAcpiTablesFile, 16, 4);
   LoaderAddPointer(out, kAcpiTablesFile, kAcpiTablesFile, offsets.fadt + 36, 4);
   LoaderAddPointer(out, kAcpiTablesFile, kAcpiTablesFile, offsets.fadt + 40, 4);
-  LoaderAddPointer(out, kAcpiTablesFile, kAcpiTablesFile, offsets.rsdt + 36, 4);
-  LoaderAddPointer(out, kAcpiTablesFile, kAcpiTablesFile, offsets.rsdt + 40, 4);
-  LoaderAddPointer(out, kAcpiTablesFile, kAcpiTablesFile, offsets.rsdt + 44, 4);
-  LoaderAddPointer(out, kAcpiTablesFile, kAcpiTablesFile, offsets.rsdt + 48, 4);
+  const uint32_t rsdtLength = AcpiTableLength(tables, offsets.rsdt);
+  for (uint32_t entryOffset = 36; entryOffset + 4 <= rsdtLength;
+       entryOffset += 4) {
+    LoaderAddPointer(out, kAcpiTablesFile, kAcpiTablesFile,
+                     offsets.rsdt + entryOffset, 4);
+  }
 
   LoaderAddChecksum(out, kAcpiTablesFile, offsets.dsdt + 9, offsets.dsdt,
                     AcpiTableLength(tables, offsets.dsdt));
@@ -714,6 +815,18 @@ std::vector<uint8_t> BuildTableLoader(const AcpiTableOffsets &offsets,
                     AcpiTableLength(tables, offsets.waet));
   LoaderAddChecksum(out, kAcpiTablesFile, offsets.hpet + 9, offsets.hpet,
                     AcpiTableLength(tables, offsets.hpet));
+  if (offsets.dbgp != 0) {
+    LoaderAddChecksum(out, kAcpiTablesFile, offsets.dbgp + 9, offsets.dbgp,
+                      AcpiTableLength(tables, offsets.dbgp));
+  }
+  LoaderAddChecksum(out, kAcpiTablesFile, offsets.spcr + 9, offsets.spcr,
+                    AcpiTableLength(tables, offsets.spcr));
+  LoaderAddChecksum(out, kAcpiTablesFile, offsets.dbg2 + 9, offsets.dbg2,
+                    AcpiTableLength(tables, offsets.dbg2));
+  if (offsets.tpm2 != 0) {
+    LoaderAddChecksum(out, kAcpiTablesFile, offsets.tpm2 + 9, offsets.tpm2,
+                      AcpiTableLength(tables, offsets.tpm2));
+  }
   LoaderAddChecksum(out, kAcpiTablesFile, offsets.rsdt + 9, offsets.rsdt,
                     AcpiTableLength(tables, offsets.rsdt));
   LoaderAddChecksum(out, kRsdpFile, 8, 0, 20);
@@ -766,7 +879,7 @@ uint32_t AcpiTableLength(const std::vector<uint8_t> &blob, uint32_t offset) {
          (static_cast<uint32_t>(blob[offset + 7]) << 24);
 }
 
-AcpiBuildArtifacts BuildPcAcpiTables(uint32_t processorCount) {
+AcpiBuildArtifacts BuildPcAcpiTables(uint32_t processorCount, bool includeDbgp) {
   AcpiBuildArtifacts artifacts;
   auto &tables = artifacts.tables;
   artifacts.offsets.facs = AppendFacs(tables);
@@ -776,9 +889,27 @@ AcpiBuildArtifacts BuildPcAcpiTables(uint32_t processorCount) {
   artifacts.offsets.madt = AppendMadt(tables, processorCount);
   artifacts.offsets.waet = AppendWaet(tables);
   artifacts.offsets.hpet = AppendHpet(tables);
-  artifacts.offsets.rsdt =
-      AppendRsdt(tables, {artifacts.offsets.fadt, artifacts.offsets.madt,
-                          artifacts.offsets.waet, artifacts.offsets.hpet});
+  if (includeDbgp) {
+    artifacts.offsets.dbgp = AppendDbgp(tables);
+  }
+  artifacts.offsets.spcr = AppendSpcr(tables);
+  artifacts.offsets.dbg2 = AppendDbg2(tables);
+  // TPM 2.0 ACPI table — points OVMF's Tcg2Pei/Tcg2Dxe at our CRB stub.
+  artifacts.offsets.tpm2 = AppendTpm2(
+      tables, Tpm2CrbDevice::kDefaultMmioBase + Tpm2CrbDevice::kControlAreaOffset);
+  if (includeDbgp) {
+    artifacts.offsets.rsdt =
+        AppendRsdt(tables, {artifacts.offsets.fadt, artifacts.offsets.madt,
+                            artifacts.offsets.waet, artifacts.offsets.hpet,
+                            artifacts.offsets.dbgp, artifacts.offsets.spcr,
+                            artifacts.offsets.dbg2, artifacts.offsets.tpm2});
+  } else {
+    artifacts.offsets.rsdt =
+        AppendRsdt(tables, {artifacts.offsets.fadt, artifacts.offsets.madt,
+                            artifacts.offsets.waet, artifacts.offsets.hpet,
+                            artifacts.offsets.spcr, artifacts.offsets.dbg2,
+                            artifacts.offsets.tpm2});
+  }
 
   artifacts.rsdp = BuildRsdp(artifacts.offsets.rsdt);
   artifacts.tableLoader =
