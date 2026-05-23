@@ -2537,6 +2537,15 @@ void TestReportRoundtripAndFramePaths() {
       loaded, {std::filesystem::path("screenshots") / "frame-000001.png"});
   Expect(html.find("screenshots/frame-000001.png") != std::string::npos,
          "report html: frame path includes screenshots directory");
+  const auto explicitMixedHtml = antimal::BuildHtmlReportWithFrames(
+      loaded, {std::filesystem::path("screenshots") / "livevm-000001.png",
+               std::filesystem::path("screenshots") / "guest-000001.png"});
+  Expect(explicitMixedHtml.find("screenshots/guest-000001.png") !=
+             std::string::npos,
+         "report html: explicit guest frame rendered");
+  Expect(explicitMixedHtml.find("screenshots/livevm-000001.png") ==
+             std::string::npos,
+         "report html: explicit diagnostic frames skipped when guest frames exist");
   Expect(html.find("winload-pre-kernel") != std::string::npos,
          "report html: boot stage rendered");
   Expect(html.find("kernel gate") != std::string::npos &&
@@ -2551,6 +2560,27 @@ void TestReportRoundtripAndFramePaths() {
   Expect(html.find("CPUID") != std::string::npos &&
              html.find("hypervisorBit=clear") != std::string::npos,
          "report html: CPUID diagnostics rendered");
+
+  const auto mixedDir = TempRoot();
+  antimal::EnsureDirectory(mixedDir / "screenshots");
+  antimal::WriteTextFile(mixedDir / "screenshots" / "livevm-000001.png", "diag");
+  antimal::WriteTextFile(mixedDir / "screenshots" / "guest-000001.png", "guest1");
+  antimal::WriteTextFile(mixedDir / "screenshots" / "guest-000002.png", "guest2");
+  antimal::WriteReportHtml(mixedDir / "report.html", loaded);
+  const auto mixedHtml = antimal::ReadTextFile(mixedDir / "report.html");
+  Expect(mixedHtml.find("screenshots/guest-000001.png") != std::string::npos &&
+             mixedHtml.find("screenshots/guest-000002.png") != std::string::npos,
+         "report html: discovered guest frames rendered");
+  Expect(mixedHtml.find("screenshots/livevm-000001.png") == std::string::npos,
+         "report html: diagnostic frames skipped when guest frames exist");
+
+  const auto diagDir = TempRoot();
+  antimal::EnsureDirectory(diagDir / "screenshots");
+  antimal::WriteTextFile(diagDir / "screenshots" / "livevm-000001.png", "diag");
+  antimal::WriteReportHtml(diagDir / "report.html", loaded);
+  const auto diagHtml = antimal::ReadTextFile(diagDir / "report.html");
+  Expect(diagHtml.find("screenshots/livevm-000001.png") != std::string::npos,
+         "report html: diagnostic frames render without guest frames");
 }
 
 void TestIntelLookupOffline() {

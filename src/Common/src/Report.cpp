@@ -944,6 +944,23 @@ void EmitFilmstrip(std::ostringstream &html,
   html << "</div>";
 }
 
+bool IsGuestFramePath(const std::filesystem::path &frame) {
+  const auto name = ToLowerAscii(frame.filename().string());
+  return name.rfind("guest-", 0) == 0;
+}
+
+std::vector<std::filesystem::path> PreferGuestFrames(
+    std::vector<std::filesystem::path> frames) {
+  std::sort(frames.begin(), frames.end());
+  std::vector<std::filesystem::path> guestFrames;
+  for (const auto &frame : frames) {
+    if (IsGuestFramePath(frame)) {
+      guestFrames.push_back(frame);
+    }
+  }
+  return guestFrames.empty() ? frames : guestFrames;
+}
+
 // ----- Discovering screenshot frames in the run directory --------------
 
 std::vector<std::filesystem::path> DiscoverFramesNextTo(
@@ -958,12 +975,13 @@ std::vector<std::filesystem::path> DiscoverFramesNextTo(
   while (!ec && it != end) {
     if (it->is_regular_file(ec) &&
         ToLowerAscii(it->path().extension().string()) == ".png") {
-      frames.push_back(std::filesystem::path("screenshots") / it->path().filename());
+      const auto frame =
+          std::filesystem::path("screenshots") / it->path().filename();
+      frames.push_back(frame);
     }
     it.increment(ec);
   }
-  std::sort(frames.begin(), frames.end());
-  return frames;
+  return PreferGuestFrames(frames);
 }
 
 } // namespace
@@ -1002,6 +1020,7 @@ std::string BuildHtmlReport(const AnalysisReport &report) {
 
 std::string BuildHtmlReportWithFrames(const AnalysisReport &report,
                                       const std::vector<std::filesystem::path> &frames) {
+  const auto displayFrames = PreferGuestFrames(frames);
   const auto &scan = report.scannerVerdict;
   const auto worst = scan.verdict == Verdict::Malicious || report.sandboxVerdict == Verdict::Malicious
                          ? Verdict::Malicious
@@ -1256,7 +1275,7 @@ std::string BuildHtmlReportWithFrames(const AnalysisReport &report,
   // Center column: screenshots + events + findings
   html << "<section class=\"panel\">";
   html << "<h2>Run timeline</h2>";
-  EmitFilmstrip(html, frames);
+  EmitFilmstrip(html, displayFrames);
 
   html << "<h2 style=\"margin-top:16px\">Events</h2>";
   EmitEventTable(html, report.events);
