@@ -13,6 +13,8 @@
 #include <shellapi.h>
 #include <shlobj.h>
 #include <richedit.h>
+#include <objidl.h>
+#include <gdiplus.h>
 
 #include <algorithm>
 #include <atomic>
@@ -106,6 +108,8 @@ struct AppState {
   HWND autoDetonate = nullptr;
   antimal::AppConfig config;
   std::vector<antimal::ScanResult> scanResults;
+  std::unique_ptr<Gdiplus::Image> vmFrame;
+  std::filesystem::path vmFramePath;
   std::mutex mutex;
   std::atomic_bool scanning = false;
   std::atomic_uint64_t runWatchGeneration = 0;
@@ -927,6 +931,218 @@ void FitRunEventColumns(HWND list) {
   ListView_SetColumnWidth(list, 4, targetW);
 }
 
+RECT VmScreenContentRect(HWND hwnd) {
+  RECT rc{};
+  GetClientRect(hwnd, &rc);
+  const int width = rc.right - rc.left;
+  const int margin = 12;
+  const int rightW = std::clamp(width / 3, 330, 390);
+  const int gap = 16;
+  const int leftW = std::max(520, width - rightW - gap - margin * 2);
+  const int vmH = 360;
+  return RECT{margin + 22, kContentTop + 48, margin + leftW - 22,
+              kContentTop + vmH - 32};
+}
+
+void ClearVmFrame() {
+  g_app.vmFrame.reset();
+  g_app.vmFramePath.clear();
+  if (g_app.vmScreen) {
+    ShowWindow(g_app.vmScreen, SW_SHOW);
+  }
+  if (g_app.hwnd) {
+    InvalidateRect(g_app.hwnd, nullptr, FALSE);
+  }
+}
+
+bool ShowVmFrame(const std::filesystem::path &framePath) {
+  auto image = std::make_unique<Gdiplus::Image>(framePath.wstring().c_str());
+  if (image->GetLastStatus() != Gdiplus::Ok || image->GetWidth() == 0 ||
+      image->GetHeight() == 0) {
+    return false;
+  }
+  g_app.vmFramePath = framePath;
+  g_app.vmFrame = std::move(image);
+  if (g_app.vmScreen) {
+    ShowWindow(g_app.vmScreen, SW_HIDE);
+  }
+  if (g_app.hwnd) {
+    InvalidateRect(g_app.hwnd, nullptr, FALSE);
+  }
+  return true;
+}
+
+bool IsGuestFrame(const std::filesystem::path &framePath) {
+  const std::string name =
+      antimal::ToLowerAscii(framePath.filename().string());
+  return name.rfind("guest-", 0) == 0;
+}
+
+bool ShouldDisplayVmFrame(const std::filesystem::path &framePath) {
+  if (!g_app.vmFrame) {
+    return true;
+  }
+  if (IsGuestFrame(framePath)) {
+    return true;
+  }
+  return !IsGuestFrame(g_app.vmFramePath);
+}
+
+void DrawVmFrame(HDC dc, const RECT &rc) {
+  if (!g_app.vmFrame) {
+    return;
+  }
+
+  const int boxW = std::max(1, static_cast<int>(rc.right - rc.left));
+  const int boxH = std::max(1, static_cast<int>(rc.bottom - rc.top));
+  const UINT imageW = g_app.vmFrame->GetWidth();
+  const UINT imageH = g_app.vmFrame->GetHeight();
+  if (imageW == 0 || imageH == 0) {
+    return;
+  }
+
+  Gdiplus::Graphics graphics(dc);
+  graphics.SetInterpolationMode(Gdiplus::InterpolationModeHighQualityBicubic);
+  graphics.SetPixelOffsetMode(Gdiplus::PixelOffsetModeHighQuality);
+
+  Gdiplus::SolidBrush fill(Gdiplus::Color(255, 8, 10, 14));
+  graphics.FillRectangle(&fill, rc.left, rc.top, boxW, boxH);
+
+  const double scale =
+      std::min(static_cast<double>(boxW) / static_cast<double>(imageW),
+               static_cast<double>(boxH) / static_cast<double>(imageH));
+  const int drawW = std::max(1, static_cast<int>(imageW * scale + 0.5));
+  const int drawH = std::max(1, static_cast<int>(imageH * scale + 0.5));
+  const int x = rc.left + (boxW - drawW) / 2;
+  const int y = rc.top + (boxH - drawH) / 2;
+
+  graphics.DrawImage(g_app.vmFrame.get(), x, y, drawW, drawH);
+  Gdiplus::Pen border(Gdiplus::Color(255, 47, 53, 62), 1.0f);
+  graphics.DrawRectangle(&border, rc.left, rc.top, boxW - 1, boxH - 1);
+}
+
+std::optional<std::filesystem::path> FindLatestRunDir() {
+  std::error_code ec;
+  const auto &root = g_app.config.workspaceRoot;
+  if (root.empty() || !std::filesystem::exists(root, ec)) {
+    return std::nullopt;
+  }
+
+  std::optional<std::filesystem::path> latest;
+  std::filesystem::file_time_type latestTime{};
+  for (std::filesystem::directory_iterator it(root, ec), end; !ec && it != end;
+       it.increment(ec)) {
+    if (!it->is_directory(ec)) {
+      continue;
+    }
+    const auto runDir = it->path();
+    const bool looksLikeRun =
+        std::filesystem::exists(runDir / "report.json", ec) ||
+        std::filesystem::exists(runDir / "events.jsonl", ec) ||
+        std::filesystem::exists(runDir / "screenshots", ec);
+    if (!looksLikeRun) {
+      continue;
+    }
+
+    const auto marker = std::filesystem::exists(runDir / "report.json", ec)
+                            ? runDir / "report.json"
+                            : runDir;
+    const auto stamp = std::filesystem::last_write_time(marker, ec);
+    if (ec) {
+      continue;
+    }
+    if (!latest || stamp > latestTime) {
+      latest = runDir;
+      latestTime = stamp;
+    }
+  }
+  return latest;
+}
+
+std::vector<std::filesystem::path> ListRunFrames(
+    const std::filesystem::path &runDir) {
+  std::vector<std::filesystem::path> frames;
+  const auto screenshotsDir = runDir / "screenshots";
+  std::error_code ec;
+  if (!std::filesystem::exists(screenshotsDir, ec)) {
+    return frames;
+  }
+
+  for (std::filesystem::directory_iterator it(screenshotsDir, ec), end;
+       !ec && it != end; it.increment(ec)) {
+    if (it->is_regular_file(ec) &&
+        antimal::ToLowerAscii(it->path().extension().string()) == ".png") {
+      frames.push_back(it->path());
+    }
+  }
+  std::sort(frames.begin(), frames.end());
+  return frames;
+}
+
+std::optional<std::filesystem::path> LatestPreferredFrame(
+    const std::vector<std::filesystem::path> &frames) {
+  for (auto it = frames.rbegin(); it != frames.rend(); ++it) {
+    if (IsGuestFrame(*it)) {
+      return *it;
+    }
+  }
+  if (!frames.empty()) {
+    return frames.back();
+  }
+  return std::nullopt;
+}
+
+void LoadRunPreview(const std::filesystem::path &runDir,
+                    std::string_view label) {
+  ClearVmFrame();
+  ListView_DeleteAllItems(g_app.runEvents);
+
+  std::string status = "completed run";
+  const auto reportPath = runDir / "report.json";
+  std::error_code ec;
+  if (std::filesystem::exists(reportPath, ec)) {
+    try {
+      const auto report = antimal::LoadReportBestEffort(reportPath);
+      if (!report.dynamicSummary.status.empty()) {
+        status = report.dynamicSummary.status;
+      }
+      if (!report.dynamicSummary.bootStage.empty()) {
+        status += " / " + report.dynamicSummary.bootStage;
+      }
+    } catch (...) {
+      status = "report present";
+    }
+  }
+
+  const auto frames = ListRunFrames(runDir);
+  const auto preferredFrame = LatestPreferredFrame(frames);
+  if (preferredFrame) {
+    ShowVmFrame(*preferredFrame);
+    SetWindowTextW(g_app.latestFrame,
+                   (L"Preview frame: " + preferredFrame->wstring()).c_str());
+  } else {
+    SetWindowTextW(g_app.vmScreen,
+                   (L"Run workspace\n" + runDir.wstring() +
+                    L"\nNo screenshots were captured for this run.").c_str());
+    SetWindowTextW(g_app.latestFrame, L"Preview: no screenshots captured");
+  }
+
+  antimal::EventJournalTailer tailer(runDir / "events.jsonl");
+  auto events = tailer.ReadAll();
+  constexpr size_t kMaxPreviewEvents = 2500;
+  if (events.size() > kMaxPreviewEvents) {
+    events.erase(events.begin(), events.end() - kMaxPreviewEvents);
+  }
+  for (const auto &event : events) {
+    InsertRunEvent(event);
+  }
+
+  SetWindowTextW(g_app.vmTitle,
+                 Wide("Latest run preview: " + status).c_str());
+  SetStatus(std::string(label) + ": " + antimal::PathToUtf8(runDir));
+  AppendLog(std::string(label) + ": " + antimal::PathToUtf8(runDir));
+}
+
 void Layout(HWND hwnd) {
   RECT rc{};
   GetClientRect(hwnd, &rc);
@@ -980,10 +1196,12 @@ void Layout(HWND hwnd) {
   const int liveH = std::max(150, (height - resultsY - margin - gap) / 2);
   const int resultsH = std::max(170, height - resultsY - liveH - gap - margin);
   const int liveY = resultsY + resultsH + gap;
+  const RECT vmScreenRc = VmScreenContentRect(hwnd);
 
   MoveWindow(g_app.vmTitle, margin + 16, kContentTop + 10, leftW - 32, 24, TRUE);
-  MoveWindow(g_app.vmScreen, margin + 22, kContentTop + 48, leftW - 44,
-             vmH - 48 - 32, TRUE);
+  MoveWindow(g_app.vmScreen, vmScreenRc.left, vmScreenRc.top,
+             vmScreenRc.right - vmScreenRc.left,
+             vmScreenRc.bottom - vmScreenRc.top, TRUE);
   MoveWindow(g_app.latestFrame, margin + 22, kContentTop + vmH - 28,
              leftW - 44, 22, TRUE);
   MoveWindow(g_app.results, margin, resultsY + 34 + kGridHeaderH, leftW,
@@ -1150,6 +1368,31 @@ void CreateControls(HWND hwnd) {
 
 void OpenPath(const std::filesystem::path &path) {
   ShellExecuteW(g_app.hwnd, L"open", path.wstring().c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+}
+
+void OpenLatestReportOrWorkspace() {
+  antimal::EnsureDirectory(g_app.config.workspaceRoot);
+  if (const auto latestRun = FindLatestRunDir()) {
+    const auto html = *latestRun / "report.html";
+    const auto json = *latestRun / "report.json";
+    std::error_code ec;
+    if (std::filesystem::exists(html, ec)) {
+      OpenPath(html);
+      SetStatus("Opened latest HTML report: " + antimal::PathToUtf8(html));
+      return;
+    }
+    if (std::filesystem::exists(json, ec)) {
+      OpenPath(json);
+      SetStatus("Opened latest JSON report: " + antimal::PathToUtf8(json));
+      return;
+    }
+    OpenPath(*latestRun);
+    SetStatus("Opened latest run workspace: " + antimal::PathToUtf8(*latestRun));
+    return;
+  }
+  OpenPath(g_app.config.workspaceRoot);
+  SetStatus("Opened report workspace: " +
+            antimal::PathToUtf8(g_app.config.workspaceRoot));
 }
 
 void RunImportBase() {
@@ -1348,6 +1591,7 @@ void PaintWorkspace(HWND hwnd, HDC dc) {
 
   DrawPanel(dc, RECT{margin, kContentTop, margin + leftW, kContentTop + vmH},
             L"VM WORKSPACE");
+  DrawVmFrame(dc, VmScreenContentRect(hwnd));
   DrawPanel(dc, RECT{margin, resultsY, margin + leftW, resultsY + resultsH},
             L"ANALYSIS RESULTS");
   DrawPanel(dc, RECT{margin, liveY, margin + leftW, liveY + liveH},
@@ -1619,6 +1863,9 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     AppendLog("AntiMal UI ready.");
     AppendLog("Use Base Setup to build/import a clean VHDX. Direct VHDX boot attempts are supported; external VM apps are not used.");
     RefreshVmReadiness(true);
+    if (const auto latestRun = FindLatestRunDir()) {
+      LoadRunPreview(*latestRun, "Loaded latest run preview");
+    }
     return 0;
 
   case WM_SIZE:
@@ -1747,8 +1994,7 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
       return 0;
     }
     case IDC_OPEN_REPORTS:
-      antimal::EnsureDirectory(g_app.config.workspaceRoot);
-      OpenPath(g_app.config.workspaceRoot);
+      OpenLatestReportOrWorkspace();
       return 0;
     case IDC_OPEN_CONFIG:
       OpenPath(antimal::DefaultConfigPath());
@@ -1826,6 +2072,7 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
   case WM_APP_RUN_RESET: {
     std::unique_ptr<std::filesystem::path> path(
         reinterpret_cast<std::filesystem::path *>(lParam));
+    ClearVmFrame();
     ListView_DeleteAllItems(g_app.runEvents);
     if (path) {
       SetWindowTextW(g_app.latestFrame,
@@ -1853,6 +2100,13 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     if (frame) {
       SetWindowTextW(g_app.latestFrame,
                      (L"Latest screenshot: " + frame->wstring()).c_str());
+      if (!ShouldDisplayVmFrame(*frame)) {
+        return 0;
+      }
+      if (!ShowVmFrame(*frame)) {
+        PostLog("Latest screenshot was found but could not be rendered yet: " +
+                antimal::PathToUtf8(*frame));
+      }
     }
     return 0;
   }
@@ -1877,6 +2131,7 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
 
   case WM_DESTROY:
     ++g_app.runWatchGeneration;
+    g_app.vmFrame.reset();
     if (g_font) DeleteObject(g_font);
     if (g_fontBold) DeleteObject(g_fontBold);
     if (g_fontMono) DeleteObject(g_fontMono);
@@ -1897,6 +2152,12 @@ int APIENTRY wWinMain(HINSTANCE instance, HINSTANCE, LPWSTR, int show) {
   icc.dwICC = ICC_LISTVIEW_CLASSES | ICC_STANDARD_CLASSES;
   InitCommonControlsEx(&icc);
   CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
+  Gdiplus::GdiplusStartupInput gdiInput{};
+  ULONG_PTR gdiToken = 0;
+  if (Gdiplus::GdiplusStartup(&gdiToken, &gdiInput, nullptr) != Gdiplus::Ok) {
+    CoUninitialize();
+    return 1;
+  }
 
   const wchar_t *className = L"AntiMalAppWindow";
   WNDCLASSEXW wc{};
@@ -1914,6 +2175,9 @@ int APIENTRY wWinMain(HINSTANCE instance, HINSTANCE, LPWSTR, int show) {
                               WS_OVERLAPPEDWINDOW | WS_VISIBLE, CW_USEDEFAULT,
                               CW_USEDEFAULT, 1280, 760, nullptr, nullptr, instance, nullptr);
   if (!hwnd) {
+    if (gdiToken) {
+      Gdiplus::GdiplusShutdown(gdiToken);
+    }
     CoUninitialize();
     return 1;
   }
@@ -1927,6 +2191,10 @@ int APIENTRY wWinMain(HINSTANCE instance, HINSTANCE, LPWSTR, int show) {
     DispatchMessageW(&msg);
   }
 
+  g_app.vmFrame.reset();
+  if (gdiToken) {
+    Gdiplus::GdiplusShutdown(gdiToken);
+  }
   CoUninitialize();
   return static_cast<int>(msg.wParam);
 }

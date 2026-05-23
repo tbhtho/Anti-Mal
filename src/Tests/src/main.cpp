@@ -29,6 +29,7 @@
 #include "antimal/hv/PcIoDevices.h"
 #include "antimal/hv/SerialConsole.h"
 #include "antimal/hv/StorageController.h"
+#include "antimal/hv/Tpm2CrbDevice.h"
 #include "antimal/hv/Vcpu.h"
 #include "antimal/hv/VirtualMachine.h"
 #include "antimal/hv/VirtualDisk.h"
@@ -583,6 +584,7 @@ void TestAcpiTables() {
   tableOk(acpi.offsets.hpet, "HPET");
   tableOk(acpi.offsets.spcr, "SPCR");
   tableOk(acpi.offsets.dbg2, "DBG2");
+  tableOk(acpi.offsets.tpm2, "TPM2");
   tableOk(acpi.offsets.rsdt, "RSDT");
   Expect(acpi.offsets.dbgp == 0, "ACPI: DBGP is opt-in by default");
 
@@ -668,11 +670,18 @@ void TestAcpiTables() {
          "ACPI: DBG2 GAS points to COM1");
   Expect(ReadLe32(acpi.tables, acpi.offsets.dbg2 + 78) == 8,
          "ACPI: DBG2 COM1 address size is eight registers");
-  Expect(ReadLe32(acpi.tables, acpi.offsets.rsdt + 4) == 60,
-         "ACPI: RSDT includes six default table pointers");
+  Expect(ReadLe64(acpi.tables, acpi.offsets.tpm2 + 40) ==
+             antimal::hv::Tpm2CrbDevice::kDefaultMmioBase +
+                 antimal::hv::Tpm2CrbDevice::kControlAreaOffset,
+         "ACPI: TPM2 points at CRB control area");
+  Expect(ReadLe32(acpi.tables, acpi.offsets.tpm2 + 48) == 7,
+         "ACPI: TPM2 advertises CRB ACPI start method");
+  Expect(ReadLe32(acpi.tables, acpi.offsets.rsdt + 4) == 64,
+         "ACPI: RSDT includes seven default table pointers");
   Expect(ReadLe32(acpi.tables, acpi.offsets.rsdt + 52) == acpi.offsets.spcr &&
-             ReadLe32(acpi.tables, acpi.offsets.rsdt + 56) == acpi.offsets.dbg2,
-         "ACPI: RSDT references SPCR and DBG2");
+             ReadLe32(acpi.tables, acpi.offsets.rsdt + 56) == acpi.offsets.dbg2 &&
+             ReadLe32(acpi.tables, acpi.offsets.rsdt + 60) == acpi.offsets.tpm2,
+         "ACPI: RSDT references SPCR, DBG2, and TPM2");
 
   const auto acpiDbgp = antimal::hv::BuildPcAcpiTables(1, true);
   const uint32_t dbgpLen =
@@ -689,15 +698,17 @@ void TestAcpiTables() {
          "ACPI: DBGP probe advertises full 16550-compatible COM1");
   Expect(ReadLe64(acpiDbgp.tables, acpiDbgp.offsets.dbgp + 44) == 0x03F8u,
          "ACPI: DBGP probe GAS points to COM1");
-  Expect(ReadLe32(acpiDbgp.tables, acpiDbgp.offsets.rsdt + 4) == 64,
-         "ACPI: DBGP probe RSDT includes seven table pointers");
+  Expect(ReadLe32(acpiDbgp.tables, acpiDbgp.offsets.rsdt + 4) == 68,
+         "ACPI: DBGP probe RSDT includes eight table pointers");
   Expect(ReadLe32(acpiDbgp.tables, acpiDbgp.offsets.rsdt + 52) ==
              acpiDbgp.offsets.dbgp &&
              ReadLe32(acpiDbgp.tables, acpiDbgp.offsets.rsdt + 56) ==
                  acpiDbgp.offsets.spcr &&
              ReadLe32(acpiDbgp.tables, acpiDbgp.offsets.rsdt + 60) ==
-                 acpiDbgp.offsets.dbg2,
-         "ACPI: DBGP probe RSDT references DBGP, SPCR, and DBG2");
+                 acpiDbgp.offsets.dbg2 &&
+             ReadLe32(acpiDbgp.tables, acpiDbgp.offsets.rsdt + 64) ==
+                 acpiDbgp.offsets.tpm2,
+         "ACPI: DBGP probe RSDT references DBGP, SPCR, DBG2, and TPM2");
 
   const auto dsdtLen = antimal::hv::AcpiTableLength(acpi.tables, acpi.offsets.dsdt);
   const auto dsdtBegin = acpi.tables.begin() + acpi.offsets.dsdt;
@@ -2338,6 +2349,7 @@ void TestEventJournalRoundtrip() {
     ev.imagePath = "C:\\Windows\\evil.exe";
     ev.target = "C:\\Users\\bob\\stage.bin";
     ev.details["size"] = "12345";
+    ev.details["quoted"] = "C:\\Temp\\\"payload\"\\stage.bin";
     ev.mitre = "T1105";
     writer.Append(ev);
 
@@ -2357,7 +2369,23 @@ void TestEventJournalRoundtrip() {
   Expect(all[0].category == "file", "journal: first event category");
   Expect(all[0].processId == 4321, "journal: pid preserved");
   Expect(all[0].details["size"] == "12345", "journal: details map preserved");
+  Expect(all[0].details["quoted"] == "C:\\Temp\\\"payload\"\\stage.bin",
+         "journal: escaped detail preserved");
   Expect(all[1].target == "evil.example.com:443", "journal: target preserved");
+
+  const std::string richLine = R"JSON({"timestampUtc":"2026-05-23T20:00:00Z","source":"Host","category":"vm","action":"boot.status","processId":0,"parentProcessId":0,"imagePath":"","target":"C:\\AntiMalRuns\\run\\vm-diagnostics.txt","details":{"message":"DriverSiPolicy.p7b, active CI policy data, bootres.dll","nested":"{\"status\":\"0xc0000225\",\"items\":[\"a\",\"b\"]}","note":"line\nquote\"slash\\"},"mitre":""})JSON";
+  const auto rich = antimal::ParseEventJsonLine(richLine);
+  Expect(rich.category == "vm", "journal parse: rich event category");
+  Expect(rich.target == "C:\\AntiMalRuns\\run\\vm-diagnostics.txt",
+         "journal parse: escaped target path");
+  const auto nested = rich.details.find("nested");
+  const auto note = rich.details.find("note");
+  Expect(nested != rich.details.end() &&
+             nested->second.find("0xc0000225") != std::string::npos,
+         "journal parse: nested escaped detail");
+  Expect(note != rich.details.end() &&
+             note->second.find("quote\"slash\\") != std::string::npos,
+         "journal parse: escaped quote and slash detail");
 
   // Tailer should report 0 new events on the second pull (cursor at EOF).
   antimal::EventJournalTailer tailer2(journalPath);
