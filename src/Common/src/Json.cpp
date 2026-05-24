@@ -302,6 +302,11 @@ std::string ToJson(const DynamicRunSummary &summary) {
                 summary.windowsKernelReadGateStatus);
   obj.AddString("windowsKernelReadGateEvidence",
                 summary.windowsKernelReadGateEvidence);
+  obj.AddString("windowsKernelReadGateFirstTarget",
+                summary.windowsKernelReadGateFirstTarget);
+  obj.AddString("bootFailureStatus", summary.bootFailureStatus);
+  obj.AddString("bootFailureStatusName", summary.bootFailureStatusName);
+  obj.AddString("bootFailureStatusSource", summary.bootFailureStatusSource);
   obj.AddString("bootBlocker", summary.bootBlocker);
   obj.AddRaw("cpuidDiagnostics", JsonStringArray(summary.cpuidDiagnostics));
   obj.AddString("bootStage", summary.bootStage);

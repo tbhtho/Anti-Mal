@@ -1614,6 +1614,17 @@ std::string WindowsKernelReadGateDetails(
   return JoinStrings(parts, "; ");
 }
 
+std::string WindowsKernelReadGateFirstTarget(
+    const std::vector<BootReadObservation> &observations) {
+  for (const auto &observation : observations) {
+    if (BootReadObserved(observation) &&
+        IsKernelReadGateTarget(observation.target.name)) {
+      return observation.target.name;
+    }
+  }
+  return {};
+}
+
 enum class IdeReadSpecificity : uint8_t {
   KnownFile = 0,
   FilesystemMetadata = 1,
@@ -2404,8 +2415,24 @@ const char *KnownNtStatusName(uint32_t value) {
     return "STATUS_ARRAY_BOUNDS_EXCEEDED";
   case 0xC000008Du:
     return "STATUS_FLOAT_DENORMAL_OPERAND";
+  case 0xC000008Eu:
+    return "STATUS_FLOAT_DIVIDE_BY_ZERO";
   case 0xC000008Fu:
     return "STATUS_FLOAT_INEXACT_RESULT";
+  case 0xC0000090u:
+    return "STATUS_FLOAT_INVALID_OPERATION";
+  case 0xC0000091u:
+    return "STATUS_FLOAT_OVERFLOW";
+  case 0xC0000092u:
+    return "STATUS_FLOAT_STACK_CHECK";
+  case 0xC0000093u:
+    return "STATUS_FLOAT_UNDERFLOW";
+  case 0xC0000094u:
+    return "STATUS_INTEGER_DIVIDE_BY_ZERO";
+  case 0xC000009Cu:
+    return "STATUS_DEVICE_DATA_ERROR";
+  case 0xC000009Du:
+    return "STATUS_DEVICE_NOT_CONNECTED";
   case 0xC000009Eu:
     return "STATUS_DEVICE_POWER_FAILURE";
   case 0xC000009Fu:
@@ -2613,6 +2640,51 @@ std::string EspBootstatDetails(const EspBootstatSnapshot &snapshot) {
     }
   }
   return out.str();
+}
+
+struct BootFailureStatusSummary {
+  std::string status;
+  std::string statusName;
+  std::string source;
+};
+
+BootFailureStatusSummary MakeBootFailureStatusSummary(uint32_t status,
+                                                      std::string source) {
+  BootFailureStatusSummary summary;
+  summary.status = HexDword(status);
+  if (const auto *name = KnownNtStatusName(status)) {
+    summary.statusName = name;
+  }
+  summary.source = std::move(source);
+  return summary;
+}
+
+std::optional<BootFailureStatusSummary>
+InferBootFailureStatus(const EspBootstatSnapshot &snapshot) {
+  if (!snapshot.found) {
+    return std::nullopt;
+  }
+  for (const auto &record : snapshot.decodedRecords) {
+    if (record.dominantStatusCount == 0) {
+      continue;
+    }
+    const auto label = record.guidAlias.empty() ? record.guid : record.guidAlias;
+    return MakeBootFailureStatusSummary(
+        record.dominantStatus,
+        label.empty() ? "bootstat decoded record"
+                      : "bootstat decoded record " + label);
+  }
+  if (!snapshot.lateStatusCandidates.empty()) {
+    return MakeBootFailureStatusSummary(
+        snapshot.lateStatusCandidates.front().value,
+        "bootstat late repeated NTSTATUS candidate");
+  }
+  if (!snapshot.statusLikeDwords.empty()) {
+    return MakeBootFailureStatusSummary(
+        snapshot.statusLikeDwords.front().second,
+        "bootstat status-like dword");
+  }
+  return std::nullopt;
 }
 
 std::string NtfsOwnerAttributeName(uint32_t attributeType) {
@@ -4320,7 +4392,7 @@ bool NoIntegrityChecksPatchDisabled() {
 }
 
 bool NoIntegrityChecksProbeEnabled() {
-  return !NoIntegrityChecksPatchDisabled();
+  return NoIntegrityChecksProbeEnvEnabled() && !NoIntegrityChecksPatchDisabled();
 }
 
 bool LegacyBootContextProbeEnvEnabled() {
@@ -4332,7 +4404,7 @@ bool LegacyBootContextPatchDisabled() {
 }
 
 bool LegacyBootContextProbeEnabled() {
-  return !LegacyBootContextPatchDisabled();
+  return LegacyBootContextProbeEnvEnabled() && !LegacyBootContextPatchDisabled();
 }
 
 bool DetectHalProbeEnabled() {
@@ -4416,11 +4488,8 @@ bool DebugPortAddressProbeEnabled() {
 }
 
 bool SystemLegacySecurityProbeEnabled() {
-  char buf[16]{};
-  size_t needed = 0;
-  return getenv_s(&needed, buf, sizeof(buf),
-                  "ANTIMAL_PROBE_SYSTEM_LEGACY_SECURITY") == 0 &&
-         needed > 1 && buf[0] != '\0' && std::atoi(buf) != 0;
+  return EnvFlagEnabled("ANTIMAL_PROBE_SYSTEM_VBS_COMPAT") ||
+         EnvFlagEnabled("ANTIMAL_PROBE_SYSTEM_LEGACY_SECURITY");
 }
 
 BootOverlayPatchResult ApplyEphemeralBootOverlay(hv::IBlockDevice &disk) {
@@ -4486,30 +4555,32 @@ BootOverlayPatchResult ApplyEphemeralBootOverlay(hv::IBlockDevice &disk) {
       result.noIntegrityChecksProbeEnabled = NoIntegrityChecksProbeEnabled();
       if (result.noIntegrityChecksProbeEnabled) {
         result.notes.push_back(
-            NoIntegrityChecksProbeEnvEnabled()
-                ? "BCD nointegritychecks probe enabled by "
-                  "ANTIMAL_PROBE_BCD_NOINTEGRITYCHECKS"
-                : "BCD nointegritychecks baseline patch enabled; disable "
-                  "with ANTIMAL_DISABLE_BCD_NOINTEGRITYCHECKS=1");
+            "BCD nointegritychecks probe enabled by "
+            "ANTIMAL_PROBE_BCD_NOINTEGRITYCHECKS");
         noIntegrityChanged = PatchBcdNoIntegrityChecksProbe(bytes, &result);
+      } else if (NoIntegrityChecksPatchDisabled()) {
+        result.notes.push_back(
+            "BCD nointegritychecks probe disabled by "
+            "ANTIMAL_DISABLE_BCD_NOINTEGRITYCHECKS");
       } else {
         result.notes.push_back(
-            "BCD nointegritychecks baseline patch disabled by "
-            "ANTIMAL_DISABLE_BCD_NOINTEGRITYCHECKS");
+            "BCD nointegritychecks probe not enabled; conservative baseline "
+            "keeps code integrity");
       }
       result.legacyBootContextProbeEnabled = LegacyBootContextProbeEnabled();
       if (result.legacyBootContextProbeEnabled) {
         result.notes.push_back(
-            LegacyBootContextProbeEnvEnabled()
-                ? "BCD legacy boot-context probe enabled by "
-                  "ANTIMAL_PROBE_BCD_LEGACY_CONTEXT"
-                : "BCD legacy boot-context baseline patch enabled; disable "
-                  "with ANTIMAL_DISABLE_BCD_LEGACY_CONTEXT=1");
+            "BCD legacy boot-context probe enabled by "
+            "ANTIMAL_PROBE_BCD_LEGACY_CONTEXT");
         legacyContextChanged = PatchBcdLegacyBootContextProbe(bytes, &result);
+      } else if (LegacyBootContextPatchDisabled()) {
+        result.notes.push_back(
+            "BCD legacy boot-context probe disabled by "
+            "ANTIMAL_DISABLE_BCD_LEGACY_CONTEXT");
       } else {
         result.notes.push_back(
-            "BCD legacy boot-context baseline patch disabled by "
-            "ANTIMAL_DISABLE_BCD_LEGACY_CONTEXT");
+            "BCD legacy boot-context probe not enabled; conservative baseline "
+            "preserves isolatedcontext");
       }
       result.detectHalProbeEnabled = DetectHalProbeEnabled();
       if (result.detectHalProbeEnabled) {
@@ -5061,8 +5132,6 @@ bool PatchSystemHiveLegacySecurityProbe(std::vector<uint8_t> &bytes,
   setDword({*controlSet, "Control", "Lsa"}, "LsaCfgFlags");
   setDword({*controlSet, "Control", "Lsa"}, "RunAsPPL");
   setDword({*controlSet, "Control", "Lsa"}, "RunAsPPLBoot");
-  setDword({*controlSet, "Control", "CI", "Config"},
-           "VulnerableDriverBlocklistEnable");
 
   if (result) {
     if (ok) {
@@ -5179,8 +5248,13 @@ bool PatchOverlaySystemBootStorage(hv::IBlockDevice &disk,
   }
   if (result && result->systemLegacySecurityProbeEnabled) {
     result->notes.push_back(
-        "SYSTEM legacy security probe enabled by "
-        "ANTIMAL_PROBE_SYSTEM_LEGACY_SECURITY");
+        "SYSTEM VBS compatibility probe enabled by "
+        "ANTIMAL_PROBE_SYSTEM_VBS_COMPAT");
+    if (EnvFlagEnabled("ANTIMAL_PROBE_SYSTEM_LEGACY_SECURITY")) {
+      result->notes.push_back(
+          "ANTIMAL_PROBE_SYSTEM_LEGACY_SECURITY accepted as compatibility "
+          "alias");
+    }
   }
   if (SystemLegacySecurityProbeEnabled() &&
       !PatchSystemHiveLegacySecurityProbe(bytes, result)) {
@@ -7494,6 +7568,16 @@ DetonationResult InHouseOrchestrator::PrepareAndRun(
           result.dynamicSummary.windowsKernelReadGateStatus == "reached";
       result.dynamicSummary.windowsKernelReadGateEvidence =
           WindowsKernelReadGateEvidence(bootReadObservations);
+      result.dynamicSummary.windowsKernelReadGateFirstTarget =
+          WindowsKernelReadGateFirstTarget(bootReadObservations);
+      if (const auto bootFailure =
+              InferBootFailureStatus(bootstatSnapshot)) {
+        result.dynamicSummary.bootFailureStatus = bootFailure->status;
+        result.dynamicSummary.bootFailureStatusName =
+            bootFailure->statusName;
+        result.dynamicSummary.bootFailureStatusSource =
+            bootFailure->source;
+      }
       result.dynamicSummary.bootBlocker =
           ClassifyBootBlocker(result.dynamicSummary);
       returnedArtifacts.insert(returnedArtifacts.end(),
@@ -7678,6 +7762,13 @@ DetonationResult InHouseOrchestrator::PrepareAndRun(
            result.dynamicSummary.windowsKernelReadGateStatus},
           {"windowsKernelReadGateEvidence",
            result.dynamicSummary.windowsKernelReadGateEvidence},
+          {"windowsKernelReadGateFirstTarget",
+           result.dynamicSummary.windowsKernelReadGateFirstTarget},
+          {"bootFailureStatus", result.dynamicSummary.bootFailureStatus},
+          {"bootFailureStatusName",
+           result.dynamicSummary.bootFailureStatusName},
+          {"bootFailureStatusSource",
+           result.dynamicSummary.bootFailureStatusSource},
           {"bootBlocker", result.dynamicSummary.bootBlocker},
           {"bootMilestones",
            JoinStrings(result.dynamicSummary.bootMilestones, ", ")},

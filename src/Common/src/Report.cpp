@@ -604,6 +604,14 @@ DynamicRunSummary ParseDynamicSummary(const JsonValue *value) {
       StringValue(Member(*value, "windowsKernelReadGateStatus"));
   summary.windowsKernelReadGateEvidence =
       StringValue(Member(*value, "windowsKernelReadGateEvidence"));
+  summary.windowsKernelReadGateFirstTarget =
+      StringValue(Member(*value, "windowsKernelReadGateFirstTarget"));
+  summary.bootFailureStatus =
+      StringValue(Member(*value, "bootFailureStatus"));
+  summary.bootFailureStatusName =
+      StringValue(Member(*value, "bootFailureStatusName"));
+  summary.bootFailureStatusSource =
+      StringValue(Member(*value, "bootFailureStatusSource"));
   summary.bootBlocker = StringValue(Member(*value, "bootBlocker"));
   summary.cpuidDiagnostics = StringArrayValue(Member(*value, "cpuidDiagnostics"));
   summary.bootStage = StringValue(Member(*value, "bootStage"));
@@ -1088,6 +1096,23 @@ std::string BuildHtmlReportWithFrames(const AnalysisReport &report,
       html << "<div class=\"k\">kernel evidence</div><div>"
            << HtmlEscape(report.dynamicSummary.windowsKernelReadGateEvidence)
            << "</div>";
+    }
+    if (!report.dynamicSummary.windowsKernelReadGateFirstTarget.empty()) {
+      html << "<div class=\"k\">first kernel target</div><div class=\"mono\">"
+           << HtmlEscape(report.dynamicSummary.windowsKernelReadGateFirstTarget)
+           << "</div>";
+    }
+    if (!report.dynamicSummary.bootFailureStatus.empty()) {
+      html << "<div class=\"k\">boot failure</div><div class=\"mono\">"
+           << HtmlEscape(report.dynamicSummary.bootFailureStatus);
+      if (!report.dynamicSummary.bootFailureStatusName.empty()) {
+        html << " " << HtmlEscape(report.dynamicSummary.bootFailureStatusName);
+      }
+      if (!report.dynamicSummary.bootFailureStatusSource.empty()) {
+        html << " (" << HtmlEscape(report.dynamicSummary.bootFailureStatusSource)
+             << ")";
+      }
+      html << "</div>";
     }
     if (!report.dynamicSummary.bootBlocker.empty()) {
       html << "<div class=\"k\">boot blocker</div><div>"

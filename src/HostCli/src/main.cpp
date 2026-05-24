@@ -1770,6 +1770,33 @@ void PrintSystemBootStorageSummary(const std::vector<uint8_t> &systemBytes) {
     std::cout << "  Repair hint: run elevated PowerShell with "
                  "tools\\Test-AntiMalBaseBoot.ps1 -RepairBootStorage\n";
   }
+
+  std::cout << "  GuestAgent service:\n";
+  const auto agent =
+      FindHivePath(hive, {controlSet, "Services", "AntiMalGuestAgent"});
+  if (!agent) {
+    std::cout << "    AntiMalGuestAgent: missing\n";
+  } else {
+    const auto start = HiveDwordValue(hive, *agent, "Start");
+    const auto type = HiveDwordValue(hive, *agent, "Type");
+    const auto errorControl = HiveDwordValue(hive, *agent, "ErrorControl");
+    const auto imagePath = HiveStringValue(hive, *agent, "ImagePath");
+    const auto objectName = HiveStringValue(hive, *agent, "ObjectName");
+    const bool ready =
+        start && *start == 2 &&
+        ToUpperAscii(imagePath).find("ANTIMAL.GUESTAGENT.EXE") !=
+            std::string::npos;
+    std::cout << "    AntiMalGuestAgent: "
+              << (ready ? "ready" : "needs-install")
+              << " Start=" << FormatHiveDword(start)
+              << " Type=" << FormatHiveDword(type)
+              << " ErrorControl=" << FormatHiveDword(errorControl)
+              << " ImagePath=\"" << imagePath << "\"";
+    if (!objectName.empty()) {
+      std::cout << " ObjectName=\"" << objectName << "\"";
+    }
+    std::cout << "\n";
+  }
 }
 
 std::optional<uint32_t> BcdObjectType(const RegistryHiveReader &hive,

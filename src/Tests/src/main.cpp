@@ -2466,6 +2466,12 @@ void TestReportRoundtripAndFramePaths() {
   report.dynamicSummary.windowsKernelReadGateStatus = "not-reached";
   report.dynamicSummary.windowsKernelReadGateEvidence =
       "no reads of kernel-gate targets";
+  report.dynamicSummary.windowsKernelReadGateFirstTarget =
+      "Windows\\System32\\ntoskrnl.exe";
+  report.dynamicSummary.bootFailureStatus = "0xC0000225";
+  report.dynamicSummary.bootFailureStatusName = "STATUS_NOT_FOUND";
+  report.dynamicSummary.bootFailureStatusSource =
+      "bootstat decoded record {bootmgr}";
   report.dynamicSummary.bootBlocker = "winload reached pre-kernel work";
   report.dynamicSummary.cpuidDiagnostics.push_back(
       "vcpu0 leaf=0x00000001 sub=0x00000000 ecx=0x00000000 hypervisorBit=clear");
@@ -2525,6 +2531,12 @@ void TestReportRoundtripAndFramePaths() {
          "report load: PS/2 diagnostics preserved");
   Expect(!loaded.dynamicSummary.windowsKernelReadGateReached &&
              loaded.dynamicSummary.windowsKernelReadGateStatus == "not-reached" &&
+             loaded.dynamicSummary.windowsKernelReadGateFirstTarget ==
+                 "Windows\\System32\\ntoskrnl.exe" &&
+             loaded.dynamicSummary.bootFailureStatus == "0xC0000225" &&
+             loaded.dynamicSummary.bootFailureStatusName == "STATUS_NOT_FOUND" &&
+             loaded.dynamicSummary.bootFailureStatusSource ==
+                 "bootstat decoded record {bootmgr}" &&
              loaded.dynamicSummary.bootBlocker == "winload reached pre-kernel work",
          "report load: kernel gate summary preserved");
   Expect(loaded.dynamicSummary.cpuidDiagnostics.size() == 1,

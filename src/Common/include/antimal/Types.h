@@ -257,6 +257,10 @@ struct DynamicRunSummary {
   bool windowsKernelReadGateReached = false;
   std::string windowsKernelReadGateStatus;
   std::string windowsKernelReadGateEvidence;
+  std::string windowsKernelReadGateFirstTarget;
+  std::string bootFailureStatus;
+  std::string bootFailureStatusName;
+  std::string bootFailureStatusSource;
   std::string bootBlocker;
   std::vector<std::string> cpuidDiagnostics;
   std::string bootStage;
