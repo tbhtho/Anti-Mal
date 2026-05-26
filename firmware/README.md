@@ -8,6 +8,7 @@ upstream-agnostic — drop your preferred build in here under the expected name.
 
 | File           | Description                                                                  |
 | -------------- | ---------------------------------------------------------------------------- |
+| `OVMF-tpm2.fd` | Source-built EDK2 OVMF with `TPM2_ENABLE=TRUE`, `SECURE_BOOT_ENABLE=TRUE`, and `FD_SIZE_4MB=TRUE`. Use this for Windows CI/VBS boot-contract probes. |
 | `OVMF.fd`      | Combined x86_64 UEFI firmware image. Size must be a multiple of 4 KiB and ≤ 16 MiB. Typical sizes: 2 MiB (default EDK2 build) or 4 MiB (`FD_SIZE_4MB=TRUE`). |
 
 The hypervisor maps `OVMF.fd` so its last byte sits at guest physical address
@@ -35,6 +36,38 @@ Whichever route you pick, **verify the SHA-256 hash against the source's
 published value** before placing the file here. Firmware runs in the guest CPU
 before any of AntiMal's protections engage; a tampered blob would have full
 control of the guest.
+
+## Building the TPM2 firmware locally
+
+`tools\Build-Firmware.ps1 -FromSource` builds OVMF from Tianocore EDK2 source
+and installs `firmware\OVMF-tpm2.fd`. The default source build pins
+`edk2-stable202605` and enables:
+
+```powershell
+-D TPM2_ENABLE=TRUE -D SECURE_BOOT_ENABLE=TRUE -D FD_SIZE_4MB=TRUE
+```
+
+Expected prerequisites:
+
+- Visual Studio 2022 or 2019 with the C++ workload.
+- Python 3.
+- NASM.
+- Intel ACPICA `iasl.exe`.
+
+The script stages NASM/iASL under `external\firmware-tools\bin` so EDK2 sees
+short, space-free tool paths. It also enables Git long-path support for the
+EDK2 checkout and nested submodules; OpenSSL test vectors otherwise exceed the
+default Windows path limit.
+
+Use the TPM2 build without replacing the default firmware:
+
+```powershell
+$env:ANTIMAL_FIRMWARE_NAME = "OVMF-tpm2.fd"
+bin\x64\Release\AntiMal.Tests.exe
+```
+
+If it proves better than the retrage blob, rerun the build with
+`-InstallAsDefault` or copy the built blob to `OVMF.fd`.
 
 ## License attribution
 

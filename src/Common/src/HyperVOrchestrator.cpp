@@ -25,6 +25,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
+#include <iomanip>
 #include <limits>
 #include <map>
 #include <memory>
@@ -1339,6 +1340,40 @@ struct BootReadObservation {
   uint64_t sectorsRead = 0;
 };
 
+struct CiPolicyDefinition {
+  const char *guid;
+  bool documentedDriverPolicy = false;
+  bool aggressiveOnly = false;
+};
+
+struct CiPolicyInventoryEntry {
+  std::string location;
+  std::string guid;
+  std::string path;
+  bool present = false;
+  bool documentedDriverPolicy = false;
+  bool aggressiveOnly = false;
+  uint64_t size = 0;
+  bool contentSampled = false;
+  uint64_t nonZeroBytes = 0;
+  std::vector<LbaRangeLite> ranges;
+  uint64_t readCommands = 0;
+  uint64_t sectorsRead = 0;
+};
+
+constexpr std::array<CiPolicyDefinition, 10> kKnownCiPolicies{{
+    {"{784C4414-79F4-4C32-A6A5-F0FB42A51D0D}", true, false},
+    {"{8F9CB695-5D48-48D6-A329-7202B44607E3}", true, false},
+    {"{0283AC0F-FFF1-49AE-ADA1-8A933130CAD6}", false, true},
+    {"{0939ED82-BFD5-4D32-B58E-D31D3C49715A}", false, true},
+    {"{60FD87F8-4593-44A0-91B0-2E0DA022F248}", false, true},
+    {"{1283AC0F-FFF1-49AE-ADA1-8A933130CAD6}", false, true},
+    {"{1678656C-05EF-481F-BC5B-EBD8C991502D}", false, true},
+    {"{1939ED82-BFD5-4D32-B58E-D31D3C49715A}", false, true},
+    {"{2678656C-05EF-481F-BC5B-EBD8C991502D}", false, true},
+    {"{5DAC656C-21AD-4A02-AB49-649917162E70}", false, true},
+}};
+
 uint64_t LbaRangeSectors(const LbaRangeLite &range) {
   return range.lastLba >= range.firstLba
              ? range.lastLba - range.firstLba + 1
@@ -1381,14 +1416,85 @@ std::vector<LbaRangeLite> MergeLbaRanges(std::vector<LbaRangeLite> ranges) {
   return merged;
 }
 
+std::string FormatLbaRanges(const std::vector<LbaRangeLite> &ranges) {
+  if (ranges.empty()) {
+    return "none";
+  }
+  std::ostringstream out;
+  const size_t cap = std::min<size_t>(ranges.size(), 6);
+  for (size_t i = 0; i < cap; ++i) {
+    if (i) {
+      out << ",";
+    }
+    out << ranges[i].firstLba << "-" << ranges[i].lastLba;
+  }
+  if (ranges.size() > cap) {
+    out << ",...";
+  }
+  return out.str();
+}
+
+void AddNtfsDataRunTargets(const std::string &name,
+                           const NtfsEntryLite &entry,
+                           const GptPartitionLite &partition,
+                           uint8_t sectorsPerCluster,
+                           std::vector<BootReadTarget> *targets) {
+  if (!targets || entry.dataRuns.empty()) {
+    return;
+  }
+  for (const auto &run : entry.dataRuns) {
+    const uint64_t first =
+        partition.firstLba +
+        run.lcn * static_cast<uint64_t>(sectorsPerCluster);
+    const uint64_t sectors =
+        run.clusters * static_cast<uint64_t>(sectorsPerCluster);
+    if (sectors != 0) {
+      targets->push_back({name, first, first + sectors - 1});
+    }
+  }
+}
+
+void AddEspFileTargets(const std::string &name,
+                       Fat32OverlayEditor &fat,
+                       const Fat32OverlayEditor::Entry &entry,
+                       std::vector<BootReadTarget> *targets) {
+  if (!targets) {
+    return;
+  }
+  for (const auto &range : fat.FileDataRanges(entry)) {
+    targets->push_back({name, range.firstLba, range.lastLba});
+  }
+}
+
 std::vector<BootReadTarget> DiscoverBootReadTargets(hv::IBlockDevice &disk) {
   std::vector<BootReadTarget> targets;
   const auto partitions = ReadGptPartitionsLite(disk);
+  const auto esp =
+      std::find_if(partitions.begin(), partitions.end(),
+                   [](const GptPartitionLite &partition) {
+                     return IsEspGuid(partition.typeGuid);
+                   });
   const auto windows =
       std::find_if(partitions.begin(), partitions.end(),
                    [](const GptPartitionLite &partition) {
                      return IsWindowsBasicDataGuid(partition.typeGuid);
                    });
+
+  if (esp != partitions.end()) {
+    Fat32OverlayEditor fat(disk, esp->firstLba);
+    if (fat.Init()) {
+      for (const auto &policy : kKnownCiPolicies) {
+        const std::string path =
+            std::string("EFI\\Microsoft\\Boot\\CiPolicies\\Active\\") +
+            policy.guid + ".cip";
+        const auto entry = fat.FindPath(path);
+        if (entry && (entry->attributes & 0x10u) == 0) {
+          AddEspFileTargets("ESP\\" + path, fat, *entry, &targets);
+        }
+      }
+    }
+  }
+
   if (windows == partitions.end()) {
     return targets;
   }
@@ -1411,6 +1517,18 @@ std::vector<BootReadTarget> DiscoverBootReadTargets(hv::IBlockDevice &disk) {
       "Windows\\System32\\CodeIntegrity\\previous.driver.stl",
       "Windows\\System32\\CodeIntegrity\\CiPolicies\\Active\\{1283AC0F-FFF1-49AE-ADA1-8A933130CAD6}.cip",
       "Windows\\System32\\CodeIntegrity\\CiPolicies\\Active\\{784C4414-79F4-4C32-A6A5-F0FB42A51D0D}.cip",
+      "Windows\\System32\\CodeIntegrity\\CiPolicies\\Active\\{8F9CB695-5D48-48D6-A329-7202B44607E3}.cip",
+      // The 60FD87F8 policy is the Microsoft "Vulnerable Driver Blocklist"
+      // distributed via SiPolicy on 24H2 base images. Winload references it
+      // in the CI driver bootstat event even when it never reaches a kernel
+      // file read, so track it explicitly so the read attribution surfaces
+      // the LBA range.
+      "Windows\\System32\\CodeIntegrity\\CiPolicies\\Active\\{60FD87F8-4593-44A0-91B0-2E0DA022F248}.cip",
+      "Windows\\System32\\CodeIntegrity\\CiPolicies\\Active\\{1678656C-05EF-481F-BC5B-EBD8C991502D}.cip",
+      "Windows\\System32\\CodeIntegrity\\CiPolicies\\Active\\{2678656C-05EF-481F-BC5B-EBD8C991502D}.cip",
+      "Windows\\System32\\CodeIntegrity\\CiPolicies\\Active\\{5DAC656C-21AD-4A02-AB49-649917162E70}.cip",
+      "Windows\\System32\\CodeIntegrity\\CiPolicies\\Active\\{82443E1E-8A39-4B4A-96A8-F40DDC00B9F3}.cip",
+      "Windows\\System32\\CodeIntegrity\\CiPolicies\\Active\\{CDD5CB55-DB68-4D71-AA38-3DF2B6473A52}.cip",
       "Windows\\System32\\ntoskrnl.exe",
       "Windows\\System32\\securekernel.exe",
       "Windows\\System32\\hal.dll",
@@ -1433,22 +1551,21 @@ std::vector<BootReadTarget> DiscoverBootReadTargets(hv::IBlockDevice &disk) {
       "Windows\\System32\\drivers\\volmgrx.sys",
       "Windows\\System32\\drivers\\fvevol.sys",
       "Windows\\System32\\drivers\\Wdf01000.sys",
+      "Windows\\System32\\smss.exe",
+      "Windows\\System32\\csrss.exe",
+      "Windows\\System32\\wininit.exe",
+      "Windows\\System32\\services.exe",
+      "Windows\\System32\\lsass.exe",
+      "Windows\\System32\\winlogon.exe",
+      "Windows\\System32\\LogonUI.exe",
   };
   for (const char *path : paths) {
     const auto entry = ntfs.FindPath(path);
     if (!entry || entry->dataRuns.empty()) {
       continue;
     }
-    for (const auto &run : entry->dataRuns) {
-      const uint64_t first =
-          windows->firstLba +
-          run.lcn * static_cast<uint64_t>(ntfs.SectorsPerCluster());
-      const uint64_t sectors =
-          run.clusters * static_cast<uint64_t>(ntfs.SectorsPerCluster());
-      if (sectors != 0) {
-        targets.push_back({path, first, first + sectors - 1});
-      }
-    }
+    AddNtfsDataRunTargets(path, *entry, *windows, ntfs.SectorsPerCluster(),
+                          &targets);
   }
   return targets;
 }
@@ -1478,6 +1595,185 @@ AnalyzeBootReadTargets(const hv::VmRunSummary &vm,
     observations.push_back(observation);
   }
   return observations;
+}
+
+void AddReadCountsForRanges(CiPolicyInventoryEntry *entry,
+                            const hv::VmRunSummary &vm) {
+  if (!entry) {
+    return;
+  }
+  for (const auto &access : vm.ideRecentAccesses) {
+    if (access.write || access.count == 0) {
+      continue;
+    }
+    const uint64_t first = access.lba;
+    const uint64_t last = access.lba + access.count - 1;
+    bool commandMatched = false;
+    for (const auto &range : entry->ranges) {
+      if (last < range.firstLba || first > range.lastLba) {
+        continue;
+      }
+      if (!commandMatched) {
+        ++entry->readCommands;
+        commandMatched = true;
+      }
+      const uint64_t overlapFirst = std::max(first, range.firstLba);
+      const uint64_t overlapLast = std::min(last, range.lastLba);
+      entry->sectorsRead += overlapLast - overlapFirst + 1;
+    }
+  }
+}
+
+uint64_t CountNonZeroBytes(const std::vector<uint8_t> &bytes) {
+  return static_cast<uint64_t>(
+      std::count_if(bytes.begin(), bytes.end(),
+                    [](uint8_t value) { return value != 0; }));
+}
+
+std::vector<CiPolicyInventoryEntry>
+CaptureCiPolicyInventory(hv::IBlockDevice &disk, const hv::VmRunSummary &vm) {
+  std::vector<CiPolicyInventoryEntry> out;
+  const auto partitions = ReadGptPartitionsLite(disk);
+  const auto esp =
+      std::find_if(partitions.begin(), partitions.end(),
+                   [](const GptPartitionLite &partition) {
+                     return IsEspGuid(partition.typeGuid);
+                   });
+  const auto windows =
+      std::find_if(partitions.begin(), partitions.end(),
+                   [](const GptPartitionLite &partition) {
+                     return IsWindowsBasicDataGuid(partition.typeGuid);
+                   });
+
+  if (esp != partitions.end()) {
+    Fat32OverlayEditor fat(disk, esp->firstLba);
+    if (fat.Init()) {
+      for (const auto &policy : kKnownCiPolicies) {
+        CiPolicyInventoryEntry item;
+        item.location = "ESP";
+        item.guid = policy.guid;
+        item.documentedDriverPolicy = policy.documentedDriverPolicy;
+        item.aggressiveOnly = policy.aggressiveOnly;
+        item.path = std::string("EFI\\Microsoft\\Boot\\CiPolicies\\Active\\") +
+                    policy.guid + ".cip";
+        if (const auto entry = fat.FindPath(item.path);
+            entry && (entry->attributes & 0x10u) == 0) {
+          item.present = true;
+          item.size = entry->size;
+          const auto bytes = fat.ReadFile(*entry, 16ull * 1024ull * 1024ull);
+          if (bytes.size() == entry->size) {
+            item.contentSampled = true;
+            item.nonZeroBytes = CountNonZeroBytes(bytes);
+          }
+          for (const auto &range : fat.FileDataRanges(*entry)) {
+            item.ranges.push_back({range.firstLba, range.lastLba});
+          }
+          AddReadCountsForRanges(&item, vm);
+        }
+        out.push_back(std::move(item));
+      }
+    }
+  }
+
+  if (windows != partitions.end()) {
+    NtfsBootFileLocator ntfs(disk, windows->firstLba);
+    if (ntfs.Init()) {
+      for (const auto &policy : kKnownCiPolicies) {
+        CiPolicyInventoryEntry item;
+        item.location = "Windows";
+        item.guid = policy.guid;
+        item.documentedDriverPolicy = policy.documentedDriverPolicy;
+        item.aggressiveOnly = policy.aggressiveOnly;
+        item.path =
+            std::string("Windows\\System32\\CodeIntegrity\\CiPolicies\\Active\\") +
+            policy.guid + ".cip";
+        if (const auto entry = ntfs.FindPath(item.path);
+            entry && !entry->dataRuns.empty()) {
+          item.present = true;
+          item.size = entry->size;
+          const auto bytes = ntfs.ReadFile(*entry, 16ull * 1024ull * 1024ull);
+          if (bytes.size() == entry->size) {
+            item.contentSampled = true;
+            item.nonZeroBytes = CountNonZeroBytes(bytes);
+          }
+          for (const auto &run : entry->dataRuns) {
+            const uint64_t first =
+                windows->firstLba +
+                run.lcn * static_cast<uint64_t>(ntfs.SectorsPerCluster());
+            const uint64_t sectors =
+                run.clusters * static_cast<uint64_t>(ntfs.SectorsPerCluster());
+            if (sectors != 0) {
+              item.ranges.push_back({first, first + sectors - 1});
+            }
+          }
+          AddReadCountsForRanges(&item, vm);
+        }
+        out.push_back(std::move(item));
+      }
+    }
+  }
+  return out;
+}
+
+std::string CiPolicyInventoryDetails(
+    const std::vector<CiPolicyInventoryEntry> &inventory) {
+  if (inventory.empty()) {
+    return {};
+  }
+  std::vector<std::string> parts;
+  parts.reserve(inventory.size());
+  for (const auto &entry : inventory) {
+    std::ostringstream item;
+    item << entry.location << ":" << entry.guid
+         << (entry.present ? " present" : " missing");
+    if (entry.documentedDriverPolicy) {
+      item << " documented";
+    }
+    if (entry.aggressiveOnly) {
+      item << " bootstat-mentioned";
+    }
+    if (entry.present) {
+      item << " size=" << entry.size
+           << " nonZeroBytes="
+           << (entry.contentSampled ? std::to_string(entry.nonZeroBytes)
+                                    : "unsampled")
+           << " lba=" << FormatLbaRanges(entry.ranges)
+           << " readCommands=" << entry.readCommands
+           << " sectorsRead=" << entry.sectorsRead;
+    }
+    parts.push_back(item.str());
+  }
+  return JoinStrings(parts, "; ");
+}
+
+std::string FormatCiPolicyInventory(
+    const std::vector<CiPolicyInventoryEntry> &inventory) {
+  if (inventory.empty()) {
+    return {};
+  }
+  std::ostringstream out;
+  out << "\nCI policy inventory:\n";
+  for (const auto &entry : inventory) {
+    out << "  " << entry.location << " " << entry.path << " guid="
+        << entry.guid << " status=" << (entry.present ? "present" : "missing");
+    if (entry.documentedDriverPolicy) {
+      out << " documentedDriverPolicy=true";
+    }
+    if (entry.aggressiveOnly) {
+      out << " bootstatMentioned=true";
+    }
+    if (entry.present) {
+      out << " size=" << entry.size
+          << " nonZeroBytes="
+          << (entry.contentSampled ? std::to_string(entry.nonZeroBytes)
+                                   : "unsampled")
+          << " lba=" << FormatLbaRanges(entry.ranges)
+          << " readCommands=" << entry.readCommands
+          << " sectorsRead=" << entry.sectorsRead;
+    }
+    out << "\n";
+  }
+  return out.str();
 }
 
 std::string FormatBootReadObservations(
@@ -1554,6 +1850,20 @@ void AddBootReadMilestones(
       AddMilestone(signals, "SYSTEM hive data read");
     } else if (ContainsTextNoCase(observation.target.name, "SOFTWARE")) {
       AddMilestone(signals, "SOFTWARE hive data read");
+    } else if (ContainsTextNoCase(observation.target.name, "LogonUI.exe")) {
+      AddMilestone(signals, "LogonUI.exe data read");
+    } else if (ContainsTextNoCase(observation.target.name, "winlogon.exe")) {
+      AddMilestone(signals, "winlogon.exe data read");
+    } else if (ContainsTextNoCase(observation.target.name, "services.exe")) {
+      AddMilestone(signals, "services.exe data read");
+    } else if (ContainsTextNoCase(observation.target.name, "lsass.exe")) {
+      AddMilestone(signals, "lsass.exe data read");
+    } else if (ContainsTextNoCase(observation.target.name, "wininit.exe")) {
+      AddMilestone(signals, "wininit.exe data read");
+    } else if (ContainsTextNoCase(observation.target.name, "csrss.exe")) {
+      AddMilestone(signals, "csrss.exe data read");
+    } else if (ContainsTextNoCase(observation.target.name, "smss.exe")) {
+      AddMilestone(signals, "smss.exe data read");
     }
   }
 }
@@ -1588,6 +1898,20 @@ bool IsKernelReadGateTarget(std::string_view path) {
          ContainsTextNoCase(path, "\\drivers\\");
 }
 
+bool IsLogonUiReadGateTarget(std::string_view path) {
+  return ContainsTextNoCase(path, "LogonUI.exe");
+}
+
+bool IsUserModeReadGateTarget(std::string_view path) {
+  return ContainsTextNoCase(path, "smss.exe") ||
+         ContainsTextNoCase(path, "csrss.exe") ||
+         ContainsTextNoCase(path, "wininit.exe") ||
+         ContainsTextNoCase(path, "services.exe") ||
+         ContainsTextNoCase(path, "lsass.exe") ||
+         ContainsTextNoCase(path, "winlogon.exe") ||
+         IsLogonUiReadGateTarget(path);
+}
+
 bool WindowsKernelReadGateReached(
     const std::vector<BootReadObservation> &observations) {
   return std::any_of(observations.begin(), observations.end(),
@@ -1619,6 +1943,43 @@ std::string WindowsKernelReadGateFirstTarget(
   for (const auto &observation : observations) {
     if (BootReadObserved(observation) &&
         IsKernelReadGateTarget(observation.target.name)) {
+      return observation.target.name;
+    }
+  }
+  return {};
+}
+
+bool WindowsUserModeGateReached(
+    const std::vector<BootReadObservation> &observations) {
+  return std::any_of(observations.begin(), observations.end(),
+                     [](const BootReadObservation &observation) {
+                       return BootReadObserved(observation) &&
+                              IsUserModeReadGateTarget(observation.target.name);
+                     });
+}
+
+std::string WindowsUserModeGateDetails(
+    const std::vector<BootReadObservation> &observations) {
+  std::vector<std::string> parts;
+  for (const auto &observation : observations) {
+    if (!BootReadObserved(observation) ||
+        !IsUserModeReadGateTarget(observation.target.name)) {
+      continue;
+    }
+    std::ostringstream item;
+    item << observation.target.name << " readCommands="
+         << observation.readCommands << " sectorsRead="
+         << observation.sectorsRead;
+    parts.push_back(item.str());
+  }
+  return JoinStrings(parts, "; ");
+}
+
+std::string WindowsUserModeGateFirstTarget(
+    const std::vector<BootReadObservation> &observations) {
+  for (const auto &observation : observations) {
+    if (BootReadObserved(observation) &&
+        IsUserModeReadGateTarget(observation.target.name)) {
       return observation.target.name;
     }
   }
@@ -2205,6 +2566,8 @@ struct EspBootstatSnapshot {
     std::string guid;
     std::string guidAlias;
     std::vector<std::string> embeddedAscii;
+    std::vector<std::string> embeddedUtf16;
+    std::vector<std::string> scalarHints;
     uint32_t dominantStatus = 0;
     size_t dominantStatusCount = 0;
   };
@@ -2282,6 +2645,88 @@ std::vector<std::string> BootstatExtractAscii(const uint8_t *data, size_t size,
   return out;
 }
 
+// Pulls UTF-16LE strings out of a binary blob. Windows winload writes ETW
+// events with filenames/paths/keys as UTF-16, so the ASCII scan misses the
+// most diagnostic strings. We treat a run of (printable ASCII, 0x00) pairs as
+// a UTF-16 string and reject anything shorter than `minChars` so we don't
+// spam the diagnostic with two-character fragments.
+std::vector<std::string> BootstatExtractUtf16(const uint8_t *data, size_t size,
+                                              size_t minChars,
+                                              size_t maxStrings) {
+  std::vector<std::string> out;
+  std::string current;
+  for (size_t i = 0; i + 1 < size && out.size() < maxStrings; i += 2) {
+    const uint8_t low = data[i];
+    const uint8_t high = data[i + 1];
+    if (high == 0 && low >= 0x20 && low < 0x7F) {
+      current.push_back(static_cast<char>(low));
+      continue;
+    }
+    if (current.size() >= minChars) {
+      out.push_back(current);
+    }
+    current.clear();
+  }
+  if (current.size() >= minChars && out.size() < maxStrings) {
+    out.push_back(current);
+  }
+  return out;
+}
+
+std::vector<std::string> BootstatExtractNamedScalarHints(
+    const uint8_t *data, size_t size, size_t absolutePayloadOffset,
+    size_t maxHints) {
+  constexpr std::array<std::string_view, 5> kFields{{
+      "FailedPicrootExceptionsPolicy",
+      "PicrootExceptionsPolicyVersion",
+      "VerificationStatus",
+      "RootPolicyBits",
+      "SigningScenario",
+  }};
+  std::vector<std::string> hints;
+  if (!data || size < sizeof(uint32_t) || maxHints == 0) {
+    return hints;
+  }
+  for (const auto field : kFields) {
+    size_t start = 0;
+    size_t matches = 0;
+    while (start + field.size() <= size && hints.size() < maxHints &&
+           matches < 2) {
+      const auto begin = reinterpret_cast<const char *>(data);
+      const auto it =
+          std::search(begin + start, begin + size, field.begin(), field.end());
+      if (it == begin + size) {
+        break;
+      }
+      const size_t found = static_cast<size_t>(it - begin);
+      ++matches;
+      std::ostringstream out;
+      out << field << "@0x" << std::hex << std::uppercase
+          << (absolutePayloadOffset + found) << std::dec << " dwords=[";
+      bool first = true;
+      for (int rel = -16; rel <= 32; rel += 4) {
+        const int64_t posSigned = static_cast<int64_t>(found) + rel;
+        if (posSigned < 0 ||
+            static_cast<size_t>(posSigned) + sizeof(uint32_t) > size) {
+          continue;
+        }
+        const auto pos = static_cast<size_t>(posSigned);
+        const uint32_t value = ReadLe32(data + pos);
+        if (!first) {
+          out << ", ";
+        }
+        first = false;
+        out << (rel >= 0 ? "+" : "") << rel << ":0x" << std::hex
+            << std::uppercase << value << std::dec;
+      }
+      out << "]";
+      hints.push_back(out.str());
+      start = found + field.size();
+    }
+  }
+  return hints;
+}
+
 void DecodeBootstatRecords(EspBootstatSnapshot &snapshot,
                            const std::vector<uint8_t> &bytes) {
   if (bytes.size() < 16) {
@@ -2315,7 +2760,19 @@ void DecodeBootstatRecords(EspBootstatSnapshot &snapshot,
     const size_t payloadStart = offset + 24;
     const size_t payloadSize = static_cast<size_t>(length) - 24;
     record.embeddedAscii =
-        BootstatExtractAscii(bytes.data() + payloadStart, payloadSize, 8, 6);
+        BootstatExtractAscii(bytes.data() + payloadStart, payloadSize, 6, 64);
+    record.embeddedUtf16 =
+        BootstatExtractUtf16(bytes.data() + payloadStart, payloadSize, 4, 64);
+    if (record.embeddedUtf16.size() < 64 && payloadSize > 0) {
+      auto extra = BootstatExtractUtf16(bytes.data() + payloadStart + 1,
+                                        payloadSize - 1, 4,
+                                        64 - record.embeddedUtf16.size());
+      for (auto &s : extra) {
+        record.embeddedUtf16.push_back(std::move(s));
+      }
+    }
+    record.scalarHints = BootstatExtractNamedScalarHints(
+        bytes.data() + payloadStart, payloadSize, payloadStart, 16);
 
     std::map<uint32_t, size_t> statusCounts;
     for (size_t i = payloadStart;
@@ -2338,7 +2795,9 @@ void DecodeBootstatRecords(EspBootstatSnapshot &snapshot,
   }
 }
 
-EspBootstatSnapshot CaptureEspBootstatSnapshot(hv::IBlockDevice &disk) {
+EspBootstatSnapshot CaptureEspBootstatSnapshot(
+    hv::IBlockDevice &disk,
+    std::vector<uint8_t> *outRawBytes = nullptr) {
   EspBootstatSnapshot snapshot;
   const auto partitions = ReadGptPartitionsLite(disk);
   const auto esp = std::find_if(partitions.begin(), partitions.end(),
@@ -2360,6 +2819,9 @@ EspBootstatSnapshot CaptureEspBootstatSnapshot(hv::IBlockDevice &disk) {
   snapshot.fileBytes = bootstat->size;
   const auto bytes = fat.ReadFile(*bootstat, 1024ull * 1024ull);
   snapshot.bytesRead = bytes.size();
+  if (outRawBytes) {
+    *outRawBytes = bytes;
+  }
   const size_t headBytes = std::min<size_t>(bytes.size(), 256);
   snapshot.headBytes.assign(bytes.begin(), bytes.begin() + headBytes);
   for (size_t i = 0; i < bytes.size(); ++i) {
@@ -2445,6 +2907,20 @@ const char *KnownNtStatusName(uint32_t value) {
     return "STATUS_ABIOS_NOT_PRESENT";
   case 0xC0000225u:
     return "STATUS_NOT_FOUND";
+  // Storage / cryptographic / boot facility codes — Windows surfaces these on
+  // the WinRE screen when winload aborts during the kernel boot environment
+  // setup phase (post-CI). Naming the visible value makes it easier to spot
+  // a phase shift in the run report instead of just "yet another 0xC04xxxxx".
+  case 0xC00002A2u:
+    return "STATUS_INVALID_DEVICE_REQUEST";
+  case 0xC0210000u:
+    return "STATUS_FVE_LOCKED_VOLUME";
+  case 0xC0430001u:
+    // FACILITY_HV_SHIELDED_VM-adjacent code observed when CI policy files are
+    // zeroed in the overlay; winload reaches Microsoft.Windows.Kernel.
+    // BootEnvironment / SpacebootInitialize before aborting. Treat as the
+    // best-known label for "post-CI BootEnvironment abort".
+    return "STATUS_SECURE_BOOT_NOT_ENABLED_OR_SIPOLICY_MISSING";
   default:
     return nullptr;
   }
@@ -2577,7 +3053,7 @@ std::string FormatEspBootstatSnapshot(const EspBootstatSnapshot &snapshot) {
     }
     if (!record.embeddedAscii.empty()) {
       out << " ascii=[";
-      const size_t cap = std::min<size_t>(record.embeddedAscii.size(), 4);
+      const size_t cap = std::min<size_t>(record.embeddedAscii.size(), 32);
       for (size_t j = 0; j < cap; ++j) {
         if (j) {
           out << ", ";
@@ -2589,9 +3065,50 @@ std::string FormatEspBootstatSnapshot(const EspBootstatSnapshot &snapshot) {
       }
       out << "]";
     }
+    if (!record.embeddedUtf16.empty()) {
+      out << " utf16=[";
+      const size_t cap = std::min<size_t>(record.embeddedUtf16.size(), 32);
+      for (size_t j = 0; j < cap; ++j) {
+        if (j) {
+          out << ", ";
+        }
+        out << "\"" << record.embeddedUtf16[j] << "\"";
+      }
+      if (record.embeddedUtf16.size() > cap) {
+        out << ", ...";
+      }
+      out << "]";
+    }
+    if (!record.scalarHints.empty()) {
+      out << " scalars=[";
+      const size_t cap = std::min<size_t>(record.scalarHints.size(), 12);
+      for (size_t j = 0; j < cap; ++j) {
+        if (j) {
+          out << ", ";
+        }
+        out << "\"" << record.scalarHints[j] << "\"";
+      }
+      if (record.scalarHints.size() > cap) {
+        out << ", ...";
+      }
+      out << "]";
+    }
     out << "\n";
   }
   return out.str();
+}
+
+std::string BootstatScalarDetails(const EspBootstatSnapshot &snapshot) {
+  std::vector<std::string> hints;
+  for (const auto &record : snapshot.decodedRecords) {
+    for (const auto &hint : record.scalarHints) {
+      hints.push_back(hint);
+      if (hints.size() >= 12) {
+        return JoinStrings(hints, "; ");
+      }
+    }
+  }
+  return JoinStrings(hints, "; ");
 }
 
 std::string EspBootstatDetails(const EspBootstatSnapshot &snapshot) {
@@ -2638,6 +3155,13 @@ std::string EspBootstatDetails(const EspBootstatSnapshot &snapshot) {
     if (!record.embeddedAscii.empty()) {
       out << " name=" << record.embeddedAscii.front();
     }
+    if (!record.scalarHints.empty()) {
+      out << " scalar=" << record.scalarHints.front();
+    }
+  }
+  const auto scalarDetails = BootstatScalarDetails(snapshot);
+  if (!scalarDetails.empty()) {
+    out << "; scalarHints=" << scalarDetails;
   }
   return out.str();
 }
@@ -3668,7 +4192,9 @@ std::string CaptureOverlayBcdSummary(hv::IBlockDevice &disk) {
         << " nointegritychecks="
         << BcdElementValueText(hive, *defaultObject, "16000048")
         << " testsigning="
-        << BcdElementValueText(hive, *defaultObject, "16000049") << "\n";
+        << BcdElementValueText(hive, *defaultObject, "16000049")
+        << " hypervisorlaunchtype="
+        << BcdElementValueText(hive, *defaultObject, "250000F0") << "\n";
   } else {
     out << "  {default}: missing\n";
   }
@@ -3759,6 +4285,12 @@ struct BootOverlayPatchResult {
   bool testSigningPatched = false;
   bool systemLegacySecurityProbeEnabled = false;
   bool systemLegacySecurityPatched = false;
+  bool hypervisorLaunchOffProbeEnabled = false;
+  bool hypervisorLaunchOffPatched = false;
+  bool ciPolicyOffProbeEnabled = false;
+  bool ciPolicyOffAggressive = false;
+  bool ciPolicyOffPatched = false;
+  uint32_t ciPolicyOffFilesZeroed = 0;
   std::vector<std::string> notes;
 };
 
@@ -4195,6 +4727,49 @@ bool PatchBcdNoIntegrityChecksProbe(std::vector<uint8_t> &bcd,
   return false;
 }
 
+bool PatchBcdHypervisorLaunchTypeOff(std::vector<uint8_t> &bcd,
+                                     BootOverlayPatchResult *result) {
+  MutableHiveView hive(bcd);
+  if (!hive.IsValid()) {
+    return false;
+  }
+  const auto root = hive.RootIndex();
+  const auto objects = root ? hive.FindSubkey(*root, "Objects") : std::nullopt;
+  const auto bootmgr =
+      objects ? hive.FindSubkey(*objects,
+                                "{9dea862c-5cdd-4e70-acc1-f32b344d4795}")
+              : std::nullopt;
+  const std::string defaultGuid =
+      bootmgr ? BcdElementString(hive, *bootmgr, "23000003") : std::string{};
+  const auto defaultObject =
+      !defaultGuid.empty() && objects ? hive.FindSubkey(*objects, defaultGuid)
+                                      : std::nullopt;
+  const auto elements =
+      defaultObject ? hive.FindSubkey(*defaultObject, "Elements") : std::nullopt;
+  if (!elements) {
+    if (result) {
+      result->notes.push_back(
+          "BCD hypervisorlaunchtype probe: default loader Elements key not "
+          "found");
+    }
+    return false;
+  }
+
+  // BcdOSLoaderInteger_HypervisorLaunchType = 0x250000F0, uint64 value (0 =
+  // Off, 1 = Auto). Stored as REG_BINARY in the BCD hive.
+  if (UpsertBcdElementRaw(hive, *elements, "250000F0", 3, BcdU64Bytes(0))) {
+    if (result) {
+      result->hypervisorLaunchOffPatched = true;
+    }
+    return true;
+  }
+  if (result) {
+    result->notes.push_back(
+        "BCD hypervisorlaunchtype probe failed to set element");
+  }
+  return false;
+}
+
 bool PatchBcdLegacyBootContextProbe(std::vector<uint8_t> &bcd,
                                     BootOverlayPatchResult *result) {
   MutableHiveView hive(bcd);
@@ -4379,8 +4954,23 @@ bool EnvFlagEnabled(const char *name) {
          buf[0] != '\0' && std::atoi(buf) != 0;
 }
 
+std::optional<std::filesystem::path> EnvPathValue(const char *name) {
+  std::array<char, 4096> buf{};
+  size_t needed = 0;
+  if (getenv_s(&needed, buf.data(), buf.size(), name) != 0 || needed <= 1 ||
+      buf[0] == '\0') {
+    return std::nullopt;
+  }
+  return Utf8ToWide(buf.data());
+}
+
 bool WinloadDebugPatchDisabled() {
   return EnvFlagEnabled("ANTIMAL_DISABLE_WINLOAD_DEBUG");
+}
+
+bool WinloadDebugProbeEnabled() {
+  return EnvFlagEnabled("ANTIMAL_PROBE_WINLOAD_DEBUG") &&
+         !WinloadDebugPatchDisabled();
 }
 
 bool NoIntegrityChecksProbeEnvEnabled() {
@@ -4405,6 +4995,23 @@ bool LegacyBootContextPatchDisabled() {
 
 bool LegacyBootContextProbeEnabled() {
   return LegacyBootContextProbeEnvEnabled() && !LegacyBootContextPatchDisabled();
+}
+
+bool HypervisorLaunchOffPatchDisabled() {
+  return EnvFlagEnabled("ANTIMAL_DISABLE_BCD_HYPERVISOR_LAUNCH_OFF");
+}
+
+bool HypervisorLaunchOffProbeEnabled() {
+  // hypervisorlaunchtype=Off (BCD element 250000F0) tells the OS loader not to
+  // try launching a Hyper-V/VBS root partition. Nested guests under WHP cannot
+  // expose VTL1/Secure Kernel, so any VBS handoff request from winload aborts
+  // with an internal status. Setting Off makes winload skip the handoff and
+  // lets the boot continue toward ntoskrnl.exe. Opt-in via
+  // ANTIMAL_PROBE_BCD_HYPERVISOR_LAUNCH_OFF=1; clean A/B with
+  // ANTIMAL_DISABLE_BCD_HYPERVISOR_LAUNCH_OFF=1 to skip even when the probe is
+  // selected.
+  return EnvFlagEnabled("ANTIMAL_PROBE_BCD_HYPERVISOR_LAUNCH_OFF") &&
+         !HypervisorLaunchOffPatchDisabled();
 }
 
 bool DetectHalProbeEnabled() {
@@ -4492,6 +5099,85 @@ bool SystemLegacySecurityProbeEnabled() {
          EnvFlagEnabled("ANTIMAL_PROBE_SYSTEM_LEGACY_SECURITY");
 }
 
+bool CiPolicyOffProbeEnabled() {
+  return EnvFlagEnabled("ANTIMAL_PROBE_CI_POLICY_OFF");
+}
+
+bool CiPolicyOffAggressiveEnabled() {
+  return EnvFlagEnabled("ANTIMAL_PROBE_CI_POLICY_OFF_AGGRESSIVE");
+}
+
+bool ZeroNtfsFileSameSize(NtfsBootFileLocator &ntfs,
+                          const NtfsEntryLite &entry,
+                          size_t maxBytes) {
+  if (entry.directory || entry.size == 0 || entry.size > maxBytes) {
+    return false;
+  }
+  std::vector<uint8_t> zeros(static_cast<size_t>(entry.size), 0);
+  return ntfs.WriteFileSameSize(entry, zeros);
+}
+
+void ApplyCiPolicyOffProbe(hv::IBlockDevice &disk,
+                           Fat32OverlayEditor &fat,
+                           const std::vector<GptPartitionLite> &partitions,
+                           BootOverlayPatchResult *result) {
+  if (!result || !CiPolicyOffProbeEnabled()) {
+    return;
+  }
+  result->ciPolicyOffProbeEnabled = true;
+  result->ciPolicyOffAggressive = CiPolicyOffAggressiveEnabled();
+  constexpr size_t kMaxPolicyBytes = 16ull * 1024ull * 1024ull;
+
+  for (const auto &policy : kKnownCiPolicies) {
+    if (policy.aggressiveOnly && !result->ciPolicyOffAggressive) {
+      continue;
+    }
+    const std::string path =
+        std::string("EFI\\Microsoft\\Boot\\CiPolicies\\Active\\") +
+        policy.guid + ".cip";
+    if (const auto entry = fat.FindPath(path);
+        entry && (entry->attributes & 0x10u) == 0 &&
+        fat.ZeroFile(*entry, kMaxPolicyBytes)) {
+      result->ciPolicyOffPatched = true;
+      ++result->ciPolicyOffFilesZeroed;
+      result->notes.push_back("zeroed ESP CI policy " + path);
+    }
+  }
+
+  const auto windows =
+      std::find_if(partitions.begin(), partitions.end(),
+                   [](const GptPartitionLite &partition) {
+                     return IsWindowsBasicDataGuid(partition.typeGuid);
+                   });
+  if (windows == partitions.end()) {
+    result->notes.push_back("CI policy-off probe: Windows partition not found");
+    return;
+  }
+  NtfsBootFileLocator ntfs(disk, windows->firstLba);
+  if (!ntfs.Init()) {
+    result->notes.push_back("CI policy-off probe: NTFS not readable");
+    return;
+  }
+  for (const auto &policy : kKnownCiPolicies) {
+    if (policy.aggressiveOnly && !result->ciPolicyOffAggressive) {
+      continue;
+    }
+    const std::string path =
+        std::string("Windows\\System32\\CodeIntegrity\\CiPolicies\\Active\\") +
+        policy.guid + ".cip";
+    if (const auto entry = ntfs.FindPath(path);
+        entry && ZeroNtfsFileSameSize(ntfs, *entry, kMaxPolicyBytes)) {
+      result->ciPolicyOffPatched = true;
+      ++result->ciPolicyOffFilesZeroed;
+      result->notes.push_back("zeroed Windows CI policy " + path);
+    }
+  }
+  if (!result->ciPolicyOffPatched) {
+    result->notes.push_back(
+        "CI policy-off probe enabled but no documented policy files were zeroed");
+  }
+}
+
 BootOverlayPatchResult ApplyEphemeralBootOverlay(hv::IBlockDevice &disk) {
   BootOverlayPatchResult result;
   result.attempted = true;
@@ -4516,6 +5202,8 @@ BootOverlayPatchResult ApplyEphemeralBootOverlay(hv::IBlockDevice &disk) {
     return result;
   }
 
+  ApplyCiPolicyOffProbe(disk, fat, partitions, &result);
+
   if (const auto bcd = fat.FindPath("EFI\\Microsoft\\Boot\\BCD")) {
     result.bcdFound = true;
     auto bytes = fat.ReadFile(*bcd, 4ull * 1024ull * 1024ull);
@@ -4530,7 +5218,13 @@ BootOverlayPatchResult ApplyEphemeralBootOverlay(hv::IBlockDevice &disk) {
       if (WinloadDebugPatchDisabled()) {
         result.notes.push_back(
             "winload debug patch disabled by ANTIMAL_DISABLE_WINLOAD_DEBUG");
+      } else if (!WinloadDebugProbeEnabled()) {
+        result.notes.push_back(
+            "winload debug patch not enabled; default boot profile keeps "
+            "debug policy unchanged");
       } else {
+        result.notes.push_back(
+            "winload debug patch enabled by ANTIMAL_PROBE_WINLOAD_DEBUG");
         result.kernelDebugProbeEnabled = KernelDebugProbeEnabled();
         if (result.kernelDebugProbeEnabled) {
           result.notes.push_back(
@@ -4581,6 +5275,23 @@ BootOverlayPatchResult ApplyEphemeralBootOverlay(hv::IBlockDevice &disk) {
         result.notes.push_back(
             "BCD legacy boot-context probe not enabled; conservative baseline "
             "preserves isolatedcontext");
+      }
+      bool hypervisorLaunchOffChanged = false;
+      result.hypervisorLaunchOffProbeEnabled = HypervisorLaunchOffProbeEnabled();
+      if (result.hypervisorLaunchOffProbeEnabled) {
+        result.notes.push_back(
+            "BCD hypervisorlaunchtype=Off probe enabled by "
+            "ANTIMAL_PROBE_BCD_HYPERVISOR_LAUNCH_OFF");
+        hypervisorLaunchOffChanged =
+            PatchBcdHypervisorLaunchTypeOff(bytes, &result);
+      } else if (HypervisorLaunchOffPatchDisabled()) {
+        result.notes.push_back(
+            "BCD hypervisorlaunchtype=Off probe disabled by "
+            "ANTIMAL_DISABLE_BCD_HYPERVISOR_LAUNCH_OFF");
+      } else {
+        result.notes.push_back(
+            "BCD hypervisorlaunchtype=Off probe not enabled; loader will keep "
+            "the default hypervisorlaunchtype value");
       }
       result.detectHalProbeEnabled = DetectHalProbeEnabled();
       if (result.detectHalProbeEnabled) {
@@ -4648,7 +5359,8 @@ BootOverlayPatchResult ApplyEphemeralBootOverlay(hv::IBlockDevice &disk) {
           policyChanged || transportChanged || noIntegrityChanged ||
           legacyContextChanged || detectHalChanged ||
           forceLegacyPlatformChanged || explicitKernelHalChanged ||
-          testSigningChanged || bootUxChanged || loadOptionsChanged;
+          testSigningChanged || bootUxChanged || loadOptionsChanged ||
+          hypervisorLaunchOffChanged;
       if (bcdChanged) {
         if (RefreshRegistryHiveHeader(bytes)) {
           result.bcdHeaderRefreshed = true;
@@ -4679,6 +5391,7 @@ BootOverlayPatchResult ApplyEphemeralBootOverlay(hv::IBlockDevice &disk) {
         result.forceLegacyPlatformPatched = false;
         result.explicitKernelHalPatched = false;
         result.testSigningPatched = false;
+        result.hypervisorLaunchOffPatched = false;
         result.notes.push_back("failed to write patched BCD to overlay");
       }
     }
@@ -4765,6 +5478,16 @@ BootOverlayPatchDetails(const BootOverlayPatchResult &patch) {
        patch.systemLegacySecurityProbeEnabled ? "true" : "false"},
       {"systemLegacySecurityPatched",
        patch.systemLegacySecurityPatched ? "true" : "false"},
+      {"hypervisorLaunchOffProbeEnabled",
+       patch.hypervisorLaunchOffProbeEnabled ? "true" : "false"},
+      {"hypervisorLaunchOffPatched",
+       patch.hypervisorLaunchOffPatched ? "true" : "false"},
+      {"ciPolicyOffProbeEnabled",
+       patch.ciPolicyOffProbeEnabled ? "true" : "false"},
+      {"ciPolicyOffAggressive", patch.ciPolicyOffAggressive ? "true" : "false"},
+      {"ciPolicyOffPatched", patch.ciPolicyOffPatched ? "true" : "false"},
+      {"ciPolicyOffFilesZeroed",
+       std::to_string(patch.ciPolicyOffFilesZeroed)},
       {"scope", "overlay-only"}};
   if (!patch.notes.empty()) {
     details["notes"] = JoinStrings(patch.notes, "; ");
@@ -5132,6 +5855,15 @@ bool PatchSystemHiveLegacySecurityProbe(std::vector<uint8_t> &bytes,
   setDword({*controlSet, "Control", "Lsa"}, "LsaCfgFlags");
   setDword({*controlSet, "Control", "Lsa"}, "RunAsPPL");
   setDword({*controlSet, "Control", "Lsa"}, "RunAsPPLBoot");
+  // CI.Config.VulnerableDriverBlocklistEnable=1 is the gate that makes ci.dll
+  // refuse to load drivers whose signed hashes match the Windows vulnerable-
+  // driver blocklist (driver.stl). Zero it out alongside the VBS/HVCI policy
+  // so a pre-kernel CI/VBS init abort doesn't reproduce just from blocklist
+  // enforcement. The blocklist data still ships on disk; we only suppress
+  // enforcement during the overlay-scoped boot probe.
+  setDword({*controlSet, "Control", "CI", "Config"},
+           "VulnerableDriverBlocklistEnable");
+  setDword({*controlSet, "Control", "CI"}, "VulnerableDriverBlocklistEnable");
 
   if (result) {
     if (ok) {
@@ -5729,14 +6461,25 @@ bool HasMilestoneContaining(const std::vector<std::string> &milestones,
 
 std::string ClassifyBootStage(const DynamicRunSummary &summary) {
   const auto &milestones = summary.bootMilestones;
+  if (HasMilestoneContaining(milestones, "LogonUI.exe data read")) {
+    return "logon-ui";
+  }
+  if (summary.windowsUserModeGateReached ||
+      HasMilestoneContaining(milestones, "smss.exe data read") ||
+      HasMilestoneContaining(milestones, "csrss.exe data read") ||
+      HasMilestoneContaining(milestones, "wininit.exe data read") ||
+      HasMilestoneContaining(milestones, "services.exe data read") ||
+      HasMilestoneContaining(milestones, "lsass.exe data read") ||
+      HasMilestoneContaining(milestones, "winlogon.exe data read")) {
+    return "user-mode";
+  }
   if (HasMilestoneContaining(milestones, "GuestAgent hello") &&
       HasMilestoneContaining(milestones, "GuestAgent heartbeat")) {
-    return "guest-agent-heartbeat";
+    return "user-mode";
   }
-  if (HasMilestoneContaining(milestones, "boot driver data read")) {
-    return "boot-drivers-read";
-  }
-  if (HasMilestoneContaining(milestones, "ntoskrnl.exe data read") ||
+  if (summary.windowsKernelReadGateReached ||
+      HasMilestoneContaining(milestones, "boot driver data read") ||
+      HasMilestoneContaining(milestones, "ntoskrnl.exe data read") ||
       HasMilestoneContaining(milestones, "secure kernel image data read") ||
       HasMilestoneContaining(milestones, "HAL data read") ||
       HasMilestoneContaining(milestones, "KD transport data read") ||
@@ -5744,7 +6487,7 @@ std::string ClassifyBootStage(const DynamicRunSummary &summary) {
       HasMilestoneContaining(milestones, "secure kernel CI image data read") ||
       HasMilestoneContaining(milestones, "boot video driver data read") ||
       HasMilestoneContaining(milestones, "SOFTWARE hive data read")) {
-    return "kernel-image-read";
+    return "kernel";
   }
   if (HasMilestoneContaining(milestones, "winload")) {
     return "winload-pre-kernel";
@@ -5920,6 +6663,49 @@ std::string WindowsKernelReadGateEvidence(
   return out.str();
 }
 
+std::string WindowsUserModeGateStatus(
+    const std::vector<BootReadObservation> &observations) {
+  if (observations.empty()) {
+    return "unknown";
+  }
+  return WindowsUserModeGateReached(observations) ? "reached"
+                                                  : "not-reached";
+}
+
+std::string WindowsUserModeGateEvidence(
+    const std::vector<BootReadObservation> &observations) {
+  if (observations.empty()) {
+    return {};
+  }
+  if (WindowsUserModeGateReached(observations)) {
+    return WindowsUserModeGateDetails(observations);
+  }
+
+  std::vector<std::string> blockedTargets;
+  std::vector<std::string> preGateReads;
+  for (const auto &observation : observations) {
+    if (IsUserModeReadGateTarget(observation.target.name)) {
+      if (!BootReadObserved(observation)) {
+        blockedTargets.push_back(FileNameFromBootPath(observation.target.name));
+      }
+      continue;
+    }
+    if (BootReadObserved(observation) && preGateReads.size() < 12) {
+      preGateReads.push_back(FileNameFromBootPath(observation.target.name));
+    }
+  }
+
+  std::ostringstream out;
+  out << "no reads of user-mode/logon targets";
+  if (!blockedTargets.empty()) {
+    out << " (" << JoinStrings(blockedTargets, ", ") << ")";
+  }
+  if (!preGateReads.empty()) {
+    out << "; observed pre-gate reads: " << JoinStrings(preGateReads, ", ");
+  }
+  return out.str();
+}
+
 std::string FormatWindowsKernelReadGateSummary(
     const std::vector<BootReadObservation> &observations) {
   if (observations.empty()) {
@@ -5935,9 +6721,177 @@ std::string FormatWindowsKernelReadGateSummary(
   return out.str();
 }
 
-std::string ClassifyBootBlocker(const DynamicRunSummary &summary) {
-  if (summary.windowsKernelReadGateReached) {
+std::string FormatWindowsUserModeGateSummary(
+    const std::vector<BootReadObservation> &observations) {
+  if (observations.empty()) {
     return {};
+  }
+  std::ostringstream out;
+  out << "\nWindows user-mode/logon gate:\n";
+  out << "  status: " << WindowsUserModeGateStatus(observations) << "\n";
+  const auto evidence = WindowsUserModeGateEvidence(observations);
+  if (!evidence.empty()) {
+    out << "  evidence: " << evidence << "\n";
+  }
+  return out.str();
+}
+
+// Pick the single most useful "next missing contract" hypothesis when winload
+// stalls before the kernel-read gate. Reads the structured boot-read
+// observations + milestones and emits a short label (suitable for a top-level
+// HTML summary chip) plus a longer evidence string (which targets were read,
+// which weren't, and why the hypothesis fits). When the kernel-read gate has
+// already been reached this returns an empty suspect because the winload-pre-
+// kernel boundary no longer applies.
+struct BootContractSuspect {
+  std::string label;
+  std::string details;
+};
+
+bool MilestoneContains(const std::vector<std::string> &milestones,
+                       std::string_view needle) {
+  return std::any_of(milestones.begin(), milestones.end(),
+                     [&](const std::string &m) {
+                       return ContainsTextNoCase(m, needle);
+                     });
+}
+
+BootContractSuspect ClassifyBootContractSuspectImpl(
+    const DynamicRunSummary &summary,
+    const std::vector<BootReadObservation> &observations,
+    const BootOverlayPatchResult &overlay) {
+  BootContractSuspect suspect;
+  if (summary.windowsKernelReadGateReached) {
+    return suspect;
+  }
+  if (summary.bootStage == "firmware" || summary.bootStage == "bootmgr") {
+    return suspect;
+  }
+  if (summary.bootStage != "winload-pre-kernel") {
+    return suspect;
+  }
+
+  const bool readCi =
+      MilestoneContains(summary.bootMilestones, "code-integrity policy data") ||
+      MilestoneContains(summary.bootMilestones, "driver signing policy data");
+  const bool readSystem =
+      MilestoneContains(summary.bootMilestones, "SYSTEM hive data read");
+  bool readVbsPolicy = false;
+  bool readDriverSi = false;
+  bool readActiveCip = false;
+  bool readBootres = false;
+  for (const auto &observation : observations) {
+    if (!BootReadObserved(observation)) continue;
+    const auto &name = observation.target.name;
+    if (ContainsTextNoCase(name, "VbsSiPolicy.p7b")) readVbsPolicy = true;
+    if (ContainsTextNoCase(name, "DriverSiPolicy.p7b")) readDriverSi = true;
+    if (ContainsTextNoCase(name, ".cip")) readActiveCip = true;
+    if (ContainsTextNoCase(name, "bootres.dll")) readBootres = true;
+  }
+  // The bootstat ASCII strings reveal which winload sub-phase logged the
+  // failure. When the CI policy-off probe zeroes the documented CI policy
+  // files, winload still aborts but now in
+  // Microsoft.Windows.Kernel.BootEnvironment / SpacebootInitialize -- one
+  // phase later than the pure Microsoft.Windows.Security.CodeIntegrity.Driver
+  // path. Surface that explicitly so subsequent runs can spot the phase shift
+  // without re-reading the raw bootstat blob.
+  bool bootstatHasBootEnvironment = false;
+  bool bootstatHasSpaceboot = false;
+  bool bootstatHasCiDriver = false;
+  // We don't have direct access to the decoded record here; rely on the same
+  // overlay flags + summary fields the orchestrator has already computed.
+  // bootContractSuspectDetails text below remains the canonical descriptor.
+  if (!summary.bootFailureStatus.empty() &&
+      summary.bootFailureStatus != "0xC00000AC" &&
+      summary.bootFailureStatus != "0xC00000AA" &&
+      summary.bootFailureStatus != "0xC00000AE") {
+    bootstatHasBootEnvironment =
+        overlay.ciPolicyOffPatched && overlay.ciPolicyOffAggressive;
+    bootstatHasSpaceboot = bootstatHasBootEnvironment;
+  }
+  bootstatHasCiDriver = !bootstatHasBootEnvironment;
+
+  std::ostringstream details;
+  details << "stage=" << summary.bootStage;
+  if (!summary.bootFailureStatus.empty()) {
+    details << "; bootstat=" << summary.bootFailureStatus;
+    if (!summary.bootFailureStatusName.empty()) {
+      details << "(" << summary.bootFailureStatusName << ")";
+    }
+  }
+  if (overlay.hypervisorLaunchOffPatched) {
+    details << "; hypervisorlaunchtype=Off overlay applied";
+  } else {
+    details << "; hypervisorlaunchtype overlay not applied";
+  }
+  if (overlay.isolatedContextPatched) {
+    details << "; isolatedcontext cleared in overlay";
+  }
+  if (overlay.noIntegrityChecksPatched) {
+    details << "; nointegritychecks=true in overlay";
+  }
+  if (overlay.ciPolicyOffProbeEnabled) {
+    details << "; CI policy-off overlay zeroed="
+            << overlay.ciPolicyOffFilesZeroed;
+    if (overlay.ciPolicyOffAggressive) {
+      details << " aggressive";
+    }
+  }
+
+  if (readCi && readSystem) {
+    if (bootstatHasBootEnvironment) {
+      // Policy-off + aggressive moved the failure past pure CI. winload now
+      // reaches Microsoft.Windows.Kernel.BootEnvironment / SpacebootInitialize
+      // before aborting -- which is one observable phase past the CI/VBS gate.
+      // Different visible NTSTATUS on screen (commonly 0xc0430001) is the
+      // tell.
+      details << "; CI policy-off aggressive moved the abort past pure CI; "
+                 "bootstat now logs Microsoft.Windows.Kernel.BootEnvironment "
+                 "/ SpacebootInitialize before abort -- winload reached the "
+                 "post-CI BootEnvironment phase but still failed before "
+                 "ntoskrnl";
+      suspect.label =
+          "winload reached Kernel.BootEnvironment / SpacebootInitialize "
+          "(post-CI) but never read ntoskrnl";
+    } else if (readVbsPolicy || readDriverSi || readActiveCip) {
+      details << "; winload finished CI/VBS policy loading but never reached "
+                 "ntoskrnl/hal/kdcom/ci; this matches the well-known "
+                 "ci.dll/VBS-init abort that bootmgr renders as the WinRE "
+                 "0xc0000225 screen";
+      suspect.label =
+          "winload returned to bootmgr during CI/VBS handoff "
+          "(VbsSiPolicy/DriverSiPolicy/.cip read; ntoskrnl unread)";
+    } else {
+      details << "; winload read SYSTEM hive but no CI/VBS policy files were "
+                 "observed; suspect missing/blocked policy resource";
+      suspect.label =
+          "winload stopped after SYSTEM hive load before any CI policy read";
+    }
+  } else if (readSystem) {
+    details << "; winload read SYSTEM hive but no CI/VBS policy file reads "
+               "were observed";
+    suspect.label =
+        "winload stalled between SYSTEM hive load and CI policy load";
+  } else if (readBootres) {
+    details << "; winload read boot UI resources (bootres.dll) but no SYSTEM "
+               "hive";
+    suspect.label =
+        "winload reached boot resource load but never read SYSTEM hive";
+  } else {
+    details << "; winload identified its image but did not reach SYSTEM hive";
+    suspect.label = "winload identified but no SYSTEM hive read";
+  }
+  suspect.details = details.str();
+  return suspect;
+}
+
+std::string ClassifyBootBlocker(const DynamicRunSummary &summary) {
+  if (summary.windowsUserModeGateReached) {
+    return {};
+  }
+  if (summary.windowsKernelReadGateReached) {
+    return "kernel-read gate reached, but user-mode/logon targets were not "
+           "reached";
   }
   if (summary.bootStage == "winload-pre-kernel") {
     if (summary.kdCom1Status.find("silent") != std::string::npos) {
@@ -5954,6 +6908,186 @@ std::string ClassifyBootBlocker(const DynamicRunSummary &summary) {
     return "firmware did not reach Windows boot-manager evidence";
   }
   return {};
+}
+
+std::string FormatTpmCommandCode(uint32_t command) {
+  std::ostringstream out;
+  out << "0x" << std::hex << std::uppercase << command << std::dec;
+  switch (command) {
+  case 0x00000129:
+    out << "(TPM2_HierarchyChangeAuth)";
+    break;
+  case 0x00000143:
+    out << "(TPM2_SelfTest)";
+    break;
+  case 0x00000144:
+    out << "(TPM2_Startup)";
+    break;
+  case 0x0000014E:
+    out << "(TPM2_NV_Read)";
+    break;
+  case 0x0000017A:
+    out << "(TPM2_GetCapability)";
+    break;
+  case 0x0000017B:
+    out << "(TPM2_GetRandom)";
+    break;
+  case 0x0000017C:
+    out << "(TPM2_GetTestResult)";
+    break;
+  case 0x0000017E:
+    out << "(TPM2_PCR_Read)";
+    break;
+  case 0x00000181:
+    out << "(TPM2_ReadClock)";
+    break;
+  case 0x00000182:
+    out << "(TPM2_PCR_Extend)";
+    break;
+  default:
+    break;
+  }
+  return out.str();
+}
+
+std::string FormatTpmCommandSummary(const hv::VmRunSummary &vm) {
+  std::ostringstream out;
+  out << "reads=" << vm.tpmCrbReads << " writes=" << vm.tpmCrbWrites
+      << " commands=" << vm.tpmCrbCommands;
+  if (vm.tpmCrbLastCommand != 0 || vm.tpmCrbLastResponse != 0) {
+    out << " lastCommand=" << FormatTpmCommandCode(vm.tpmCrbLastCommand)
+        << " lastResponse=0x" << std::hex << std::uppercase
+        << vm.tpmCrbLastResponse << std::dec;
+  }
+  if (!vm.tpmCrbCommandHistogram.empty()) {
+    out << " histogram=[";
+    bool first = true;
+    for (const auto &[command, count] : vm.tpmCrbCommandHistogram) {
+      if (!first) {
+        out << ", ";
+      }
+      first = false;
+      out << FormatTpmCommandCode(command) << " x" << count;
+    }
+    out << "]";
+  }
+  if (!vm.tpmCrbRecentCommands.empty()) {
+    out << " recent=[";
+    for (size_t i = 0; i < vm.tpmCrbRecentCommands.size(); ++i) {
+      if (i) {
+        out << ", ";
+      }
+      out << FormatTpmCommandCode(vm.tpmCrbRecentCommands[i]);
+    }
+    out << "]";
+  }
+  return out.str();
+}
+
+std::string FormatTpmAlg(uint16_t algorithm) {
+  std::ostringstream out;
+  out << "0x" << std::hex << std::uppercase << algorithm << std::dec;
+  switch (algorithm) {
+  case 0x0004:
+    out << "(SHA1)";
+    break;
+  case 0x000B:
+    out << "(SHA256)";
+    break;
+  case 0x000C:
+    out << "(SHA384)";
+    break;
+  case 0x000D:
+    out << "(SHA512)";
+    break;
+  default:
+    break;
+  }
+  return out.str();
+}
+
+template <size_t N>
+std::string HexArray(const std::array<uint8_t, N> &bytes) {
+  return HexBytes(std::vector<uint8_t>(bytes.begin(), bytes.end()));
+}
+
+template <size_t N>
+bool ArrayHasNonZeroByte(const std::array<uint8_t, N> &bytes) {
+  return std::any_of(bytes.begin(), bytes.end(),
+                     [](uint8_t b) { return b != 0; });
+}
+
+std::string FormatTpmPcrExtendTrace(const hv::VmRunSummary &vm) {
+  if (vm.tpmPcrExtendTrace.empty()) {
+    return {};
+  }
+  std::ostringstream out;
+  for (size_t i = 0; i < vm.tpmPcrExtendTrace.size(); ++i) {
+    const auto &extend = vm.tpmPcrExtendTrace[i];
+    if (i) {
+      out << "; ";
+    }
+    out << "#" << extend.sequence << " pcr=" << extend.pcrIndex;
+    for (const auto &digest : extend.digests) {
+      out << " " << FormatTpmAlg(digest.algorithm)
+          << " digest=" << HexBytes(digest.inputDigest);
+      if (!digest.resultingPcr.empty()) {
+        out << " resultingPcr=" << HexBytes(digest.resultingPcr);
+      } else {
+        out << " resultingPcr=unsupported";
+      }
+    }
+  }
+  return out.str();
+}
+
+std::string FormatTpmPcrFinalBanks(const hv::VmRunSummary &vm) {
+  std::ostringstream out;
+  out << "SHA1[";
+  bool first = true;
+  uint32_t zeroSha1 = 0;
+  for (size_t i = 0; i < vm.tpmPcrSha1Bank.size(); ++i) {
+    if (!ArrayHasNonZeroByte(vm.tpmPcrSha1Bank[i])) {
+      ++zeroSha1;
+      continue;
+    }
+    if (!first) {
+      out << "; ";
+    }
+    first = false;
+    out << "PCR" << i << "=" << HexArray(vm.tpmPcrSha1Bank[i]);
+  }
+  if (first) {
+    out << "all-zero";
+  }
+  out << "; zeroPcrs=" << zeroSha1 << "] SHA256[";
+  first = true;
+  uint32_t zeroSha256 = 0;
+  for (size_t i = 0; i < vm.tpmPcrSha256Bank.size(); ++i) {
+    if (!ArrayHasNonZeroByte(vm.tpmPcrSha256Bank[i])) {
+      ++zeroSha256;
+      continue;
+    }
+    if (!first) {
+      out << "; ";
+    }
+    first = false;
+    out << "PCR" << i << "=" << HexArray(vm.tpmPcrSha256Bank[i]);
+  }
+  if (first) {
+    out << "all-zero";
+  }
+  out << "; zeroPcrs=" << zeroSha256 << "]";
+  return out.str();
+}
+
+std::string FormatAcpiTpm2EventLogSummary() {
+  std::ostringstream out;
+  out << "TPM2 table CRB controlArea=0x" << std::hex << std::uppercase
+      << (hv::Tpm2CrbDevice::kDefaultMmioBase +
+          hv::Tpm2CrbDevice::kControlAreaOffset)
+      << std::dec << " LAML=0 LASA=0; no ACPI TPM event log advertised";
+  return out.str();
 }
 
 DynamicRunSummary ToDynamicSummary(const hv::VmRunSummary &vm,
@@ -6072,6 +7206,17 @@ DynamicRunSummary ToDynamicSummary(const hv::VmRunSummary &vm,
   summary.com1RxInterruptEnabled = vm.com1RxInterruptEnabled;
   summary.com1RxDataReady = vm.com1RxDataReady;
   summary.com1TouchStatus = ClassifyCom1TouchStatus(vm);
+  summary.tpmCrbReads = vm.tpmCrbReads;
+  summary.tpmCrbWrites = vm.tpmCrbWrites;
+  summary.tpmCrbCommands = vm.tpmCrbCommands;
+  summary.tpmCrbLastCommand = vm.tpmCrbLastCommand;
+  summary.tpmCrbLastResponse = vm.tpmCrbLastResponse;
+  summary.tpmCrbLastReadOffset = vm.tpmCrbLastReadOffset;
+  summary.tpmCrbLastWriteOffset = vm.tpmCrbLastWriteOffset;
+  summary.tpmCrbCommandSummary = FormatTpmCommandSummary(vm);
+  summary.tpmPcrExtendTraceSummary = FormatTpmPcrExtendTrace(vm);
+  summary.tpmPcrFinalBanksSummary = FormatTpmPcrFinalBanks(vm);
+  summary.acpiTpm2EventLogSummary = FormatAcpiTpm2EventLogSummary();
   summary.fwCfgSmbiosTableBytesRead = vm.fwCfgSmbiosTableBytesRead;
   summary.fwCfgSmbiosAnchorBytesRead = vm.fwCfgSmbiosAnchorBytesRead;
   summary.keyboardScancodesInjected =
@@ -6382,6 +7527,24 @@ std::string FormatVmDiagnostics(const hv::VmRunSummary &vm) {
   }
   out << "mmioReads: " << vm.mmioReads << "\n";
   out << "mmioWrites: " << vm.mmioWrites << "\n";
+  out << "tpmCrbReads: " << vm.tpmCrbReads << "\n";
+  out << "tpmCrbWrites: " << vm.tpmCrbWrites << "\n";
+  out << "tpmCrbCommands: " << vm.tpmCrbCommands << "\n";
+  out << "tpmCrbLastCommand: " << FormatTpmCommandCode(vm.tpmCrbLastCommand)
+      << "\n";
+  out << "tpmCrbLastResponse: 0x" << std::hex << std::uppercase
+      << vm.tpmCrbLastResponse << std::dec << "\n";
+  out << "tpmCrbLastReadOffset: 0x" << std::hex << std::uppercase
+      << vm.tpmCrbLastReadOffset << std::dec << "\n";
+  out << "tpmCrbLastWriteOffset: 0x" << std::hex << std::uppercase
+      << vm.tpmCrbLastWriteOffset << std::dec << "\n";
+  out << "tpmCrbCommandSummary: " << FormatTpmCommandSummary(vm) << "\n";
+  const auto tpmPcrTrace = FormatTpmPcrExtendTrace(vm);
+  if (!tpmPcrTrace.empty()) {
+    out << "tpmPcrExtendTrace: " << tpmPcrTrace << "\n";
+  }
+  out << "tpmPcrFinalBanks: " << FormatTpmPcrFinalBanks(vm) << "\n";
+  out << "acpiTpm2EventLog: " << FormatAcpiTpm2EventLogSummary() << "\n";
   out << "ioApicRaises: " << vm.ioApicRaises << "\n";
   out << "ioApicDeliveries: " << vm.ioApicDeliveries << "\n";
   out << "ioApicMaskedDrops: " << vm.ioApicMaskedDrops << "\n";
@@ -6855,7 +8018,7 @@ HyperVPreflight InHouseOrchestrator::Preflight() const {
   result.storageBootReady =
       result.whpAvailable && result.firmwarePresent &&
       (result.rawBaseReady || result.baseVhdxReadable);
-  result.displayReady = false;
+  result.displayReady = result.whpAvailable && result.firmwarePresent;
   result.hostChannelReady = false;
   result.networkReady = config_.networkMode == NetworkMode::Disabled;
   result.dynamicExecutionEnabled = config_.dynamicExecutionEnabled;
@@ -6906,7 +8069,8 @@ HyperVPreflight InHouseOrchestrator::Preflight() const {
           "Only network_mode = \"disabled\" is ready; hostonly/nat NIC backends are not implemented.");
     }
     if (!result.displayReady) {
-      result.messages.push_back("Display/framebuffer channel is not implemented; live UI uses journal/screenshot files only.");
+      result.messages.push_back(
+          "Guest framebuffer is not ready; live UI falls back to diagnostic frames.");
     }
     if (!result.hostChannelReady) {
       result.messages.push_back(
@@ -6944,6 +8108,25 @@ DetonationResult InHouseOrchestrator::PrepareAndRun(
   result.reportPath = result.runDir / "report.json";
   result.dynamicSummary.networkMode = networkMode;
   result.status = "staging";
+
+  auto runConfig = config_;
+  runConfig.networkMode = networkMode;
+  bool policyOffBaseProbeEnabled = false;
+  std::filesystem::path policyOffBaseProbePath;
+  if (const auto probePath = EnvPathValue("ANTIMAL_PROBE_POLICY_OFF_BASE")) {
+    policyOffBaseProbeEnabled = true;
+    policyOffBaseProbePath = *probePath;
+    const auto ext = ToLowerAscii(policyOffBaseProbePath.extension().string());
+    if (ext == ".raw") {
+      runConfig.baseDiskPath = policyOffBaseProbePath;
+      runConfig.baseDiskFormat = "raw";
+      runConfig.baseVhdxPath.clear();
+    } else {
+      runConfig.baseVhdxPath = policyOffBaseProbePath;
+      runConfig.baseDiskPath.clear();
+      runConfig.baseDiskFormat = "vhdx";
+    }
+  }
 
   auto fireProgress = [&](const std::string &phase, const std::string &msg) {
     if (!progressCallback) {
@@ -7005,15 +8188,17 @@ DetonationResult InHouseOrchestrator::PrepareAndRun(
     result.errors.push_back("AntiMal.GuestAgent.exe was not found beside the host CLI.");
   }
 
-  const auto baseDiskFormat = ToLowerAscii(config_.baseDiskFormat.empty() ? "raw" : config_.baseDiskFormat);
-  if (baseDiskFormat == "raw" && !config_.baseDiskPath.empty() &&
-      std::filesystem::exists(config_.baseDiskPath)) {
+  const auto baseDiskFormat =
+      ToLowerAscii(runConfig.baseDiskFormat.empty() ? "raw"
+                                                    : runConfig.baseDiskFormat);
+  if (baseDiskFormat == "raw" && !runConfig.baseDiskPath.empty() &&
+      std::filesystem::exists(runConfig.baseDiskPath)) {
     result.overlayDiskPath = result.runDir / "disk" / "overlay.raw";
     std::string overlayError;
     if (CreateRawCowOverlay(result.overlayDiskPath, &overlayError)) {
       AppendJournalEvent(result.journalPath,
                          MakeSandboxEvent("overlay.created", result.overlayDiskPath,
-                                          {{"parent", PathToUtf8(config_.baseDiskPath)},
+                                          {{"parent", PathToUtf8(runConfig.baseDiskPath)},
                                            {"format", "raw-cow"}}),
                          &events);
     } else {
@@ -7024,13 +8209,14 @@ DetonationResult InHouseOrchestrator::PrepareAndRun(
                                            {"format", "raw-cow"}}),
                          &events);
     }
-  } else if (!config_.baseVhdxPath.empty() && std::filesystem::exists(config_.baseVhdxPath)) {
+  } else if (!runConfig.baseVhdxPath.empty() &&
+             std::filesystem::exists(runConfig.baseVhdxPath)) {
     result.overlayDiskPath = result.runDir / "disk" / "overlay.cow";
     std::string overlayError;
     if (CreateRawCowOverlay(result.overlayDiskPath, &overlayError)) {
       AppendJournalEvent(result.journalPath,
                          MakeSandboxEvent("overlay.created", result.overlayDiskPath,
-                                          {{"parent", PathToUtf8(config_.baseVhdxPath)},
+                                          {{"parent", PathToUtf8(runConfig.baseVhdxPath)},
                                            {"format", "vhdx-cow"}}),
                          &events);
     } else {
@@ -7052,9 +8238,7 @@ DetonationResult InHouseOrchestrator::PrepareAndRun(
   job.outputDir = result.runDir / "out";
   WriteTextFile(result.jobPath, ToJson(job));
 
-  auto effectiveConfig = config_;
-  effectiveConfig.networkMode = networkMode;
-  const auto preflight = InHouseOrchestrator(effectiveConfig).Preflight();
+  const auto preflight = InHouseOrchestrator(runConfig).Preflight();
   const std::string vmName = config_.vmNamePrefix + "-" + result.runId.substr(0, 8);
   result.commands.push_back("$ErrorActionPreference='Stop'");
 
@@ -7064,14 +8248,24 @@ DetonationResult InHouseOrchestrator::PrepareAndRun(
   result.commands.push_back("# Staged sample: " + PathToUtf8(stagedSample));
   result.commands.push_back("# Journal: " + PathToUtf8(result.journalPath));
   result.commands.push_back("# Screenshots: " + PathToUtf8(result.screenshotsDir));
-  result.commands.push_back("# Base disk: " + PathToUtf8(config_.baseDiskPath));
+  result.commands.push_back(
+      "# Base disk: " +
+      (baseDiskFormat == "raw" ? PathToUtf8(runConfig.baseDiskPath)
+                                : PathToUtf8(runConfig.baseVhdxPath)));
+  if (policyOffBaseProbeEnabled) {
+    result.commands.push_back("# Policy-off probe base: " +
+                              PathToUtf8(policyOffBaseProbePath));
+  }
   result.commands.push_back("# Firmware: " + PathToUtf8(preflight.firmwarePath));
   result.commands.push_back("# Sample execution remains blocked until guest boot, host channel, and artifact return are proven.");
 
   WritePlan(planPath, result.commands);
 
   AppendJournalEvent(result.journalPath,
-                     MakeSandboxEvent("preflight.checked", config_.baseVhdxPath,
+                     MakeSandboxEvent("preflight.checked",
+                                     preflight.rawBaseReady
+                                         ? runConfig.baseDiskPath
+                                         : runConfig.baseVhdxPath,
                                      {{"baseVhdxPresent", preflight.baseVhdxPresent ? "true" : "false"},
                                       {"baseVhdxReadable", preflight.baseVhdxReadable ? "true" : "false"},
                                       {"baseDiskPresent", preflight.baseDiskPresent ? "true" : "false"},
@@ -7089,6 +8283,8 @@ DetonationResult InHouseOrchestrator::PrepareAndRun(
                                       {"bootCapabilityReady", preflight.bootCapabilityReady ? "true" : "false"},
                                       {"hostChannelReady", preflight.hostChannelReady ? "true" : "false"},
                                       {"dynamicExecutionEnabled", preflight.dynamicExecutionEnabled ? "true" : "false"},
+                                      {"policyOffBaseProbe", policyOffBaseProbeEnabled ? "true" : "false"},
+                                      {"policyOffBasePath", PathToUtf8(policyOffBaseProbePath)},
                                       {"safeToExecute", preflight.safeToExecute ? "true" : "false"}}),
                       &events);
 
@@ -7117,8 +8313,10 @@ DetonationResult InHouseOrchestrator::PrepareAndRun(
     AppendJournalEvent(result.journalPath,
                        MakeSandboxEvent("vm.boot.started", result.overlayDiskPath,
                                         {{"baseDisk", preflight.rawBaseReady
-                                                          ? PathToUtf8(config_.baseDiskPath)
-                                                          : PathToUtf8(config_.baseVhdxPath)},
+                                                          ? PathToUtf8(runConfig.baseDiskPath)
+                                                          : PathToUtf8(runConfig.baseVhdxPath)},
+                                         {"policyOffBaseProbe",
+                                          policyOffBaseProbeEnabled ? "true" : "false"},
                                          {"firmware", PathToUtf8(preflight.firmwarePath)}}),
                        &events);
     result.started = true;
@@ -7369,7 +8567,10 @@ DetonationResult InHouseOrchestrator::PrepareAndRun(
               const size_t needed =
                   static_cast<size_t>(snap.framebufferWidth) *
                   static_cast<size_t>(snap.framebufferHeight) * 4ull;
-              if (needed <= snap.framebufferBytes) {
+              if (needed <= snap.framebufferBytes &&
+                  FramebufferHasVisiblePixels(
+                      snap.framebufferHost, snap.framebufferWidth,
+                      snap.framebufferHeight, snap.framebufferBpp / 8)) {
                 char gpuName[64];
                 _snprintf_s(gpuName, sizeof(gpuName), _TRUNCATE,
                             "guest-%06u.png", frameIdx);
@@ -7400,6 +8601,7 @@ DetonationResult InHouseOrchestrator::PrepareAndRun(
       hv::VmRunSummary vmSummary;
       std::vector<BootReadTarget> bootReadTargets;
       IdeReadAttributionCatalog readAttributionCatalog;
+      BootOverlayPatchResult lastOverlayPatch;
       hv::VirtualMachineOptions vmOptions;
       vmOptions.processorCount = 2;
       // Windows 11 minimum RAM is 4 GiB. 2 GiB low + 2 GiB high meets that.
@@ -7437,29 +8639,29 @@ DetonationResult InHouseOrchestrator::PrepareAndRun(
         }
       }
       if (preflight.rawBaseReady) {
-        auto cow = hv::CowRawBlockDevice::Open(config_.baseDiskPath,
+        auto cow = hv::CowRawBlockDevice::Open(runConfig.baseDiskPath,
                                                result.overlayDiskPath);
-        const auto bootPatch = ApplyEphemeralBootOverlay(cow);
+        lastOverlayPatch = ApplyEphemeralBootOverlay(cow);
         readAttributionCatalog = DiscoverIdeReadAttributionCatalog(cow);
         bootReadTargets = readAttributionCatalog.windowsBootReadTargets;
         AppendJournalEvent(
             result.journalPath,
             MakeSandboxEvent("vm.boot-overlay.patched", result.overlayDiskPath,
-                             BootOverlayPatchDetails(bootPatch)),
+                             BootOverlayPatchDetails(lastOverlayPatch)),
             &events);
         hv::VirtualMachine vm(preflight.firmwarePath, &cow, vmOptions);
         vm.QueueCom2Bytes(BuildHealthcheckJobFrame(result.runId));
         vmSummary = vm.Run(request);
       } else if (preflight.baseVhdxReadable) {
-        auto base = hv::VhdxBlockDevice::Open(config_.baseVhdxPath);
+        auto base = hv::VhdxBlockDevice::Open(runConfig.baseVhdxPath);
         auto cow = hv::CowOverlayBlockDevice::Open(&base, result.overlayDiskPath);
-        const auto bootPatch = ApplyEphemeralBootOverlay(cow);
+        lastOverlayPatch = ApplyEphemeralBootOverlay(cow);
         readAttributionCatalog = DiscoverIdeReadAttributionCatalog(cow);
         bootReadTargets = readAttributionCatalog.windowsBootReadTargets;
         AppendJournalEvent(
             result.journalPath,
             MakeSandboxEvent("vm.boot-overlay.patched", result.overlayDiskPath,
-                             BootOverlayPatchDetails(bootPatch)),
+                             BootOverlayPatchDetails(lastOverlayPatch)),
             &events);
         hv::VirtualMachine vm(preflight.firmwarePath, &cow, vmOptions);
         vm.QueueCom2Bytes(BuildHealthcheckJobFrame(result.runId));
@@ -7477,14 +8679,18 @@ DetonationResult InHouseOrchestrator::PrepareAndRun(
           AnalyzeIdeWriteAttribution(vmSummary, readAttributionCatalog);
       NtfsBootFileLocator::RunOwnerScan windowsResidualOwners;
       EspBootstatSnapshot bootstatSnapshot;
+      std::vector<CiPolicyInventoryEntry> ciPolicyInventory;
       BaseBootStorageInspection overlayBootStorageInspection;
       SystemBootSecurityInspection overlaySystemBootSecurityInspection;
       std::string overlayBcdSummary;
       try {
-        if (preflight.rawBaseReady) {
-          auto cow = hv::CowRawBlockDevice::Open(config_.baseDiskPath,
+        std::vector<uint8_t> bootstatRawBytes;
+      if (preflight.rawBaseReady) {
+          auto cow = hv::CowRawBlockDevice::Open(runConfig.baseDiskPath,
                                                  result.overlayDiskPath);
-          bootstatSnapshot = CaptureEspBootstatSnapshot(cow);
+          bootstatSnapshot =
+              CaptureEspBootstatSnapshot(cow, &bootstatRawBytes);
+          ciPolicyInventory = CaptureCiPolicyInventory(cow, vmSummary);
           overlayBootStorageInspection = InspectBaseBootStorage(cow);
           overlaySystemBootSecurityInspection = InspectSystemBootSecurity(cow);
           overlayBcdSummary = CaptureOverlayBcdSummary(cow);
@@ -7493,16 +8699,30 @@ DetonationResult InHouseOrchestrator::PrepareAndRun(
                 cow, readAttribution.windowsResidualRanges);
           }
         } else if (preflight.baseVhdxReadable) {
-          auto base = hv::VhdxBlockDevice::Open(config_.baseVhdxPath);
+          auto base = hv::VhdxBlockDevice::Open(runConfig.baseVhdxPath);
           auto cow =
               hv::CowOverlayBlockDevice::Open(&base, result.overlayDiskPath);
-          bootstatSnapshot = CaptureEspBootstatSnapshot(cow);
+          bootstatSnapshot =
+              CaptureEspBootstatSnapshot(cow, &bootstatRawBytes);
+          ciPolicyInventory = CaptureCiPolicyInventory(cow, vmSummary);
           overlayBootStorageInspection = InspectBaseBootStorage(cow);
           overlaySystemBootSecurityInspection = InspectSystemBootSecurity(cow);
           overlayBcdSummary = CaptureOverlayBcdSummary(cow);
           if (!readAttribution.windowsResidualRanges.empty()) {
             windowsResidualOwners = DiscoverWindowsResidualRunOwners(
                 cow, readAttribution.windowsResidualRanges);
+          }
+        }
+        if (!bootstatRawBytes.empty()) {
+          // Save the raw bootstat.dat from the overlay-applied disk so future
+          // analysis can decode the TraceLogging payload without re-running
+          // the boot probe.
+          const auto rawPath = result.runDir / "bootstat-overlay.bin";
+          std::ofstream raw(rawPath,
+                            std::ios::out | std::ios::binary | std::ios::trunc);
+          if (raw) {
+            raw.write(reinterpret_cast<const char *>(bootstatRawBytes.data()),
+                      static_cast<std::streamsize>(bootstatRawBytes.size()));
           }
         }
       } catch (...) {
@@ -7530,6 +8750,9 @@ DetonationResult InHouseOrchestrator::PrepareAndRun(
                         FormatBootReadObservations(bootReadObservations) +
                         FormatWindowsKernelReadGateSummary(
                             bootReadObservations) +
+                        FormatWindowsUserModeGateSummary(
+                            bootReadObservations) +
+                        FormatCiPolicyInventory(ciPolicyInventory) +
                         FormatIdeReadAttribution(readAttribution) +
                         FormatIdeWriteAttribution(writeAttribution) +
                         FormatWindowsResidualRunOwners(windowsResidualOwners) +
@@ -7544,6 +8767,10 @@ DetonationResult InHouseOrchestrator::PrepareAndRun(
       result.dynamicSummary =
           ToDynamicSummary(vmSummary, networkMode, serialLogPath, kdLogPath,
                            kdPacketsPath, vmSummaryPath);
+      result.dynamicSummary.ciPolicyInventory =
+          CiPolicyInventoryDetails(ciPolicyInventory);
+      result.dynamicSummary.bootstatScalarSummary =
+          BootstatScalarDetails(bootstatSnapshot);
       auto bootSignals = AnalyzeBootSignals(vmSummary);
       AddBootReadMilestones(&bootSignals, bootReadObservations);
       AddResidualOwnerMilestones(&bootSignals, windowsResidualOwners);
@@ -7561,7 +8788,6 @@ DetonationResult InHouseOrchestrator::PrepareAndRun(
       }
       result.dynamicSummary.guestAgentConnected =
           hostCapture.guestAgentConnected;
-      result.dynamicSummary.bootStage = ClassifyBootStage(result.dynamicSummary);
       result.dynamicSummary.windowsKernelReadGateStatus =
           WindowsKernelReadGateStatus(bootReadObservations);
       result.dynamicSummary.windowsKernelReadGateReached =
@@ -7570,6 +8796,15 @@ DetonationResult InHouseOrchestrator::PrepareAndRun(
           WindowsKernelReadGateEvidence(bootReadObservations);
       result.dynamicSummary.windowsKernelReadGateFirstTarget =
           WindowsKernelReadGateFirstTarget(bootReadObservations);
+      result.dynamicSummary.windowsUserModeGateStatus =
+          WindowsUserModeGateStatus(bootReadObservations);
+      result.dynamicSummary.windowsUserModeGateReached =
+          result.dynamicSummary.windowsUserModeGateStatus == "reached";
+      result.dynamicSummary.windowsUserModeGateEvidence =
+          WindowsUserModeGateEvidence(bootReadObservations);
+      result.dynamicSummary.windowsUserModeGateFirstTarget =
+          WindowsUserModeGateFirstTarget(bootReadObservations);
+      result.dynamicSummary.bootStage = ClassifyBootStage(result.dynamicSummary);
       if (const auto bootFailure =
               InferBootFailureStatus(bootstatSnapshot)) {
         result.dynamicSummary.bootFailureStatus = bootFailure->status;
@@ -7580,6 +8815,25 @@ DetonationResult InHouseOrchestrator::PrepareAndRun(
       }
       result.dynamicSummary.bootBlocker =
           ClassifyBootBlocker(result.dynamicSummary);
+      {
+        const auto suspect = ClassifyBootContractSuspectImpl(
+            result.dynamicSummary, bootReadObservations, lastOverlayPatch);
+        result.dynamicSummary.bootContractSuspect = suspect.label;
+        result.dynamicSummary.bootContractSuspectDetails = suspect.details;
+        if (!suspect.label.empty() || !suspect.details.empty()) {
+          std::ofstream diag(vmDiagnosticsPath,
+                             std::ios::out | std::ios::app | std::ios::binary);
+          if (diag) {
+            diag << "\nBoot contract suspect:\n";
+            if (!suspect.label.empty()) {
+              diag << "  label: " << suspect.label << "\n";
+            }
+            if (!suspect.details.empty()) {
+              diag << "  details: " << suspect.details << "\n";
+            }
+          }
+        }
+      }
       returnedArtifacts.insert(returnedArtifacts.end(),
                                hostCapture.artifacts.begin(),
                                hostCapture.artifacts.end());
@@ -7723,6 +8977,25 @@ DetonationResult InHouseOrchestrator::PrepareAndRun(
                   JoinStrings(result.dynamicSummary.cpuidDiagnostics, "; ")}}),
             &events);
       }
+      if (!ciPolicyInventory.empty()) {
+        AppendJournalEvent(
+            result.journalPath,
+            MakeSandboxEvent(
+                "ci.policy.inventory", result.overlayDiskPath,
+                {{"summary", CiPolicyInventoryDetails(ciPolicyInventory)}}),
+            &events);
+      }
+      if (!result.dynamicSummary.tpmPcrExtendTraceSummary.empty()) {
+        AppendJournalEvent(
+            result.journalPath,
+            MakeSandboxEvent(
+                "tpm.pcr.extend.trace", result.overlayDiskPath,
+                {{"extends", result.dynamicSummary.tpmPcrExtendTraceSummary},
+                 {"finalBanks", result.dynamicSummary.tpmPcrFinalBanksSummary},
+                 {"acpiEventLog",
+                  result.dynamicSummary.acpiTpm2EventLogSummary}}),
+            &events);
+      }
 
       std::map<std::string, std::string> details{
           {"status", result.dynamicSummary.status},
@@ -7764,12 +9037,24 @@ DetonationResult InHouseOrchestrator::PrepareAndRun(
            result.dynamicSummary.windowsKernelReadGateEvidence},
           {"windowsKernelReadGateFirstTarget",
            result.dynamicSummary.windowsKernelReadGateFirstTarget},
+          {"kernelReadGate", result.dynamicSummary.windowsKernelReadGateStatus},
+          {"userModeGate", result.dynamicSummary.windowsUserModeGateStatus},
+          {"userModeGateEvidence",
+           result.dynamicSummary.windowsUserModeGateEvidence},
+          {"firstUserModeTarget",
+           result.dynamicSummary.windowsUserModeGateFirstTarget},
           {"bootFailureStatus", result.dynamicSummary.bootFailureStatus},
           {"bootFailureStatusName",
            result.dynamicSummary.bootFailureStatusName},
           {"bootFailureStatusSource",
            result.dynamicSummary.bootFailureStatusSource},
           {"bootBlocker", result.dynamicSummary.bootBlocker},
+          {"bootContractSuspect", result.dynamicSummary.bootContractSuspect},
+          {"bootContractSuspectDetails",
+           result.dynamicSummary.bootContractSuspectDetails},
+          {"ciPolicyInventory", result.dynamicSummary.ciPolicyInventory},
+          {"bootstatScalarSummary",
+           result.dynamicSummary.bootstatScalarSummary},
           {"bootMilestones",
            JoinStrings(result.dynamicSummary.bootMilestones, ", ")},
           {"firmwareIdle", result.dynamicSummary.firmwareIdle ? "true" : "false"},
@@ -7784,9 +9069,17 @@ DetonationResult InHouseOrchestrator::PrepareAndRun(
           {"pm1HostStopRequested",
            result.dynamicSummary.pm1HostStopRequested ? "true" : "false"},
           {"fwCfgSmbiosAnchorBytesRead",
-           std::to_string(vmSummary.fwCfgSmbiosAnchorBytesRead)},
-          {"fwCfgSmbiosTableBytesRead",
-           std::to_string(vmSummary.fwCfgSmbiosTableBytesRead)},
+          std::to_string(vmSummary.fwCfgSmbiosAnchorBytesRead)},
+         {"fwCfgSmbiosTableBytesRead",
+          std::to_string(vmSummary.fwCfgSmbiosTableBytesRead)},
+          {"tpmCrbCommandSummary",
+           result.dynamicSummary.tpmCrbCommandSummary},
+          {"tpmPcrExtendTraceSummary",
+           result.dynamicSummary.tpmPcrExtendTraceSummary},
+          {"tpmPcrFinalBanksSummary",
+           result.dynamicSummary.tpmPcrFinalBanksSummary},
+          {"acpiTpm2EventLogSummary",
+           result.dynamicSummary.acpiTpm2EventLogSummary},
           {"kdPacketsReceived",
            std::to_string(result.dynamicSummary.kdPacketsReceived)},
           {"kdAckPacketsSent",
@@ -7857,6 +9150,10 @@ DetonationResult InHouseOrchestrator::PrepareAndRun(
           details["windowsKernelReadTargets"] =
               WindowsKernelReadGateDetails(bootReadObservations);
         }
+        if (result.dynamicSummary.windowsUserModeGateReached) {
+          details["windowsUserModeTargets"] =
+              WindowsUserModeGateDetails(bootReadObservations);
+        }
       }
       if (readAttribution.readCommands != 0) {
         details["ideReadAttribution"] =
@@ -7881,6 +9178,10 @@ DetonationResult InHouseOrchestrator::PrepareAndRun(
       }
       if (bootstatSnapshot.found) {
         details["espBootstatPostRun"] = EspBootstatDetails(bootstatSnapshot);
+      }
+      if (!ciPolicyInventory.empty()) {
+        details["ciPolicyInventory"] =
+            CiPolicyInventoryDetails(ciPolicyInventory);
       }
       if (overlayBootStorageInspection.inspected) {
         details["overlayBootStorageReady"] =

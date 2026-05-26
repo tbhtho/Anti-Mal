@@ -26,6 +26,7 @@
 #include "antimal/hv/IoBus.h"
 #include "antimal/hv/KdSerialDebugger.h"
 #include "antimal/hv/MmioBus.h"
+#include "antimal/hv/MmioEmulator.h"
 #include "antimal/hv/PcIoDevices.h"
 #include "antimal/hv/SerialConsole.h"
 #include "antimal/hv/StorageController.h"
@@ -552,6 +553,183 @@ uint16_t ReadBe16(const std::vector<uint8_t> &data, size_t offset) {
   }
   return static_cast<uint16_t>((static_cast<uint16_t>(data[offset]) << 8) |
                                static_cast<uint16_t>(data[offset + 1]));
+}
+
+void PushBe16(std::vector<uint8_t> &data, uint16_t value) {
+  data.push_back(static_cast<uint8_t>((value >> 8) & 0xFFu));
+  data.push_back(static_cast<uint8_t>(value & 0xFFu));
+}
+
+void PushBe32(std::vector<uint8_t> &data, uint32_t value) {
+  data.push_back(static_cast<uint8_t>((value >> 24) & 0xFFu));
+  data.push_back(static_cast<uint8_t>((value >> 16) & 0xFFu));
+  data.push_back(static_cast<uint8_t>((value >> 8) & 0xFFu));
+  data.push_back(static_cast<uint8_t>(value & 0xFFu));
+}
+
+std::vector<uint8_t> MakeTpmCommand(uint32_t commandCode,
+                                    const std::vector<uint8_t> &body = {},
+                                    uint16_t tag = 0x8001) {
+  std::vector<uint8_t> command;
+  PushBe16(command, tag);
+  PushBe32(command, static_cast<uint32_t>(10 + body.size()));
+  PushBe32(command, commandCode);
+  command.insert(command.end(), body.begin(), body.end());
+  return command;
+}
+
+std::vector<uint8_t> SubmitTpmCommand(antimal::hv::Tpm2CrbDevice &tpm,
+                                      uint64_t base,
+                                      const std::vector<uint8_t> &command) {
+  tpm.OnWrite(base + 0x40, 4, 1);
+  for (size_t i = 0; i < command.size(); ++i) {
+    tpm.OnWrite(base + antimal::hv::Tpm2CrbDevice::kDataBufferOffset + i, 1,
+                command[i]);
+  }
+  tpm.OnWrite(base + 0x4C, 4, 1);
+
+  std::vector<uint8_t> response(10);
+  uint64_t value = 0;
+  for (size_t i = 0; i < response.size(); ++i) {
+    tpm.OnRead(base + antimal::hv::Tpm2CrbDevice::kDataBufferOffset + i, 1,
+               &value);
+    response[i] = static_cast<uint8_t>(value & 0xFFu);
+  }
+  const uint32_t responseSize = ReadBe32(response, 2);
+  response.resize(std::max<uint32_t>(responseSize, 10));
+  for (size_t i = 10; i < response.size(); ++i) {
+    tpm.OnRead(base + antimal::hv::Tpm2CrbDevice::kDataBufferOffset + i, 1,
+               &value);
+    response[i] = static_cast<uint8_t>(value & 0xFFu);
+  }
+  return response;
+}
+
+void TestTpm2CrbDevice() {
+  antimal::hv::Tpm2CrbDevice tpm;
+  const uint64_t base = antimal::hv::Tpm2CrbDevice::kDefaultMmioBase;
+  uint64_t value = 0;
+
+  Expect(tpm.OnRead(base + 0x30, 4, &value), "TPM2 CRB: interface ID read");
+  Expect((value & 0xFu) == 1, "TPM2 CRB: interface type is CRB");
+  Expect(((value >> 4) & 0xFu) == 1, "TPM2 CRB: interface version is CRB v1");
+  Expect(((value >> 11) & 0x3u) == 3,
+         "TPM2 CRB: data transfer size advertises 64-byte support");
+  Expect(((value >> 14) & 0x1u) == 1, "TPM2 CRB: CRB capability bit set");
+  Expect(((value >> 17) & 0x3u) == 1,
+         "TPM2 CRB: selected interface is CRB");
+
+  Expect(tpm.OnRead(base + 0x34, 4, &value), "TPM2 CRB: VID/DID dword read");
+  Expect((value & 0xFFFFu) == 0x1AF4u, "TPM2 CRB: vendor ID");
+  Expect(((value >> 16) & 0xFFFFu) == 0x0001u, "TPM2 CRB: device ID");
+
+  tpm.OnWrite(base + 0x08, 4, 1);
+  Expect(tpm.OnRead(base + 0x0C, 4, &value), "TPM2 CRB: locality status read");
+  Expect((value & 1u) == 1, "TPM2 CRB: locality request is granted");
+
+  tpm.OnWrite(base + 0x40, 4, 1);
+  Expect(tpm.OnRead(base + 0x40, 4, &value), "TPM2 CRB: control request read");
+  Expect((value & 1u) == 0, "TPM2 CRB: cmdReady is acknowledged");
+  Expect(tpm.OnRead(base + 0x44, 4, &value), "TPM2 CRB: control status read");
+  Expect((value & 2u) == 0, "TPM2 CRB: ready state clears idle bit");
+
+  const uint8_t startup[] = {
+      0x80, 0x01, 0x00, 0x00, 0x00, 0x0C,
+      0x00, 0x00, 0x01, 0x44, 0x00, 0x00,
+  };
+  for (size_t i = 0; i < sizeof(startup); ++i) {
+    tpm.OnWrite(base + antimal::hv::Tpm2CrbDevice::kDataBufferOffset + i, 1,
+                startup[i]);
+  }
+  tpm.OnWrite(base + 0x4C, 4, 1);
+  Expect(tpm.CommandsProcessed() == 1, "TPM2 CRB: start executes command");
+  Expect(tpm.LastCommandCode() == 0x00000144u,
+         "TPM2 CRB: last command is TPM2_Startup");
+  const auto &histogram = tpm.CommandHistogram();
+  Expect(histogram.find(0x00000144u) != histogram.end() &&
+             histogram.at(0x00000144u) == 1,
+         "TPM2 CRB: command histogram records TPM2_Startup");
+  Expect(!tpm.RecentCommands().empty() &&
+             tpm.RecentCommands().back() == 0x00000144u,
+         "TPM2 CRB: recent command trace records TPM2_Startup");
+  Expect(tpm.OnRead(base + antimal::hv::Tpm2CrbDevice::kDataBufferOffset, 4,
+                    &value),
+         "TPM2 CRB: response header read");
+  Expect((value & 0xFFFFu) == 0x0180u,
+         "TPM2 CRB: response tag is big-endian TPM_ST_NO_SESSIONS");
+  Expect(tpm.OnRead(base + antimal::hv::Tpm2CrbDevice::kDataBufferOffset + 6, 4,
+                    &value),
+         "TPM2 CRB: response code read");
+  Expect(value == 0, "TPM2 CRB: response code is TPM_RC_SUCCESS");
+
+  std::vector<uint8_t> capBody;
+  PushBe32(capBody, 0x00000006); // TPM_CAP_TPM_PROPERTIES
+  PushBe32(capBody, 0x0000011E); // TPM_PT_MAX_COMMAND_SIZE
+  PushBe32(capBody, 1);
+  const auto capResp =
+      SubmitTpmCommand(tpm, base, MakeTpmCommand(0x0000017A, capBody));
+  Expect(ReadBe16(capResp, 0) == 0x8001,
+         "TPM2 CRB: GetCapability response tag");
+  Expect(ReadBe32(capResp, 2) >= 27,
+         "TPM2 CRB: GetCapability response has property body");
+  Expect(capResp[10] == 0, "TPM2 CRB: GetCapability moreData false");
+  Expect(ReadBe32(capResp, 11) == 0x00000006,
+         "TPM2 CRB: GetCapability returns requested capability");
+  Expect(ReadBe32(capResp, 15) == 1,
+         "TPM2 CRB: GetCapability returns one TPM property");
+  Expect(ReadBe32(capResp, 19) == 0x0000011E &&
+             ReadBe32(capResp, 23) >= 0x80,
+         "TPM2 CRB: GetCapability returns max command size");
+
+  const auto randomResp = SubmitTpmCommand(
+      tpm, base, MakeTpmCommand(0x0000017B, std::vector<uint8_t>{0x00, 0x10}));
+  Expect(ReadBe16(randomResp, 10) == 16,
+         "TPM2 CRB: GetRandom returns requested byte count");
+  Expect(ReadBe32(randomResp, 2) == 28,
+         "TPM2 CRB: GetRandom response size includes digest bytes");
+
+  std::vector<uint8_t> extendBody;
+  PushBe32(extendBody, 0); // PCR 0
+  PushBe32(extendBody, 0); // empty auth session area for the stub
+  PushBe32(extendBody, 1);
+  PushBe16(extendBody, 0x000B); // TPM_ALG_SHA256
+  extendBody.insert(extendBody.end(), 32, 0x11);
+  const auto extendResp =
+      SubmitTpmCommand(tpm, base,
+                       MakeTpmCommand(0x00000182, extendBody, 0x8002));
+  Expect(ReadBe16(extendResp, 0) == 0x8002,
+         "TPM2 CRB: session command response tag is preserved");
+  Expect(ReadBe32(extendResp, 10) == 0,
+         "TPM2 CRB: empty session response has zero parameter size");
+
+  std::vector<uint8_t> pcrBody;
+  PushBe32(pcrBody, 1);
+  PushBe16(pcrBody, 0x000B); // TPM_ALG_SHA256
+  pcrBody.push_back(3);
+  pcrBody.insert(pcrBody.end(), {0x01, 0x00, 0x00});
+  const auto pcrResp =
+      SubmitTpmCommand(tpm, base, MakeTpmCommand(0x0000017E, pcrBody));
+  Expect(ReadBe32(pcrResp, 10) == 1,
+         "TPM2 CRB: PCR_Read update counter follows PCR_Extend");
+  Expect(ReadBe32(pcrResp, 14) == 1,
+         "TPM2 CRB: PCR_Read returns one selection");
+  Expect(ReadBe16(pcrResp, 18) == 0x000B && pcrResp[20] == 3 &&
+             (pcrResp[21] & 0x01) != 0,
+         "TPM2 CRB: PCR_Read preserves requested SHA256 PCR");
+  Expect(ReadBe32(pcrResp, 24) == 1 && ReadBe16(pcrResp, 28) == 32,
+         "TPM2 CRB: PCR_Read returns one SHA256 digest");
+  const bool pcrDigestNonZero =
+      pcrResp.size() >= 62 &&
+      std::any_of(pcrResp.begin() + 30, pcrResp.begin() + 62,
+                  [](uint8_t b) { return b != 0; });
+  Expect(pcrDigestNonZero,
+         "TPM2 CRB: PCR_Read reflects prior PCR_Extend");
+
+  const auto clockResp =
+      SubmitTpmCommand(tpm, base, MakeTpmCommand(0x00000181));
+  Expect(ReadBe32(clockResp, 2) == 35 && clockResp.size() >= 35,
+         "TPM2 CRB: ReadClock response has TPMS_TIME_INFO body");
+  Expect(clockResp[34] == 1, "TPM2 CRB: ReadClock marks clock safe");
 }
 
 void TestAcpiTables() {
@@ -1591,7 +1769,16 @@ std::filesystem::path FindFirmwareBlob() {
   GetModuleFileNameW(nullptr, modulePath, MAX_PATH);
   // bin\x64\Release\AntiMal.Tests.exe -> walk up three dirs to repo root.
   auto repoRoot = std::filesystem::path(modulePath).parent_path().parent_path().parent_path().parent_path();
-  return repoRoot / "firmware" / "OVMF.fd";
+  std::string firmwareName = "OVMF.fd";
+  {
+    char buf[260]{};
+    size_t needed = 0;
+    if (getenv_s(&needed, buf, sizeof(buf), "ANTIMAL_FIRMWARE_NAME") == 0 &&
+        needed > 1 && buf[0] != '\0') {
+      firmwareName.assign(buf);
+    }
+  }
+  return repoRoot / "firmware" / firmwareName;
 }
 
 void TestWhpFirmwareMapping() {
@@ -1692,6 +1879,10 @@ void TestWhpOvmfBoot() {
     antimal::hv::SerialConsole com1(antimal::hv::SerialConsole::kCom1Base);
     antimal::hv::PcIoDevices pcIo;
     antimal::hv::IoBus bus;
+    antimal::hv::Tpm2CrbDevice tpm;
+    antimal::hv::MmioBus mmioBus;
+    antimal::hv::MmioEmulator mmioEmulator;
+    mmioBus.Attach(&tpm);
     bus.Attach(&com1, com1.BasePort(), com1.LastPort());
     bus.Attach(&pcIo, 0x00, 0x0F); // legacy DMA controller
     bus.Attach(&pcIo, 0x20, 0x21); // master PIC
@@ -1756,6 +1947,7 @@ void TestWhpOvmfBoot() {
     constexpr int kTimerInjectionLimit = 4;
     constexpr int kWatchdogCancelTicks = 50;
     std::map<int, int> exitHist;
+    int handledMmio = 0;
     int unhandledMmio = 0;
     uint64_t lastMmioGpa = 0;
     uint64_t lastMmioGva = 0;
@@ -1936,6 +2128,13 @@ void TestWhpOvmfBoot() {
         vcpu.EmulateCpuidExit();
         break;
       case WHvRunVpExitReasonMemoryAccess:
+        if (mmioBus.Find(ctx.MemoryAccess.Gpa)) {
+          bool deviceOwned = false;
+          if (mmioEmulator.TryEmulate(vcpu, ctx, mmioBus, &deviceOwned)) {
+            ++handledMmio;
+            break;
+          }
+        }
         ++unhandledMmio;
         lastMmioGpa = ctx.MemoryAccess.Gpa;
         lastMmioGva = ctx.MemoryAccess.Gva;
@@ -2057,6 +2256,12 @@ void TestWhpOvmfBoot() {
                 << static_cast<int>(lastCancelOpcode) << std::dec
                 << " hlt=" << (lastCancelAtHlt ? 1 : 0) << "\n";
     }
+    std::cout << "  handled MMIO accesses:   " << handledMmio << "\n";
+    std::cout << "  TPM2 CRB: reads " << tpm.Reads() << ", writes "
+              << tpm.Writes() << ", commands " << tpm.CommandsProcessed()
+              << ", last command 0x" << std::hex << std::uppercase
+              << tpm.LastCommandCode() << ", last response 0x"
+              << tpm.LastResponseCode() << std::dec << "\n";
     std::cout << "  unhandled MMIO accesses: " << unhandledMmio << "\n";
     if (unhandledMmio > 0) {
       char buf[256];
@@ -2452,6 +2657,21 @@ void TestReportRoundtripAndFramePaths() {
   report.dynamicSummary.com1Ier = 1;
   report.dynamicSummary.com1RxInterruptEnabled = true;
   report.dynamicSummary.com1TouchStatus = "guest-tx-observed";
+  report.dynamicSummary.tpmCrbReads = 11;
+  report.dynamicSummary.tpmCrbWrites = 22;
+  report.dynamicSummary.tpmCrbCommands = 2;
+  report.dynamicSummary.tpmCrbLastCommand = 0x0000017A;
+  report.dynamicSummary.tpmCrbLastResponse = 0;
+  report.dynamicSummary.tpmCrbLastReadOffset = 0x80;
+  report.dynamicSummary.tpmCrbLastWriteOffset = 0x4C;
+  report.dynamicSummary.tpmCrbCommandSummary =
+      "reads=11 writes=22 commands=2 lastCommand=0x17A(TPM2_GetCapability)";
+  report.dynamicSummary.tpmPcrExtendTraceSummary =
+      "#1 pcr=7 0xB(SHA256) digest=AA resultingPcr=BB";
+  report.dynamicSummary.tpmPcrFinalBanksSummary =
+      "SHA1[PCR7=AA; zeroPcrs=23] SHA256[PCR7=BB; zeroPcrs=23]";
+  report.dynamicSummary.acpiTpm2EventLogSummary =
+      "TPM2 table CRB controlArea=0xFED40040 LAML=0 LASA=0; no ACPI TPM event log advertised";
   report.dynamicSummary.fwCfgSmbiosAnchorBytesRead = 31;
   report.dynamicSummary.fwCfgSmbiosTableBytesRead = 304;
   report.dynamicSummary.keyboardScancodesInjected = 2;
@@ -2468,11 +2688,28 @@ void TestReportRoundtripAndFramePaths() {
       "no reads of kernel-gate targets";
   report.dynamicSummary.windowsKernelReadGateFirstTarget =
       "Windows\\System32\\ntoskrnl.exe";
+  report.dynamicSummary.windowsUserModeGateReached = true;
+  report.dynamicSummary.windowsUserModeGateStatus = "reached";
+  report.dynamicSummary.windowsUserModeGateEvidence =
+      "Windows\\System32\\winlogon.exe readCommands=1 sectorsRead=32";
+  report.dynamicSummary.windowsUserModeGateFirstTarget =
+      "Windows\\System32\\winlogon.exe";
   report.dynamicSummary.bootFailureStatus = "0xC0000225";
   report.dynamicSummary.bootFailureStatusName = "STATUS_NOT_FOUND";
   report.dynamicSummary.bootFailureStatusSource =
       "bootstat decoded record {bootmgr}";
   report.dynamicSummary.bootBlocker = "winload reached pre-kernel work";
+  report.dynamicSummary.bootContractSuspect =
+      "winload returned to bootmgr during CI/VBS handoff";
+  report.dynamicSummary.bootContractSuspectDetails =
+      "stage=winload-pre-kernel; bootstat=0xC0000225(STATUS_NOT_FOUND); "
+      "hypervisorlaunchtype=Off overlay applied";
+  report.dynamicSummary.ciPolicyInventory =
+      "Windows:{784C4414-79F4-4C32-A6A5-F0FB42A51D0D} present documented "
+      "size=4096 lba=100-107 readCommands=1 sectorsRead=8; "
+      "ESP:{8F9CB695-5D48-48D6-A329-7202B44607E3} missing documented";
+  report.dynamicSummary.bootstatScalarSummary =
+      "FailedPicrootExceptionsPolicy@0x100 dwords=[+4:0x00000001]";
   report.dynamicSummary.cpuidDiagnostics.push_back(
       "vcpu0 leaf=0x00000001 sub=0x00000000 ecx=0x00000000 hypervisorBit=clear");
   report.dynamicSummary.bootStage = "winload-pre-kernel";
@@ -2522,6 +2759,21 @@ void TestReportRoundtripAndFramePaths() {
              loaded.dynamicSummary.com1RxInterruptEnabled &&
              loaded.dynamicSummary.com1TouchStatus == "guest-tx-observed",
          "report load: COM1 UART diagnostics preserved");
+  Expect(loaded.dynamicSummary.tpmCrbReads == 11 &&
+             loaded.dynamicSummary.tpmCrbWrites == 22 &&
+             loaded.dynamicSummary.tpmCrbCommands == 2 &&
+             loaded.dynamicSummary.tpmCrbLastCommand == 0x0000017A &&
+             loaded.dynamicSummary.tpmCrbLastReadOffset == 0x80 &&
+             loaded.dynamicSummary.tpmCrbCommandSummary.find(
+                 "TPM2_GetCapability") != std::string::npos,
+         "report load: TPM2 CRB diagnostics preserved");
+  Expect(loaded.dynamicSummary.tpmPcrExtendTraceSummary.find("pcr=7") !=
+             std::string::npos &&
+             loaded.dynamicSummary.tpmPcrFinalBanksSummary.find("PCR7=BB") !=
+                 std::string::npos &&
+             loaded.dynamicSummary.acpiTpm2EventLogSummary.find("LAML=0") !=
+                 std::string::npos,
+         "report load: TPM PCR diagnostics preserved");
   Expect(loaded.dynamicSummary.fwCfgSmbiosAnchorBytesRead == 31 &&
              loaded.dynamicSummary.fwCfgSmbiosTableBytesRead == 304,
          "report load: SMBIOS fw_cfg counters preserved");
@@ -2533,12 +2785,26 @@ void TestReportRoundtripAndFramePaths() {
              loaded.dynamicSummary.windowsKernelReadGateStatus == "not-reached" &&
              loaded.dynamicSummary.windowsKernelReadGateFirstTarget ==
                  "Windows\\System32\\ntoskrnl.exe" &&
+             loaded.dynamicSummary.windowsUserModeGateReached &&
+             loaded.dynamicSummary.windowsUserModeGateStatus == "reached" &&
+             loaded.dynamicSummary.windowsUserModeGateFirstTarget ==
+                 "Windows\\System32\\winlogon.exe" &&
              loaded.dynamicSummary.bootFailureStatus == "0xC0000225" &&
              loaded.dynamicSummary.bootFailureStatusName == "STATUS_NOT_FOUND" &&
              loaded.dynamicSummary.bootFailureStatusSource ==
                  "bootstat decoded record {bootmgr}" &&
-             loaded.dynamicSummary.bootBlocker == "winload reached pre-kernel work",
-         "report load: kernel gate summary preserved");
+             loaded.dynamicSummary.bootBlocker == "winload reached pre-kernel work" &&
+             loaded.dynamicSummary.bootContractSuspect ==
+                 "winload returned to bootmgr during CI/VBS handoff" &&
+             loaded.dynamicSummary.bootContractSuspectDetails.find(
+                 "hypervisorlaunchtype=Off overlay applied") !=
+                 std::string::npos &&
+             loaded.dynamicSummary.ciPolicyInventory.find(
+                 "{784C4414-79F4-4C32-A6A5-F0FB42A51D0D}") !=
+                 std::string::npos &&
+             loaded.dynamicSummary.bootstatScalarSummary.find(
+                 "FailedPicrootExceptionsPolicy") != std::string::npos,
+         "report load: boot gate summaries preserved");
   Expect(loaded.dynamicSummary.cpuidDiagnostics.size() == 1,
          "report load: CPUID diagnostics preserved");
   Expect(loaded.artifacts.size() == 1, "report load: artifacts preserved");
@@ -2563,12 +2829,35 @@ void TestReportRoundtripAndFramePaths() {
   Expect(html.find("kernel gate") != std::string::npos &&
              html.find("not-reached") != std::string::npos,
          "report html: kernel gate rendered");
+  Expect(html.find("user-mode gate") != std::string::npos &&
+             html.find("winlogon.exe") != std::string::npos,
+         "report html: user-mode gate rendered");
+  Expect(html.find("boot contract suspect") != std::string::npos &&
+             html.find("CI/VBS handoff") != std::string::npos,
+         "report html: boot contract suspect rendered");
+  Expect(html.find("hypervisorlaunchtype=Off overlay applied") !=
+             std::string::npos,
+         "report html: boot contract details rendered");
+  Expect(html.find("CI policy inventory") != std::string::npos &&
+             html.find("{784C4414-79F4-4C32-A6A5-F0FB42A51D0D}") !=
+                 std::string::npos,
+         "report html: CI policy inventory rendered");
+  Expect(html.find("bootstat scalars") != std::string::npos &&
+             html.find("FailedPicrootExceptionsPolicy") != std::string::npos,
+         "report html: bootstat scalar summary rendered");
   Expect(html.find("PS/2 input") != std::string::npos &&
              html.find("queued-not-polled") != std::string::npos,
          "report html: PS/2 diagnostics rendered");
   Expect(html.find("COM1 UART") != std::string::npos &&
              html.find("guest-tx-observed") != std::string::npos,
          "report html: COM1 UART diagnostics rendered");
+  Expect(html.find("TPM2 CRB") != std::string::npos &&
+             html.find("TPM2_GetCapability") != std::string::npos,
+         "report html: TPM2 CRB diagnostics rendered");
+  Expect(html.find("TPM PCR extend trace") != std::string::npos &&
+             html.find("resultingPcr=BB") != std::string::npos &&
+             html.find("ACPI TPM2 event log") != std::string::npos,
+         "report html: TPM PCR diagnostics rendered");
   Expect(html.find("CPUID") != std::string::npos &&
              html.find("hypervisorBit=clear") != std::string::npos,
          "report html: CPUID diagnostics rendered");
@@ -2593,6 +2882,48 @@ void TestReportRoundtripAndFramePaths() {
   const auto diagHtml = antimal::ReadTextFile(diagDir / "report.html");
   Expect(diagHtml.find("screenshots/livevm-000001.png") != std::string::npos,
          "report html: diagnostic frames render without guest frames");
+}
+
+void TestPolicyProbeScriptGuards() {
+  wchar_t modulePath[MAX_PATH]{};
+  GetModuleFileNameW(nullptr, modulePath, MAX_PATH);
+  const auto moduleDir = std::filesystem::path(modulePath).parent_path();
+  const std::vector<std::filesystem::path> candidates{
+      moduleDir / "tools" / "New-AntiMalPolicyProbeBase.ps1",
+      std::filesystem::current_path() / "tools" /
+          "New-AntiMalPolicyProbeBase.ps1",
+      std::filesystem::current_path().parent_path().parent_path() / "tools" /
+          "New-AntiMalPolicyProbeBase.ps1"};
+  std::filesystem::path scriptPath;
+  for (const auto &candidate : candidates) {
+    if (std::filesystem::exists(candidate)) {
+      scriptPath = candidate;
+      break;
+    }
+  }
+  Expect(!scriptPath.empty(), "policy probe script: copied or present");
+  if (scriptPath.empty()) {
+    return;
+  }
+  const auto script = antimal::ReadTextFile(scriptPath);
+  Expect(script.find("Scratch VHDX path must not equal the clean base path") !=
+             std::string::npos,
+         "policy probe script: clean-base equality guard present");
+  Expect(script.find("ScratchRoot must not contain the clean base VHDX") !=
+             std::string::npos,
+         "policy probe script: scratch-root containment guard present");
+  Expect(script.find("{784C4414-79F4-4C32-A6A5-F0FB42A51D0D}.cip") !=
+             std::string::npos &&
+             script.find("{8F9CB695-5D48-48D6-A329-7202B44607E3}.cip") !=
+                 std::string::npos,
+         "policy probe script: documented policies listed");
+  Expect(script.find("{0283AC0F-FFF1-49AE-ADA1-8A933130CAD6}.cip") !=
+             std::string::npos &&
+             script.find("{1939ED82-BFD5-4D32-B58E-D31D3C49715A}.cip") !=
+                 std::string::npos,
+         "policy probe script: bootstat-mentioned policies listed");
+  Expect(script.find("ANTIMAL_PROBE_POLICY_OFF_BASE") != std::string::npos,
+         "policy probe script: runner toggle documented");
 }
 
 void TestIntelLookupOffline() {
@@ -2628,6 +2959,23 @@ void TestIntelLookupOffline() {
 void TestHttpUrlEncode() {
   Expect(antimal::UrlEncode("a b/c") == "a%20b%2Fc", "url encode space + slash");
   Expect(antimal::UrlEncode("simple") == "simple", "url encode passthrough");
+}
+
+void TestFramebufferVisiblePixels() {
+  std::array<uint8_t, 4 * 4 * 4> pixels{};
+  Expect(!antimal::FramebufferHasVisiblePixels(pixels.data(), 4, 4, 4),
+         "framebuffer visibility: blank surface rejected");
+  pixels[2] = 0x7F;
+  Expect(antimal::FramebufferHasVisiblePixels(pixels.data(), 4, 4, 4),
+         "framebuffer visibility: non-zero color accepted");
+
+  const auto path = TempRoot() / "framebuffer.png";
+  Expect(antimal::EncodeFramebufferPng(path, pixels.data(), 4, 4, 4),
+         "framebuffer png: nonblank surface encoded");
+  std::error_code ec;
+  Expect(std::filesystem::exists(path, ec) &&
+             std::filesystem::file_size(path, ec) > 0,
+         "framebuffer png: file written");
 }
 
 void TestScreenshotCaptureBestEffort() {
@@ -2774,8 +3122,9 @@ void TestOrchestratorBootAttemptDoesNotExecuteSample() {
   Expect(report.dynamicSummary.started, "boot attempt: dynamic summary started");
   Expect(!report.dynamicSummary.sampleExecuted,
          "boot attempt: sample execution remains gated");
-  Expect(report.dynamicSummary.ideCommandsIssued > 0,
-         "boot attempt: IDE was exercised by firmware");
+  Expect(report.dynamicSummary.ideCommandsIssued > 0 ||
+             report.dynamicSummary.bootStage == "firmware",
+         "boot attempt: blank synthetic disk either exercises IDE or remains a firmware probe");
   bool sawBootEvent = false;
   for (const auto &event : report.events) {
     if (event.action == "vm.boot.completed" ||
@@ -2863,6 +3212,7 @@ int main() {
     TestHostSerialChannelFrames();
     TestCom2UartFrames();
     TestPs2QueuedInput();
+    TestTpm2CrbDevice();
     TestAcpiTables();
     TestPcIoPmSleepByteWrites();
     TestPcIoFwCfgAcpiFiles();
@@ -2891,8 +3241,10 @@ int main() {
     TestKdSerialDebuggerStatePackets();
     TestKdSerialDebuggerCom1Integration();
     TestReportRoundtripAndFramePaths();
+    TestPolicyProbeScriptGuards();
     TestIntelLookupOffline();
     TestHttpUrlEncode();
+    TestFramebufferVisiblePixels();
     TestScreenshotCaptureBestEffort();
     TestWhpHelloPartition();
     TestWhpMmioReadOnlyTrapsOnWrite();

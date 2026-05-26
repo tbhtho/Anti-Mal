@@ -23,6 +23,7 @@
 #include "antimal/hv/WhpHost.h"
 
 #include <atomic>
+#include <array>
 #include <chrono>
 #include <cstdint>
 #include <filesystem>
@@ -157,6 +158,18 @@ struct VmRunSummary {
   uint64_t lastPageFaultAssistGpa = 0;
   uint32_t mmioReads = 0;
   uint32_t mmioWrites = 0;
+  uint64_t tpmCrbReads = 0;
+  uint64_t tpmCrbWrites = 0;
+  uint64_t tpmCrbCommands = 0;
+  uint32_t tpmCrbLastCommand = 0;
+  uint32_t tpmCrbLastResponse = 0;
+  uint64_t tpmCrbLastReadOffset = 0;
+  uint64_t tpmCrbLastWriteOffset = 0;
+  std::map<uint32_t, uint64_t> tpmCrbCommandHistogram;
+  std::vector<uint32_t> tpmCrbRecentCommands;
+  std::vector<TpmPcrExtendTrace> tpmPcrExtendTrace;
+  std::array<std::array<uint8_t, 20>, 24> tpmPcrSha1Bank{};
+  std::array<std::array<uint8_t, 32>, 24> tpmPcrSha256Bank{};
   uint64_t lastCanceledRip = 0;
   uint8_t lastCanceledOpcode = 0;
   bool lastCanceledAtHlt = false;
@@ -441,6 +454,8 @@ private:
   bool IdentifyGuestImage(uint64_t gva, VmGuestImageInfo *info);
   bool HandleStringIoPortAccess(const WHV_X64_IO_PORT_ACCESS_CONTEXT &io,
                                 uint64_t rflags, bool *allPortsHandled);
+  bool TryEmulateSimpleMmioAccess(const WHV_RUN_VP_EXIT_CONTEXT &exit,
+                                  IMmioDevice *device, bool *isWrite);
   bool TryAssistFirmwarePageFault(uint64_t gva, uint32_t errorCode,
                                   uint64_t *mappedGpa);
   uint64_t AllocatePageTableAssistPage();

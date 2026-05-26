@@ -34,6 +34,12 @@ bool EncodeFramebufferPng(const std::filesystem::path &outputPath,
                           const uint8_t *pixels, int width, int height,
                           int bytesPerPixel);
 
+// Returns true when a framebuffer contains at least one non-zero color byte.
+// This lets the host avoid emitting blank guest frames before OVMF/Windows
+// has actually painted the GOP surface.
+bool FramebufferHasVisiblePixels(const uint8_t *pixels, int width, int height,
+                                 int bytesPerPixel);
+
 // Long-running worker that writes numbered PNG frames to `outputDir`
 // at the requested interval until Stop() is called.
 //

@@ -2,6 +2,7 @@
 # These are reproducibly fetched (URL + SHA-256 pinned in the script), so we
 # don't need them in version control.
 edk2/
+edk2.failed-*/
 firmware-tools/
 *.zip
 *.7z

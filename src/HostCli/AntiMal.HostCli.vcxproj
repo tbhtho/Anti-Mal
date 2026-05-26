@@ -42,6 +42,10 @@
       <Link>tools\Test-AntiMalBaseBoot.ps1</Link>
       <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
     </None>
+    <None Include="..\..\tools\New-AntiMalPolicyProbeBase.ps1">
+      <Link>tools\New-AntiMalPolicyProbeBase.ps1</Link>
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+    </None>
     <None Include="..\..\rules\tags.json">
       <Link>rules\tags.json</Link>
       <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>

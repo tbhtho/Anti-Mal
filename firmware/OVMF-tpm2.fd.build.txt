@@ -1,0 +1,8 @@
+source=https://github.com/tianocore/edk2.git
+ref=edk2-stable202605
+commit=b03a21a63e3bd001f52c527e5a57feddb53a690b
+target=RELEASE
+toolchain=VS2022
+defines=TPM2_ENABLE=TRUE SECURE_BOOT_ENABLE=TRUE FD_SIZE_4MB=TRUE
+built=2026-05-26 00:32:50Z
+sourceArtifact=C:\Users\hunnid\Documents\code\01_My_Projects\AntiMal\external\edk2\Build\OvmfX64\RELEASE_VS2022\FV\OVMF.fd

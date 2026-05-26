@@ -358,6 +358,154 @@ bool VirtualMachine::WriteGuestMemory(uint64_t gva, const void *buffer,
   return true;
 }
 
+bool VirtualMachine::TryEmulateSimpleMmioAccess(
+    const WHV_RUN_VP_EXIT_CONTEXT &exit, IMmioDevice *device, bool *isWrite) {
+  if (!device || !isWrite) {
+    return false;
+  }
+  *isWrite = false;
+
+  uint8_t instr[16]{};
+  if (!ReadGuestMemoryFor(vcpu_, exit.VpContext.Rip, instr, sizeof(instr))) {
+    return false;
+  }
+
+  size_t pos = 0;
+  bool operand16 = false;
+  bool rexPresent = false;
+  uint8_t rex = 0;
+  while (pos < sizeof(instr)) {
+    const uint8_t b = instr[pos];
+    if (b == 0x66) {
+      operand16 = true;
+      ++pos;
+      continue;
+    }
+    if (b >= 0x40 && b <= 0x4F) {
+      rexPresent = true;
+      rex = b;
+      ++pos;
+      continue;
+    }
+    break;
+  }
+  if (pos + 2 > sizeof(instr)) {
+    return false;
+  }
+
+  const uint8_t opcode = instr[pos++];
+  const bool writeToMem = opcode == 0x88 || opcode == 0x89;
+  const bool readFromMem = opcode == 0x8A || opcode == 0x8B;
+  if (!writeToMem && !readFromMem) {
+    return false;
+  }
+  const bool byteAccess = opcode == 0x88 || opcode == 0x8A;
+  const uint8_t modrm = instr[pos++];
+  const uint8_t mod = (modrm >> 6) & 0x3u;
+  const uint8_t reg =
+      static_cast<uint8_t>(((modrm >> 3) & 0x7u) | ((rex & 0x4u) ? 8u : 0u));
+  const uint8_t rm = static_cast<uint8_t>(modrm & 0x7u);
+  if (mod == 0x3u) {
+    return false;
+  }
+  if (rm == 0x4u) {
+    if (pos >= sizeof(instr)) {
+      return false;
+    }
+    ++pos; // SIB byte.
+  }
+  if (mod == 0x0u && rm == 0x5u) {
+    pos += 4;
+  } else if (mod == 0x1u) {
+    pos += 1;
+  } else if (mod == 0x2u) {
+    pos += 4;
+  }
+  if (pos > sizeof(instr)) {
+    return false;
+  }
+
+  const uint8_t accessSize =
+      byteAccess ? 1 : operand16 ? 2 : (rex & 0x8u) ? 8 : 4;
+  if (accessSize != 1 && accessSize != 2 && accessSize != 4 &&
+      accessSize != 8) {
+    return false;
+  }
+
+  static constexpr WHV_REGISTER_NAME kRegs[16] = {
+      WHvX64RegisterRax, WHvX64RegisterRcx, WHvX64RegisterRdx,
+      WHvX64RegisterRbx, WHvX64RegisterRsp, WHvX64RegisterRbp,
+      WHvX64RegisterRsi, WHvX64RegisterRdi, WHvX64RegisterR8,
+      WHvX64RegisterR9,  WHvX64RegisterR10, WHvX64RegisterR11,
+      WHvX64RegisterR12, WHvX64RegisterR13, WHvX64RegisterR14,
+      WHvX64RegisterR15};
+  WHV_REGISTER_VALUE regs[16]{};
+  if (FAILED(WHvGetVirtualProcessorRegisters(vcpu_.Partition(), vcpu_.Index(),
+                                             kRegs, 16, regs))) {
+    return false;
+  }
+
+  auto readReg = [&](uint8_t index) -> uint64_t {
+    if (index >= 16) {
+      return 0;
+    }
+    const uint64_t full = regs[index].Reg64;
+    if (accessSize == 1) {
+      if (!rexPresent && index >= 4 && index <= 7) {
+        return (full >> 8) & 0xFFu;
+      }
+      return full & 0xFFu;
+    }
+    if (accessSize == 2) {
+      return full & 0xFFFFu;
+    }
+    if (accessSize == 4) {
+      return full & 0xFFFFFFFFu;
+    }
+    return full;
+  };
+
+  auto writeReg = [&](uint8_t index, uint64_t value) -> bool {
+    if (index >= 16) {
+      return false;
+    }
+    uint64_t full = regs[index].Reg64;
+    if (accessSize == 1) {
+      if (!rexPresent && index >= 4 && index <= 7) {
+        full = (full & ~0xFF00ull) | ((value & 0xFFu) << 8);
+      } else {
+        full = (full & ~0xFFull) | (value & 0xFFu);
+      }
+    } else if (accessSize == 2) {
+      full = (full & ~0xFFFFull) | (value & 0xFFFFu);
+    } else if (accessSize == 4) {
+      full = value & 0xFFFFFFFFu;
+    } else {
+      full = value;
+    }
+    WHV_REGISTER_VALUE out{};
+    out.Reg64 = full;
+    return SUCCEEDED(WHvSetVirtualProcessorRegisters(
+        vcpu_.Partition(), vcpu_.Index(), &kRegs[index], 1, &out));
+  };
+
+  if (writeToMem) {
+    if (!device->OnWrite(exit.MemoryAccess.Gpa, accessSize, readReg(reg))) {
+      return false;
+    }
+    *isWrite = true;
+  } else {
+    uint64_t value = 0;
+    if (!device->OnRead(exit.MemoryAccess.Gpa, accessSize, &value) ||
+        !writeReg(reg, value)) {
+      return false;
+    }
+  }
+
+  vcpu_.AdvanceRip(pos);
+  return true;
+}
+
 bool VirtualMachine::IdentifyGuestImage(uint64_t gva, VmGuestImageInfo *info) {
   if (!info || gva == 0 || gva == UINT64_MAX || (gva >> 48) != 0) {
     return false;
@@ -1149,6 +1297,16 @@ VmRunSummary VirtualMachine::RunLoop(
           }
           break;
         }
+        bool fallbackWrite = false;
+        if (TryEmulateSimpleMmioAccess(ctx, device, &fallbackWrite)) {
+          madeProgress = true;
+          if (fallbackWrite) {
+            ++summary.mmioWrites;
+          } else {
+            ++summary.mmioReads;
+          }
+          break;
+        }
         ++summary.unhandledMmio;
         if (instrLen > 0) {
           vcpu_.AdvanceRip(instrLen);
@@ -1618,6 +1776,18 @@ VmRunSummary VirtualMachine::RunLoop(
   summary.pm1SleepRequests = pcIo_.Pm1SleepRequestCount();
   summary.hpetReads = hpet_.Reads();
   summary.hpetWrites = hpet_.Writes();
+  summary.tpmCrbReads = tpm_.Reads();
+  summary.tpmCrbWrites = tpm_.Writes();
+  summary.tpmCrbCommands = tpm_.CommandsProcessed();
+  summary.tpmCrbLastCommand = tpm_.LastCommandCode();
+  summary.tpmCrbLastResponse = tpm_.LastResponseCode();
+  summary.tpmCrbLastReadOffset = tpm_.LastReadOffset();
+  summary.tpmCrbLastWriteOffset = tpm_.LastWriteOffset();
+  summary.tpmCrbCommandHistogram = tpm_.CommandHistogram();
+  summary.tpmCrbRecentCommands = tpm_.RecentCommands();
+  summary.tpmPcrExtendTrace = tpm_.PcrExtendTrace();
+  summary.tpmPcrSha1Bank = tpm_.PcrSha1Bank();
+  summary.tpmPcrSha256Bank = tpm_.PcrSha256Bank();
   summary.pitInterruptsPending = pcIo_.PitInterruptPending() ? 1 : 0;
   summary.rtcInterruptsPending = pcIo_.RtcInterruptPending() ? 1 : 0;
   summary.ps2StatusReads = ps2_.StatusReads();

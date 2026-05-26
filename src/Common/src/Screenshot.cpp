@@ -178,6 +178,22 @@ bool EncodeFramebufferPng(const std::filesystem::path &outputPath,
          Gdiplus::Ok;
 }
 
+bool FramebufferHasVisiblePixels(const uint8_t *pixels, int width, int height,
+                                 int bytesPerPixel) {
+  if (!pixels || width <= 0 || height <= 0 || bytesPerPixel < 3) {
+    return false;
+  }
+  const size_t total =
+      static_cast<size_t>(width) * static_cast<size_t>(height) *
+      static_cast<size_t>(bytesPerPixel);
+  for (size_t i = 0; i + 2 < total; i += static_cast<size_t>(bytesPerPixel)) {
+    if (pixels[i] != 0 || pixels[i + 1] != 0 || pixels[i + 2] != 0) {
+      return true;
+    }
+  }
+  return false;
+}
+
 bool CaptureScreenToPng(const std::filesystem::path &outputPath) {
   (void)GdiPlusInstance(); // ensure GDI+ is initialized
 

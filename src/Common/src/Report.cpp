@@ -569,6 +569,28 @@ DynamicRunSummary ParseDynamicSummary(const JsonValue *value) {
       BoolValue(Member(*value, "com1RxInterruptEnabled"));
   summary.com1RxDataReady = BoolValue(Member(*value, "com1RxDataReady"));
   summary.com1TouchStatus = StringValue(Member(*value, "com1TouchStatus"));
+  summary.tpmCrbReads =
+      static_cast<uint64_t>(IntValue(Member(*value, "tpmCrbReads")));
+  summary.tpmCrbWrites =
+      static_cast<uint64_t>(IntValue(Member(*value, "tpmCrbWrites")));
+  summary.tpmCrbCommands =
+      static_cast<uint64_t>(IntValue(Member(*value, "tpmCrbCommands")));
+  summary.tpmCrbLastCommand =
+      static_cast<uint32_t>(IntValue(Member(*value, "tpmCrbLastCommand")));
+  summary.tpmCrbLastResponse =
+      static_cast<uint32_t>(IntValue(Member(*value, "tpmCrbLastResponse")));
+  summary.tpmCrbLastReadOffset =
+      static_cast<uint64_t>(IntValue(Member(*value, "tpmCrbLastReadOffset")));
+  summary.tpmCrbLastWriteOffset =
+      static_cast<uint64_t>(IntValue(Member(*value, "tpmCrbLastWriteOffset")));
+  summary.tpmCrbCommandSummary =
+      StringValue(Member(*value, "tpmCrbCommandSummary"));
+  summary.tpmPcrExtendTraceSummary =
+      StringValue(Member(*value, "tpmPcrExtendTraceSummary"));
+  summary.tpmPcrFinalBanksSummary =
+      StringValue(Member(*value, "tpmPcrFinalBanksSummary"));
+  summary.acpiTpm2EventLogSummary =
+      StringValue(Member(*value, "acpiTpm2EventLogSummary"));
   summary.fwCfgSmbiosTableBytesRead = static_cast<uint64_t>(
       IntValue(Member(*value, "fwCfgSmbiosTableBytesRead")));
   summary.fwCfgSmbiosAnchorBytesRead = static_cast<uint64_t>(
@@ -606,6 +628,16 @@ DynamicRunSummary ParseDynamicSummary(const JsonValue *value) {
       StringValue(Member(*value, "windowsKernelReadGateEvidence"));
   summary.windowsKernelReadGateFirstTarget =
       StringValue(Member(*value, "windowsKernelReadGateFirstTarget"));
+  summary.windowsUserModeGateReached =
+      BoolValue(Member(*value, "windowsUserModeGateReached"));
+  summary.windowsUserModeGateStatus =
+      StringValue(Member(*value, "windowsUserModeGateStatus"),
+                  StringValue(Member(*value, "userModeGate")));
+  summary.windowsUserModeGateEvidence =
+      StringValue(Member(*value, "windowsUserModeGateEvidence"));
+  summary.windowsUserModeGateFirstTarget =
+      StringValue(Member(*value, "windowsUserModeGateFirstTarget"),
+                  StringValue(Member(*value, "firstUserModeTarget")));
   summary.bootFailureStatus =
       StringValue(Member(*value, "bootFailureStatus"));
   summary.bootFailureStatusName =
@@ -613,6 +645,13 @@ DynamicRunSummary ParseDynamicSummary(const JsonValue *value) {
   summary.bootFailureStatusSource =
       StringValue(Member(*value, "bootFailureStatusSource"));
   summary.bootBlocker = StringValue(Member(*value, "bootBlocker"));
+  summary.bootContractSuspect =
+      StringValue(Member(*value, "bootContractSuspect"));
+  summary.bootContractSuspectDetails =
+      StringValue(Member(*value, "bootContractSuspectDetails"));
+  summary.ciPolicyInventory = StringValue(Member(*value, "ciPolicyInventory"));
+  summary.bootstatScalarSummary =
+      StringValue(Member(*value, "bootstatScalarSummary"));
   summary.cpuidDiagnostics = StringArrayValue(Member(*value, "cpuidDiagnostics"));
   summary.bootStage = StringValue(Member(*value, "bootStage"));
   summary.bootMilestones = StringArrayValue(Member(*value, "bootMilestones"));
@@ -1102,6 +1141,21 @@ std::string BuildHtmlReportWithFrames(const AnalysisReport &report,
            << HtmlEscape(report.dynamicSummary.windowsKernelReadGateFirstTarget)
            << "</div>";
     }
+    if (!report.dynamicSummary.windowsUserModeGateStatus.empty()) {
+      html << "<div class=\"k\">user-mode gate</div><div class=\"mono\">"
+           << HtmlEscape(report.dynamicSummary.windowsUserModeGateStatus)
+           << "</div>";
+    }
+    if (!report.dynamicSummary.windowsUserModeGateEvidence.empty()) {
+      html << "<div class=\"k\">user-mode evidence</div><div>"
+           << HtmlEscape(report.dynamicSummary.windowsUserModeGateEvidence)
+           << "</div>";
+    }
+    if (!report.dynamicSummary.windowsUserModeGateFirstTarget.empty()) {
+      html << "<div class=\"k\">first user-mode target</div><div class=\"mono\">"
+           << HtmlEscape(report.dynamicSummary.windowsUserModeGateFirstTarget)
+           << "</div>";
+    }
     if (!report.dynamicSummary.bootFailureStatus.empty()) {
       html << "<div class=\"k\">boot failure</div><div class=\"mono\">"
            << HtmlEscape(report.dynamicSummary.bootFailureStatus);
@@ -1117,6 +1171,24 @@ std::string BuildHtmlReportWithFrames(const AnalysisReport &report,
     if (!report.dynamicSummary.bootBlocker.empty()) {
       html << "<div class=\"k\">boot blocker</div><div>"
            << HtmlEscape(report.dynamicSummary.bootBlocker) << "</div>";
+    }
+    if (!report.dynamicSummary.bootContractSuspect.empty()) {
+      html << "<div class=\"k\">boot contract suspect</div><div>"
+           << HtmlEscape(report.dynamicSummary.bootContractSuspect) << "</div>";
+    }
+    if (!report.dynamicSummary.bootContractSuspectDetails.empty()) {
+      html << "<div class=\"k\">boot contract details</div><div>"
+           << HtmlEscape(report.dynamicSummary.bootContractSuspectDetails)
+           << "</div>";
+    }
+    if (!report.dynamicSummary.ciPolicyInventory.empty()) {
+      html << "<div class=\"k\">CI policy inventory</div><div class=\"mono\">"
+           << HtmlEscape(report.dynamicSummary.ciPolicyInventory) << "</div>";
+    }
+    if (!report.dynamicSummary.bootstatScalarSummary.empty()) {
+      html << "<div class=\"k\">bootstat scalars</div><div class=\"mono\">"
+           << HtmlEscape(report.dynamicSummary.bootstatScalarSummary)
+           << "</div>";
     }
     html << "<div class=\"k\">vCPU exits</div><div class=\"mono\">"
          << report.dynamicSummary.vcpuExits << "</div>";
@@ -1210,6 +1282,35 @@ std::string BuildHtmlReportWithFrames(const AnalysisReport &report,
            << report.dynamicSummary.com1RxBytesRead
            << ", IER 0x" << std::hex << std::uppercase
            << report.dynamicSummary.com1Ier << std::dec << "</div>";
+    }
+    if (report.dynamicSummary.tpmCrbReads != 0 ||
+        report.dynamicSummary.tpmCrbWrites != 0 ||
+        report.dynamicSummary.tpmCrbCommands != 0 ||
+        !report.dynamicSummary.tpmCrbCommandSummary.empty()) {
+      html << "<div class=\"k\">TPM2 CRB</div><div class=\"mono\">";
+      if (!report.dynamicSummary.tpmCrbCommandSummary.empty()) {
+        html << HtmlEscape(report.dynamicSummary.tpmCrbCommandSummary);
+      } else {
+        html << "reads/writes " << report.dynamicSummary.tpmCrbReads << "/"
+             << report.dynamicSummary.tpmCrbWrites << ", commands "
+             << report.dynamicSummary.tpmCrbCommands;
+      }
+      html << "</div>";
+    }
+    if (!report.dynamicSummary.tpmPcrExtendTraceSummary.empty()) {
+      html << "<div class=\"k\">TPM PCR extend trace</div><div class=\"mono\">"
+           << HtmlEscape(report.dynamicSummary.tpmPcrExtendTraceSummary)
+           << "</div>";
+    }
+    if (!report.dynamicSummary.tpmPcrFinalBanksSummary.empty()) {
+      html << "<div class=\"k\">TPM PCR final banks</div><div class=\"mono\">"
+           << HtmlEscape(report.dynamicSummary.tpmPcrFinalBanksSummary)
+           << "</div>";
+    }
+    if (!report.dynamicSummary.acpiTpm2EventLogSummary.empty()) {
+      html << "<div class=\"k\">ACPI TPM2 event log</div><div class=\"mono\">"
+           << HtmlEscape(report.dynamicSummary.acpiTpm2EventLogSummary)
+           << "</div>";
     }
     if (report.dynamicSummary.keyboardScancodesInjected != 0 ||
         report.dynamicSummary.ps2StatusReads != 0 ||

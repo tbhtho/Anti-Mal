@@ -8,9 +8,9 @@
 // the TPM responds to TPM2_Startup. Without that, ci.dll / VBS init
 // inside winload aborts and bootmgr renders 0xc0000225.
 //
-// What this is NOT: a real TPM. Every command returns TPM_RC_SUCCESS
-// with a zero-payload response. Real PCR extends are discarded. Real
-// random numbers come from a deterministic counter, not /dev/urandom.
+// What this is NOT: a real TPM. Only the boot-time command shapes used by
+// OVMF/winload return structured payloads. Real PCR extends are discarded.
+// Real random numbers come from a deterministic counter, not /dev/urandom.
 // We are forging "TPM is present and healthy" so winload's existence
 // check stops gating boot. Any real cryptographic operation that
 // actually relies on the TPM's responses (BitLocker unlock, measured-
@@ -25,9 +25,22 @@
 
 #include <array>
 #include <cstdint>
+#include <map>
 #include <vector>
 
 namespace antimal::hv {
+
+struct TpmPcrDigestTrace {
+  uint16_t algorithm = 0;
+  std::vector<uint8_t> inputDigest;
+  std::vector<uint8_t> resultingPcr;
+};
+
+struct TpmPcrExtendTrace {
+  uint64_t sequence = 0;
+  uint32_t pcrIndex = 0;
+  std::vector<TpmPcrDigestTrace> digests;
+};
 
 class Tpm2CrbDevice final : public IMmioDevice {
 public:
@@ -53,6 +66,26 @@ public:
   uint64_t CommandsProcessed() const noexcept { return commandsProcessed_; }
   uint32_t LastCommandCode() const noexcept { return lastCommandCode_; }
   uint32_t LastResponseCode() const noexcept { return lastResponseCode_; }
+  uint64_t LastReadOffset() const noexcept { return lastReadOffset_; }
+  uint64_t LastWriteOffset() const noexcept { return lastWriteOffset_; }
+  const std::map<uint32_t, uint64_t> &CommandHistogram() const noexcept {
+    return commandHistogram_;
+  }
+  const std::vector<uint32_t> &RecentCommands() const noexcept {
+    return recentCommands_;
+  }
+  const std::vector<TpmPcrExtendTrace> &PcrExtendTrace() const noexcept {
+    return pcrExtendTrace_;
+  }
+  const std::array<std::array<uint8_t, 20>, 24> &PcrSha1Bank()
+      const noexcept {
+    return pcrSha1_;
+  }
+  const std::array<std::array<uint8_t, 32>, 24> &PcrSha256Bank()
+      const noexcept {
+    return pcrSha256_;
+  }
+  uint32_t InterfaceIdRegister() const noexcept { return interfaceId_; }
   uint8_t LocStateRegister() const noexcept { return locState_; }
   uint8_t LocStsRegister() const noexcept { return locSts_; }
   uint32_t CrbCtrlReq() const noexcept { return crbCtrlReq_; }
@@ -64,8 +97,12 @@ private:
   static constexpr uint64_t kRegLocState        = 0x00; // 1 byte (we widen to 4-byte access)
   static constexpr uint64_t kRegLocCtrl         = 0x08; // 1 byte
   static constexpr uint64_t kRegLocSts          = 0x0C; // 1 byte
+  static constexpr uint64_t kRegFifoIntfCap     = 0x14; // 4 bytes, FIFO alias
+  static constexpr uint64_t kRegFifoStatusEx    = 0x1B; // 1 byte, FIFO alias
   static constexpr uint64_t kRegInterfaceId     = 0x30; // 4 bytes
-  static constexpr uint64_t kRegIntfCapability  = 0x34; // 4 bytes
+  static constexpr uint64_t kRegVid             = 0x34; // 2 bytes
+  static constexpr uint64_t kRegDid             = 0x36; // 2 bytes
+  static constexpr uint64_t kRegCtrlExt         = 0x38; // 8 bytes
   static constexpr uint64_t kRegCtrlReq         = 0x40; // 4 bytes
   static constexpr uint64_t kRegCtrlSts         = 0x44; // 4 bytes
   static constexpr uint64_t kRegCtrlCancel      = 0x48; // 4 bytes
@@ -89,13 +126,22 @@ private:
   static constexpr uint32_t kCtrlStsTpmSts           = 1u << 0;
   static constexpr uint32_t kCtrlStsTpmIdle          = 1u << 1;
   static constexpr uint32_t kCtrlStartGo             = 1u << 0;
+  static constexpr uint32_t kInterfaceSelectorMask   = 0x3u << 17;
 
   // TPM2 wire constants (big-endian on the wire).
   static constexpr uint16_t kTpmStNoSessions = 0x8001;
+  static constexpr uint16_t kTpmStSessions   = 0x8002;
   static constexpr uint32_t kTpmRcSuccess    = 0x00000000;
 
+  uint64_t ReadRegisterWindow(uint64_t offset, uint8_t accessSize) const;
   void RunCommand();
-  void WriteSuccessResponseHeader(uint32_t additionalBodyBytes);
+  void ApplyPcrExtend(const uint8_t *command, uint32_t commandSize);
+  std::vector<uint8_t> BuildPcrReadResponseBody(const uint8_t *command,
+                                                uint32_t commandSize) const;
+  void WriteSuccessResponseHeader(uint16_t responseTag,
+                                  uint32_t additionalBodyBytes);
+  void WriteSuccessResponseBody(uint16_t responseTag,
+                                const std::vector<uint8_t> &body);
   static uint16_t ReadBe16(const uint8_t *p);
   static uint32_t ReadBe32(const uint8_t *p);
   static void WriteBe16(uint8_t *p, uint16_t v);
@@ -107,6 +153,8 @@ private:
   uint8_t  locState_ = kLocStateRegValidSts;  // bit 7 = valid; activeLocality=0
   uint8_t  locCtrl_ = 0;
   uint8_t  locSts_ = 0;                       // bit 0 cleared until request
+  uint32_t interfaceId_ = 0;
+  uint64_t crbControlExtension_ = 0;
   uint32_t crbCtrlReq_ = 0;
   uint32_t crbCtrlSts_ = kCtrlStsTpmIdle;     // start idle
   uint32_t crbCtrlCancel_ = 0;
@@ -129,6 +177,16 @@ private:
   uint64_t commandsProcessed_ = 0;
   uint32_t lastCommandCode_ = 0;
   uint32_t lastResponseCode_ = 0;
+  uint64_t lastReadOffset_ = 0;
+  uint64_t lastWriteOffset_ = 0;
+  uint32_t pcrUpdateCounter_ = 0;
+  uint32_t randomCounter_ = 0xA5A5A5A5u;
+  uint64_t clockTicks_ = 1;
+  std::array<std::array<uint8_t, 20>, 24> pcrSha1_{};
+  std::array<std::array<uint8_t, 32>, 24> pcrSha256_{};
+  std::vector<TpmPcrExtendTrace> pcrExtendTrace_;
+  std::map<uint32_t, uint64_t> commandHistogram_;
+  std::vector<uint32_t> recentCommands_;
 };
 
 } // namespace antimal::hv

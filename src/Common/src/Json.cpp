@@ -275,6 +275,20 @@ std::string ToJson(const DynamicRunSummary &summary) {
   obj.AddBool("com1RxInterruptEnabled", summary.com1RxInterruptEnabled);
   obj.AddBool("com1RxDataReady", summary.com1RxDataReady);
   obj.AddString("com1TouchStatus", summary.com1TouchStatus);
+  obj.AddNumber("tpmCrbReads", summary.tpmCrbReads);
+  obj.AddNumber("tpmCrbWrites", summary.tpmCrbWrites);
+  obj.AddNumber("tpmCrbCommands", summary.tpmCrbCommands);
+  obj.AddNumber("tpmCrbLastCommand", summary.tpmCrbLastCommand);
+  obj.AddNumber("tpmCrbLastResponse", summary.tpmCrbLastResponse);
+  obj.AddNumber("tpmCrbLastReadOffset", summary.tpmCrbLastReadOffset);
+  obj.AddNumber("tpmCrbLastWriteOffset", summary.tpmCrbLastWriteOffset);
+  obj.AddString("tpmCrbCommandSummary", summary.tpmCrbCommandSummary);
+  obj.AddString("tpmPcrExtendTraceSummary",
+                summary.tpmPcrExtendTraceSummary);
+  obj.AddString("tpmPcrFinalBanksSummary",
+                summary.tpmPcrFinalBanksSummary);
+  obj.AddString("acpiTpm2EventLogSummary",
+                summary.acpiTpm2EventLogSummary);
   obj.AddNumber("fwCfgSmbiosTableBytesRead",
                 summary.fwCfgSmbiosTableBytesRead);
   obj.AddNumber("fwCfgSmbiosAnchorBytesRead",
@@ -304,10 +318,27 @@ std::string ToJson(const DynamicRunSummary &summary) {
                 summary.windowsKernelReadGateEvidence);
   obj.AddString("windowsKernelReadGateFirstTarget",
                 summary.windowsKernelReadGateFirstTarget);
+  obj.AddString("kernelReadGate", summary.windowsKernelReadGateStatus);
+  obj.AddBool("windowsUserModeGateReached",
+              summary.windowsUserModeGateReached);
+  obj.AddString("windowsUserModeGateStatus",
+                summary.windowsUserModeGateStatus);
+  obj.AddString("windowsUserModeGateEvidence",
+                summary.windowsUserModeGateEvidence);
+  obj.AddString("windowsUserModeGateFirstTarget",
+                summary.windowsUserModeGateFirstTarget);
+  obj.AddString("userModeGate", summary.windowsUserModeGateStatus);
+  obj.AddString("firstUserModeTarget",
+                summary.windowsUserModeGateFirstTarget);
   obj.AddString("bootFailureStatus", summary.bootFailureStatus);
   obj.AddString("bootFailureStatusName", summary.bootFailureStatusName);
   obj.AddString("bootFailureStatusSource", summary.bootFailureStatusSource);
   obj.AddString("bootBlocker", summary.bootBlocker);
+  obj.AddString("bootContractSuspect", summary.bootContractSuspect);
+  obj.AddString("bootContractSuspectDetails",
+                summary.bootContractSuspectDetails);
+  obj.AddString("ciPolicyInventory", summary.ciPolicyInventory);
+  obj.AddString("bootstatScalarSummary", summary.bootstatScalarSummary);
   obj.AddRaw("cpuidDiagnostics", JsonStringArray(summary.cpuidDiagnostics));
   obj.AddString("bootStage", summary.bootStage);
   obj.AddRaw("bootMilestones", JsonStringArray(summary.bootMilestones));
