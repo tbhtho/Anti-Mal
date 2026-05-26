@@ -410,6 +410,31 @@ std::vector<uint8_t> BuildNvReadResponseBody() {
 Tpm2CrbDevice::Tpm2CrbDevice(uint64_t mmioBase)
     : mmioBase_(mmioBase), interfaceId_(kInterfaceIdValue) {}
 
+bool Tpm2CrbDevice::ExtendInternal(uint32_t pcrIndex, uint16_t algId,
+                                   const uint8_t *digest, size_t digestSize) {
+  if (!digest || pcrIndex >= pcrSha256_.size()) {
+    return false;
+  }
+  if (algId == kTpmAlgSha1 && digestSize == 20) {
+    std::array<uint8_t, 20> next{};
+    if (HashExtendDigest(BCRYPT_SHA1_ALGORITHM, pcrSha1_[pcrIndex].data(),
+                         pcrSha1_[pcrIndex].size(), digest, digestSize,
+                         next.data(), next.size())) {
+      pcrSha1_[pcrIndex] = next;
+      return true;
+    }
+  } else if (algId == kTpmAlgSha256 && digestSize == 32) {
+    std::array<uint8_t, 32> next{};
+    if (HashExtendDigest(BCRYPT_SHA256_ALGORITHM, pcrSha256_[pcrIndex].data(),
+                         pcrSha256_[pcrIndex].size(), digest, digestSize,
+                         next.data(), next.size())) {
+      pcrSha256_[pcrIndex] = next;
+      return true;
+    }
+  }
+  return false;
+}
+
 uint64_t Tpm2CrbDevice::ReadRegisterWindow(uint64_t offset,
                                            uint8_t accessSize) const {
   std::array<uint8_t, kDataBufferOffset> regs{};

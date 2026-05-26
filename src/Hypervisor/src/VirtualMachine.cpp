@@ -245,7 +245,49 @@ VirtualMachine::VirtualMachine(const std::filesystem::path &firmwarePath,
             static_cast<uint8_t>((eventSize >> 16) & 0xFF);
         log[eventSizeOffset + 3] =
             static_cast<uint8_t>((eventSize >> 24) & 0xFF);
+
+        // Append TCG_PCR_EVENT2 entries for PCR0..PCR7 with EV_SEPARATOR
+        // (TCG_EvSeparator = 0x00000004). Per TCG PC Client Platform
+        // Firmware Profile §10.4.1, firmware records a separator event into
+        // every PCR in the [0,7] range before invoking the OS loader; OS
+        // measured-boot logic uses the separator presence + value to know
+        // the firmware phase is complete. Digest = SHA1/SHA256 of
+        // {0xFF,0xFF,0xFF,0xFF}. EventData = same 4 bytes.
+        constexpr uint8_t kSepSha1[20] = {
+            0xD9, 0xBE, 0x65, 0x24, 0xA5, 0xF5, 0x04, 0x7D, 0xB5, 0x86,
+            0x68, 0x13, 0xAC, 0xF3, 0x27, 0x78, 0x92, 0xA7, 0xA3, 0x0A};
+        constexpr uint8_t kSepSha256[32] = {
+            0xAD, 0x95, 0x13, 0x1B, 0xC0, 0xB7, 0x99, 0xC0, 0xB1, 0xAF,
+            0x47, 0x7F, 0xB1, 0x4F, 0xCF, 0x26, 0xA6, 0xA9, 0xF7, 0x60,
+            0x79, 0xE4, 0x8B, 0xF0, 0x90, 0xAC, 0xB7, 0xE8, 0x36, 0x7B,
+            0xFD, 0x0E};
+        constexpr uint32_t kEvSeparator = 0x00000004;
+        for (uint32_t pcr = 0; pcr < 8; ++pcr) {
+          if (w + 120 > kTpmEventLogSize) break;
+          putLe32(pcr);                  // PCRIndex
+          putLe32(kEvSeparator);         // EventType
+          putLe32(2);                    // DigestValues.count
+          // SHA1 digest
+          putLe16(0x0004);               // alg = SHA1
+          for (uint8_t b : kSepSha1) log[w++] = b;
+          // SHA256 digest
+          putLe16(0x000B);               // alg = SHA256
+          for (uint8_t b : kSepSha256) log[w++] = b;
+          // EventSize + EventData (separator value)
+          putLe32(4);
+          log[w++] = 0xFF;
+          log[w++] = 0xFF;
+          log[w++] = 0xFF;
+          log[w++] = 0xFF;
+        }
+        tpmEventLogBytesWritten_ = static_cast<uint32_t>(w);
         tpmEventLogPopulated_ = true;
+        // Mirror these separator extends into the in-stub PCR banks so
+        // PCR_Read returns the same digests the log advertises.
+        for (uint32_t pcr = 0; pcr < 8; ++pcr) {
+          tpm_.ExtendInternal(pcr, /*algId=*/0x0004, kSepSha1, 20);
+          tpm_.ExtendInternal(pcr, /*algId=*/0x000B, kSepSha256, 32);
+        }
       }
     }
     if (fwGpa > kMmioGapEnd) {

@@ -489,6 +489,7 @@ private:
   // this to decide whether to populate the LAML/LASA fields of the TPM2
   // table so winload's measured-boot path can locate the pre-boot log.
   bool tpmEventLogPopulated_ = false;
+  uint32_t tpmEventLogBytesWritten_ = 0;
   BochsVbeDevice vbe_;
   IoBus bus_;
   MmioBus mmioBus_;

@@ -85,6 +85,14 @@ public:
       const noexcept {
     return pcrSha256_;
   }
+  // Host-side PCR extend, used by VirtualMachine when it pre-populates the
+  // ACPI TPM 2.0 event log with pretend firmware measurements (e.g. the
+  // mandatory PCR0..7 EV_SEPARATOR entries). Mirrors PCR_Extend in semantics
+  // but bypasses the CRB command channel — see Tpm2CrbDevice.cpp::RunCommand.
+  // algId: 0x0004 = SHA1, 0x000B = SHA256.
+  bool ExtendInternal(uint32_t pcrIndex, uint16_t algId, const uint8_t *digest,
+                      size_t digestSize);
+
   uint32_t InterfaceIdRegister() const noexcept { return interfaceId_; }
   uint8_t LocStateRegister() const noexcept { return locState_; }
   uint8_t LocStsRegister() const noexcept { return locSts_; }
