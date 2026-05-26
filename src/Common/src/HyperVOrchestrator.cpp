@@ -7125,12 +7125,19 @@ std::string FormatTpmPcrFinalBanks(const hv::VmRunSummary &vm) {
   return out.str();
 }
 
-std::string FormatAcpiTpm2EventLogSummary() {
+std::string FormatAcpiTpm2EventLogSummary(uint32_t laml = 0,
+                                          uint64_t lasa = 0) {
   std::ostringstream out;
   out << "TPM2 table CRB controlArea=0x" << std::hex << std::uppercase
       << (hv::Tpm2CrbDevice::kDefaultMmioBase +
-          hv::Tpm2CrbDevice::kControlAreaOffset)
-      << std::dec << " LAML=0 LASA=0; no ACPI TPM event log advertised";
+          hv::Tpm2CrbDevice::kControlAreaOffset);
+  if (laml != 0 && lasa != 0) {
+    out << " LAML=0x" << laml << " LASA=0x" << lasa << std::dec
+        << "; TPM event log advertised at 0x" << std::hex << std::uppercase
+        << lasa << " size=" << std::dec << laml << " bytes";
+  } else {
+    out << std::dec << " LAML=0 LASA=0; no ACPI TPM event log advertised";
+  }
   return out.str();
 }
 
@@ -7260,7 +7267,8 @@ DynamicRunSummary ToDynamicSummary(const hv::VmRunSummary &vm,
   summary.tpmCrbCommandSummary = FormatTpmCommandSummary(vm);
   summary.tpmPcrExtendTraceSummary = FormatTpmPcrExtendTrace(vm);
   summary.tpmPcrFinalBanksSummary = FormatTpmPcrFinalBanks(vm);
-  summary.acpiTpm2EventLogSummary = FormatAcpiTpm2EventLogSummary();
+  summary.acpiTpm2EventLogSummary =
+      FormatAcpiTpm2EventLogSummary(vm.tpmEventLogLaml, vm.tpmEventLogLasa);
   summary.fwCfgSmbiosTableBytesRead = vm.fwCfgSmbiosTableBytesRead;
   summary.fwCfgSmbiosAnchorBytesRead = vm.fwCfgSmbiosAnchorBytesRead;
   summary.keyboardScancodesInjected =
@@ -7588,7 +7596,9 @@ std::string FormatVmDiagnostics(const hv::VmRunSummary &vm) {
     out << "tpmPcrExtendTrace: " << tpmPcrTrace << "\n";
   }
   out << "tpmPcrFinalBanks: " << FormatTpmPcrFinalBanks(vm) << "\n";
-  out << "acpiTpm2EventLog: " << FormatAcpiTpm2EventLogSummary() << "\n";
+  out << "acpiTpm2EventLog: "
+      << FormatAcpiTpm2EventLogSummary(vm.tpmEventLogLaml, vm.tpmEventLogLasa)
+      << "\n";
   out << "ioApicRaises: " << vm.ioApicRaises << "\n";
   out << "ioApicDeliveries: " << vm.ioApicDeliveries << "\n";
   out << "ioApicMaskedDrops: " << vm.ioApicMaskedDrops << "\n";

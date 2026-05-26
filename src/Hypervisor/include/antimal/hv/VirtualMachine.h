@@ -158,6 +158,11 @@ struct VmRunSummary {
   uint64_t lastPageFaultAssistGpa = 0;
   uint32_t mmioReads = 0;
   uint32_t mmioWrites = 0;
+  // TPM 2.0 event log advertisement from the ACPI TPM2 table. Non-zero
+  // when the VM populated firmwareLowScratch with a TCG_EfiSpecIDEvent03
+  // header and pointed LAML/LASA at it.
+  uint32_t tpmEventLogLaml = 0;
+  uint64_t tpmEventLogLasa = 0;
   uint64_t tpmCrbReads = 0;
   uint64_t tpmCrbWrites = 0;
   uint64_t tpmCrbCommands = 0;

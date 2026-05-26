@@ -1861,6 +1861,10 @@ VmRunSummary VirtualMachine::RunLoop(
   summary.pm1SleepRequests = pcIo_.Pm1SleepRequestCount();
   summary.hpetReads = hpet_.Reads();
   summary.hpetWrites = hpet_.Writes();
+  if (tpmEventLogPopulated_) {
+    summary.tpmEventLogLaml = static_cast<uint32_t>(kTpmEventLogSize);
+    summary.tpmEventLogLasa = kTpmEventLogGpa;
+  }
   summary.tpmCrbReads = tpm_.Reads();
   summary.tpmCrbWrites = tpm_.Writes();
   summary.tpmCrbCommands = tpm_.CommandsProcessed();
