@@ -2305,9 +2305,48 @@ int CommandBaseInspect(int argc, wchar_t **argv,
                   << "\n";
         PrintNtfsDataRuns("Windows\\System32\\winload.efi", *winload,
                           windows->firstLba, ntfs.SectorsPerCluster());
+        const auto dumpWinload =
+            OptionValue(argc, argv, "--dump-winload");
+        if (dumpWinload) {
+          const auto bytes = ntfs.ReadFile(*winload, 16ull * 1024ull * 1024ull);
+          if (!bytes.empty()) {
+            const std::filesystem::path outPath(Utf8ToWide(*dumpWinload));
+            std::ofstream of(outPath, std::ios::out | std::ios::binary);
+            if (of) {
+              of.write(reinterpret_cast<const char *>(bytes.data()),
+                       static_cast<std::streamsize>(bytes.size()));
+              std::cout << "Dumped winload.efi (" << bytes.size()
+                        << " bytes) to " << antimal::PathToUtf8(outPath)
+                        << "\n";
+            }
+          }
+        }
       } else {
         std::cout << "MISSING: Windows\\System32\\winload.efi\n";
         ok = false;
+      }
+      // --dump-bootmgfw lets us inspect the bootmgr image too. The visible
+      // WinRE status (0xc0000225, 0xc0430001) is rendered by bootmgfw, not
+      // winload; bootmgfw reads the failure status from bootstat and looks
+      // it up in its own status -> message table.
+      if (const auto dumpBootmgr = OptionValue(argc, argv, "--dump-bootmgfw")) {
+        const auto bootmgrEntry =
+            fat.FindPath("EFI\\Microsoft\\Boot\\bootmgfw.efi");
+        if (bootmgrEntry) {
+          const auto bytes = fat.ReadFile(*bootmgrEntry,
+                                          16ull * 1024ull * 1024ull);
+          if (!bytes.empty()) {
+            const std::filesystem::path outPath(Utf8ToWide(*dumpBootmgr));
+            std::ofstream of(outPath, std::ios::out | std::ios::binary);
+            if (of) {
+              of.write(reinterpret_cast<const char *>(bytes.data()),
+                       static_cast<std::streamsize>(bytes.size()));
+              std::cout << "Dumped bootmgfw.efi (" << bytes.size()
+                        << " bytes) to " << antimal::PathToUtf8(outPath)
+                        << "\n";
+            }
+          }
+        }
       }
       const auto systemHive =
           ntfs.FindPath("Windows\\System32\\config\\SYSTEM");
