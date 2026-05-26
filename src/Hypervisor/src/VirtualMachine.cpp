@@ -32,6 +32,16 @@ constexpr uint64_t kMmioGapStart = 0xFEC00000ull;
 constexpr uint64_t kMmioGapEnd = 0xFEF00000ull;
 constexpr uint64_t kImageSearchBackBytes = 256ull * 1024ull * 1024ull;
 
+// TPM 2.0 event log buffer location in guest physical memory. Sits in the
+// firmwareLowScratch_ RAM mapping (0xFC000000-0xFEC00000) so the guest OS
+// reads it as ordinary RAM. We pre-populate the first record with the TCG
+// EfiSpecIDEvent03 header advertising SHA1 + SHA256 banks; OVMF / winload
+// then walk the log via the TPM2 ACPI table's LAML/LASA fields. Without
+// this, Microsoft.Windows.Kernel.BootEnvironment / SpacebootInitialize
+// aborts the boot with the visible 0xc0430001 WinRE code.
+constexpr uint64_t kTpmEventLogGpa = 0xFEB00000ull;
+constexpr size_t kTpmEventLogSize = 0x10000;
+
 enum class IrqDeliveryBackend {
   Failed,
   IoApic,
@@ -166,6 +176,77 @@ VirtualMachine::VirtualMachine(const std::filesystem::path &firmwarePath,
           host_, kFirmwareApertureBase, lowerSize,
           GuestMemoryProt::ReadWriteExecute);
       std::memset(firmwareLowScratch_->HostPtr(), 0, lowerSize);
+      // Initialize the TPM 2.0 event log Spec ID Event header inside the
+      // firmwareLowScratch RAM region. The first record is the TCG 1.2-format
+      // PCR_EVENT carrying a TCG_EfiSpecIDEventStruct payload that tells the
+      // OS measured-boot path "this log is TPM 2.0, banks SHA1 + SHA256".
+      if (kTpmEventLogGpa >= kFirmwareApertureBase &&
+          kTpmEventLogGpa + kTpmEventLogSize <= kMmioGapStart) {
+        const auto offset =
+            static_cast<size_t>(kTpmEventLogGpa - kFirmwareApertureBase);
+        uint8_t *log = firmwareLowScratch_->HostPtr() + offset;
+        std::memset(log, 0, kTpmEventLogSize);
+        // TCG_PCR_EVENT header (32 bytes + variable event payload):
+        //   uint32_t PCRIndex           = 0
+        //   uint32_t EventType          = EV_NO_ACTION (0x03)
+        //   uint8_t  Digest[20]         = 0
+        //   uint32_t EventSize          = sizeof(TCG_EfiSpecIDEventStruct)
+        // TCG_EfiSpecIDEventStruct (after PCR_EVENT header):
+        //   uint8_t  Signature[16]      = "Spec ID Event03\0"
+        //   uint32_t PlatformClass      = 0 (Client)
+        //   uint8_t  SpecVersionMinor   = 0
+        //   uint8_t  SpecVersionMajor   = 2
+        //   uint8_t  SpecErrata         = 0
+        //   uint8_t  UintnSize          = 2 (64-bit)
+        //   uint32_t NumberOfAlgorithms = 2
+        //   TCG_EfiSpecIdEventAlgorithmSize[NumberOfAlgorithms]
+        //   uint8_t  VendorInfoSize     = 0
+        size_t w = 0;
+        auto putLe32 = [&](uint32_t v) {
+          log[w++] = static_cast<uint8_t>(v & 0xFF);
+          log[w++] = static_cast<uint8_t>((v >> 8) & 0xFF);
+          log[w++] = static_cast<uint8_t>((v >> 16) & 0xFF);
+          log[w++] = static_cast<uint8_t>((v >> 24) & 0xFF);
+        };
+        auto putLe16 = [&](uint16_t v) {
+          log[w++] = static_cast<uint8_t>(v & 0xFF);
+          log[w++] = static_cast<uint8_t>((v >> 8) & 0xFF);
+        };
+        putLe32(0);                       // PCRIndex
+        putLe32(3);                       // EventType = EV_NO_ACTION
+        for (int i = 0; i < 20; ++i) {
+          log[w++] = 0;                   // Digest (zero for EV_NO_ACTION)
+        }
+        const size_t eventSizeOffset = w;
+        putLe32(0);                       // EventSize placeholder
+        const size_t eventStart = w;
+        // EfiSpecIDEvent payload
+        const char kSig[16] = {'S', 'p', 'e', 'c', ' ', 'I', 'D', ' ',
+                               'E', 'v', 'e', 'n', 't', '0', '3', 0};
+        for (int i = 0; i < 16; ++i) {
+          log[w++] = static_cast<uint8_t>(kSig[i]);
+        }
+        putLe32(0);                       // PlatformClass = Client
+        log[w++] = 0;                     // SpecVersionMinor
+        log[w++] = 2;                     // SpecVersionMajor
+        log[w++] = 0;                     // SpecErrata
+        log[w++] = 2;                     // UintnSize = 2 (64-bit)
+        putLe32(2);                       // NumberOfAlgorithms
+        putLe16(0x0004);                  // SHA1 algorithm ID
+        putLe16(20);                      // SHA1 digest size
+        putLe16(0x000B);                  // SHA256 algorithm ID
+        putLe16(32);                      // SHA256 digest size
+        log[w++] = 0;                     // VendorInfoSize
+        const uint32_t eventSize =
+            static_cast<uint32_t>(w - eventStart);
+        log[eventSizeOffset + 0] = static_cast<uint8_t>(eventSize & 0xFF);
+        log[eventSizeOffset + 1] = static_cast<uint8_t>((eventSize >> 8) & 0xFF);
+        log[eventSizeOffset + 2] =
+            static_cast<uint8_t>((eventSize >> 16) & 0xFF);
+        log[eventSizeOffset + 3] =
+            static_cast<uint8_t>((eventSize >> 24) & 0xFF);
+        tpmEventLogPopulated_ = true;
+      }
     }
     if (fwGpa > kMmioGapEnd) {
       const auto upperSize = static_cast<size_t>(fwGpa - kMmioGapEnd);
@@ -187,6 +268,10 @@ VirtualMachine::VirtualMachine(const std::filesystem::path &firmwarePath,
   pcIo_.SetMemoryLayout(layout);
   pcIo_.SetProcessorCount(host_.ProcessorCount());
   pcIo_.SetAcpiTablesEnabled(options.enableAcpiTables);
+  if (tpmEventLogPopulated_) {
+    pcIo_.SetTpmEventLog(kTpmEventLogGpa,
+                          static_cast<uint32_t>(kTpmEventLogSize));
+  }
   if (options.enableFramebuffer) {
     framebuffer_ = std::make_unique<GuestMemoryRegion>(
         host_, BochsVbeDevice::kFramebufferGpa,

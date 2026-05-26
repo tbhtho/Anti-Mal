@@ -4287,6 +4287,10 @@ struct BootOverlayPatchResult {
   bool systemLegacySecurityPatched = false;
   bool hypervisorLaunchOffProbeEnabled = false;
   bool hypervisorLaunchOffPatched = false;
+  bool disableElamProbeEnabled = false;
+  bool disableElamPatched = false;
+  bool winPeProbeEnabled = false;
+  bool winPePatched = false;
   bool ciPolicyOffProbeEnabled = false;
   bool ciPolicyOffAggressive = false;
   bool ciPolicyOffPatched = false;
@@ -5314,6 +5318,40 @@ BootOverlayPatchResult ApplyEphemeralBootOverlay(hv::IBlockDevice &disk) {
             "found",
             "BCD forcelegacyplatform probe failed to set element", &result);
       }
+      bool disableElamChanged = false;
+      result.disableElamProbeEnabled =
+          EnvFlagEnabled("ANTIMAL_PROBE_BCD_DISABLE_ELAM");
+      if (result.disableElamProbeEnabled) {
+        // BcdOSLoaderBoolean_DisableElamDrivers = 0x26000080. ELAM (Early
+        // Launch Anti-Malware) drivers are loaded by winload before kernel
+        // image load; disabling them removes one input to the post-CI
+        // BootEnvironment / SpacebootInitialize path that produces
+        // 0xc0430001 in the WinRE UI.
+        result.notes.push_back(
+            "BCD disableelamdrivers probe enabled by "
+            "ANTIMAL_PROBE_BCD_DISABLE_ELAM");
+        disableElamChanged = PatchBcdLoaderBooleanProbe(
+            bytes, "26000080",
+            &BootOverlayPatchResult::disableElamPatched,
+            "BCD disableelamdrivers probe: default loader Elements key not "
+            "found",
+            "BCD disableelamdrivers probe failed to set element", &result);
+      }
+      bool winPeChanged = false;
+      result.winPeProbeEnabled = EnvFlagEnabled("ANTIMAL_PROBE_BCD_WINPE");
+      if (result.winPeProbeEnabled) {
+        // BcdOSLoaderBoolean_WinPEMode = 0x26000022. Boots Windows in PE
+        // (Pre-installation Environment) mode, which uses a simpler init
+        // path that bypasses Spaceboot/SystemGuard secure-launch entirely.
+        // Useful as a control to prove the BootEnvironment phase is the
+        // remaining gate; not appropriate for normal sandbox runs.
+        result.notes.push_back(
+            "BCD winpe probe enabled by ANTIMAL_PROBE_BCD_WINPE");
+        winPeChanged = PatchBcdLoaderBooleanProbe(
+            bytes, "26000022", &BootOverlayPatchResult::winPePatched,
+            "BCD winpe probe: default loader Elements key not found",
+            "BCD winpe probe failed to set element", &result);
+      }
       result.explicitKernelHalProbeEnabled = ExplicitKernelHalProbeEnabled();
       if (result.explicitKernelHalProbeEnabled) {
         result.notes.push_back(
@@ -5360,7 +5398,8 @@ BootOverlayPatchResult ApplyEphemeralBootOverlay(hv::IBlockDevice &disk) {
           legacyContextChanged || detectHalChanged ||
           forceLegacyPlatformChanged || explicitKernelHalChanged ||
           testSigningChanged || bootUxChanged || loadOptionsChanged ||
-          hypervisorLaunchOffChanged;
+          hypervisorLaunchOffChanged || disableElamChanged ||
+          winPeChanged;
       if (bcdChanged) {
         if (RefreshRegistryHiveHeader(bytes)) {
           result.bcdHeaderRefreshed = true;
@@ -5488,6 +5527,11 @@ BootOverlayPatchDetails(const BootOverlayPatchResult &patch) {
       {"ciPolicyOffPatched", patch.ciPolicyOffPatched ? "true" : "false"},
       {"ciPolicyOffFilesZeroed",
        std::to_string(patch.ciPolicyOffFilesZeroed)},
+      {"disableElamProbeEnabled",
+       patch.disableElamProbeEnabled ? "true" : "false"},
+      {"disableElamPatched", patch.disableElamPatched ? "true" : "false"},
+      {"winPeProbeEnabled", patch.winPeProbeEnabled ? "true" : "false"},
+      {"winPePatched", patch.winPePatched ? "true" : "false"},
       {"scope", "overlay-only"}};
   if (!patch.notes.empty()) {
     details["notes"] = JoinStrings(patch.notes, "; ");

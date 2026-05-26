@@ -479,6 +479,11 @@ private:
   IoApic ioApic_;
   HpetDevice hpet_;
   Tpm2CrbDevice tpm_;
+  // True once the firmwareLowScratch region has been seeded with a
+  // TCG_EfiSpecIDEvent03 header at kTpmEventLogGpa. The ACPI builder uses
+  // this to decide whether to populate the LAML/LASA fields of the TPM2
+  // table so winload's measured-boot path can locate the pre-boot log.
+  bool tpmEventLogPopulated_ = false;
   BochsVbeDevice vbe_;
   IoBus bus_;
   MmioBus mmioBus_;

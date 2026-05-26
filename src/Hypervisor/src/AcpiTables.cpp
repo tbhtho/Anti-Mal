@@ -637,7 +637,8 @@ uint32_t AppendDbgp(std::vector<uint8_t> &out) {
 //   uint8_t[] StartMethodSpecificParameters (12 bytes when StartMethod == 7)
 //   uint32_t  LAML (log area min length)
 //   uint64_t  LASA (log area start address)
-uint32_t AppendTpm2(std::vector<uint8_t> &out, uint64_t controlAreaGpa) {
+uint32_t AppendTpm2(std::vector<uint8_t> &out, uint64_t controlAreaGpa,
+                    uint32_t logAreaMinLength, uint64_t logAreaStartAddress) {
   const auto offset = BeginSdt(out, "TPM2", 4);
   PutLe16(out, 0);              // Platform Class: Client.
   PutLe16(out, 0);              // Reserved.
@@ -646,8 +647,8 @@ uint32_t AppendTpm2(std::vector<uint8_t> &out, uint64_t controlAreaGpa) {
   // Start-method-specific parameters (12 bytes for Start Method 7). All zero
   // for a vanilla CRB device — no special ACPI handoff bytes required.
   out.insert(out.end(), 12, 0);
-  PutLe32(out, 0);              // LAML — no event log advertised.
-  PutLe64(out, 0);              // LASA.
+  PutLe32(out, logAreaMinLength);   // LAML — TPM event log size.
+  PutLe64(out, logAreaStartAddress); // LASA — TPM event log GPA.
   EndSdt(out, offset);
   return offset;
 }
@@ -879,7 +880,9 @@ uint32_t AcpiTableLength(const std::vector<uint8_t> &blob, uint32_t offset) {
          (static_cast<uint32_t>(blob[offset + 7]) << 24);
 }
 
-AcpiBuildArtifacts BuildPcAcpiTables(uint32_t processorCount, bool includeDbgp) {
+AcpiBuildArtifacts BuildPcAcpiTables(uint32_t processorCount, bool includeDbgp,
+                                     uint32_t tpmEventLogSize,
+                                     uint64_t tpmEventLogGpa) {
   AcpiBuildArtifacts artifacts;
   auto &tables = artifacts.tables;
   artifacts.offsets.facs = AppendFacs(tables);
@@ -896,7 +899,9 @@ AcpiBuildArtifacts BuildPcAcpiTables(uint32_t processorCount, bool includeDbgp) 
   artifacts.offsets.dbg2 = AppendDbg2(tables);
   // TPM 2.0 ACPI table — points OVMF's Tcg2Pei/Tcg2Dxe at our CRB stub.
   artifacts.offsets.tpm2 = AppendTpm2(
-      tables, Tpm2CrbDevice::kDefaultMmioBase + Tpm2CrbDevice::kControlAreaOffset);
+      tables,
+      Tpm2CrbDevice::kDefaultMmioBase + Tpm2CrbDevice::kControlAreaOffset,
+      tpmEventLogSize, tpmEventLogGpa);
   if (includeDbgp) {
     artifacts.offsets.rsdt =
         AppendRsdt(tables, {artifacts.offsets.fadt, artifacts.offsets.madt,

@@ -33,7 +33,9 @@ struct AcpiBuildArtifacts {
 };
 
 AcpiBuildArtifacts BuildPcAcpiTables(uint32_t processorCount = 1,
-                                     bool includeDbgp = false);
+                                     bool includeDbgp = false,
+                                     uint32_t tpmEventLogSize = 0,
+                                     uint64_t tpmEventLogGpa = 0);
 
 bool AcpiChecksumValid(const uint8_t *bytes, size_t size);
 uint32_t AcpiTableLength(const std::vector<uint8_t> &blob, uint32_t offset);

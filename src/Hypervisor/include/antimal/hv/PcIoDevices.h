@@ -47,8 +47,20 @@ public:
   }
   void SetProcessorCount(uint32_t count) {
     processorCount_ = count == 0 ? 1u : count;
-    acpi_ = BuildPcAcpiTables(processorCount_);
+    acpi_ = BuildPcAcpiTables(processorCount_, /*includeDbgp=*/false,
+                              tpmEventLogSize_, tpmEventLogGpa_);
     cpuHotplugSelectionValid_ = cpuHotplugSelected_ < processorCount_;
+  }
+  // Set the TPM 2.0 event log advertisement that the ACPI builder feeds into
+  // the TPM2 table's LAML/LASA fields. The VirtualMachine populates the
+  // buffer before booting; without these the OS measured-boot path can't
+  // walk the pre-boot log and aborts in
+  // Microsoft.Windows.Kernel.BootEnvironment / SpacebootInitialize.
+  void SetTpmEventLog(uint64_t gpa, uint32_t size) {
+    tpmEventLogGpa_ = gpa;
+    tpmEventLogSize_ = size;
+    acpi_ = BuildPcAcpiTables(processorCount_, /*includeDbgp=*/false,
+                              tpmEventLogSize_, tpmEventLogGpa_);
   }
   const std::array<uint32_t, 128> &CmosReadHistogram() const noexcept {
     return cmosReadHistogram_;
@@ -187,6 +199,8 @@ private:
   bool vgaControllerPresent_ = false;
   bool acpiTablesEnabled_ = true;
   uint32_t processorCount_ = 1;
+  uint64_t tpmEventLogGpa_ = 0;
+  uint32_t tpmEventLogSize_ = 0;
   uint32_t cpuHotplugSelected_ = 0;
   bool cpuHotplugSelectionValid_ = true;
   uint8_t cpuHotplugCommand_ = 0;
