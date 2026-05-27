@@ -1344,6 +1344,13 @@ struct CiPolicyDefinition {
   const char *guid;
   bool documentedDriverPolicy = false;
   bool aggressiveOnly = false;
+  // EndpointSec (`{60FD87F8-...}`): IDA analysis of winload.efi confirms
+  // SIPolicyIsPolicyActive iterates g_SiPolicyHandles[], populated only by
+  // SIPolicyCommitState after a real .cip file is parsed and validated.
+  // Zeroing this file makes the OS-loader emit 0xC0430001 from
+  // OslpProcessSIPolicy. Preserve it even in aggressive mode -- aggressive
+  // zeroing of OTHER policies still lets the EndpointSec gate open.
+  bool preserveAlways = false;
 };
 
 struct CiPolicyInventoryEntry {
@@ -1362,16 +1369,18 @@ struct CiPolicyInventoryEntry {
 };
 
 constexpr std::array<CiPolicyDefinition, 10> kKnownCiPolicies{{
-    {"{784C4414-79F4-4C32-A6A5-F0FB42A51D0D}", true, false},
-    {"{8F9CB695-5D48-48D6-A329-7202B44607E3}", true, false},
-    {"{0283AC0F-FFF1-49AE-ADA1-8A933130CAD6}", false, true},
-    {"{0939ED82-BFD5-4D32-B58E-D31D3C49715A}", false, true},
-    {"{60FD87F8-4593-44A0-91B0-2E0DA022F248}", false, true},
-    {"{1283AC0F-FFF1-49AE-ADA1-8A933130CAD6}", false, true},
-    {"{1678656C-05EF-481F-BC5B-EBD8C991502D}", false, true},
-    {"{1939ED82-BFD5-4D32-B58E-D31D3C49715A}", false, true},
-    {"{2678656C-05EF-481F-BC5B-EBD8C991502D}", false, true},
-    {"{5DAC656C-21AD-4A02-AB49-649917162E70}", false, true},
+    {"{784C4414-79F4-4C32-A6A5-F0FB42A51D0D}", true, false, false},
+    {"{8F9CB695-5D48-48D6-A329-7202B44607E3}", true, false, false},
+    {"{0283AC0F-FFF1-49AE-ADA1-8A933130CAD6}", false, true, false},
+    {"{0939ED82-BFD5-4D32-B58E-D31D3C49715A}", false, true, false},
+    // EndpointSec — required for OslpProcessSIPolicy to succeed.
+    // Never zero it, even in aggressive mode.
+    {"{60FD87F8-4593-44A0-91B0-2E0DA022F248}", false, true, true},
+    {"{1283AC0F-FFF1-49AE-ADA1-8A933130CAD6}", false, true, false},
+    {"{1678656C-05EF-481F-BC5B-EBD8C991502D}", false, true, false},
+    {"{1939ED82-BFD5-4D32-B58E-D31D3C49715A}", false, true, false},
+    {"{2678656C-05EF-481F-BC5B-EBD8C991502D}", false, true, false},
+    {"{5DAC656C-21AD-4A02-AB49-649917162E70}", false, true, false},
 }};
 
 uint64_t LbaRangeSectors(const LbaRangeLite &range) {
@@ -5138,6 +5147,12 @@ void ApplyCiPolicyOffProbe(hv::IBlockDevice &disk,
     if (policy.aggressiveOnly && !result->ciPolicyOffAggressive) {
       continue;
     }
+    if (policy.preserveAlways) {
+      result->notes.push_back(
+          std::string("preserved ESP CI policy ") + policy.guid +
+          " (required for OslpProcessSIPolicy to succeed)");
+      continue;
+    }
     const std::string path =
         std::string("EFI\\Microsoft\\Boot\\CiPolicies\\Active\\") +
         policy.guid + ".cip";
@@ -5166,6 +5181,12 @@ void ApplyCiPolicyOffProbe(hv::IBlockDevice &disk,
   }
   for (const auto &policy : kKnownCiPolicies) {
     if (policy.aggressiveOnly && !result->ciPolicyOffAggressive) {
+      continue;
+    }
+    if (policy.preserveAlways) {
+      result->notes.push_back(
+          std::string("preserved Windows CI policy ") + policy.guid +
+          " (required for OslpProcessSIPolicy to succeed)");
       continue;
     }
     const std::string path =

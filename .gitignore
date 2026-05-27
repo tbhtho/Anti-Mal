@@ -16,6 +16,8 @@ CMakeFiles/
 *.aps
 *.ncb
 
+# Private development documentation
+
 /docs/
 
 /ARCHITECTURE.md
