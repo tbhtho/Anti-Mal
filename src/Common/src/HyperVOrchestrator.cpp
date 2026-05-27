@@ -4291,6 +4291,8 @@ struct BootOverlayPatchResult {
   bool disableElamPatched = false;
   bool winPeProbeEnabled = false;
   bool winPePatched = false;
+  bool ciEnrollmentProbeEnabled = false;
+  bool ciEnrollmentPatched = false;
   bool ciPolicyOffProbeEnabled = false;
   bool ciPolicyOffAggressive = false;
   bool ciPolicyOffPatched = false;
@@ -5920,6 +5922,78 @@ bool PatchSystemHiveLegacySecurityProbe(std::vector<uint8_t> &bytes,
   return ok;
 }
 
+// Inject a System Integrity policy enrollment for the WDAC EndpointSec class
+// GUID into the offline SYSTEM hive. IDA disassembly of winload.efi traced
+// the visible WinRE `0xc0430001` boundary to `OslpProcessSIPolicy`'s call to
+// `SIPolicyIsPolicyActive(SiPolicyIDEndpointSec)`. That helper walks
+// `HKLM\SYSTEM\<ctrlset>\Control\CI\Enrollments\*\TenantID`; if no
+// enrollment has TenantID = the EndpointSec GUID, the helper returns FALSE
+// and winload bubbles `0xC0430001` back through `OslPrepareTarget`. Adding
+// a valid enrollment subkey here makes the helper return TRUE.
+//
+// References:
+//   IDA work on C:\Temp\winload.efi (build 26100.x), function VA
+//   0x180018484, GUID at .rdata:0x1802B1CE0.
+bool PatchSystemHiveCiEnrollment(std::vector<uint8_t> &bytes,
+                                 BootOverlayPatchResult *result) {
+  MutableHiveView hive(bytes);
+  const auto controlSet =
+      !bytes.empty() && hive.IsValid() ? SelectOfflineControlSet(hive)
+                                       : std::nullopt;
+  if (!controlSet) {
+    if (result) {
+      result->notes.push_back("SYSTEM control set not found for CI enrollment");
+    }
+    return false;
+  }
+  // The Microsoft WDAC EndpointSec policy class GUID. Encoded both in
+  // canonical-string form (the value we write into TenantID) and as the
+  // subkey name itself. Both forms are accepted by SIPolicyIsPolicyActive.
+  constexpr const char *kEndpointSecGuidText =
+      "{60FD87F8-4593-44A0-91B0-2E0DA022F248}";
+  const std::wstring tenantId =
+      L"{60FD87F8-4593-44A0-91B0-2E0DA022F248}";
+
+  const auto enrollments =
+      EnsureHivePath(hive, {*controlSet, "Control", "CI", "Enrollments"});
+  if (!enrollments) {
+    if (result) {
+      result->notes.push_back("CI Enrollments key could not be created");
+    }
+    return false;
+  }
+  const auto child = hive.FindSubkey(*enrollments, kEndpointSecGuidText)
+                         ? hive.FindSubkey(*enrollments, kEndpointSecGuidText)
+                         : hive.CreateAsciiKey(*enrollments,
+                                               kEndpointSecGuidText);
+  if (!child) {
+    if (result) {
+      result->notes.push_back(
+          "CI Enrollments EndpointSec subkey allocation failed");
+    }
+    return false;
+  }
+  if (!hive.SetAsciiStringValue(*child, "TenantID", tenantId)) {
+    if (result) {
+      result->notes.push_back("CI Enrollments TenantID write failed");
+    }
+    return false;
+  }
+  // A small "Enabled" hint that some SIPolicy code paths read to short-
+  // circuit a runtime status check. Harmless when ignored.
+  if (const auto enrollmentsKey =
+          EnsureHivePath(hive, {*controlSet, "Control", "CI", "Enrollments"})) {
+    UpsertHiveDword(hive, *enrollmentsKey, "Active", 1);
+  }
+  if (result) {
+    result->ciEnrollmentPatched = true;
+    result->notes.push_back(
+        "SYSTEM CI Enrollments EndpointSec enrollment injected (winload "
+        "OslpProcessSIPolicy / 0xc0430001 unlock)");
+  }
+  return true;
+}
+
 bool PatchSystemHivePiixCriticalDevices(std::vector<uint8_t> &bytes,
                                         BootOverlayPatchResult *result) {
   MutableHiveView hive(bytes);
@@ -6035,6 +6109,13 @@ bool PatchOverlaySystemBootStorage(hv::IBlockDevice &disk,
   if (SystemLegacySecurityProbeEnabled() &&
       !PatchSystemHiveLegacySecurityProbe(bytes, result)) {
     return false;
+  }
+  if (result) {
+    result->ciEnrollmentProbeEnabled =
+        EnvFlagEnabled("ANTIMAL_PROBE_SYSTEM_CI_ENROLLMENT");
+  }
+  if (result && result->ciEnrollmentProbeEnabled) {
+    PatchSystemHiveCiEnrollment(bytes, result);
   }
   if (RefreshRegistryHiveHeader(bytes)) {
     if (result) {
