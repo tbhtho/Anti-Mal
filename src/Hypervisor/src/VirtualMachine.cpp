@@ -431,6 +431,12 @@ void VirtualMachine::AttachIdeDisk(IBlockDevice *disk) {
               IdeController::kSecondaryLast);
   bus_.Attach(secondaryIde_.get(), IdeController::kSecondaryControl,
               IdeController::kSecondaryControl);
+  // Bus-master IDE (BMDMA / BAR4) register block. PcIoDevices owns these 16 IO
+  // ports; the BAR is OS-relocatable, so we attach at the current base now and
+  // re-attach (see the IO-exit handler) whenever the guest reassigns BAR4.
+  const uint16_t bmdmaBase = pcIo_.IdeBmdmaBase();
+  bus_.Attach(&pcIo_, bmdmaBase, static_cast<uint16_t>(bmdmaBase + 15));
+  pcIo_.ConsumeBmdmaAttachDirty();
 }
 
 uint8_t *VirtualMachine::HostPointerForGpa(uint64_t gpa,
@@ -1501,6 +1507,16 @@ VmRunSummary VirtualMachine::RunLoop(
         const uint64_t mask = IoAccessSizeMask(size);
         vcpu_.WriteRax((io.Rax & ~mask) | (static_cast<uint64_t>(value) & mask));
       }
+      // BAR4 (bus-master IDE) is OS-relocatable. If the guest just reassigned it
+      // via a PCI config write, re-attach the 16-port BMDMA block at the new
+      // base so subsequent BMDMA accesses route to PcIoDevices instead of
+      // falling through to the "no device" default.
+      if (pcIo_.ConsumeBmdmaAttachDirty()) {
+        const uint16_t bmBase = pcIo_.IdeBmdmaBase();
+        if (bmBase != 0) {
+          bus_.Attach(&pcIo_, bmBase, static_cast<uint16_t>(bmBase + 15));
+        }
+      }
       vcpu_.AdvanceRip(instrLen != 0 ? instrLen : io.InstructionByteCount);
       break;
     }
@@ -2133,6 +2149,7 @@ VmRunSummary VirtualMachine::RunLoop(
     summary.ioApicRedir[i] = ioApic_.RedirectionEntry(i);
     summary.ioApicWrites[i] = ioApic_.WriteCount(i);
   }
+  summary.ideConfigSelects = pcIo_.IdeConfigSelects();
   summary.whpIoApicGpaProbe = whpIoApicGpaProbeResult_;
   summary.whpMmioGapBitmap = whpMmioGapBitmap_;
   summary.tpm2TableEnabled = tpm2TableEnabled_;

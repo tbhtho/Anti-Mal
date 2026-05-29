@@ -8555,6 +8555,7 @@ std::string FormatVmDiagnostics(const hv::VmRunSummary &vm) {
     }
   }
   out << "\n";
+  out << "ideConfigSelects: " << vm.ideConfigSelects << "\n";
   out << "hpetReads: " << vm.hpetReads << "\n";
   out << "hpetWrites: " << vm.hpetWrites << "\n";
   out << "pitInterruptsPending: " << vm.pitInterruptsPending << "\n";

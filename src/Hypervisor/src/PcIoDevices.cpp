@@ -472,6 +472,10 @@ uint8_t PcIoDevices::E820Byte(size_t offset) const {
 
 void PcIoDevices::OnWrite(uint16_t port, uint32_t value, uint8_t accessSize) {
   const uint8_t byte = static_cast<uint8_t>(value & 0xFFu);
+  if (OwnsBmdma(port)) {
+    WriteBmdma(port, value, accessSize);
+    return;
+  }
   if (port == kFwCfgSelector) {
     fwCfgSelector_ = static_cast<uint16_t>(value & 0x3FFFu);
     fwCfgOffset_ = 0;
@@ -774,6 +778,9 @@ void PcIoDevices::WritePicData(bool master, uint8_t value) {
 }
 
 uint32_t PcIoDevices::OnRead(uint16_t port, uint8_t accessSize) {
+  if (OwnsBmdma(port)) {
+    return ReadBmdma(port, accessSize);
+  }
   if (port == kFwCfgData) {
     return ReadFwCfgData(accessSize);
   }
@@ -959,6 +966,51 @@ void PcIoDevices::WritePciAddressWindow(uint16_t port, uint32_t value,
   const uint32_t mask = AccessMask(accessSize) << shift;
   pciConfigAddress_ =
       (pciConfigAddress_ & ~mask) | ((value << shift) & mask);
+  // Count selects of the IDE function (enable bit set, bus 0, dev 1, func 1).
+  // Distinguishes "Windows pci.sys enumerated/probed the IDE" (count climbs
+  // well past winload's handful) from "kernel never touched it".
+  if ((pciConfigAddress_ & 0x80000000u) != 0 &&
+      ((pciConfigAddress_ >> 16) & 0xFFu) == 0 &&
+      ((pciConfigAddress_ >> 11) & 0x1Fu) == 1 &&
+      ((pciConfigAddress_ >> 8) & 0x07u) == 1) {
+    ++ideConfigSelects_;
+  }
+}
+
+uint32_t PcIoDevices::ReadBmdma(uint16_t port, uint8_t accessSize) const {
+  const uint16_t offset = static_cast<uint16_t>(port - ideBmdmaBase_);
+  uint32_t result = 0;
+  for (uint8_t i = 0; i < accessSize && (offset + i) < 16; ++i) {
+    uint8_t b = bmdmaRegs_[offset + i];
+    // BMISX (status) lives at channel offsets 2 (primary) and 0x0A (secondary).
+    // Report the bus master as idle (bit 0 clear -- we complete transfers
+    // synchronously, so the guest never observes "active"), keep latched
+    // error/interrupt bits, and advertise both drives as DMA-capable (bits 5/6)
+    // so the intelide miniport keeps DMA enabled instead of disabling the
+    // channel.
+    if (offset + i == 2 || offset + i == 0x0A) {
+      b = static_cast<uint8_t>((b & 0x06u) | 0x60u);
+    }
+    result |= static_cast<uint32_t>(b) << (i * 8);
+  }
+  return result;
+}
+
+void PcIoDevices::WriteBmdma(uint16_t port, uint32_t value, uint8_t accessSize) {
+  const uint16_t offset = static_cast<uint16_t>(port - ideBmdmaBase_);
+  for (uint8_t i = 0; i < accessSize && (offset + i) < 16; ++i) {
+    const uint8_t b = static_cast<uint8_t>((value >> (i * 8)) & 0xFFu);
+    const uint16_t off = static_cast<uint16_t>(offset + i);
+    if (off == 2 || off == 0x0A) {
+      // BMISX: bit 1 (error) and bit 2 (interrupt) are write-1-to-clear.
+      bmdmaRegs_[off] = static_cast<uint8_t>(bmdmaRegs_[off] & ~(b & 0x06u));
+    } else {
+      // BMICX command + BMIDTPX PRD-table pointer are read/write. We do not run
+      // a real PRD transfer yet (PIO still serves IDENTIFY/READ); the block
+      // exists so intelide accepts the controller and creates the channels.
+      bmdmaRegs_[off] = b;
+    }
+  }
 }
 
 void PcIoDevices::WritePciConfigData(uint16_t port, uint32_t value,
@@ -990,6 +1042,17 @@ void PcIoDevices::WritePciConfigData(uint16_t port, uint32_t value,
             (ideBarWriteValues_[index] & ~mask) | ((value << shift) & mask);
         ideBarSizing_[index] =
             (ideBarWriteValues_[index] & 0xFFFFFFFCu) == 0xFFFFFFFCu;
+        // BAR4 (index 4) is the bus-master BMDMA block. When the guest assigns
+        // a real base (not the all-ones sizing probe), latch it and flag the
+        // host to re-attach the 16 BMDMA ports there.
+        if (index == 4 && !ideBarSizing_[4]) {
+          const uint16_t base =
+              static_cast<uint16_t>(ideBarWriteValues_[4] & 0xFFF0u);
+          if (base != 0 && base != ideBmdmaBase_) {
+            ideBmdmaBase_ = base;
+            ideBmdmaAttachDirty_ = true;
+          }
+        }
       }
       return;
     }
@@ -1060,26 +1123,36 @@ uint32_t PcIoDevices::ReadPciConfigDword() const {
     case 0x04:
       return ideCommand_; // IO enabled; BMDMA stays off until emulated.
     case 0x08:
-      // IDE storage class, prog-if 0x00 = PURE legacy compatibility mode: both
-      // channels at the fixed ISA ports (0x1F0/0x3F6 + IRQ14), NOT switchable
-      // to native, NOT bus-master. The previous 0x8A (switchable + bus master)
-      // was inconsistent with our config -- we expose compat-mode BARs while
-      // claiming native/BM capability, which makes Windows' pci.sys mis-size
-      // the BARs and pciide refuse to attach (kernel issues 0 IDE commands ->
-      // INACCESSIBLE_BOOT_DEVICE 0x7B). PIO-only matches what we actually
-      // emulate; the boot disk is small enough that PIO is fine.
-      return 0x01010001u;
+      // IDE storage class 0x01, subclass 0x01, prog-if 0x80 = compatibility-mode
+      // channels (fixed ISA ports 0x1F0/0x3F6 + legacy IRQ14/15) WITH bus-master
+      // DMA capability. A real PIIX4 IDE (8086:7111) is exactly this, and
+      // Windows' intelide miniport expects the bus-master register block (BAR4)
+      // to be present -- without it pciide/intelide never create the IDE
+      // channels, atapi never attaches, and the boot disk is never enumerated
+      // (INACCESSIBLE_BOOT_DEVICE 0x7B, kernel issues 0 IDENTIFYs). The legacy
+      // command/control ports stay hardwired; only the BMDMA block (BAR4) is
+      // PCI-mapped. Revision 0x01.
+      return 0x01018001u;
     case 0x0C:
       return 0x00000000u; // Type-0 header.
     case 0x10:
     case 0x14:
     case 0x18:
     case 0x1C:
-    case 0x20:
       // Compatibility-mode IDE: command/control BARs are unimplemented (the
-      // ports are hardwired to the legacy ISA addresses), and we expose no
-      // bus-master BAR. Reading 0 tells pci.sys these BARs are absent.
+      // ports are hardwired to the legacy ISA addresses 0x1F0/0x3F6/0x170/0x376).
+      // Reading 0 tells pci.sys these BARs are absent.
       return 0;
+    case 0x20:
+      // BAR4: bus-master IDE (BMDMA) register block, a 16-byte IO BAR (8 ports
+      // per channel). During sizing the guest writes all-ones; report the size
+      // mask (16-byte IO BAR -> low nibble 0x1 = IO, bits[3:1]=0). Otherwise
+      // report the current base | IO-indicator. The host re-attaches the 16
+      // BMDMA ports wherever the guest assigns this BAR.
+      if (ideBarSizing_[4]) {
+        return 0xFFFFFFF1u; // ~(16-1) | IO indicator.
+      }
+      return (static_cast<uint32_t>(ideBmdmaBase_) & 0xFFF0u) | 0x1u;
     case 0x3C:
       // Compatibility-mode IDE uses the dedicated legacy IRQ14/15 lines, NOT a
       // PCI INTx interrupt. A real PIIX-class IDE function in compat mode

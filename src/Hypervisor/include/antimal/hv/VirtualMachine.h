@@ -188,6 +188,9 @@ struct VmRunSummary {
   // Per-GSI count of guest writes to each redirection entry. Zero => the HAL
   // never programmed that GSI (its owning device never connected its IRQ).
   uint32_t ioApicWrites[24]{};
+  // # of PCI-config selects of the IDE function (bus0/dev1/func1). Low =>
+  // Windows pci.sys never enumerated the IDE; high => it probed it.
+  uint32_t ideConfigSelects = 0;
   // WHP IOAPIC GPA probe result: 0=not probed, 1=unmap succeeded (WHP had it
   // mapped), 2=unmap failed (was genuinely unmapped), 3=remap succeeded.
   int whpIoApicGpaProbe = 0;

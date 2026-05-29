@@ -141,7 +141,30 @@ public:
   void OnWrite(uint16_t port, uint32_t value, uint8_t accessSize) override;
   uint32_t OnRead(uint16_t port, uint8_t accessSize) override;
 
+  // Bus-master IDE (BMDMA) host integration. BAR4 is OS-relocatable; after each
+  // IO exit the host calls ConsumeBmdmaAttachDirty() and, if true, re-attaches
+  // the 16-port BMDMA block at IdeBmdmaBase() so the block follows the guest's
+  // BAR assignment.
+  uint16_t IdeBmdmaBase() const noexcept { return ideBmdmaBase_; }
+  bool ConsumeBmdmaAttachDirty() noexcept {
+    const bool dirty = ideBmdmaAttachDirty_;
+    ideBmdmaAttachDirty_ = false;
+    return dirty;
+  }
+  // Number of times the guest selected the IDE function (bus0/dev1/func1) via
+  // the PCI config address port. Stays low (winload only) if the Windows kernel
+  // pci.sys never enumerates the device; climbs high once pci.sys + pciide
+  // probe it.
+  uint32_t IdeConfigSelects() const noexcept { return ideConfigSelects_; }
+
 private:
+  uint32_t ReadBmdma(uint16_t port, uint8_t accessSize) const;
+  void WriteBmdma(uint16_t port, uint32_t value, uint8_t accessSize);
+  bool OwnsBmdma(uint16_t port) const noexcept {
+    return ideControllerPresent_ && ideBmdmaBase_ != 0 &&
+           port >= ideBmdmaBase_ &&
+           port < static_cast<uint32_t>(ideBmdmaBase_) + 16u;
+  }
   void RebuildAcpi() {
     acpi_ = BuildPcAcpiTables(processorCount_, /*includeDbgp=*/false,
                               tpmEventLogSize_, tpmEventLogGpa_,
@@ -236,6 +259,16 @@ private:
                                              0x00000171u, 0x00000375u,
                                              0x0000C001u};
   std::array<bool, 5> ideBarSizing_{};
+  // Bus-master IDE (BMDMA / BAR4). Win11's intelide miniport expects a real
+  // PIIX4 IDE (prog-if 0x80) with a working BMDMA register block; without it
+  // pciide/intelide never create the IDE channels so atapi never attaches and
+  // the boot disk is never enumerated (INACCESSIBLE_BOOT_DEVICE 0x7B). BAR4 is
+  // OS-relocatable, so the host re-attaches the 16-port block whenever the
+  // guest reassigns it (ConsumeBmdmaAttachDirty).
+  uint16_t ideBmdmaBase_ = 0xC000;        // current guest-assigned BMDMA base.
+  bool ideBmdmaAttachDirty_ = true;       // base changed -> host must re-attach.
+  std::array<uint8_t, 16> bmdmaRegs_{};   // BMICX/BMISX/BMIDTPX, both channels.
+  uint32_t ideConfigSelects_ = 0;         // # of CF8 selects of dev 1.1 (IDE).
   uint32_t vgaBar0_ = 0x80000008u;
   uint32_t vgaBar0WriteValue_ = 0x80000008u;
   bool vgaBar0Sizing_ = false;
