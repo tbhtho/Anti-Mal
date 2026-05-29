@@ -6367,6 +6367,20 @@ bool PatchSystemHiveLegacySecurityProbe(std::vector<uint8_t> &bytes,
   setDword({*controlSet, "Control", "DeviceGuard", "Scenarios",
             "SystemGuard"},
            "Enabled");
+  // IDA: OslGetEffectiveHvciConfiguration also reads the HVCI Level/Locked
+  // under Scenarios and a HypervisorEnforcedCodeIntegrity DWORD directly under
+  // DeviceGuard (not only Scenarios\...\Enabled). OslGetVsmEnabled treats any
+  // of these as VSM-enabled, which sets BlVsmpSystemPolicy's 0x180 bits and
+  // makes OslpLoadRevocationLists run the failing temporal-policy load. Zero
+  // the registry-sourced HVCI inputs too (no-op when a value is absent).
+  setDword({*controlSet, "Control", "DeviceGuard", "Scenarios",
+            "HypervisorEnforcedCodeIntegrity"},
+           "Locked");
+  setDword({*controlSet, "Control", "DeviceGuard", "Scenarios",
+            "HypervisorEnforcedCodeIntegrity"},
+           "Level");
+  setDword({*controlSet, "Control", "DeviceGuard"},
+           "HypervisorEnforcedCodeIntegrity");
   setDword({*controlSet, "Control", "Lsa"}, "LsaCfgFlags");
   setDword({*controlSet, "Control", "Lsa"}, "RunAsPPL");
   setDword({*controlSet, "Control", "Lsa"}, "RunAsPPLBoot");
