@@ -1368,7 +1368,7 @@ struct CiPolicyInventoryEntry {
   uint64_t sectorsRead = 0;
 };
 
-constexpr std::array<CiPolicyDefinition, 10> kKnownCiPolicies{{
+constexpr std::array<CiPolicyDefinition, 12> kKnownCiPolicies{{
     {"{784C4414-79F4-4C32-A6A5-F0FB42A51D0D}", true, false, false},
     {"{8F9CB695-5D48-48D6-A329-7202B44607E3}", true, false, false},
     {"{0283AC0F-FFF1-49AE-ADA1-8A933130CAD6}", false, true, false},
@@ -1381,6 +1381,16 @@ constexpr std::array<CiPolicyDefinition, 10> kKnownCiPolicies{{
     {"{1939ED82-BFD5-4D32-B58E-D31D3C49715A}", false, true, false},
     {"{2678656C-05EF-481F-BC5B-EBD8C991502D}", false, true, false},
     {"{5DAC656C-21AD-4A02-AB49-649917162E70}", false, true, false},
+    // EModeBase and the {5951A96A} policy: IDA shows winload's
+    // OslpLoadRevocationLists calls BlSIPolicyLoadAndActivateTemporalPolicy
+    // (which loads driver.stl for policy {D2BDA982-...} and aborts in our VM)
+    // whenever SIPolicyIsPolicyActive() is true for EModeBase
+    // ({82443E1E-...}) or {5951A96A-...}. EModeBase ships active on 24H2 and
+    // was the remaining trigger after the others above were zeroed. Zero them
+    // in aggressive mode so OslpLoadRevocationLists returns STATUS_SUCCESS
+    // (skips the revocation-list load) and the boot reaches ntoskrnl.
+    {"{82443E1E-8A39-4B4A-96A8-F40DDC00B9F3}", false, true, false},
+    {"{5951A96A-E0B5-4D3D-8FB8-3E5B61030784}", false, true, false},
 }};
 
 uint64_t LbaRangeSectors(const LbaRangeLite &range) {
