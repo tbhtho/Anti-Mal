@@ -821,6 +821,13 @@ std::vector<uint8_t> BuildTableLoader(const AcpiTableOffsets &offsets,
   LoaderAddPointer(out, kRsdpFile, kAcpiTablesFile, 24, 8);  // RSDP XsdtAddress
   LoaderAddPointer(out, kAcpiTablesFile, kAcpiTablesFile, offsets.fadt + 36, 4);
   LoaderAddPointer(out, kAcpiTablesFile, kAcpiTablesFile, offsets.fadt + 40, 4);
+  // The 64-bit X_FirmwareCtrl / X_Dsdt pointers (offsets 132 / 140) MUST be
+  // relocated too -- modern OVMF and Windows prefer the X_ fields over the
+  // 32-bit FirmwareCtrl/Dsdt. Leaving them as raw blob offsets makes OVMF read
+  // a garbage DSDT pointer and abort table installation after only the FADT
+  // ("installed 1 tables"), so the MADT/APIC never reaches the guest.
+  LoaderAddPointer(out, kAcpiTablesFile, kAcpiTablesFile, offsets.fadt + 132, 8);
+  LoaderAddPointer(out, kAcpiTablesFile, kAcpiTablesFile, offsets.fadt + 140, 8);
   const uint32_t rsdtLength = AcpiTableLength(tables, offsets.rsdt);
   for (uint32_t entryOffset = 36; entryOffset + 4 <= rsdtLength;
        entryOffset += 4) {
