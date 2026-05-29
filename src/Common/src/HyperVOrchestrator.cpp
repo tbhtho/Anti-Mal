@@ -4415,6 +4415,9 @@ struct BootOverlayPatchResult {
   uint32_t ciPolicyOffFilesZeroed = 0;
   bool spacebootPatchProbeEnabled = false;
   bool spacebootPatchApplied = false;
+  bool ciBypassPatchProbeEnabled = false;
+  bool ciBypassWinloadPatched = false;
+  int ciBypassBootmgrFilesPatched = 0;
   std::vector<std::string> notes;
 };
 
@@ -5551,6 +5554,140 @@ void ApplySpacebootPatch(hv::IBlockDevice &disk,
   }
 }
 
+// Overwrite a function prologue with `xor eax,eax; ret` so the function returns
+// STATUS_SUCCESS (0) immediately. Verifies the expected prologue first (build
+// guard), is idempotent if already patched, and repairs the PE image checksum
+// so the loader's 0xC0000221 checksum gate still passes. Returns true if the
+// image now carries the patch.
+bool ForceFunctionReturnZero(std::vector<uint8_t> &image, size_t fo,
+                             const uint8_t *expectedPrologue, size_t expectedLen,
+                             const char *label,
+                             std::vector<std::string> *notes) {
+  static const uint8_t kRet0[3] = {0x33, 0xC0, 0xC3};  // xor eax,eax ; ret
+  if (fo + expectedLen > image.size()) {
+    if (notes)
+      notes->push_back(std::string(label) + ": offset out of range");
+    return false;
+  }
+  if (std::memcmp(image.data() + fo, kRet0, 3) == 0) {
+    if (notes)
+      notes->push_back(std::string(label) + ": already patched (idempotent)");
+    return true;
+  }
+  if (std::memcmp(image.data() + fo, expectedPrologue, expectedLen) != 0) {
+    char hex[48];
+    snprintf(hex, sizeof(hex), "%02X %02X %02X %02X %02X", image[fo],
+             image[fo + 1], image[fo + 2], image[fo + 3], image[fo + 4]);
+    if (notes)
+      notes->push_back(std::string(label) + ": unexpected prologue " + hex +
+                       " (build mismatch) -- not patched");
+    return false;
+  }
+  std::memcpy(image.data() + fo, kRet0, 3);
+  RecomputePeImageChecksum(image);
+  return true;
+}
+
+// Overlay-only code-integrity bypass for boot probes (gate:
+// ANTIMAL_PROBE_PATCH_CI_BYPASS):
+//   (1) winload.efi OslpLoadRevocationLists (RVA 0x1A790 / fo 0x19B90) ->
+//       STATUS_SUCCESS, so the VSM-triggered driver.stl temporal-policy load
+//       (which fails under WHP and aborts winload with 0xc0000225) is skipped
+//       and the boot proceeds to load ntoskrnl.
+//   (2) bootmgr (\EFI\BOOT\BOOTX64.EFI and \EFI\Microsoft\Boot\bootmgfw.efi)
+//       ImgpValidateImageHash (RVA 0x1ABE18 / fo 0x1AB218) -> STATUS_SUCCESS, so
+//       bootmgr accepts the byte-modified winload.efi instead of rejecting it
+//       with 0xC0000428. OVMF loads the modified bootmgr because Secure Boot is
+//       off in our firmware; each image's PE checksum is repaired so the loader
+//       checksum gate (0xC0000221) still passes.
+// Overlay-only; the base VHDX is never written.
+void ApplyCiBypassPatch(hv::IBlockDevice &disk, Fat32OverlayEditor &fat,
+                        const std::vector<GptPartitionLite> &partitions,
+                        BootOverlayPatchResult *result) {
+  if (!result) {
+    return;
+  }
+  result->ciBypassPatchProbeEnabled =
+      EnvFlagEnabled("ANTIMAL_PROBE_PATCH_CI_BYPASS");
+  if (!result->ciBypassPatchProbeEnabled) {
+    return;
+  }
+  result->notes.push_back(
+      "CI-bypass patch enabled by ANTIMAL_PROBE_PATCH_CI_BYPASS");
+  constexpr size_t kMaxImage = 8ull * 1024ull * 1024ull;
+
+  // (1) winload.efi on the NTFS Windows partition. Skip the entire failing CI
+  //     subsystem (OslInitializeCodeIntegrity, fo 0x1697C) -- it aborts before
+  //     ntoskrnl under WHP regardless of policy/registry -- and force winload's
+  //     own image-hash validator (ImgpValidateImageHash, fo 0x195FB0) to accept
+  //     the modules it then loads, since the CI catalogs are no longer set up.
+  static constexpr size_t kOslCiInitFo = 0x1697C;       // OslInitializeCodeIntegrity
+  static constexpr size_t kWinloadValidateFo = 0x195FB0; // ImgpValidateImageHash
+  static const uint8_t kWinloadProl[5] = {0x48, 0x8B, 0xC4, 0x4C, 0x89};
+  const auto windows =
+      std::find_if(partitions.begin(), partitions.end(),
+                   [](const GptPartitionLite &p) {
+                     return IsWindowsBasicDataGuid(p.typeGuid);
+                   });
+  if (windows == partitions.end()) {
+    result->notes.push_back("CI-bypass: Windows partition not found");
+  } else {
+    NtfsBootFileLocator ntfs(disk, windows->firstLba);
+    if (!ntfs.Init()) {
+      result->notes.push_back("CI-bypass: NTFS not readable");
+    } else if (const auto entry = ntfs.FindPath("Windows\\System32\\winload.efi")) {
+      auto bytes = ntfs.ReadFile(*entry, kMaxImage);
+      if (bytes.size() == entry->size) {
+        const bool p1 = ForceFunctionReturnZero(
+            bytes, kOslCiInitFo, kWinloadProl, 5,
+            "winload OslInitializeCodeIntegrity", &result->notes);
+        const bool p2 = ForceFunctionReturnZero(
+            bytes, kWinloadValidateFo, kWinloadProl, 5,
+            "winload ImgpValidateImageHash", &result->notes);
+        if ((p1 || p2) && ntfs.WriteFileSameSize(*entry, bytes)) {
+          result->ciBypassWinloadPatched = true;
+          result->notes.push_back(
+              "winload.efi CI-init + image-hash validation forced to "
+              "STATUS_SUCCESS");
+        } else if (p1 || p2) {
+          result->notes.push_back("CI-bypass: winload WriteFileSameSize failed");
+        }
+      }
+    } else {
+      result->notes.push_back("CI-bypass: winload.efi not found");
+    }
+  }
+
+  // (2) bootmgr copies on the ESP.
+  static constexpr size_t kValidateFo = 0x1AB218;
+  static const uint8_t kBootmgrProl[5] = {0x48, 0x8B, 0xC4, 0x4C, 0x89};
+  for (const char *path :
+       {"EFI\\BOOT\\BOOTX64.EFI", "EFI\\Microsoft\\Boot\\bootmgfw.efi"}) {
+    const auto entry = fat.FindPath(path);
+    if (!entry || (entry->attributes & 0x10u) != 0) {
+      result->notes.push_back(std::string("CI-bypass: ") + path + " not found");
+      continue;
+    }
+    auto bytes = fat.ReadFile(*entry, kMaxImage);
+    if (bytes.size() != entry->size) {
+      result->notes.push_back(std::string("CI-bypass: ") + path +
+                              " read failed");
+      continue;
+    }
+    if (ForceFunctionReturnZero(bytes, kValidateFo, kBootmgrProl, 5, path,
+                                &result->notes)) {
+      if (fat.WriteFileSameSize(*entry, bytes)) {
+        ++result->ciBypassBootmgrFilesPatched;
+        result->notes.push_back(std::string(path) +
+                                " ImgpValidateImageHash forced to STATUS_SUCCESS");
+      } else {
+        result->notes.push_back(std::string("CI-bypass: ") + path +
+                                " WriteFileSameSize failed");
+      }
+    }
+  }
+}
+
 BootOverlayPatchResult ApplyEphemeralBootOverlay(hv::IBlockDevice &disk) {
   BootOverlayPatchResult result;
   result.attempted = true;
@@ -5887,6 +6024,7 @@ BootOverlayPatchResult ApplyEphemeralBootOverlay(hv::IBlockDevice &disk) {
     result.notes.push_back("bootstat.dat not found on ESP");
   }
   ApplySpacebootPatch(disk, partitions, &result);
+  ApplyCiBypassPatch(disk, fat, partitions, &result);
   PatchOverlaySystemBootStorage(disk, &result);
   return result;
 }
@@ -5979,6 +6117,12 @@ BootOverlayPatchDetails(const BootOverlayPatchResult &patch) {
        patch.spacebootPatchProbeEnabled ? "true" : "false"},
       {"spacebootPatchApplied",
        patch.spacebootPatchApplied ? "true" : "false"},
+      {"ciBypassPatchProbeEnabled",
+       patch.ciBypassPatchProbeEnabled ? "true" : "false"},
+      {"ciBypassWinloadPatched",
+       patch.ciBypassWinloadPatched ? "true" : "false"},
+      {"ciBypassBootmgrFilesPatched",
+       std::to_string(patch.ciBypassBootmgrFilesPatched)},
       {"scope", "overlay-only"}};
   if (!patch.notes.empty()) {
     details["notes"] = JoinStrings(patch.notes, "; ");
