@@ -143,6 +143,16 @@ public:
   HRESULT RequestFixedInterrupt(uint8_t vector) noexcept;
   bool TryRequestFixedInterrupt(uint8_t vector) noexcept;
 
+  // Re-injects a page fault (#PF, vector 14) into the guest so the guest's own
+  // IDT handler services it. Queues a pending exception event with the given
+  // error code and faulting linear address (delivered as CR2). Used when WHP
+  // intercepts a guest #PF that the host does not need to assist — e.g. kernel
+  // demand paging, copy-on-write, or an SEH-protected probe (ProbeForRead
+  // touching MmUserProbeAddress). On real hardware these faults are entirely
+  // the guest's business; re-injecting keeps that transparent instead of
+  // killing the VM. Returns false if the WHP register write fails.
+  bool TryInjectPageFault(uint64_t faultingAddress, uint32_t errorCode) noexcept;
+
 private:
   WHV_PARTITION_HANDLE partition_ = nullptr;
   uint32_t index_ = 0;

@@ -1206,6 +1206,15 @@ VmRunSummary VirtualMachine::RunLoop(
 
   uint64_t lastCanceledRip = 0;
   int sameCanceledRipStreak = 0;
+  // Re-injected #PF loop guard: if the identical (RIP, CR2) fault recurs this
+  // many times in a row the guest can neither resolve nor unwind it, so we stop
+  // re-injecting and treat it as fatal. Generous so it never trips on normal
+  // boot behaviour (an SEH probe unwinds away from the faulting RIP after one
+  // re-injection; demand paging resolves and the retry succeeds).
+  constexpr int kMaxReinjectedFaultStreak = 256;
+  uint64_t lastReinjectedFaultRip = 0;
+  uint64_t lastReinjectedFaultCr2 = ~0ull;
+  int reinjectedFaultStreak = 0;
   int stepsSinceProgress = 0;
   uint64_t lastIdeCommands = 0;
   const auto runStarted = std::chrono::steady_clock::now();
@@ -1455,6 +1464,32 @@ VmRunSummary VirtualMachine::RunLoop(
         madeProgress = true;
         break;
       }
+      // Not a host-assisted firmware fault: this is the guest's own page fault
+      // (kernel demand paging, copy-on-write, a guard page, or an SEH-protected
+      // probe such as ProbeForRead touching MmUserProbeAddress=0x7FFFFFFF0000).
+      // On hardware the guest's IDT #PF handler resolves or SEH-unwinds it, so
+      // re-inject it rather than killing the VM. WHP delivers it through the
+      // guest IDT with CR2 set from the faulting address. This is the gate that
+      // used to murder the boot the instant ntoskrnl ran its first probe.
+      if (ex.ExceptionType == WHvX64ExceptionTypePageFault) {
+        const uint64_t faultRip = ctx.VpContext.Rip;
+        if (faultRip == lastReinjectedFaultRip &&
+            ex.ExceptionParameter == lastReinjectedFaultCr2) {
+          ++reinjectedFaultStreak;
+        } else {
+          lastReinjectedFaultRip = faultRip;
+          lastReinjectedFaultCr2 = ex.ExceptionParameter;
+          reinjectedFaultStreak = 1;
+        }
+        if (reinjectedFaultStreak < kMaxReinjectedFaultStreak &&
+            vcpu_.TryInjectPageFault(ex.ExceptionParameter, ex.ErrorCode)) {
+          ++summary.pageFaultsReinjected;
+          summary.lastReinjectedFaultGva = ex.ExceptionParameter;
+          summary.lastReinjectedFaultErrorCode = ex.ErrorCode;
+          madeProgress = true;
+          break;
+        }
+      }
       ++summary.unhandledOther;
       summary.fatal = true;
       summary.fatalReason = reason;
@@ -1538,19 +1573,31 @@ VmRunSummary VirtualMachine::RunLoop(
             cancelRip > 0 && readGpaByte(cancelRip - 1, &prevOpcode) &&
             prevOpcode == 0xF4u;
         const bool canceledAtHlt = hltAtRip || hltBeforeRip;
+        // RFLAGS.IF set => the guest is INTERRUPTIBLE: it is waiting for an
+        // interrupt (KiIdleLoop's STI;HLT, a clock/event wait, the idle helper
+        // we park in between ticks), not hard-wedged. A healthy booting kernel
+        // runs with IF=1 and advances on each clock tick / DPC. Only a guest
+        // spinning with interrupts DISABLED (IF=0) at one RIP is a true wedge.
+        // Without this, the idleLoop detector murdered the kernel the instant
+        // it reached its idle loop (Phase 1, bootvid spinner already animating).
+        const bool interruptsEnabled = (state.rflags & 0x200ull) != 0;
         summary.lastCanceledRip = cancelRip;
         summary.lastCanceledOpcode = opcode;
         summary.lastCanceledAtHlt = canceledAtHlt;
 
-        if (canceledAtHlt) {
-          ++summary.totalHlts;
-          if (hltAtRip) {
-            vcpu_.AdvanceRip(1);
+        if (canceledAtHlt || interruptsEnabled) {
+          if (canceledAtHlt) {
+            ++summary.totalHlts;
+            if (hltAtRip) {
+              vcpu_.AdvanceRip(1);
+            }
           }
           injectLapicTimer(vcpu_);
-          // A cancellation at HLT is the watchdog catching the guest waiting
-          // for an interrupt. The watchdog thread already injects one each
-          // tick; treat this as in-progress, not stuck.
+          // The watchdog caught the guest waiting for an interrupt (at HLT or
+          // simply with interrupts enabled). The watchdog + IOAPIC keep feeding
+          // ticks; treat this as in-progress, not stuck, and reset the wedge
+          // streak so a healthy idle never trips the idleLoop kill.
+          sameCanceledRipStreak = 0;
           madeProgress = true;
           break;
         }
@@ -1570,6 +1617,15 @@ VmRunSummary VirtualMachine::RunLoop(
         // though it isn't sitting on a HLT â€” give up.
         summary.idleLoop = true;
       }
+      break;
+    case WHvRunVpExitReasonX64InterruptWindow:
+      // WHP raises this (exit reason 7) when an interrupt is pending but the
+      // guest currently can't take it (RFLAGS.IF=0 or an interrupt shadow). We
+      // don't arm deliverability notifications, so this is rare, but it is
+      // never fatal: re-assert the LAPIC timer tick and continue so WHP
+      // delivers the pending interrupt once the guest re-enables interrupts.
+      injectLapicTimer(vcpu_);
+      madeProgress = true;
       break;
     default:
       ++summary.unhandledOther;
@@ -1619,7 +1675,18 @@ VmRunSummary VirtualMachine::RunLoop(
     // is enabled. Either route succeeds when the corresponding controller
     // has been programmed by the guest; otherwise the IRQ stays latched.
     auto tryRaiseLegacyIrq = [&](uint8_t irq) -> IrqDeliveryBackend {
-      if (ioApic_.RaiseIrq(irq)) {
+      // The MADT publishes an Interrupt Source Override remapping ISA IRQ0
+      // (the 8254 PIT) to GSI2, so the guest programs the IOAPIC's input pin 2
+      // — not pin 0 — for the periodic clock. Apply the same ISA->GSI remap
+      // when raising the line on the IOAPIC; otherwise the PIT tick hits the
+      // still-masked pin 0 and is dropped, and the early kernel spins forever
+      // on the clock it wired to pin 2 (entry[2]: vector 0xD1, unmasked, the
+      // ONLY programmed redirection entry). All other ISA IRQs are identity
+      // (the SCI's IRQ9->GSI9 override keeps the same index). The 8259 PIC
+      // fallback below deliberately keeps the raw ISA line — the PIC has no
+      // Interrupt Source Override concept.
+      const uint8_t ioApicGsi = (irq == 0) ? 2u : irq;
+      if (ioApic_.RaiseIrq(ioApicGsi)) {
         ++summary.irqIoApicDeliveries;
         return IrqDeliveryBackend::IoApic;
       }

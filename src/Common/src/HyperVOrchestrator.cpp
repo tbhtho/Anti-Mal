@@ -8382,6 +8382,12 @@ std::string FormatVmDiagnostics(const hv::VmRunSummary &vm) {
   out << "watchdogCancellations: " << vm.watchdogCancellations << "\n";
   out << "timerInterruptsRequested: " << vm.timerInterruptsRequested << "\n";
   out << "timerInterruptsInjected: " << vm.timerInterruptsInjected << "\n";
+  out << "pageFaultAssists: " << vm.pageFaultAssists << "\n";
+  out << "pageFaultsReinjected: " << vm.pageFaultsReinjected << "\n";
+  out << "lastReinjectedFaultGva: 0x" << std::hex << std::uppercase
+      << vm.lastReinjectedFaultGva << std::dec << "\n";
+  out << "lastReinjectedFaultErrorCode: 0x" << std::hex << std::uppercase
+      << vm.lastReinjectedFaultErrorCode << std::dec << "\n";
   out << "keyboardScancodesInjected: " << vm.keyboardScancodesInjected << "\n";
   out << "ps2StatusReads: " << vm.ps2StatusReads << "\n";
   out << "ps2DataReads: " << vm.ps2DataReads << "\n";

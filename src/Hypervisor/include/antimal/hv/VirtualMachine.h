@@ -156,6 +156,13 @@ struct VmRunSummary {
   uint64_t pageFaultAssists = 0;
   uint64_t lastPageFaultAssistGva = 0;
   uint64_t lastPageFaultAssistGpa = 0;
+  // Guest #PFs that the host did not need to assist and instead re-injected
+  // into the guest so its own IDT #PF handler services them (kernel demand
+  // paging, copy-on-write, SEH-protected probes such as ProbeForRead touching
+  // MmUserProbeAddress). Before re-injection these were treated as fatal.
+  uint64_t pageFaultsReinjected = 0;
+  uint64_t lastReinjectedFaultGva = 0;
+  uint32_t lastReinjectedFaultErrorCode = 0;
   uint32_t mmioReads = 0;
   uint32_t mmioWrites = 0;
   // Total WHvRunVpExitReasonMemoryAccess exits on the BSP, regardless of

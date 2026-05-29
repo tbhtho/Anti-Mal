@@ -335,4 +335,30 @@ bool Vcpu::TryRequestFixedInterrupt(uint8_t vector) noexcept {
   return SUCCEEDED(RequestFixedInterrupt(vector));
 }
 
+bool Vcpu::TryInjectPageFault(uint64_t faultingAddress,
+                              uint32_t errorCode) noexcept {
+  if (!partition_) {
+    return false;
+  }
+
+  // A pending exception event with EventType=Exception, Vector=14 (#PF) and a
+  // delivered error code. WHP loads CR2 from ExceptionParameter when it vectors
+  // the fault through the guest IDT, so the guest sees exactly the fault it
+  // would on hardware. We deliberately do NOT advance RIP: WHP pushes the
+  // faulting RIP as the exception return address so the instruction is retried
+  // after the guest handler returns.
+  WHV_REGISTER_VALUE value{};
+  value.ExceptionEvent.EventPending = 1;
+  value.ExceptionEvent.EventType = WHvX64PendingEventException;
+  value.ExceptionEvent.DeliverErrorCode = 1;
+  value.ExceptionEvent.Vector = 14; // #PF
+  value.ExceptionEvent.ErrorCode = errorCode;
+  value.ExceptionEvent.ExceptionParameter = faultingAddress; // -> CR2
+
+  WHV_REGISTER_NAME name = WHvRegisterPendingEvent;
+  const HRESULT hr =
+      WHvSetVirtualProcessorRegisters(partition_, index_, &name, 1, &value);
+  return SUCCEEDED(hr);
+}
+
 } // namespace antimal::hv
