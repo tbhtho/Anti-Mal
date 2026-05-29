@@ -431,9 +431,24 @@ void VirtualMachine::AttachIdeDisk(IBlockDevice *disk) {
               IdeController::kSecondaryLast);
   bus_.Attach(secondaryIde_.get(), IdeController::kSecondaryControl,
               IdeController::kSecondaryControl);
-  // (Bus-master IDE BMDMA block is disabled pending a real PRD DMA engine; when
-  // re-enabled, attach pcIo_ at pcIo_.IdeBmdmaBase() here and rely on the
-  // IO-exit handler's ConsumeBmdmaAttachDirty re-attach for BAR4 relocation.)
+
+  // Bus-master IDE (BMDMA / BAR4). The IdeController performs real PRD-table DMA
+  // between disk and guest RAM, so give each channel a guest-physical memory
+  // accessor and attach its 8-port BMDMA register block. BAR4 is OS-relocatable;
+  // attach at the current base now and re-attach in the IO-exit handler when the
+  // guest reassigns it. Primary channel = base+0..7, secondary = base+8..15.
+  auto dmaMem = [this](uint64_t gpa, std::size_t len) -> uint8_t * {
+    return HostPointerForGpa(gpa, len);
+  };
+  ide_->SetDmaMemory(dmaMem);
+  secondaryIde_->SetDmaMemory(dmaMem);
+  const uint16_t bmBase = pcIo_.IdeBmdmaBase();
+  ide_->SetBmdmaBase(bmBase);
+  bus_.Attach(ide_.get(), bmBase, static_cast<uint16_t>(bmBase + 7));
+  secondaryIde_->SetBmdmaBase(static_cast<uint16_t>(bmBase + 8));
+  bus_.Attach(secondaryIde_.get(), static_cast<uint16_t>(bmBase + 8),
+              static_cast<uint16_t>(bmBase + 15));
+  pcIo_.ConsumeBmdmaAttachDirty();
 }
 
 uint8_t *VirtualMachine::HostPointerForGpa(uint64_t gpa,
@@ -1505,13 +1520,20 @@ VmRunSummary VirtualMachine::RunLoop(
         vcpu_.WriteRax((io.Rax & ~mask) | (static_cast<uint64_t>(value) & mask));
       }
       // BAR4 (bus-master IDE) is OS-relocatable. If the guest just reassigned it
-      // via a PCI config write, re-attach the 16-port BMDMA block at the new
-      // base so subsequent BMDMA accesses route to PcIoDevices instead of
-      // falling through to the "no device" default.
+      // via a PCI config write, re-attach each channel's 8-port BMDMA block to
+      // its IdeController at the new base (primary base+0..7, secondary +8..15)
+      // so subsequent BMDMA accesses reach the controller's PRD DMA engine.
       if (pcIo_.ConsumeBmdmaAttachDirty()) {
         const uint16_t bmBase = pcIo_.IdeBmdmaBase();
-        if (bmBase != 0) {
-          bus_.Attach(&pcIo_, bmBase, static_cast<uint16_t>(bmBase + 15));
+        if (bmBase != 0 && ide_) {
+          ide_->SetBmdmaBase(bmBase);
+          bus_.Attach(ide_.get(), bmBase, static_cast<uint16_t>(bmBase + 7));
+          if (secondaryIde_) {
+            secondaryIde_->SetBmdmaBase(static_cast<uint16_t>(bmBase + 8));
+            bus_.Attach(secondaryIde_.get(),
+                        static_cast<uint16_t>(bmBase + 8),
+                        static_cast<uint16_t>(bmBase + 15));
+          }
         }
       }
       vcpu_.AdvanceRip(instrLen != 0 ? instrLen : io.InstructionByteCount);

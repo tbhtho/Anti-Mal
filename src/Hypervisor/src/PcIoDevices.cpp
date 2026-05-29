@@ -1123,25 +1123,32 @@ uint32_t PcIoDevices::ReadPciConfigDword() const {
     case 0x04:
       return ideCommand_; // IO enabled; BMDMA stays off until emulated.
     case 0x08:
-      // IDE storage class 0x01, subclass 0x01, prog-if 0x00 = pure legacy
-      // compatibility mode (fixed ISA ports 0x1F0/0x3F6 + legacy IRQ14/15, PIO).
-      // NOTE: advertising bus-master (prog-if 0x80 + BAR4) without a real PRD
-      // DMA engine made OVMF's own IDE driver hang in BDS (it switched to BMDMA
-      // and spun), so bus-master stays OFF until the DMA engine is implemented.
-      // Revision 0x01.
-      return 0x01010001u;
+      // IDE storage class 0x01, subclass 0x01, prog-if 0x80 = compatibility-mode
+      // channels (fixed ISA ports 0x1F0/0x3F6 + legacy IRQ14/15) WITH bus-master
+      // DMA. Matches a real PIIX4 IDE (8086:7111). The BMDMA register block
+      // (BAR4) is emulated by the IdeController with a real PRD DMA engine, so
+      // OVMF and Windows pciide/intelide both drive the disk via DMA. Rev 0x01.
+      return 0x01018001u;
     case 0x0C:
       return 0x00000000u; // Type-0 header.
     case 0x10:
     case 0x14:
     case 0x18:
     case 0x1C:
-    case 0x20:
       // Compatibility-mode IDE: command/control BARs are unimplemented (the
-      // ports are hardwired to the legacy ISA addresses 0x1F0/0x3F6/0x170/0x376)
-      // and the bus-master BAR4 stays absent until a real PRD DMA engine exists.
+      // ports are hardwired to the legacy ISA addresses 0x1F0/0x3F6/0x170/0x376).
       // Reading 0 tells pci.sys these BARs are absent.
       return 0;
+    case 0x20:
+      // BAR4: bus-master IDE (BMDMA) register block, a 16-byte IO BAR. During
+      // sizing the guest writes all-ones; report the 16-byte IO size mask.
+      // Otherwise report the current base | IO indicator. The actual BMDMA
+      // ports are served by the IdeController (the VM routes them to it and
+      // re-attaches when this BAR is relocated).
+      if (ideBarSizing_[4]) {
+        return 0xFFFFFFF1u;
+      }
+      return (static_cast<uint32_t>(ideBmdmaBase_) & 0xFFF0u) | 0x1u;
     case 0x3C:
       // Compatibility-mode IDE uses the dedicated legacy IRQ14/15 lines, NOT a
       // PCI INTx interrupt. A real PIIX-class IDE function in compat mode

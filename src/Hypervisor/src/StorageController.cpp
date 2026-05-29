@@ -26,6 +26,10 @@ constexpr uint8_t kCmdSetMultipleMode = 0xC6;
 constexpr uint8_t kCmdIdentify = 0xEC;
 constexpr uint8_t kCmdSetFeatures = 0xEF;
 constexpr uint8_t kCmdFlushCache = 0xE7;
+constexpr uint8_t kCmdReadDma = 0xC8;     // READ DMA (28-bit LBA).
+constexpr uint8_t kCmdReadDmaExt = 0x25;  // READ DMA EXT (48-bit LBA).
+constexpr uint8_t kCmdWriteDma = 0xCA;    // WRITE DMA (28-bit LBA).
+constexpr uint8_t kCmdWriteDmaExt = 0x35; // WRITE DMA EXT (48-bit LBA).
 
 uint32_t MaskToAccessSize(uint32_t value, uint8_t accessSize) {
   switch (accessSize) {
@@ -88,6 +92,11 @@ void IdeController::Reset() {
 
 void IdeController::OnWrite(uint16_t port, uint32_t value, uint8_t accessSize) {
   value = MaskToAccessSize(value, accessSize);
+  if (OwnsBmdmaPort(port)) {
+    WriteBmdmaRegister(static_cast<uint16_t>(port - bmdmaBase_), value,
+                       accessSize);
+    return;
+  }
   if (port == controlPort_) {
     deviceControl_ = static_cast<uint8_t>(value & 0xFFu);
     if ((deviceControl_ & 0x04u) != 0) {
@@ -142,6 +151,10 @@ void IdeController::OnWrite(uint16_t port, uint32_t value, uint8_t accessSize) {
 }
 
 uint32_t IdeController::OnRead(uint16_t port, uint8_t accessSize) {
+  if (OwnsBmdmaPort(port)) {
+    return ReadBmdmaRegister(static_cast<uint16_t>(port - bmdmaBase_),
+                             accessSize);
+  }
   if (port == controlPort_) {
     // Alternate status register: same value as the main status register but
     // explicitly does not clear the IRQ latch.
@@ -208,6 +221,19 @@ void IdeController::ExecuteCommand(uint8_t command) {
     if ((deviceControl_ & 0x02u) == 0) {
       interruptPending_ = true;
     }
+    break;
+  case kCmdReadDma:
+  case kCmdReadDmaExt:
+    // Bus-master READ DMA: stage the sectors, but do NOT raise the IRQ here.
+    // The completion interrupt is asserted by the bus-master engine once the
+    // guest writes the BMICX start bit and the PRD transfer runs.
+    ++readCommands_;
+    StartReadDma(command);
+    break;
+  case kCmdWriteDma:
+  case kCmdWriteDmaExt:
+    ++writeCommands_;
+    StartWriteDma(command);
     break;
   case kCmdFlushCache:
     status_ = (ActiveDisk() && ActiveDisk()->Flush())
@@ -284,6 +310,200 @@ void IdeController::StartRead(uint8_t command) {
   sectorsRead_ += count;
   RecordAccess(false, command, lba, count);
   PrepareTransfer(std::move(bytes), TransferKind::Read);
+}
+
+void IdeController::StartReadDma(uint8_t command) {
+  auto *disk = ActiveDisk();
+  if (!disk) {
+    SetError(kErrorAbort);
+    return;
+  }
+  const uint16_t count = RequestedSectorCount();
+  const uint64_t lba = CurrentLba();
+  std::vector<uint8_t> bytes(static_cast<size_t>(count) *
+                             IBlockDevice::kSectorSize);
+  if (!disk->ReadSectors(lba, count, bytes.data())) {
+    SetError(kErrorAbort);
+    return;
+  }
+  sectorsRead_ += count;
+  RecordAccess(false, command, lba, count);
+  // Stage the data for the bus-master engine. DMA does not use the PIO data
+  // port, so there is no DRQ; the controller is DRDY and waits for BMICX start.
+  transfer_ = std::move(bytes);
+  transferOffset_ = 0;
+  transferKind_ = TransferKind::None;
+  dmaKind_ = TransferKind::Read;
+  dmaPending_ = true;
+  status_ = kStatusDrdy | kStatusDsc;
+  error_ = 0;
+  // If the guest armed the bus master (BMICX start) before issuing the command,
+  // run the transfer now.
+  if ((bmCommand_ & 0x01u) != 0) {
+    RunBusMasterDma();
+  }
+}
+
+void IdeController::StartWriteDma(uint8_t command) {
+  auto *disk = ActiveDisk();
+  if (!disk) {
+    SetError(kErrorAbort);
+    return;
+  }
+  dmaWriteCount_ = RequestedSectorCount();
+  dmaWriteLba_ = CurrentLba();
+  transfer_.assign(static_cast<size_t>(dmaWriteCount_) *
+                       IBlockDevice::kSectorSize,
+                   0);
+  transferOffset_ = 0;
+  transferKind_ = TransferKind::None;
+  dmaKind_ = TransferKind::Write;
+  dmaPending_ = true;
+  status_ = kStatusDrdy | kStatusDsc;
+  error_ = 0;
+  (void)command;
+  if ((bmCommand_ & 0x01u) != 0) {
+    RunBusMasterDma();
+  }
+}
+
+void IdeController::RunBusMasterDma() {
+  if (!dmaPending_ || dmaKind_ == TransferKind::None || !dmaMemory_) {
+    return;
+  }
+  uint64_t prd = bmPrdAddr_;
+  size_t dataOffset = 0;
+  // Walk the Physical Region Descriptor table. Each 8-byte entry is
+  // [0:3] base physical address, [4:5] byte count (0 => 64 KiB), [6:7] flags
+  // (bit 15 = end-of-table). Bound the walk defensively.
+  for (int guard = 0; guard < 4096; ++guard) {
+    uint8_t *entry = dmaMemory_(prd, 8);
+    if (!entry) {
+      break;
+    }
+    const uint32_t addr = static_cast<uint32_t>(entry[0]) |
+                          (static_cast<uint32_t>(entry[1]) << 8) |
+                          (static_cast<uint32_t>(entry[2]) << 16) |
+                          (static_cast<uint32_t>(entry[3]) << 24);
+    uint32_t bytes = static_cast<uint32_t>(entry[4]) |
+                     (static_cast<uint32_t>(entry[5]) << 8);
+    if (bytes == 0) {
+      bytes = 0x10000u;
+    }
+    const bool endOfTable =
+        (static_cast<uint16_t>(entry[6] | (entry[7] << 8)) & 0x8000u) != 0;
+    uint8_t *mem = dmaMemory_(addr, bytes);
+    if (mem && dataOffset < transfer_.size()) {
+      const size_t n = std::min<size_t>(bytes, transfer_.size() - dataOffset);
+      if (dmaKind_ == TransferKind::Read) {
+        std::memcpy(mem, transfer_.data() + dataOffset, n);
+      } else {
+        std::memcpy(transfer_.data() + dataOffset, mem, n);
+      }
+    }
+    dataOffset += bytes;
+    prd += 8;
+    if (endOfTable) {
+      break;
+    }
+  }
+  if (dmaKind_ == TransferKind::Write) {
+    auto *disk = ActiveDisk();
+    if (disk && disk->WriteSectors(dmaWriteLba_, dmaWriteCount_,
+                                   transfer_.data())) {
+      sectorsWritten_ += dmaWriteCount_;
+      RecordAccess(true, kCmdWriteDma, dmaWriteLba_, dmaWriteCount_);
+    } else {
+      SetError(kErrorAbort);
+    }
+  }
+  ++dmaTransfers_;
+  dmaSectorsMoved_ += transfer_.size() / IBlockDevice::kSectorSize;
+  // Complete: clear bus-master "active", latch the interrupt status bit, ready
+  // the drive, and assert the channel IRQ (unless masked via nIEN).
+  bmStatus_ = static_cast<uint8_t>((bmStatus_ & ~0x01u) | 0x04u);
+  bmCommand_ = static_cast<uint8_t>(bmCommand_ & ~0x01u);
+  if ((status_ & kStatusErr) == 0) {
+    status_ = kStatusDrdy | kStatusDsc;
+    error_ = 0;
+  }
+  dmaPending_ = false;
+  dmaKind_ = TransferKind::None;
+  transfer_.clear();
+  transferOffset_ = 0;
+  if ((deviceControl_ & 0x02u) == 0) {
+    interruptPending_ = true;
+  }
+}
+
+uint32_t IdeController::ReadBmdmaRegister(uint16_t offset,
+                                          uint8_t accessSize) const {
+  auto byteAt = [&](uint16_t o) -> uint8_t {
+    switch (o) {
+    case 0:
+      return bmCommand_;
+    case 2:
+      // BMISX status: latched error/interrupt bits plus "both drives DMA
+      // capable" (bits 5/6). Never report "active" (bit 0) -- transfers
+      // complete synchronously.
+      return static_cast<uint8_t>((bmStatus_ & 0x06u) | 0x60u);
+    case 4:
+      return static_cast<uint8_t>(bmPrdAddr_ & 0xFFu);
+    case 5:
+      return static_cast<uint8_t>((bmPrdAddr_ >> 8) & 0xFFu);
+    case 6:
+      return static_cast<uint8_t>((bmPrdAddr_ >> 16) & 0xFFu);
+    case 7:
+      return static_cast<uint8_t>((bmPrdAddr_ >> 24) & 0xFFu);
+    default:
+      return 0;
+    }
+  };
+  uint32_t value = 0;
+  const uint8_t bytes = accessSize == 1 ? 1 : accessSize == 2 ? 2 : 4;
+  for (uint8_t i = 0; i < bytes && (offset + i) < 8; ++i) {
+    value |= static_cast<uint32_t>(byteAt(static_cast<uint16_t>(offset + i)))
+             << (i * 8);
+  }
+  return value;
+}
+
+void IdeController::WriteBmdmaRegister(uint16_t offset, uint32_t value,
+                                       uint8_t accessSize) {
+  const uint8_t bytes = accessSize == 1 ? 1 : accessSize == 2 ? 2 : 4;
+  for (uint8_t i = 0; i < bytes && (offset + i) < 8; ++i) {
+    const uint8_t b = static_cast<uint8_t>((value >> (i * 8)) & 0xFFu);
+    switch (static_cast<uint16_t>(offset + i)) {
+    case 0: {
+      const bool wasStart = (bmCommand_ & 0x01u) != 0;
+      bmCommand_ = b;
+      if (!wasStart && (bmCommand_ & 0x01u) != 0 && dmaPending_) {
+        RunBusMasterDma();
+      }
+      break;
+    }
+    case 2:
+      // BMISX: bit 1 (error) and bit 2 (interrupt) are write-1-to-clear.
+      bmStatus_ = static_cast<uint8_t>(bmStatus_ & ~(b & 0x06u));
+      break;
+    case 4:
+      bmPrdAddr_ = (bmPrdAddr_ & 0xFFFFFF00u) | b;
+      break;
+    case 5:
+      bmPrdAddr_ = (bmPrdAddr_ & 0xFFFF00FFu) | (static_cast<uint32_t>(b) << 8);
+      break;
+    case 6:
+      bmPrdAddr_ =
+          (bmPrdAddr_ & 0xFF00FFFFu) | (static_cast<uint32_t>(b) << 16);
+      break;
+    case 7:
+      bmPrdAddr_ =
+          (bmPrdAddr_ & 0x00FFFFFFu) | (static_cast<uint32_t>(b) << 24);
+      break;
+    default:
+      break;
+    }
+  }
 }
 
 void IdeController::StartWrite(uint8_t command) {
@@ -427,10 +647,14 @@ IdeController::BuildIdentifyData(const IBlockDevice *disk) {
   PutAtaString(data, 10, 10, "AM0000000001");
   PutAtaString(data, 23, 4, "0001");
   PutAtaString(data, 27, 20, "AntiMal In-House IDE Disk");
-  PutWord(data, 49, 0x0200);      // LBA supported.
+  PutWord(data, 49, 0x0300);      // Capabilities: DMA supported + LBA supported.
   PutWord(data, 53, 0x0007);      // Words 54-58, 64-70, 88 valid.
   PutWord(data, 60, static_cast<uint16_t>(lba28 & 0xFFFFu));
   PutWord(data, 61, static_cast<uint16_t>((lba28 >> 16) & 0xFFFFu));
+  // Multiword DMA: modes 0-2 supported (low byte 0x07), mode 2 selected/active
+  // (bit 10 = 0x0400). Paired with the controller's bus-master block + prog-if
+  // 0x80, this lets pciide/intelide (and OVMF) drive the disk via PRD DMA.
+  PutWord(data, 63, 0x0407);
   PutWord(data, 80, 0x007E);      // ATA-1 through ATA-6 supported.
   PutWord(data, 83, 0x4000);      // FLUSH CACHE supported bit area valid.
   return data;

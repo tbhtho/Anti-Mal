@@ -10,6 +10,7 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <map>
 #include <vector>
 
@@ -59,6 +60,20 @@ public:
   }
   uint8_t Status() const noexcept { return status_; }
 
+  // Bus-master IDE (BMDMA) integration. The controller emulates the 8-port
+  // BMDMA register block for its channel and performs real PRD-table DMA so
+  // both OVMF and the Windows kernel's storage stack (pciide/intelide/atapi)
+  // can attach. The BMDMA base is OS-relocatable (PCI BAR4), so the host sets
+  // it whenever the guest reassigns the BAR, and supplies a guest-physical
+  // memory accessor so the PRD walk can move bytes between disk and RAM.
+  using DmaMemoryFn =
+      std::function<uint8_t *(uint64_t gpa, std::size_t length)>;
+  void SetDmaMemory(DmaMemoryFn fn) { dmaMemory_ = std::move(fn); }
+  void SetBmdmaBase(uint16_t base) noexcept { bmdmaBase_ = base; }
+  uint16_t BmdmaBase() const noexcept { return bmdmaBase_; }
+  uint64_t DmaTransfers() const noexcept { return dmaTransfers_; }
+  uint64_t DmaSectorsMoved() const noexcept { return dmaSectorsMoved_; }
+
   // Returns true when the controller has asserted its IRQ line (IRQ 14 for
   // the primary channel, IRQ 15 for the secondary) since the last call and
   // clears the latch. The host run loop uses this to inject the matching
@@ -100,6 +115,17 @@ private:
   void RecordAccess(bool write, uint8_t command, uint64_t lba,
                     uint16_t count);
 
+  // Bus-master DMA helpers.
+  bool OwnsBmdmaPort(uint16_t port) const noexcept {
+    return bmdmaBase_ != 0 && port >= bmdmaBase_ &&
+           port < static_cast<uint32_t>(bmdmaBase_) + 8u;
+  }
+  uint32_t ReadBmdmaRegister(uint16_t offset, uint8_t accessSize) const;
+  void WriteBmdmaRegister(uint16_t offset, uint32_t value, uint8_t accessSize);
+  void StartReadDma(uint8_t command);
+  void StartWriteDma(uint8_t command);
+  void RunBusMasterDma();
+
   static std::array<uint8_t, IBlockDevice::kSectorSize>
   BuildIdentifyData(const IBlockDevice *disk);
 
@@ -138,6 +164,19 @@ private:
   uint16_t controlPort_ = kPrimaryControl;
   uint8_t irqLine_ = 14;
   bool interruptPending_ = false;
+
+  // Bus-master IDE (BMDMA) state for this channel.
+  DmaMemoryFn dmaMemory_;          // guest-physical memory accessor (from VM).
+  uint16_t bmdmaBase_ = 0;         // IO base of this channel's 8-port block.
+  uint8_t bmCommand_ = 0;          // BMICX: bit0 start/stop, bit3 direction.
+  uint8_t bmStatus_ = 0;           // BMISX: bit0 active, bit1 err, bit2 irq.
+  uint32_t bmPrdAddr_ = 0;         // BMIDTPX: guest-physical PRD table address.
+  bool dmaPending_ = false;        // a DMA command is staged, awaiting start.
+  TransferKind dmaKind_ = TransferKind::None;
+  uint64_t dmaWriteLba_ = 0;       // staged WRITE DMA target.
+  uint16_t dmaWriteCount_ = 0;
+  uint64_t dmaTransfers_ = 0;      // diagnostics: completed PRD transfers.
+  uint64_t dmaSectorsMoved_ = 0;   // diagnostics: sectors moved via DMA.
 };
 
 } // namespace antimal::hv
