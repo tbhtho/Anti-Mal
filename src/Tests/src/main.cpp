@@ -1220,23 +1220,30 @@ void TestPcIoIdePciResources() {
          "PCI IDE: exposes Intel PIIX4 IDE identifier");
 
   select(0x08);
-  Expect(pc.OnRead(0xCFC, 4) == 0x01018A01u,
-         "PCI IDE: reports legacy-mode IDE storage class");
+  // Pure legacy compatibility-mode IDE: class 01/01, prog-if 0x00 (fixed ISA
+  // ports + IRQ14, not native-switchable, not bus-master). The prior 0x8A
+  // (native-capable + bus master) with populated compat BARs was inconsistent
+  // and made Windows pci.sys reject the controller (pciide never attached ->
+  // INACCESSIBLE_BOOT_DEVICE 0x7B).
+  Expect(pc.OnRead(0xCFC, 4) == 0x01010001u,
+         "PCI IDE: reports compat-mode IDE storage class (prog-if 0x00)");
 
+  // Compatibility-mode IDE exposes no command/control/bus-master BARs (the
+  // ports are hardwired to the legacy ISA addresses); BARs 0-4 read as 0.
   select(0x10);
-  Expect(pc.OnRead(0xCFC, 4) == 0x000001F1u,
-         "PCI IDE: primary command BAR reports legacy 0x1F0 IO window");
+  Expect(pc.OnRead(0xCFC, 4) == 0u,
+         "PCI IDE: command BAR is unimplemented (compat fixed ports)");
   pc.OnWrite(0xCFC, 0xFFFFFFFFu, 4);
-  Expect(pc.OnRead(0xCFC, 4) == 0xFFFFFFF9u,
-         "PCI IDE: primary command BAR reports 8-port sizing mask");
-  pc.OnWrite(0xCFC, 0x000001F1u, 4);
+  Expect(pc.OnRead(0xCFC, 4) == 0u,
+         "PCI IDE: command BAR stays 0 under sizing");
 
   select(0x14);
-  Expect(pc.OnRead(0xCFC, 4) == 0x000003F5u,
-         "PCI IDE: primary control BAR reports legacy 0x3F4 IO window");
-  pc.OnWrite(0xCFC, 0xFFFFFFFFu, 4);
-  Expect(pc.OnRead(0xCFC, 4) == 0xFFFFFFFDu,
-         "PCI IDE: control BAR reports 4-port sizing mask");
+  Expect(pc.OnRead(0xCFC, 4) == 0u,
+         "PCI IDE: control BAR is unimplemented (compat fixed ports)");
+
+  select(0x20);
+  Expect(pc.OnRead(0xCFC, 4) == 0u,
+         "PCI IDE: bus-master BAR is unimplemented (PIO only)");
 
   select(0x3C);
   Expect(pc.OnRead(0xCFC, 4) == 0x0000010Eu,

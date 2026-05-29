@@ -1060,19 +1060,26 @@ uint32_t PcIoDevices::ReadPciConfigDword() const {
     case 0x04:
       return ideCommand_; // IO enabled; BMDMA stays off until emulated.
     case 0x08:
-      return 0x01018A01u; // IDE storage class, legacy/native capable.
+      // IDE storage class, prog-if 0x00 = PURE legacy compatibility mode: both
+      // channels at the fixed ISA ports (0x1F0/0x3F6 + IRQ14), NOT switchable
+      // to native, NOT bus-master. The previous 0x8A (switchable + bus master)
+      // was inconsistent with our config -- we expose compat-mode BARs while
+      // claiming native/BM capability, which makes Windows' pci.sys mis-size
+      // the BARs and pciide refuse to attach (kernel issues 0 IDE commands ->
+      // INACCESSIBLE_BOOT_DEVICE 0x7B). PIO-only matches what we actually
+      // emulate; the boot disk is small enough that PIO is fine.
+      return 0x01010001u;
     case 0x0C:
       return 0x00000000u; // Type-0 header.
     case 0x10:
-      return ideBarSizing_[0] ? IdeBarSizeMask(0) : kIdePrimaryCommandBar;
     case 0x14:
-      return ideBarSizing_[1] ? IdeBarSizeMask(1) : kIdePrimaryControlBar;
     case 0x18:
-      return ideBarSizing_[2] ? IdeBarSizeMask(2) : kIdeSecondaryCommandBar;
     case 0x1C:
-      return ideBarSizing_[3] ? IdeBarSizeMask(3) : kIdeSecondaryControlBar;
     case 0x20:
-      return ideBarSizing_[4] ? IdeBarSizeMask(4) : kIdeBusMasterBar;
+      // Compatibility-mode IDE: command/control BARs are unimplemented (the
+      // ports are hardwired to the legacy ISA addresses), and we expose no
+      // bus-master BAR. Reading 0 tells pci.sys these BARs are absent.
+      return 0;
     case 0x3C:
       return 0x0000010Eu; // INT line 14, INTA#.
     default:
