@@ -2325,6 +2325,47 @@ int CommandBaseInspect(int argc, wchar_t **argv,
         std::cout << "MISSING: Windows\\System32\\winload.efi\n";
         ok = false;
       }
+      // --dump-ntfs-file <path> [--dump-ntfs-out <out>] extracts an arbitrary
+      // file from the Windows NTFS volume read-only (no OS mount, no admin) for
+      // offline disassembly -- e.g. ntoskrnl.exe / hal.dll / a boot driver when
+      // diagnosing a kernel-side boot stall. Accepts '/' or '\\' separators.
+      if (const auto ntfsFile = OptionValue(argc, argv, "--dump-ntfs-file")) {
+        std::string rel = *ntfsFile;
+        for (auto &ch : rel) {
+          if (ch == '/') {
+            ch = '\\';
+          }
+        }
+        const auto entry = ntfs.FindPath(rel);
+        if (!entry) {
+          std::cout << "MISSING(--dump-ntfs-file): " << rel << "\n";
+          ok = false;
+        } else {
+          std::cout << "OK: " << rel << " size=" << entry->size
+                    << " fileRecord=" << entry->fileRecord << "\n";
+          PrintNtfsDataRuns(rel, *entry, windows->firstLba,
+                            ntfs.SectorsPerCluster());
+          const auto bytes = ntfs.ReadFile(*entry, 64ull * 1024ull * 1024ull);
+          if (bytes.empty()) {
+            std::cout << "error: unreadable file bytes for " << rel << "\n";
+            ok = false;
+          } else {
+            const auto outOpt = OptionValue(argc, argv, "--dump-ntfs-out");
+            const std::filesystem::path outPath =
+                outOpt ? std::filesystem::path(Utf8ToWide(*outOpt))
+                       : std::filesystem::path(L"dumped.bin");
+            if (!outPath.parent_path().empty()) {
+              antimal::EnsureDirectory(outPath.parent_path());
+            }
+            std::ofstream of(outPath,
+                             std::ios::out | std::ios::binary | std::ios::trunc);
+            of.write(reinterpret_cast<const char *>(bytes.data()),
+                     static_cast<std::streamsize>(bytes.size()));
+            std::cout << "Dumped " << rel << " (" << bytes.size()
+                      << " bytes) to " << antimal::PathToUtf8(outPath) << "\n";
+          }
+        }
+      }
       // --dump-bootmgfw lets us inspect the bootmgr image too. The visible
       // WinRE status (0xc0000225, 0xc0430001) is rendered by bootmgfw, not
       // winload; bootmgfw reads the failure status from bootstat and looks

@@ -1102,6 +1102,21 @@ VmRunSummary VirtualMachine::RunLoop(
       }
     }
   };
+  // Deliver the guest's programmed IOAPIC clock (the 8254 PIT, remapped to GSI2
+  // by the MADT ISO) at a steady real cadence from the watchdog thread. The
+  // run loop only raises GSI2 on guest *exits*, which collapse to ~1/s once the
+  // kernel idles -> the system clock (KeUpdateSystemTime on vector 0xD1) crawls
+  // and Phase-1 time-waits never expire. Injecting entry[2]'s vector here keeps
+  // the kernel's wall clock advancing like real hardware does. Inert until the
+  // guest programs+unmasks GSI2, so OVMF-only smoke tests are unaffected.
+  auto injectIoApicClock = [&](Vcpu &cpu) {
+    const uint64_t rte = ioApic_.RedirectionEntry(2);
+    const bool masked = (rte & (1ull << 16)) != 0;
+    const uint8_t vector = static_cast<uint8_t>(rte & 0xFFu);
+    if (!masked && vector >= 0x10) {
+      (void)cpu.TryRequestFixedInterrupt(vector);
+    }
+  };
   for (auto &ap : apVcpus_) {
     auto *cpu = ap.get();
     apThreads.emplace_back([&, cpu](std::stop_token stop) {
@@ -1188,6 +1203,7 @@ VmRunSummary VirtualMachine::RunLoop(
 
       if (now - lastTimer >= kTimerInterval) {
         injectLapicTimer(vcpu_);
+        injectIoApicClock(vcpu_);
         for (auto &ap : apVcpus_) {
           if (ap) {
             injectLapicTimer(*ap);
