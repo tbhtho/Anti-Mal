@@ -344,6 +344,26 @@ std::vector<uint8_t> BuildDsdtAml(uint32_t processorCount) {
              PackageObject({IntegerObject(5), IntegerObject(5),
                             IntegerObject(0), IntegerObject(0)}));
 
+  // \_PIC control method. Windows evaluates \_PIC(1) early in boot to tell the
+  // platform it chose the APIC interrupt model. CRITICAL: if \_PIC is absent,
+  // an OS running in APIC mode interprets PCI0._PRT source indices as legacy
+  // 8259 PIC IRQs and routes PCI device interrupts to the (masked) PICs instead
+  // of the IOAPIC. That is exactly what bit us: with both PICs masked (pure
+  // APIC mode), the IDE controller's interrupt (PCI0._PRT dev1 INTA -> 14) was
+  // routed to the dead PIC, IOAPIC RTE[14] was left masked (0x100FF), all
+  // 64388 IDE completion IRQs were dropped, and atapi's StartDevice hung
+  // waiting for an interrupt that never arrived -> INACCESSIBLE_BOOT_DEVICE
+  // (0x7B, STATUS_OBJECT_NAME_NOT_FOUND, boot disk device never created).
+  // Encoding: MethodOp(0x14) PkgLen(6) "_PIC"(5F 50 49 43) MethodFlags(0x01 =
+  // 1 arg, not serialized) with an empty body -- Windows only requires the
+  // method to exist and be callable; our _PRT already returns hardwired GSIs.
+  {
+    static const uint8_t kPicMethod[] = {0x14, 0x06, 0x5F,
+                                         0x50, 0x49, 0x43, 0x01};
+    rootTerms.insert(rootTerms.end(), kPicMethod,
+                     kPicMethod + sizeof(kPicMethod));
+  }
+
   std::vector<uint8_t> sbTerms;
 
   const uint32_t cpuCount = std::clamp<uint32_t>(processorCount, 1, 64);
