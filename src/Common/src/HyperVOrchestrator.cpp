@@ -5386,6 +5386,55 @@ void ApplyCiPolicyOffProbe(hv::IBlockDevice &disk,
   }
 }
 
+// Recompute the PE OptionalHeader.CheckSum for an in-memory image after an
+// in-place byte patch. bootmgr/winload verify this 32-bit image checksum at
+// load and reject a stale one with 0xC0000221 (STATUS_IMAGE_CHECKSUM_MISMATCH),
+// surfaced as the "header checksum ... doesn't match" WinRE screen. The
+// algorithm matches CheckSumMappedFile: a folded 16-bit word sum over the whole
+// file (the checksum field itself treated as zero) plus the file size. Returns
+// the checksum written, or 0 when the buffer is not a recognizable PE (field
+// left unchanged).
+uint32_t RecomputePeImageChecksum(std::vector<uint8_t> &image) {
+  if (image.size() < 0x40) {
+    return 0;
+  }
+  const size_t peOff = static_cast<size_t>(image[0x3C]) |
+                       (static_cast<size_t>(image[0x3D]) << 8) |
+                       (static_cast<size_t>(image[0x3E]) << 16) |
+                       (static_cast<size_t>(image[0x3F]) << 24);
+  if (peOff + 0x5C > image.size() || image[peOff] != 'P' ||
+      image[peOff + 1] != 'E' || image[peOff + 2] != 0 ||
+      image[peOff + 3] != 0) {
+    return 0;
+  }
+  // OptionalHeader.CheckSum is 64 bytes into the optional header (same offset
+  // for PE32 and PE32+): PE signature (4) + COFF header (20) + 64.
+  const size_t cksumOff = peOff + 24 + 64;
+  image[cksumOff] = 0;
+  image[cksumOff + 1] = 0;
+  image[cksumOff + 2] = 0;
+  image[cksumOff + 3] = 0;
+  uint32_t sum = 0;
+  const size_t n = image.size();
+  for (size_t i = 0; i + 1 < n; i += 2) {
+    sum += static_cast<uint32_t>(image[i]) |
+           (static_cast<uint32_t>(image[i + 1]) << 8);
+    sum = (sum & 0xFFFFu) + (sum >> 16);
+  }
+  if ((n & 1u) != 0) {
+    sum += image[n - 1];
+    sum = (sum & 0xFFFFu) + (sum >> 16);
+  }
+  sum = (sum & 0xFFFFu) + (sum >> 16);
+  sum = (sum & 0xFFFFu) + (sum >> 16);
+  const uint32_t checksum = (sum & 0xFFFFu) + static_cast<uint32_t>(n);
+  image[cksumOff] = static_cast<uint8_t>(checksum & 0xFFu);
+  image[cksumOff + 1] = static_cast<uint8_t>((checksum >> 8) & 0xFFu);
+  image[cksumOff + 2] = static_cast<uint8_t>((checksum >> 16) & 0xFFu);
+  image[cksumOff + 3] = static_cast<uint8_t>((checksum >> 24) & 0xFFu);
+  return checksum;
+}
+
 // Binary-patch winload.efi on the ESP to force SpacebootInitialize into its
 // "not applicable" (STATUS_NOT_FOUND) fallback path.  This eliminates the
 // BootEnvironment / SystemGuard phase that produces 0xc0430001 / 0xc0000225
@@ -5403,6 +5452,14 @@ void ApplyCiPolicyOffProbe(hv::IBlockDevice &disk,
 //
 // The net effect is identical to winload deciding that Spaceboot does not
 // apply on this hardware — which is the truth.
+//
+// NOTE (evidence): even with the PE checksum repaired (RecomputePeImageChecksum
+// above), bootmgr still rejects the modified image at its Authenticode/CI hash
+// check with 0xC0000428 (STATUS_INVALID_IMAGE_HASH) -- Secure Boot off and
+// nointegritychecks set do not relax that hash check. So this probe only yields
+// a loadable winload if the image is afterwards re-signed with a trusted key;
+// on a stock retail winload it advances the visible failure from the checksum
+// screen (0xC0000221) to the signature screen (0xC0000428), no further.
 void ApplySpacebootPatch(hv::IBlockDevice &disk,
                          const std::vector<GptPartitionLite> &partitions,
                          BootOverlayPatchResult *result) {
@@ -5455,11 +5512,16 @@ void ApplySpacebootPatch(hv::IBlockDevice &disk,
 
   if (std::memcmp(bytes.data() + kPatchOffset, kOriginal, 5) == 0) {
     std::memcpy(bytes.data() + kPatchOffset, kPatched, 5);
+    const uint32_t newChecksum = RecomputePeImageChecksum(bytes);
     if (ntfs.WriteFileSameSize(*entry, bytes)) {
       result->spacebootPatchApplied = true;
-      result->notes.push_back(
-          "winload.efi patched: SpacebootInitialize forced to "
-          "STATUS_NOT_FOUND fallback at offset 0x6EAD0");
+      char note[160];
+      snprintf(note, sizeof(note),
+               "winload.efi patched: SpacebootInitialize forced to "
+               "STATUS_NOT_FOUND fallback at offset 0x6EAD0; PE checksum "
+               "repaired to 0x%08X",
+               newChecksum);
+      result->notes.push_back(note);
     } else {
       result->notes.push_back("winload.efi patch: WriteFileSameSize failed");
     }
