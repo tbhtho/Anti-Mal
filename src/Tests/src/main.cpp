@@ -735,6 +735,17 @@ void TestTpm2CrbDevice() {
 void TestAcpiTables() {
   const auto acpi = antimal::hv::BuildPcAcpiTables();
   Expect(!acpi.tables.empty(), "ACPI: table blob produced");
+  if (std::getenv("ANTIMAL_DUMP_ACPI") != nullptr) {
+    // Dump our built DSDT so it can be validated offline with iasl -- a malformed
+    // DSDT would make the guest's acpi.sys fail to enumerate the PCI root, which
+    // would leave pci.sys unable to attach pciide (INACCESSIBLE_BOOT_DEVICE 0x7B).
+    const auto dOff = acpi.offsets.dsdt;
+    const auto dLen = antimal::hv::AcpiTableLength(acpi.tables, dOff);
+    std::ofstream of("C:\\Temp\\our-dsdt.aml",
+                     std::ios::binary | std::ios::trunc);
+    of.write(reinterpret_cast<const char *>(acpi.tables.data() + dOff),
+             static_cast<std::streamsize>(dLen));
+  }
   Expect(!acpi.tableLoader.empty(), "ACPI: table-loader produced");
   Expect(acpi.tableLoader.size() % 128 == 0,
          "ACPI: table-loader entries are 128-byte records");
