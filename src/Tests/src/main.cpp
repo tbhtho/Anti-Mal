@@ -745,10 +745,13 @@ void TestAcpiTables() {
   Expect(ReadLe32(acpi.rsdp, 20) == 36, "ACPI: RSDP length field is 36");
   Expect(ReadLe64(acpi.rsdp, 24) == acpi.offsets.xsdt,
          "ACPI: RSDP XsdtAddress points to XSDT offset");
-  Expect(antimal::hv::AcpiChecksumValid(acpi.rsdp.data(), 20),
-         "ACPI: RSDP legacy checksum valid before relocation");
-  Expect(antimal::hv::AcpiChecksumValid(acpi.rsdp.data(), acpi.rsdp.size()),
-         "ACPI: RSDP extended checksum valid before relocation");
+  // Checksum bytes are left 0 at build time; the fw_cfg table-loader fills them
+  // at load. (OVMF's ADD_CHECKSUM sums the byte in-place without pre-zeroing, so
+  // a pre-computed non-zero checksum would make every SDT fail validation.)
+  Expect(acpi.rsdp[8] == 0,
+         "ACPI: RSDP legacy checksum byte left 0 for table-loader");
+  Expect(acpi.rsdp[32] == 0,
+         "ACPI: RSDP extended checksum byte left 0 for table-loader");
 
   auto tableOk = [&](uint32_t offset, const char *sig) {
     const uint32_t length = antimal::hv::AcpiTableLength(acpi.tables, offset);
@@ -757,8 +760,8 @@ void TestAcpiTables() {
            "ACPI: table stays inside table blob");
     Expect(std::memcmp(acpi.tables.data() + offset, sig, 4) == 0,
            "ACPI: expected table signature");
-    Expect(antimal::hv::AcpiChecksumValid(acpi.tables.data() + offset, length),
-           "ACPI: table checksum valid before relocation");
+    Expect(acpi.tables[offset + 9] == 0,
+           "ACPI: table checksum byte left 0 for table-loader");
   };
 
   tableOk(acpi.offsets.dsdt, "DSDT");
@@ -883,9 +886,8 @@ void TestAcpiTables() {
              std::memcmp(acpiDbgp.tables.data() + acpiDbgp.offsets.dbgp,
                          "DBGP", 4) == 0,
          "ACPI: DBGP probe signature");
-  Expect(antimal::hv::AcpiChecksumValid(
-             acpiDbgp.tables.data() + acpiDbgp.offsets.dbgp, dbgpLen),
-         "ACPI: DBGP probe checksum valid before relocation");
+  Expect(acpiDbgp.tables[acpiDbgp.offsets.dbgp + 9] == 0,
+         "ACPI: DBGP probe checksum byte left 0 for table-loader");
   Expect(acpiDbgp.tables[acpiDbgp.offsets.dbgp + 36] == 0,
          "ACPI: DBGP probe advertises full 16550-compatible COM1");
   Expect(ReadLe64(acpiDbgp.tables, acpiDbgp.offsets.dbgp + 44) == 0x03F8u,

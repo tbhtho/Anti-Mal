@@ -67,14 +67,6 @@ void AppendFixedAscii(std::vector<uint8_t> &out, std::string_view text,
   }
 }
 
-uint8_t ChecksumByte(const uint8_t *bytes, size_t size) {
-  uint8_t sum = 0;
-  for (size_t i = 0; i < size; ++i) {
-    sum = static_cast<uint8_t>(sum + bytes[i]);
-  }
-  return static_cast<uint8_t>(0u - sum);
-}
-
 uint32_t BeginSdt(std::vector<uint8_t> &out, std::string_view signature,
                   uint8_t revision) {
   const auto offset = static_cast<uint32_t>(out.size());
@@ -93,8 +85,17 @@ uint32_t BeginSdt(std::vector<uint8_t> &out, std::string_view signature,
 void EndSdt(std::vector<uint8_t> &out, uint32_t offset) {
   const uint32_t length = static_cast<uint32_t>(out.size() - offset);
   WriteLe32(out, offset + 4, length);
+  // Leave the SDT checksum byte (offset 9) ZERO. The fw_cfg table-loader's
+  // ADD_CHECKSUM command fills it at load time as CalculateCheckSum8 =
+  // 0x100 - Sum8(range). That range INCLUDES the checksum byte and OVMF does
+  // NOT pre-zero it (QemuFwCfgAcpi.c: Blob[ResultOffset] = CalculateCheckSum8(
+  // Start, Length)). So if we pre-store a non-zero checksum V here, OVMF's
+  // recompute yields a final Sum8 == -V != 0, and EVERY SDT fails OVMF's
+  // ACPI-header validation -> "installed 1 tables" (only the FACS, which has
+  // no checksum byte, survives) -> the MADT never reaches the guest ->
+  // winload's OslpDetermineKernelHal returns STATUS_NOT_FOUND (0xC0000225).
+  // The byte MUST be 0 pre-loader.
   out[offset + 9] = 0;
-  out[offset + 9] = ChecksumByte(out.data() + offset, length);
 }
 
 void AppendPkgLength(std::vector<uint8_t> &out, size_t bodyBytes) {
@@ -805,8 +806,11 @@ std::vector<uint8_t> BuildRsdp(uint32_t rsdtOffset, uint32_t xsdtOffset) {
   PutLe64(out, xsdtOffset);          // 24..31 XsdtAddress (loader relocates)
   out.push_back(0);                  // 32     ExtendedChecksum (loader recomputes)
   out.insert(out.end(), 3, 0);       // 33..35 reserved
-  out[8] = ChecksumByte(out.data(), 20);          // ACPI 1.0 checksum (first 20)
-  out[32] = ChecksumByte(out.data(), out.size()); // extended checksum (all 36)
+  // Leave both RSDP checksums ZERO -- the table-loader's ADD_CHECKSUM commands
+  // (offset 8 over 20 bytes; offset 32 over 36 bytes) fill them at load time,
+  // and only yield valid sums if the bytes are 0 beforehand (see EndSdt).
+  out[8] = 0;
+  out[32] = 0;
   return out;
 }
 
