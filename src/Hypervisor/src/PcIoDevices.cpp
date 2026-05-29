@@ -1081,7 +1081,17 @@ uint32_t PcIoDevices::ReadPciConfigDword() const {
       // bus-master BAR. Reading 0 tells pci.sys these BARs are absent.
       return 0;
     case 0x3C:
-      return 0x0000010Eu; // INT line 14, INTA#.
+      // Compatibility-mode IDE uses the dedicated legacy IRQ14/15 lines, NOT a
+      // PCI INTx interrupt. A real PIIX-class IDE function in compat mode
+      // reports Interrupt Pin = 0 (no PCI interrupt); pciide supplies IRQ14/15
+      // itself from the compat-mode prog-if. Previously we claimed INT pin INTA
+      // (0x01) while prog-if said compat (0x00) -- an inconsistency that makes
+      // Windows arbitrate the IDE interrupt as a PCI INTA line via _PRT instead
+      // of (or in addition to) the legacy IRQ, so pciide's StartDevice
+      // mishandles its interrupt resource, never creates the channels, and
+      // atapi never attaches (kernel issues 0 IDENTIFYs -> 0x7B). INT line 0xFF
+      // = "not connected to a PCI interrupt router".
+      return 0x000000FFu; // INT line 0xFF (none), INT pin 0 (no PCI INTx).
     default:
       return 0;
     }

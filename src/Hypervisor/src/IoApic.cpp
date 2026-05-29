@@ -63,6 +63,7 @@ void IoApic::IndirectWrite(uint8_t index, uint32_t value) {
               static_cast<uint64_t>(value);
     }
     redirection_[pair] = entry;
+    ++writeCount_[pair];
   }
 }
 

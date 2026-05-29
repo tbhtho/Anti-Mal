@@ -2131,6 +2131,7 @@ VmRunSummary VirtualMachine::RunLoop(
   summary.slavePicIcw2Value = pcIo_.SlavePicIcw2Value();
   for (uint32_t i = 0; i < IoApic::kRedirectionEntries; ++i) {
     summary.ioApicRedir[i] = ioApic_.RedirectionEntry(i);
+    summary.ioApicWrites[i] = ioApic_.WriteCount(i);
   }
   summary.whpIoApicGpaProbe = whpIoApicGpaProbeResult_;
   summary.whpMmioGapBitmap = whpMmioGapBitmap_;

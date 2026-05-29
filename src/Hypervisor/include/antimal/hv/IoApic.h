@@ -75,6 +75,15 @@ public:
   uint64_t MaskedDrops() const noexcept { return maskedDrops_; }
   uint64_t Deliveries() const noexcept { return deliveries_; }
 
+  // Number of times the guest wrote either 32-bit half of redirection entry i.
+  // A zero count means the guest's HAL never programmed that GSI at all (the
+  // device that owns it never requested/connected its interrupt). This is how
+  // we tell "atapi never attached so RTE[14] was never touched" apart from
+  // "RTE[14] was programmed but left masked / mis-delivered".
+  uint32_t WriteCount(uint32_t i) const noexcept {
+    return i < kRedirectionEntries ? writeCount_[i] : 0;
+  }
+
 private:
   uint64_t mmioBase_;
   uint32_t ioRegSel_ = 0;
@@ -85,6 +94,7 @@ private:
   uint64_t raiseCount_ = 0;
   uint64_t maskedDrops_ = 0;
   uint64_t deliveries_ = 0;
+  std::array<uint32_t, kRedirectionEntries> writeCount_{};
 };
 
 } // namespace antimal::hv

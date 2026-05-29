@@ -1257,8 +1257,8 @@ void TestPcIoIdePciResources() {
          "PCI IDE: bus-master BAR is unimplemented (PIO only)");
 
   select(0x3C);
-  Expect(pc.OnRead(0xCFC, 4) == 0x0000010Eu,
-         "PCI IDE: interrupt line/pin reports IRQ14 INTA");
+  Expect(pc.OnRead(0xCFC, 4) == 0x000000FFu,
+         "PCI IDE: compat-mode reports no PCI INTx (pin 0, line 0xFF)");
 }
 
 void TestIdeIdentifyDevice() {

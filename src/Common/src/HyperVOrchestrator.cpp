@@ -8545,6 +8545,16 @@ std::string FormatVmDiagnostics(const hv::VmRunSummary &vm) {
         << vm.ioApicRedir[i] << std::dec;
   }
   out << "\n";
+  // Per-GSI guest write counts. A GSI with writes>0 was programmed by the HAL
+  // (its device connected an interrupt); writes==0 means the HAL never touched
+  // it. Used to tell "device never attached" from "attached but mis-routed".
+  out << "ioApicWritesByGsi:";
+  for (uint32_t i = 0; i < 24; ++i) {
+    if (vm.ioApicWrites[i] != 0) {
+      out << " [" << i << "]=" << vm.ioApicWrites[i];
+    }
+  }
+  out << "\n";
   out << "hpetReads: " << vm.hpetReads << "\n";
   out << "hpetWrites: " << vm.hpetWrites << "\n";
   out << "pitInterruptsPending: " << vm.pitInterruptsPending << "\n";

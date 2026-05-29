@@ -185,6 +185,9 @@ struct VmRunSummary {
   uint8_t slavePicIcw2Value = 0;
   // IOAPIC redirection table snapshot at summary time.
   uint64_t ioApicRedir[24]{};
+  // Per-GSI count of guest writes to each redirection entry. Zero => the HAL
+  // never programmed that GSI (its owning device never connected its IRQ).
+  uint32_t ioApicWrites[24]{};
   // WHP IOAPIC GPA probe result: 0=not probed, 1=unmap succeeded (WHP had it
   // mapped), 2=unmap failed (was genuinely unmapped), 3=remap succeeded.
   int whpIoApicGpaProbe = 0;
