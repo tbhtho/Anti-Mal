@@ -5695,16 +5695,46 @@ void ApplyCiBypassPatch(hv::IBlockDevice &disk, Fat32OverlayEditor &fat,
       auto bytes = ntfs.ReadFile(*entry, kMaxImage);
       if (bytes.size() == entry->size) {
         if (voiceMode) {
-          const bool pv = WriteFunctionStub(
+          bool pv = WriteFunctionStub(
               bytes, kOslFatalErrorExFo, kFatalProl, 6, kVoiceStub,
               sizeof(kVoiceStub), "winload OslFatalErrorEx voice",
               &result->notes);
+          // Configurable bisection hook: ANTIMAL_PROBE_VOICE_FO=<hex file offset>
+          // writes the same voice stub over an arbitrary winload function entry so
+          // its args are emitted to 0x402 (then it halts). Lets us bisect the
+          // late-boot path WITHOUT a rebuild -- the fo is verified against the IDB
+          // beforehand. Light safety: entry must start with REX.W (0x48/0x4C).
+          size_t voiceFo = 0;
+          {
+            char buf[32]{};
+            size_t needed = 0;
+            if (getenv_s(&needed, buf, sizeof(buf), "ANTIMAL_PROBE_VOICE_FO") == 0 &&
+                needed > 0)
+              voiceFo = static_cast<size_t>(strtoull(buf, nullptr, 16));
+          }
+          if (voiceFo && voiceFo + sizeof(kVoiceStub) <= bytes.size()) {
+            if ((bytes[voiceFo] == 0x48 || bytes[voiceFo] == 0x4C) &&
+                std::memcmp(bytes.data() + voiceFo, kVoiceStub, 8) != 0) {
+              std::memcpy(bytes.data() + voiceFo, kVoiceStub, sizeof(kVoiceStub));
+              RecomputePeImageChecksum(bytes);
+              pv = true;
+              char note[112];
+              snprintf(note, sizeof(note),
+                       "winload voice stub also written at fo 0x%zX "
+                       "(ANTIMAL_PROBE_VOICE_FO bisection hook)",
+                       voiceFo);
+              result->notes.push_back(note);
+            } else {
+              result->notes.push_back(
+                  "CI-bypass: ANTIMAL_PROBE_VOICE_FO rejected (not REX.W entry or "
+                  "already patched)");
+            }
+          }
           if (pv && ntfs.WriteFileSameSize(*entry, bytes)) {
             result->winloadVoiceStubWritten = true;
             result->notes.push_back(
-                "winload.efi OslFatalErrorEx replaced with voice stub (emits "
-                "ZZZZ errorCode|fileId|status|arg4 to debugcon 0x402; CI left "
-                "intact so winload reaches its real abort)");
+                "winload.efi voice stub(s) installed (OslFatalErrorEx + optional "
+                "ANTIMAL_PROBE_VOICE_FO); emits ZZZZ args to debugcon 0x402");
           } else if (pv) {
             result->notes.push_back(
                 "CI-bypass: winload voice WriteFileSameSize failed");
