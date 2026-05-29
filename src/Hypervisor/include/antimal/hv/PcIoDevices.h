@@ -161,9 +161,13 @@ private:
   uint32_t ReadBmdma(uint16_t port, uint8_t accessSize) const;
   void WriteBmdma(uint16_t port, uint32_t value, uint8_t accessSize);
   bool OwnsBmdma(uint16_t port) const noexcept {
-    return ideControllerPresent_ && ideBmdmaBase_ != 0 &&
-           port >= ideBmdmaBase_ &&
-           port < static_cast<uint32_t>(ideBmdmaBase_) + 16u;
+    // Bus-master IDE is disabled pending a real PRD DMA engine: advertising it
+    // (prog-if 0x80 + BAR4) without performing the DMA made OVMF's own IDE
+    // driver hang in BDS. The register helpers stay compiled (ReadBmdma/
+    // WriteBmdma) so re-enabling is a one-line change once DMA is implemented,
+    // but no IO is routed to them today.
+    (void)port;
+    return false;
   }
   void RebuildAcpi() {
     acpi_ = BuildPcAcpiTables(processorCount_, /*includeDbgp=*/false,
@@ -266,7 +270,7 @@ private:
   // OS-relocatable, so the host re-attaches the 16-port block whenever the
   // guest reassigns it (ConsumeBmdmaAttachDirty).
   uint16_t ideBmdmaBase_ = 0xC000;        // current guest-assigned BMDMA base.
-  bool ideBmdmaAttachDirty_ = true;       // base changed -> host must re-attach.
+  bool ideBmdmaAttachDirty_ = false;      // base changed -> host must re-attach.
   std::array<uint8_t, 16> bmdmaRegs_{};   // BMICX/BMISX/BMIDTPX, both channels.
   uint32_t ideConfigSelects_ = 0;         // # of CF8 selects of dev 1.1 (IDE).
   uint32_t vgaBar0_ = 0x80000008u;

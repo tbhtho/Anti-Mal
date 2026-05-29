@@ -431,12 +431,9 @@ void VirtualMachine::AttachIdeDisk(IBlockDevice *disk) {
               IdeController::kSecondaryLast);
   bus_.Attach(secondaryIde_.get(), IdeController::kSecondaryControl,
               IdeController::kSecondaryControl);
-  // Bus-master IDE (BMDMA / BAR4) register block. PcIoDevices owns these 16 IO
-  // ports; the BAR is OS-relocatable, so we attach at the current base now and
-  // re-attach (see the IO-exit handler) whenever the guest reassigns BAR4.
-  const uint16_t bmdmaBase = pcIo_.IdeBmdmaBase();
-  bus_.Attach(&pcIo_, bmdmaBase, static_cast<uint16_t>(bmdmaBase + 15));
-  pcIo_.ConsumeBmdmaAttachDirty();
+  // (Bus-master IDE BMDMA block is disabled pending a real PRD DMA engine; when
+  // re-enabled, attach pcIo_ at pcIo_.IdeBmdmaBase() here and rely on the
+  // IO-exit handler's ConsumeBmdmaAttachDirty re-attach for BAR4 relocation.)
 }
 
 uint8_t *VirtualMachine::HostPointerForGpa(uint64_t gpa,

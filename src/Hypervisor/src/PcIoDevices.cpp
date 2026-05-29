@@ -1123,36 +1123,25 @@ uint32_t PcIoDevices::ReadPciConfigDword() const {
     case 0x04:
       return ideCommand_; // IO enabled; BMDMA stays off until emulated.
     case 0x08:
-      // IDE storage class 0x01, subclass 0x01, prog-if 0x80 = compatibility-mode
-      // channels (fixed ISA ports 0x1F0/0x3F6 + legacy IRQ14/15) WITH bus-master
-      // DMA capability. A real PIIX4 IDE (8086:7111) is exactly this, and
-      // Windows' intelide miniport expects the bus-master register block (BAR4)
-      // to be present -- without it pciide/intelide never create the IDE
-      // channels, atapi never attaches, and the boot disk is never enumerated
-      // (INACCESSIBLE_BOOT_DEVICE 0x7B, kernel issues 0 IDENTIFYs). The legacy
-      // command/control ports stay hardwired; only the BMDMA block (BAR4) is
-      // PCI-mapped. Revision 0x01.
-      return 0x01018001u;
+      // IDE storage class 0x01, subclass 0x01, prog-if 0x00 = pure legacy
+      // compatibility mode (fixed ISA ports 0x1F0/0x3F6 + legacy IRQ14/15, PIO).
+      // NOTE: advertising bus-master (prog-if 0x80 + BAR4) without a real PRD
+      // DMA engine made OVMF's own IDE driver hang in BDS (it switched to BMDMA
+      // and spun), so bus-master stays OFF until the DMA engine is implemented.
+      // Revision 0x01.
+      return 0x01010001u;
     case 0x0C:
       return 0x00000000u; // Type-0 header.
     case 0x10:
     case 0x14:
     case 0x18:
     case 0x1C:
+    case 0x20:
       // Compatibility-mode IDE: command/control BARs are unimplemented (the
-      // ports are hardwired to the legacy ISA addresses 0x1F0/0x3F6/0x170/0x376).
+      // ports are hardwired to the legacy ISA addresses 0x1F0/0x3F6/0x170/0x376)
+      // and the bus-master BAR4 stays absent until a real PRD DMA engine exists.
       // Reading 0 tells pci.sys these BARs are absent.
       return 0;
-    case 0x20:
-      // BAR4: bus-master IDE (BMDMA) register block, a 16-byte IO BAR (8 ports
-      // per channel). During sizing the guest writes all-ones; report the size
-      // mask (16-byte IO BAR -> low nibble 0x1 = IO, bits[3:1]=0). Otherwise
-      // report the current base | IO-indicator. The host re-attaches the 16
-      // BMDMA ports wherever the guest assigns this BAR.
-      if (ideBarSizing_[4]) {
-        return 0xFFFFFFF1u; // ~(16-1) | IO indicator.
-      }
-      return (static_cast<uint32_t>(ideBmdmaBase_) & 0xFFF0u) | 0x1u;
     case 0x3C:
       // Compatibility-mode IDE uses the dedicated legacy IRQ14/15 lines, NOT a
       // PCI INTx interrupt. A real PIIX-class IDE function in compat mode
