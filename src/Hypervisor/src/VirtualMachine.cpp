@@ -28,9 +28,24 @@ constexpr uint64_t kAssistReserveBytes = 2ull * 1024ull * 1024ull;
 constexpr uint64_t kHighScratchBase = 0x100000000ull;
 constexpr uint64_t kFirmwareApertureBase = 0xFC000000ull;
 constexpr uint64_t kFirmwareApertureSize = 64ull * 1024ull * 1024ull;
-constexpr uint64_t kMmioGapStart = 0xFEC00000ull;
+// WHP's Local APIC emulation (WHvX64LocalApicEmulationModeXApic) silently
+// maps dummy RAM across the ENTIRE conventional MMIO gap [0xFEC00000,
+// 0xFEF00000). WHvUnmapGpaRange "succeeds" but the internal handling
+// persists — guest accesses are absorbed without VM exits. Moving devices
+// anywhere inside this 3 MiB zone is futile.
+//
+// Solution: shrink firmwareLowScratch_ to end 512 KiB earlier (at
+// 0xFEB80000 instead of 0xFEC00000) and place our MMIO devices in the
+// newly created gap [0xFEB80000, 0xFEC00000) which WHP does NOT claim.
+// The TPM event log at 0xFEB00000 stays inside the shortened scratch.
+constexpr uint64_t kMmioGapStart = 0xFEB80000ull;
 constexpr uint64_t kMmioGapEnd = 0xFEF00000ull;
 constexpr uint64_t kImageSearchBackBytes = 256ull * 1024ull * 1024ull;
+
+// Relocated MMIO base addresses — below the WHP dummy zone.
+constexpr uint64_t kIoApicRelocBase = 0xFEB80000ull;
+constexpr uint64_t kHpetRelocBase   = 0xFEB90000ull;
+constexpr uint64_t kTpmCrbRelocBase = 0xFEBA0000ull;
 
 // TPM 2.0 event log buffer location in guest physical memory. Sits in the
 // firmwareLowScratch_ RAM mapping (0xFC000000-0xFEC00000) so the guest OS
@@ -143,7 +158,10 @@ VirtualMachine::VirtualMachine(const std::filesystem::path &firmwarePath,
       firmware_(host_, firmwarePath),
       vcpu_(host_, 0),
       com1_(SerialConsole::kCom1Base),
-      com2_(SerialConsole::kCom2Base) {
+      com2_(SerialConsole::kCom2Base),
+      ioApic_(kIoApicRelocBase),
+      hpet_(kHpetRelocBase),
+      tpm_(kTpmCrbRelocBase) {
   vcpu_.SetX86ResetState();
   (void)vcpu_.TrySetStartupSuspended(false);
   for (uint32_t i = 1; i < host_.ProcessorCount(); ++i) {
@@ -298,16 +316,42 @@ VirtualMachine::VirtualMachine(const std::filesystem::path &firmwarePath,
       std::memset(firmwareUpperScratch_->HostPtr(), 0, upperSize);
     }
   }
-  // Leave IOAPIC and HPET GPA pages unmapped so both reads and writes produce
-  // WHP memory-access exits and flow through the MMIO emulator. Read-only trap
-  // pages catch writes only; reads would see zeros and make the advertised
-  // ACPI/APIC devices look absent or malformed to firmware and winload.
+  // WHP's Local APIC emulation (xAPIC mode) silently maps internal dummy
+  // pages at the canonical IOAPIC (0xFEC00000), HPET (0xFED00000), and
+  // TPM CRB (0xFED40000) GPAs. These pages absorb guest reads/writes
+  // without VM exits, defeating our software device emulators.
+  //
+  // Scan the entire MMIO gap [0xFEC00000, 0xFEF00000) at 64-KiB stride
+  // via WHvUnmapGpaRange. A successful unmap means WHP had the page
+  // mapped — the bitmap tells us exactly how wide the interference zone
+  // is, so we can choose a relocation target outside it.
+  {
+    constexpr uint64_t kGapBase = 0xFEC00000ull;
+    constexpr uint64_t kGapEnd = 0xFEF00000ull;
+    constexpr uint64_t kStride = 0x10000ull;
+    for (uint64_t gpa = kGapBase; gpa < kGapEnd; gpa += kStride) {
+      const HRESULT hr = WHvUnmapGpaRange(host_.Handle(), gpa, 0x1000);
+      if (SUCCEEDED(hr)) {
+        const uint64_t bit = (gpa - kGapBase) / kStride;
+        if (bit < 64) {
+          whpMmioGapBitmap_ |= (1ull << bit);
+        }
+        whpIoApicGpaProbeResult_ = 1;
+      }
+    }
+  }
 
   PcIoMemoryLayout layout{};
   layout.lowRamBytes =
       pageTableAssistBase_ != 0 ? pageTableAssistBase_ : options.lowRamBytes;
   layout.highRamBytes = options.highRamBytes;
   pcIo_.SetMemoryLayout(layout);
+  // Tell the ACPI table builder about the relocated MMIO bases so the MADT,
+  // HPET, and TPM2 tables advertise addresses that match our actual devices.
+  pcIo_.SetMmioBaseAddresses(kIoApicRelocBase, kHpetRelocBase,
+                             kTpmCrbRelocBase);
+  tpm2TableEnabled_ = options.enableTpm2Table;
+  pcIo_.SetTpm2TableEnabled(tpm2TableEnabled_);
   pcIo_.SetProcessorCount(host_.ProcessorCount());
   pcIo_.SetAcpiTablesEnabled(options.enableAcpiTables);
   if (tpmEventLogPopulated_) {
@@ -1008,6 +1052,20 @@ VmRunSummary VirtualMachine::RunLoop(
   VmRunSummary summary;
   summary.started = true;
   summary.processorCount = host_.ProcessorCount();
+  // Diagnostic: attempt to unmap WHP's internal dummy pages at the canonical
+  // MMIO GPAs one last time. This no longer affects correctness because our
+  // devices are relocated to non-canonical GPAs (kIoApicRelocBase, etc.),
+  // but the attempt confirms whether WHP re-maps between setup and first run.
+  {
+    constexpr uint64_t kReclaimPages[][2] = {
+        {0xFEC00000ull, 0x1000},
+        {0xFED00000ull, 0x1000},
+        {0xFED40000ull, 0x1000},
+    };
+    for (auto &[gpa, size] : kReclaimPages) {
+      (void)WHvUnmapGpaRange(host_.Handle(), gpa, size);
+    }
+  }
   // Steps with no I/O progress before we call the guest stuck. Sized loosely
   // so a long stretch of PCI scan + ACPI probe (~20K exits) does not get
   // mis-flagged when the guest is just busy.
@@ -1406,6 +1464,11 @@ VmRunSummary VirtualMachine::RunLoop(
     case WHvRunVpExitReasonMemoryAccess: {
       const auto &mem = ctx.MemoryAccess;
       const uint64_t gpa = mem.Gpa;
+      ++summary.totalBspMemoryAccessExits;
+      if (summary.totalBspMemoryAccessExits == 1) {
+        summary.firstBspMemoryAccessGpa = gpa;
+      }
+      summary.lastBspMemoryAccessGpa = gpa;
       summary.lastUnhandledMmioGpa = gpa;
       summary.lastUnhandledMmioGva = mem.Gva;
       summary.lastUnhandledMmioAccess = mem.AccessInfo.AccessType;
@@ -1896,6 +1959,16 @@ VmRunSummary VirtualMachine::RunLoop(
   summary.slavePicVectorBase = pcIo_.SlavePicVectorBase();
   summary.masterPicMask = pcIo_.MasterPicMask();
   summary.slavePicMask = pcIo_.SlavePicMask();
+  summary.masterPicIcw1Writes = pcIo_.MasterPicIcw1Writes();
+  summary.slavePicIcw1Writes = pcIo_.SlavePicIcw1Writes();
+  summary.masterPicIcw2Value = pcIo_.MasterPicIcw2Value();
+  summary.slavePicIcw2Value = pcIo_.SlavePicIcw2Value();
+  for (uint32_t i = 0; i < IoApic::kRedirectionEntries; ++i) {
+    summary.ioApicRedir[i] = ioApic_.RedirectionEntry(i);
+  }
+  summary.whpIoApicGpaProbe = whpIoApicGpaProbeResult_;
+  summary.whpMmioGapBitmap = whpMmioGapBitmap_;
+  summary.tpm2TableEnabled = tpm2TableEnabled_;
   summary.pm1SleepEnable = pcIo_.LastPm1SleepEnable();
   summary.pm1SleepType = pcIo_.LastSleepType();
   summary.pm1ControlValue = pcIo_.LastPm1ControlValue();

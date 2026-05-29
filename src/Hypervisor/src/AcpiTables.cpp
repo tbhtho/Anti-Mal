@@ -545,7 +545,8 @@ uint32_t AppendFadt(std::vector<uint8_t> &out, uint32_t facsOffset,
   return offset;
 }
 
-uint32_t AppendMadt(std::vector<uint8_t> &out, uint32_t processorCount) {
+uint32_t AppendMadt(std::vector<uint8_t> &out, uint32_t processorCount,
+                    uint64_t ioApicBase) {
   const auto offset = BeginSdt(out, "APIC", 1);
   PutLe32(out, 0xFEE00000u); // Local APIC address.
   PutLe32(out, 1);           // PC-AT compatibility.
@@ -563,7 +564,7 @@ uint32_t AppendMadt(std::vector<uint8_t> &out, uint32_t processorCount) {
   out.push_back(12);
   out.push_back(0); // IOAPIC ID.
   out.push_back(0); // Reserved.
-  PutLe32(out, 0xFEC00000u);
+  PutLe32(out, static_cast<uint32_t>(ioApicBase));
   PutLe32(out, 0); // GSI base.
 
   // Interrupt Source Override entries. Without these the guest assumes
@@ -606,10 +607,10 @@ uint32_t AppendWaet(std::vector<uint8_t> &out) {
   return offset;
 }
 
-uint32_t AppendHpet(std::vector<uint8_t> &out) {
+uint32_t AppendHpet(std::vector<uint8_t> &out, uint64_t hpetBase) {
   const auto offset = BeginSdt(out, "HPET", 1);
   PutLe32(out, HpetDevice::kEventTimerBlockId);
-  AppendGas(out, 0, 64, 0, 0, HpetDevice::kDefaultMmioBase);
+  AppendGas(out, 0, 64, 0, 0, hpetBase);
   out.push_back(0);   // HPET sequence number.
   PutLe16(out, 0x80); // Minimum clock tick.
   out.push_back(0);   // Page protection: no guarantee.
@@ -721,7 +722,7 @@ uint32_t AppendDbg2(std::vector<uint8_t> &out) {
 }
 
 uint32_t AppendRsdt(std::vector<uint8_t> &out,
-                    std::initializer_list<uint32_t> tableOffsets) {
+                    const std::vector<uint32_t> &tableOffsets) {
   const auto offset = BeginSdt(out, "RSDT", 1);
   for (uint32_t tableOffset : tableOffsets) {
     PutLe32(out, tableOffset);
@@ -882,39 +883,51 @@ uint32_t AcpiTableLength(const std::vector<uint8_t> &blob, uint32_t offset) {
 
 AcpiBuildArtifacts BuildPcAcpiTables(uint32_t processorCount, bool includeDbgp,
                                      uint32_t tpmEventLogSize,
-                                     uint64_t tpmEventLogGpa) {
+                                     uint64_t tpmEventLogGpa,
+                                     uint64_t ioApicBase,
+                                     uint64_t hpetBase,
+                                     uint64_t tpmCrbBase,
+                                     bool includeTpm2) {
   AcpiBuildArtifacts artifacts;
   auto &tables = artifacts.tables;
   artifacts.offsets.facs = AppendFacs(tables);
   artifacts.offsets.dsdt = AppendDsdt(tables, processorCount);
   artifacts.offsets.fadt =
       AppendFadt(tables, artifacts.offsets.facs, artifacts.offsets.dsdt);
-  artifacts.offsets.madt = AppendMadt(tables, processorCount);
+  artifacts.offsets.madt = AppendMadt(tables, processorCount, ioApicBase);
   artifacts.offsets.waet = AppendWaet(tables);
-  artifacts.offsets.hpet = AppendHpet(tables);
+  artifacts.offsets.hpet = AppendHpet(tables, hpetBase);
   if (includeDbgp) {
     artifacts.offsets.dbgp = AppendDbgp(tables);
   }
   artifacts.offsets.spcr = AppendSpcr(tables);
   artifacts.offsets.dbg2 = AppendDbg2(tables);
   // TPM 2.0 ACPI table — points OVMF's Tcg2Pei/Tcg2Dxe at our CRB stub.
-  artifacts.offsets.tpm2 = AppendTpm2(
-      tables,
-      Tpm2CrbDevice::kDefaultMmioBase + Tpm2CrbDevice::kControlAreaOffset,
-      tpmEventLogSize, tpmEventLogGpa);
-  if (includeDbgp) {
-    artifacts.offsets.rsdt =
-        AppendRsdt(tables, {artifacts.offsets.fadt, artifacts.offsets.madt,
-                            artifacts.offsets.waet, artifacts.offsets.hpet,
-                            artifacts.offsets.dbgp, artifacts.offsets.spcr,
-                            artifacts.offsets.dbg2, artifacts.offsets.tpm2});
-  } else {
-    artifacts.offsets.rsdt =
-        AppendRsdt(tables, {artifacts.offsets.fadt, artifacts.offsets.madt,
-                            artifacts.offsets.waet, artifacts.offsets.hpet,
-                            artifacts.offsets.spcr, artifacts.offsets.dbg2,
-                            artifacts.offsets.tpm2});
+  // When includeTpm2 is false we omit the table entirely so that neither
+  // firmware nor the OS attempts to use a TPM that WHP's LAPIC emulation
+  // makes unreachable (dummy pages absorb all MMIO accesses in the
+  // [0xFEC00000, 0xFEF00000) range). Without a TPM2 ACPI table, winload's
+  // SpacebootInitialize skips the measured-boot path that was returning
+  // STATUS_ILLEGAL_FUNCTION (0xC00000B9).
+  if (includeTpm2) {
+    artifacts.offsets.tpm2 = AppendTpm2(
+        tables,
+        tpmCrbBase + Tpm2CrbDevice::kControlAreaOffset,
+        tpmEventLogSize, tpmEventLogGpa);
   }
+  // Build RSDT with all present tables.
+  std::vector<uint32_t> rsdtEntries = {
+      artifacts.offsets.fadt, artifacts.offsets.madt,
+      artifacts.offsets.waet, artifacts.offsets.hpet};
+  if (includeDbgp) {
+    rsdtEntries.push_back(artifacts.offsets.dbgp);
+  }
+  rsdtEntries.push_back(artifacts.offsets.spcr);
+  rsdtEntries.push_back(artifacts.offsets.dbg2);
+  if (artifacts.offsets.tpm2 != 0) {
+    rsdtEntries.push_back(artifacts.offsets.tpm2);
+  }
+  artifacts.offsets.rsdt = AppendRsdt(tables, rsdtEntries);
 
   artifacts.rsdp = BuildRsdp(artifacts.offsets.rsdt);
   artifacts.tableLoader =

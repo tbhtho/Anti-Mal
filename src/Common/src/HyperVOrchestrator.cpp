@@ -3747,43 +3747,132 @@ private:
     if (required > static_cast<size_t>(std::numeric_limits<int32_t>::max())) {
       return std::nullopt;
     }
-    size_t hbin = kHiveBase;
-    while (hbin + 32 <= bytes_.size() &&
-           std::memcmp(bytes_.data() + hbin, "hbin", 4) == 0) {
-      const uint32_t hbinSize = ReadLe32(bytes_.data() + hbin + 8);
-      if (hbinSize < 32 || hbin + hbinSize > bytes_.size()) {
+    for (int attempt = 0; attempt < 2; ++attempt) {
+      size_t hbin = kHiveBase;
+      while (hbin + 32 <= bytes_.size() &&
+             std::memcmp(bytes_.data() + hbin, "hbin", 4) == 0) {
+        const uint32_t hbinSize = ReadLe32(bytes_.data() + hbin + 8);
+        if (hbinSize < 32 || hbin + hbinSize > bytes_.size()) {
+          break;
+        }
+        size_t cell = hbin + 32;
+        while (cell + 4 <= hbin + hbinSize) {
+          const int32_t signedSize =
+              static_cast<int32_t>(ReadLe32(bytes_.data() + cell));
+          if (signedSize == 0 ||
+              signedSize == std::numeric_limits<int32_t>::min()) {
+            break;
+          }
+          const size_t cellSize =
+              static_cast<size_t>(signedSize < 0 ? -signedSize : signedSize);
+          if (cellSize < 8 || cell + cellSize > hbin + hbinSize) {
+            break;
+          }
+          if (signedSize > 0 && cellSize >= required) {
+            const size_t remainder = cellSize - required;
+            const size_t used = remainder >= 8 ? required : cellSize;
+            WriteLe32(bytes_.data() + cell,
+                      static_cast<uint32_t>(-static_cast<int32_t>(used)));
+            std::memset(bytes_.data() + cell + 4, 0, used - 4);
+            if (remainder >= 8) {
+              WriteLe32(bytes_.data() + cell + used,
+                        static_cast<uint32_t>(remainder));
+            }
+            return static_cast<uint32_t>(cell - kHiveBase);
+          }
+          cell += cellSize;
+        }
+        // Trailing zeros in hbin: treat remaining space as a free cell.
+        // Windows registry hives often have zero-filled tails inside the
+        // last hbin that aren't encoded as a proper free cell. If the cell
+        // walk stopped because it hit signedSize==0 and there's enough
+        // remaining space, synthesize a free cell from that tail.
+        const size_t hbinEnd = hbin + hbinSize;
+        if (cell + required <= hbinEnd) {
+          const size_t tailSize = hbinEnd - cell;
+          // Verify the tail is actually zeros (not corrupted data)
+          bool tailIsZero = true;
+          for (size_t i = 0; i < std::min<size_t>(tailSize, 64); ++i) {
+            if (bytes_[cell + i] != 0) {
+              tailIsZero = false;
+              break;
+            }
+          }
+          if (tailIsZero && tailSize >= required) {
+            // Synthesize: mark the required portion as allocated, leave
+            // remainder as a free cell.
+            const size_t remainder = tailSize - required;
+            const size_t used = remainder >= 8 ? required : tailSize;
+            WriteLe32(bytes_.data() + cell,
+                      static_cast<uint32_t>(-static_cast<int32_t>(used)));
+            std::memset(bytes_.data() + cell + 4, 0, used - 4);
+            if (remainder >= 8) {
+              WriteLe32(bytes_.data() + cell + used,
+                        static_cast<uint32_t>(remainder));
+            }
+            return static_cast<uint32_t>(cell - kHiveBase);
+          }
+        }
+        hbin += hbinSize;
+      }
+      // First attempt exhausted existing free cells — grow the hive
+      // but only if the growth fits within the original file allocation.
+      if (attempt == 0 && !GrowHive(required)) {
         break;
       }
-      size_t cell = hbin + 32;
-      while (cell + 4 <= hbin + hbinSize) {
-        const int32_t signedSize =
-            static_cast<int32_t>(ReadLe32(bytes_.data() + cell));
-        if (signedSize == 0 ||
-            signedSize == std::numeric_limits<int32_t>::min()) {
-          break;
-        }
-        const size_t cellSize =
-            static_cast<size_t>(signedSize < 0 ? -signedSize : signedSize);
-        if (cellSize < 8 || cell + cellSize > hbin + hbinSize) {
-          break;
-        }
-        if (signedSize > 0 && cellSize >= required) {
-          const size_t remainder = cellSize - required;
-          const size_t used = remainder >= 8 ? required : cellSize;
-          WriteLe32(bytes_.data() + cell,
-                    static_cast<uint32_t>(-static_cast<int32_t>(used)));
-          std::memset(bytes_.data() + cell + 4, 0, used - 4);
-          if (remainder >= 8) {
-            WriteLe32(bytes_.data() + cell + used,
-                      static_cast<uint32_t>(remainder));
-          }
-          return static_cast<uint32_t>(cell - kHiveBase);
-        }
-        cell += cellSize;
-      }
-      hbin += hbinSize;
     }
     return std::nullopt;
+  }
+
+  // Append a new hbin block to the hive so AllocateCell can find free space.
+  // Updates regf data-length (offset 0x28) and recomputes header checksum.
+  // IMPORTANT: will NOT grow bytes_ beyond its current size (the original
+  // file allocation). If there's slack between the regf data length and the
+  // file size, the new hbin is written into that slack. Otherwise fails so
+  // that WriteFileSameSize can still succeed.
+  bool GrowHive(size_t minCellBytes) {
+    constexpr size_t kHiveBase = 0x1000;
+    constexpr size_t kHbinHeaderSize = 32;
+    if (!IsValid()) {
+      return false;
+    }
+    const uint32_t currentDataLen = ReadLe32(bytes_.data() + 0x28);
+    const size_t newHbinOffset = static_cast<size_t>(currentDataLen);
+    // Hbin size must be 4096-aligned, at least 4096
+    const size_t minHbinSize = kHbinHeaderSize + minCellBytes;
+    const size_t newHbinSize =
+        std::max<size_t>(4096, ((minHbinSize + 4095) / 4096) * 4096);
+    if (newHbinSize > 0x7FFFFFFFull) {
+      return false;
+    }
+    const size_t writeStart = kHiveBase + newHbinOffset;
+    const size_t writeEnd = writeStart + newHbinSize;
+    if (writeStart > bytes_.size()) {
+      return false; // regf header claims more data than buffer holds
+    }
+    // Only grow if the new hbin fits within the existing file allocation.
+    // If it would exceed bytes_.size(), refuse — this preserves the
+    // invariant that the hive fits in its original on-disk clusters.
+    if (writeEnd > bytes_.size()) {
+      return false;
+    }
+    // Write hbin header (space is already zeroed from file read)
+    uint8_t *hdr = bytes_.data() + writeStart;
+    std::memcpy(hdr, "hbin", 4);
+    WriteLe32(hdr + 4, static_cast<uint32_t>(newHbinOffset));
+    WriteLe32(hdr + 8, static_cast<uint32_t>(newHbinSize));
+    // Bytes 12..31 stay zeroed (reserved + timestamp + spare)
+    // Single free cell covering the remainder of the hbin
+    const uint32_t freeCellSize =
+        static_cast<uint32_t>(newHbinSize - kHbinHeaderSize);
+    WriteLe32(hdr + kHbinHeaderSize, freeCellSize);
+    // Update regf data length
+    const uint32_t newDataLen =
+        static_cast<uint32_t>(newHbinOffset + newHbinSize);
+    WriteLe32(bytes_.data() + 0x28, newDataLen);
+    // Recompute regf checksum
+    WriteLe32(bytes_.data() + 0x1FC, RegistryHiveHeaderChecksum(bytes_));
+    return true;
   }
 
   bool AppendSubkey(uint32_t parentIndex, uint32_t childIndex) {
@@ -4203,7 +4292,13 @@ std::string CaptureOverlayBcdSummary(hv::IBlockDevice &disk) {
         << " testsigning="
         << BcdElementValueText(hive, *defaultObject, "16000049")
         << " hypervisorlaunchtype="
-        << BcdElementValueText(hive, *defaultObject, "250000F0") << "\n";
+        << BcdElementValueText(hive, *defaultObject, "250000F0")
+        << " winpe="
+        << BcdElementValueText(hive, *defaultObject, "26000022")
+        << " disableelam="
+        << BcdElementValueText(hive, *defaultObject, "26000080")
+        << " safeboot="
+        << BcdElementValueText(hive, *defaultObject, "25000080") << "\n";
   } else {
     out << "  {default}: missing\n";
   }
@@ -4300,12 +4395,16 @@ struct BootOverlayPatchResult {
   bool disableElamPatched = false;
   bool winPeProbeEnabled = false;
   bool winPePatched = false;
+  bool safeBootProbeEnabled = false;
+  bool safeBootPatched = false;
   bool ciEnrollmentProbeEnabled = false;
   bool ciEnrollmentPatched = false;
   bool ciPolicyOffProbeEnabled = false;
   bool ciPolicyOffAggressive = false;
   bool ciPolicyOffPatched = false;
   uint32_t ciPolicyOffFilesZeroed = 0;
+  bool spacebootPatchProbeEnabled = false;
+  bool spacebootPatchApplied = false;
   std::vector<std::string> notes;
 };
 
@@ -4386,8 +4485,22 @@ bool UpsertBcdElementRaw(MutableHiveView &hive, uint32_t elementsKey,
                          const std::string &elementId, uint32_t valueType,
                          const std::vector<uint8_t> &valueBytes) {
   if (const auto existing = hive.FindSubkey(elementsKey, elementId)) {
-    return hive.UpsertBinaryValueSameSize(*existing, "Element", valueType,
-                                          valueBytes);
+    // Try exact-size update first.
+    if (hive.UpsertBinaryValueSameSize(*existing, "Element", valueType,
+                                       valueBytes)) {
+      return true;
+    }
+    // Size mismatch (e.g. Windows stores some booleans as 1-byte, others
+    // as 8-byte).  Re-encode to match the stored size.
+    const auto val = hive.FindValue(*existing, "Element");
+    if (val && val->type == valueType && val->dataLength != valueBytes.size()) {
+      std::vector<uint8_t> resized(val->dataLength, 0);
+      const size_t copy = std::min(valueBytes.size(), resized.size());
+      std::memcpy(resized.data(), valueBytes.data(), copy);
+      return hive.UpsertBinaryValueSameSize(*existing, "Element", valueType,
+                                            resized);
+    }
+    return false;
   }
   const auto child = hive.CreateAsciiKey(elementsKey, elementId);
   if (!child) {
@@ -4448,6 +4561,9 @@ bool PatchBcdDebugTransport(std::vector<uint8_t> &bcd,
   }
 
   bool changed = false;
+  // BCD booleans (type 0x16xxxx) are stored as 1-byte REG_BINARY on this
+  // Windows build. UpsertBcdElementRaw size-adaptation handles the existing-
+  // element case; for creation, 1-byte is what bootmgr expects.
   if (UpsertBcdElementRaw(hive, *elements, "16000010", 3,
                           std::vector<uint8_t>{1})) {
     changed = true;
@@ -4810,6 +4926,40 @@ bool PatchBcdLegacyBootContextProbe(std::vector<uint8_t> &bcd,
           "BCD legacy-context probe: default loader Elements key not found");
     }
     return false;
+  }
+
+  // Diagnose the existing element before attempting the upsert so we can
+  // understand failures.  The element key may already exist with a size
+  // different from our BcdU64Bytes(0) payload (8 bytes).
+  const auto existingKey = hive.FindSubkey(*elements, "16000060");
+  if (existingKey) {
+    const auto val = hive.FindValue(*existingKey, "Element");
+    if (val) {
+      std::string diag = "isolatedcontext existing: type=";
+      diag += std::to_string(val->type);
+      diag += " dataLen=";
+      diag += std::to_string(val->dataLength);
+      const auto raw = hive.ValueBytes(*val);
+      diag += " raw=";
+      for (size_t i = 0; i < std::min<size_t>(raw.size(), 16); ++i) {
+        char hex[4];
+        snprintf(hex, sizeof(hex), "%02X", raw[i]);
+        diag += hex;
+      }
+      if (result) {
+        result->notes.push_back(diag);
+      }
+    } else {
+      if (result) {
+        result->notes.push_back(
+            "isolatedcontext key exists but 'Element' value missing");
+      }
+    }
+  } else {
+    if (result) {
+      result->notes.push_back("isolatedcontext key 16000060 not found "
+                               "under Elements — will create");
+    }
   }
 
   if (UpsertBcdElementRaw(hive, *elements, "16000060", 3,
@@ -5199,9 +5349,133 @@ void ApplyCiPolicyOffProbe(hv::IBlockDevice &disk,
       result->notes.push_back("zeroed Windows CI policy " + path);
     }
   }
+  // In aggressive mode, also zero VbsSiPolicy.p7b and DriverSiPolicy.p7b.
+  // These signed integration policies can block boot at the
+  // SpacebootInitialize phase even when hypervisorlaunchtype=Off and all
+  // .cip files are zeroed.
+  if (result->ciPolicyOffAggressive) {
+    // ESP copies
+    for (const char *name : {"EFI\\Microsoft\\Boot\\VbsSiPolicy.p7b",
+                             "EFI\\Microsoft\\Boot\\DriverSiPolicy.p7b"}) {
+      if (const auto entry = fat.FindPath(name);
+          entry && (entry->attributes & 0x10u) == 0 &&
+          fat.ZeroFile(*entry, kMaxPolicyBytes)) {
+        result->ciPolicyOffPatched = true;
+        ++result->ciPolicyOffFilesZeroed;
+        result->notes.push_back(
+            std::string("zeroed ESP signed-integration policy ") + name);
+      }
+    }
+    // NTFS copies
+    for (const char *name :
+         {"Windows\\System32\\CodeIntegrity\\VbsSiPolicy.p7b",
+          "Windows\\System32\\CodeIntegrity\\DriverSiPolicy.p7b"}) {
+      if (const auto entry = ntfs.FindPath(name);
+          entry && ZeroNtfsFileSameSize(ntfs, *entry, kMaxPolicyBytes)) {
+        result->ciPolicyOffPatched = true;
+        ++result->ciPolicyOffFilesZeroed;
+        result->notes.push_back(
+            std::string("zeroed Windows signed-integration policy ") + name);
+      }
+    }
+  }
+
   if (!result->ciPolicyOffPatched) {
     result->notes.push_back(
         "CI policy-off probe enabled but no documented policy files were zeroed");
+  }
+}
+
+// Binary-patch winload.efi on the ESP to force SpacebootInitialize into its
+// "not applicable" (STATUS_NOT_FOUND) fallback path.  This eliminates the
+// BootEnvironment / SystemGuard phase that produces 0xc0430001 / 0xc0000225
+// on our WHP-based VM.
+//
+// The patch replaces a single 5-byte CALL instruction inside
+// SpacebootInitialize (file offset 0x6EAD0 in the 26100-era winload.efi)
+// with MOV EAX, 0xC0000225.  The control flow after the patch:
+//   1. eax = STATUS_NOT_FOUND  (our patch)
+//   2. mov edi, eax            (saves status)
+//   3. test eax, eax / js      (taken — status is negative)
+//   4. cmp edi, r12d           (r12d = STATUS_NOT_FOUND — equal!)
+//   5. jne                     (NOT taken — falls through to fallback)
+//   6. Fallback initialises Spaceboot state as "not applicable"
+//
+// The net effect is identical to winload deciding that Spaceboot does not
+// apply on this hardware — which is the truth.
+void ApplySpacebootPatch(hv::IBlockDevice &disk,
+                         const std::vector<GptPartitionLite> &partitions,
+                         BootOverlayPatchResult *result) {
+  if (!result) {
+    return;
+  }
+  result->spacebootPatchProbeEnabled =
+      EnvFlagEnabled("ANTIMAL_PROBE_PATCH_SPACEBOOT");
+  if (!result->spacebootPatchProbeEnabled) {
+    return;
+  }
+  result->notes.push_back("winload Spaceboot patch enabled by "
+                           "ANTIMAL_PROBE_PATCH_SPACEBOOT");
+
+  // winload.efi lives on the NTFS Windows partition at
+  // Windows\System32\winload.efi (not on the ESP).
+  const auto windows =
+      std::find_if(partitions.begin(), partitions.end(),
+                   [](const GptPartitionLite &partition) {
+                     return IsWindowsBasicDataGuid(partition.typeGuid);
+                   });
+  if (windows == partitions.end()) {
+    result->notes.push_back("winload patch: Windows partition not found");
+    return;
+  }
+  NtfsBootFileLocator ntfs(disk, windows->firstLba);
+  if (!ntfs.Init()) {
+    result->notes.push_back("winload patch: NTFS not readable");
+    return;
+  }
+  const auto entry = ntfs.FindPath("Windows\\System32\\winload.efi");
+  if (!entry) {
+    result->notes.push_back("winload.efi not found on Windows partition");
+    return;
+  }
+  // Sanity: expect ≥3 MiB winload.efi.
+  constexpr size_t kMaxWinloadSize = 8ull * 1024ull * 1024ull;
+  auto bytes = ntfs.ReadFile(*entry, kMaxWinloadSize);
+  if (bytes.size() != entry->size || bytes.size() < 0x6EAD5) {
+    result->notes.push_back("winload.efi too small or read failed (size=" +
+                            std::to_string(bytes.size()) + ")");
+    return;
+  }
+
+  // The 5-byte CALL instruction we want to replace.
+  constexpr size_t kPatchOffset = 0x6EAD0;
+  static constexpr uint8_t kOriginal[5] = {0xE8, 0xB7, 0x19, 0x00, 0x00};
+  // MOV EAX, 0xC0000225 (STATUS_NOT_FOUND) — same 5 bytes.
+  static constexpr uint8_t kPatched[5] = {0xB8, 0x25, 0x02, 0x00, 0xC0};
+
+  if (std::memcmp(bytes.data() + kPatchOffset, kOriginal, 5) == 0) {
+    std::memcpy(bytes.data() + kPatchOffset, kPatched, 5);
+    if (ntfs.WriteFileSameSize(*entry, bytes)) {
+      result->spacebootPatchApplied = true;
+      result->notes.push_back(
+          "winload.efi patched: SpacebootInitialize forced to "
+          "STATUS_NOT_FOUND fallback at offset 0x6EAD0");
+    } else {
+      result->notes.push_back("winload.efi patch: WriteFileSameSize failed");
+    }
+  } else if (std::memcmp(bytes.data() + kPatchOffset, kPatched, 5) == 0) {
+    result->spacebootPatchApplied = true;
+    result->notes.push_back("winload.efi already patched (idempotent)");
+  } else {
+    // Different winload build — log what we found for diagnostics.
+    char hex[32];
+    snprintf(hex, sizeof(hex), "%02X %02X %02X %02X %02X",
+             bytes[kPatchOffset], bytes[kPatchOffset + 1],
+             bytes[kPatchOffset + 2], bytes[kPatchOffset + 3],
+             bytes[kPatchOffset + 4]);
+    result->notes.push_back(
+        std::string("winload.efi patch: unexpected bytes at 0x6EAD0: ") +
+        hex + " (expected E8 B7 19 00 00)");
   }
 }
 
@@ -5341,6 +5615,25 @@ BootOverlayPatchResult ApplyEphemeralBootOverlay(hv::IBlockDevice &disk) {
             "found",
             "BCD forcelegacyplatform probe failed to set element", &result);
       }
+      // WinPE comes FIRST — it bypasses Spaceboot/SystemGuard entirely
+      // and is the highest-priority BCD patch for getting past the
+      // BootEnvironment phase. Allocate its cell before other probes
+      // consume available hive free space.
+      bool winPeChanged = false;
+      result.winPeProbeEnabled = EnvFlagEnabled("ANTIMAL_PROBE_BCD_WINPE");
+      if (result.winPeProbeEnabled) {
+        // BcdOSLoaderBoolean_WinPEMode = 0x26000022. Boots Windows in PE
+        // (Pre-installation Environment) mode, which uses a simpler init
+        // path that bypasses Spaceboot/SystemGuard secure-launch entirely.
+        // Useful as a control to prove the BootEnvironment phase is the
+        // remaining gate; not appropriate for normal sandbox runs.
+        result.notes.push_back(
+            "BCD winpe probe enabled by ANTIMAL_PROBE_BCD_WINPE");
+        winPeChanged = PatchBcdLoaderBooleanProbe(
+            bytes, "26000022", &BootOverlayPatchResult::winPePatched,
+            "BCD winpe probe: default loader Elements key not found",
+            "BCD winpe probe failed to set element", &result);
+      }
       bool disableElamChanged = false;
       result.disableElamProbeEnabled =
           EnvFlagEnabled("ANTIMAL_PROBE_BCD_DISABLE_ELAM");
@@ -5359,21 +5652,6 @@ BootOverlayPatchResult ApplyEphemeralBootOverlay(hv::IBlockDevice &disk) {
             "BCD disableelamdrivers probe: default loader Elements key not "
             "found",
             "BCD disableelamdrivers probe failed to set element", &result);
-      }
-      bool winPeChanged = false;
-      result.winPeProbeEnabled = EnvFlagEnabled("ANTIMAL_PROBE_BCD_WINPE");
-      if (result.winPeProbeEnabled) {
-        // BcdOSLoaderBoolean_WinPEMode = 0x26000022. Boots Windows in PE
-        // (Pre-installation Environment) mode, which uses a simpler init
-        // path that bypasses Spaceboot/SystemGuard secure-launch entirely.
-        // Useful as a control to prove the BootEnvironment phase is the
-        // remaining gate; not appropriate for normal sandbox runs.
-        result.notes.push_back(
-            "BCD winpe probe enabled by ANTIMAL_PROBE_BCD_WINPE");
-        winPeChanged = PatchBcdLoaderBooleanProbe(
-            bytes, "26000022", &BootOverlayPatchResult::winPePatched,
-            "BCD winpe probe: default loader Elements key not found",
-            "BCD winpe probe failed to set element", &result);
       }
       result.explicitKernelHalProbeEnabled = ExplicitKernelHalProbeEnabled();
       if (result.explicitKernelHalProbeEnabled) {
@@ -5416,13 +5694,78 @@ BootOverlayPatchResult ApplyEphemeralBootOverlay(hv::IBlockDevice &disk) {
               PatchBcdLoadOptionsProbe(bytes, wide, &result);
         }
       }
+      bool safeBootChanged = false;
+      result.safeBootProbeEnabled =
+          EnvFlagEnabled("ANTIMAL_PROBE_BCD_SAFEBOOT");
+      if (result.safeBootProbeEnabled) {
+        // BcdOSLoaderInteger_SafeBoot = 0x25000080. Values:
+        //   1 = Minimal, 2 = Network, 3 = DsRepair.
+        // Safe Mode forces a minimal driver-load set and may bypass the
+        // SpacebootInitialize BootEnvironment phase that currently blocks
+        // normal boot in our WHP VM.
+        // ANTIMAL_PROBE_BCD_SAFEBOOT_TYPE overrides the value (default=1).
+        uint64_t safeBootType = 1;
+        {
+          char sbuf[16] = {};
+          size_t slen = 0;
+          if (getenv_s(&slen, sbuf, sizeof(sbuf),
+                       "ANTIMAL_PROBE_BCD_SAFEBOOT_TYPE") == 0 &&
+              slen > 1 && sbuf[0] != '\0') {
+            const int v = std::atoi(sbuf);
+            if (v >= 1 && v <= 3) {
+              safeBootType = static_cast<uint64_t>(v);
+            }
+          }
+        }
+        {
+          std::string note = "BCD safeboot probe enabled by "
+                             "ANTIMAL_PROBE_BCD_SAFEBOOT (type=";
+          note += std::to_string(safeBootType);
+          note += safeBootType == 1   ? " Minimal"
+                  : safeBootType == 2 ? " Network"
+                                      : " DsRepair";
+          note += ")";
+          result.notes.push_back(note);
+        }
+        MutableHiveView hive(bytes);
+        if (hive.IsValid()) {
+          const auto root = hive.RootIndex();
+          const auto objects =
+              root ? hive.FindSubkey(*root, "Objects") : std::nullopt;
+          const auto bootmgr =
+              objects
+                  ? hive.FindSubkey(
+                        *objects,
+                        "{9dea862c-5cdd-4e70-acc1-f32b344d4795}")
+                  : std::nullopt;
+          const std::string defaultGuid =
+              bootmgr ? BcdElementString(hive, *bootmgr, "23000003")
+                      : std::string{};
+          const auto defaultObject =
+              !defaultGuid.empty() && objects
+                  ? hive.FindSubkey(*objects, defaultGuid)
+                  : std::nullopt;
+          const auto elements =
+              defaultObject ? hive.FindSubkey(*defaultObject, "Elements")
+                            : std::nullopt;
+          if (elements &&
+              UpsertBcdElementRaw(hive, *elements, "25000080", 3,
+                                  BcdU64Bytes(safeBootType))) {
+            result.safeBootPatched = true;
+            safeBootChanged = true;
+          } else {
+            result.notes.push_back(
+                "BCD safeboot probe failed to set element");
+          }
+        }
+      }
       const bool bcdChanged =
           policyChanged || transportChanged || noIntegrityChanged ||
           legacyContextChanged || detectHalChanged ||
           forceLegacyPlatformChanged || explicitKernelHalChanged ||
           testSigningChanged || bootUxChanged || loadOptionsChanged ||
           hypervisorLaunchOffChanged || disableElamChanged ||
-          winPeChanged;
+          winPeChanged || safeBootChanged;
       if (bcdChanged) {
         if (RefreshRegistryHiveHeader(bytes)) {
           result.bcdHeaderRefreshed = true;
@@ -5454,6 +5797,7 @@ BootOverlayPatchResult ApplyEphemeralBootOverlay(hv::IBlockDevice &disk) {
         result.explicitKernelHalPatched = false;
         result.testSigningPatched = false;
         result.hypervisorLaunchOffPatched = false;
+        result.safeBootPatched = false;
         result.notes.push_back("failed to write patched BCD to overlay");
       }
     }
@@ -5470,6 +5814,7 @@ BootOverlayPatchResult ApplyEphemeralBootOverlay(hv::IBlockDevice &disk) {
   } else {
     result.notes.push_back("bootstat.dat not found on ESP");
   }
+  ApplySpacebootPatch(disk, partitions, &result);
   PatchOverlaySystemBootStorage(disk, &result);
   return result;
 }
@@ -5555,6 +5900,13 @@ BootOverlayPatchDetails(const BootOverlayPatchResult &patch) {
       {"disableElamPatched", patch.disableElamPatched ? "true" : "false"},
       {"winPeProbeEnabled", patch.winPeProbeEnabled ? "true" : "false"},
       {"winPePatched", patch.winPePatched ? "true" : "false"},
+      {"safeBootProbeEnabled",
+       patch.safeBootProbeEnabled ? "true" : "false"},
+      {"safeBootPatched", patch.safeBootPatched ? "true" : "false"},
+      {"spacebootPatchProbeEnabled",
+       patch.spacebootPatchProbeEnabled ? "true" : "false"},
+      {"spacebootPatchApplied",
+       patch.spacebootPatchApplied ? "true" : "false"},
       {"scope", "overlay-only"}};
   if (!patch.notes.empty()) {
     details["notes"] = JoinStrings(patch.notes, "; ");
@@ -5688,6 +6040,20 @@ SystemBootSecurityInspection InspectSystemBootSecurity(MutableHiveView &hive) {
            "Lsa.RunAsPPLBoot");
   addDword({*controlSet, "Control", "CI", "Config"},
            "VulnerableDriverBlocklistEnable", "CI.VulnDriverBlocklist");
+  // SafeBoot path existence — critical for SafeBoot=1 (Minimal) BCD probe.
+  // If missing, winload fails with STATUS_OBJECT_PATH_NOT_FOUND (0xC00000A6).
+  const auto safeBootKey =
+      FindHivePath(hive, {*controlSet, "Control", "SafeBoot"});
+  const auto safeBootMinimal =
+      safeBootKey ? hive.FindSubkey(*safeBootKey, "Minimal") : std::nullopt;
+  const auto safeBootNetwork =
+      safeBootKey ? hive.FindSubkey(*safeBootKey, "Network") : std::nullopt;
+  parts.push_back(std::string("SafeBoot=") +
+                  (safeBootKey ? "present" : "MISSING"));
+  parts.push_back(std::string("SafeBoot.Minimal=") +
+                  (safeBootMinimal ? "present" : "MISSING"));
+  parts.push_back(std::string("SafeBoot.Network=") +
+                  (safeBootNetwork ? "present" : "MISSING"));
   inspection.details = JoinStrings(parts, ";");
   return inspection;
 }
@@ -5777,13 +6143,23 @@ BaseBootStorageInspection InspectBaseBootStorage(hv::IBlockDevice &disk) {
       ServiceBootStartReady(hive, *controlSet, "intelide") ||
       ServiceBootStartReady(hive, *controlSet, "atapi");
   const bool criticalReady = CriticalIdeDeviceReady(hive, *controlSet);
+  // Check kernel/HAL file existence — these are what winload opens next.
+  const bool ntoskrnlExists =
+      ntfs.FindPath("Windows\\System32\\ntoskrnl.exe").has_value();
+  const bool halExists =
+      ntfs.FindPath("Windows\\System32\\hal.dll").has_value();
+  const bool ciDllExists =
+      ntfs.FindPath("Windows\\System32\\ci.dll").has_value();
   inspection.ready = coreReady && ideServiceReady && criticalReady;
   std::ostringstream details;
   details << "controlSet=" << *controlSet
           << ";storageCore=" << (coreReady ? "ready" : "needs-repair")
           << ";ideService=" << (ideServiceReady ? "ready" : "needs-repair")
           << ";criticalDevice="
-          << (criticalReady ? "ready" : "needs-repair");
+          << (criticalReady ? "ready" : "needs-repair")
+          << ";ntoskrnl=" << (ntoskrnlExists ? "found" : "MISSING")
+          << ";hal=" << (halExists ? "found" : "MISSING")
+          << ";ci=" << (ciDllExists ? "found" : "MISSING");
   inspection.details = details.str();
   return inspection;
 }
@@ -5939,6 +6315,31 @@ bool PatchSystemHiveLegacySecurityProbe(std::vector<uint8_t> &bytes,
       result->notes.push_back(
           "SYSTEM legacy security probe failed to write one or more DWORDs");
     }
+    // Diagnostic: verify SafeBoot registry paths survive our patches.
+    // If SafeBoot=1 is set in BCD, winload opens Control\SafeBoot\Minimal.
+    // A missing path here → STATUS_OBJECT_PATH_NOT_FOUND (0xC00000A6).
+    auto safeBootRoot = hive.FindSubkey(hive.RootIndex().value_or(0),
+                                        *controlSet);
+    if (safeBootRoot) {
+      safeBootRoot = hive.FindSubkey(*safeBootRoot, "Control");
+    }
+    if (safeBootRoot) {
+      safeBootRoot = hive.FindSubkey(*safeBootRoot, "SafeBoot");
+    }
+    const bool safeBootExists = safeBootRoot.has_value();
+    const auto minimalKey =
+        safeBootExists ? hive.FindSubkey(*safeBootRoot, "Minimal")
+                       : std::nullopt;
+    const auto networkKey =
+        safeBootExists ? hive.FindSubkey(*safeBootRoot, "Network")
+                       : std::nullopt;
+    std::string sbDiag = "SafeBoot registry check: Control\\SafeBoot=";
+    sbDiag += safeBootExists ? "present" : "MISSING";
+    sbDiag += " Minimal=";
+    sbDiag += minimalKey.has_value() ? "present" : "MISSING";
+    sbDiag += " Network=";
+    sbDiag += networkKey.has_value() ? "present" : "MISSING";
+    result->notes.push_back(sbDiag);
   }
   return ok;
 }
@@ -7228,8 +7629,13 @@ std::string FormatTpmPcrFinalBanks(const hv::VmRunSummary &vm) {
 }
 
 std::string FormatAcpiTpm2EventLogSummary(uint32_t laml = 0,
-                                          uint64_t lasa = 0) {
+                                          uint64_t lasa = 0,
+                                          bool tpm2TableEnabled = true) {
   std::ostringstream out;
+  if (!tpm2TableEnabled) {
+    out << "TPM2 ACPI table omitted (device unreachable in WHP MMIO gap)";
+    return out.str();
+  }
   out << "TPM2 table CRB controlArea=0x" << std::hex << std::uppercase
       << (hv::Tpm2CrbDevice::kDefaultMmioBase +
           hv::Tpm2CrbDevice::kControlAreaOffset);
@@ -7370,7 +7776,8 @@ DynamicRunSummary ToDynamicSummary(const hv::VmRunSummary &vm,
   summary.tpmPcrExtendTraceSummary = FormatTpmPcrExtendTrace(vm);
   summary.tpmPcrFinalBanksSummary = FormatTpmPcrFinalBanks(vm);
   summary.acpiTpm2EventLogSummary =
-      FormatAcpiTpm2EventLogSummary(vm.tpmEventLogLaml, vm.tpmEventLogLasa);
+      FormatAcpiTpm2EventLogSummary(vm.tpmEventLogLaml, vm.tpmEventLogLasa,
+                                    vm.tpm2TableEnabled);
   summary.fwCfgSmbiosTableBytesRead = vm.fwCfgSmbiosTableBytesRead;
   summary.fwCfgSmbiosAnchorBytesRead = vm.fwCfgSmbiosAnchorBytesRead;
   summary.keyboardScancodesInjected =
@@ -7698,8 +8105,10 @@ std::string FormatVmDiagnostics(const hv::VmRunSummary &vm) {
     out << "tpmPcrExtendTrace: " << tpmPcrTrace << "\n";
   }
   out << "tpmPcrFinalBanks: " << FormatTpmPcrFinalBanks(vm) << "\n";
+  out << "tpm2TableEnabled: " << (vm.tpm2TableEnabled ? "true" : "false") << "\n";
   out << "acpiTpm2EventLog: "
-      << FormatAcpiTpm2EventLogSummary(vm.tpmEventLogLaml, vm.tpmEventLogLasa)
+      << FormatAcpiTpm2EventLogSummary(vm.tpmEventLogLaml, vm.tpmEventLogLasa,
+                                       vm.tpm2TableEnabled)
       << "\n";
   out << "ioApicRaises: " << vm.ioApicRaises << "\n";
   out << "ioApicDeliveries: " << vm.ioApicDeliveries << "\n";
@@ -7715,6 +8124,48 @@ std::string FormatVmDiagnostics(const hv::VmRunSummary &vm) {
       << static_cast<int>(vm.masterPicMask) << std::dec << "\n";
   out << "slavePicMask: 0x" << std::hex << std::uppercase
       << static_cast<int>(vm.slavePicMask) << std::dec << "\n";
+  out << "masterPicIcw1Writes: " << vm.masterPicIcw1Writes << "\n";
+  out << "slavePicIcw1Writes: " << vm.slavePicIcw1Writes << "\n";
+  out << "masterPicIcw2Value: 0x" << std::hex << std::uppercase
+      << static_cast<int>(vm.masterPicIcw2Value) << std::dec << "\n";
+  out << "slavePicIcw2Value: 0x" << std::hex << std::uppercase
+      << static_cast<int>(vm.slavePicIcw2Value) << std::dec << "\n";
+  out << "totalBspMemoryAccessExits: " << vm.totalBspMemoryAccessExits << "\n";
+  out << "firstBspMemoryAccessGpa: 0x" << std::hex << std::uppercase
+      << vm.firstBspMemoryAccessGpa << std::dec << "\n";
+  out << "lastBspMemoryAccessGpa: 0x" << std::hex << std::uppercase
+      << vm.lastBspMemoryAccessGpa << std::dec << "\n";
+  out << "whpIoApicGpaProbe: " << vm.whpIoApicGpaProbe
+      << " (1=WHP dummy confirmed, devices relocated)\n";
+  // Decode the MMIO gap bitmap: bit N → page at 0xFEC00000 + N*0x10000.
+  out << "whpMmioGapBitmap: 0x" << std::hex << std::uppercase
+      << vm.whpMmioGapBitmap << std::dec << " [";
+  {
+    bool first = true;
+    for (int bit = 0; bit < 48; ++bit) {
+      if (vm.whpMmioGapBitmap & (1ull << bit)) {
+        if (!first) out << ",";
+        first = false;
+        out << "0x" << std::hex << std::uppercase
+            << (0xFEC00000ull + static_cast<uint64_t>(bit) * 0x10000ull)
+            << std::dec;
+      }
+    }
+    if (first) out << "none";
+  }
+  out << "]\n";
+  out << "ioApicRelocBase: 0x" << std::hex << std::uppercase
+      << 0xFEB80000ull << std::dec << "\n";
+  out << "hpetRelocBase: 0x" << std::hex << std::uppercase
+      << 0xFEB90000ull << std::dec << "\n";
+  out << "tpmCrbRelocBase: 0x" << std::hex << std::uppercase
+      << 0xFEBA0000ull << std::dec << "\n";
+  out << "ioApicRedirTable:";
+  for (uint32_t i = 0; i < 24; ++i) {
+    out << " [" << i << "]=0x" << std::hex << std::uppercase
+        << vm.ioApicRedir[i] << std::dec;
+  }
+  out << "\n";
   out << "hpetReads: " << vm.hpetReads << "\n";
   out << "hpetWrites: " << vm.hpetWrites << "\n";
   out << "pitInterruptsPending: " << vm.pitInterruptsPending << "\n";

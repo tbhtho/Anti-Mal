@@ -725,8 +725,10 @@ void PcIoDevices::WritePicCommand(bool master, uint8_t value) {
   if ((value & 0x10u) != 0) {
     if (master) {
       masterPicInitStep_ = 1;
+      ++masterPicIcw1Writes_;
     } else {
       slavePicInitStep_ = 1;
+      ++slavePicIcw1Writes_;
     }
   }
 }
@@ -736,8 +738,10 @@ void PcIoDevices::WritePicData(bool master, uint8_t value) {
   if (step == 1) {
     if (master) {
       masterPicVectorBase_ = value;
+      masterPicIcw2Value_ = value;
     } else {
       slavePicVectorBase_ = value;
+      slavePicIcw2Value_ = value;
     }
     step = 2;
     return;

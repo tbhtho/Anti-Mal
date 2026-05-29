@@ -158,6 +158,28 @@ struct VmRunSummary {
   uint64_t lastPageFaultAssistGpa = 0;
   uint32_t mmioReads = 0;
   uint32_t mmioWrites = 0;
+  // Total WHvRunVpExitReasonMemoryAccess exits on the BSP, regardless of
+  // whether the MMIO bus routes them. Zero here means no GPA in the MMIO gap
+  // ever generated an exit — the gap may be mapped with RAM.
+  uint64_t totalBspMemoryAccessExits = 0;
+  uint64_t firstBspMemoryAccessGpa = 0;
+  uint64_t lastBspMemoryAccessGpa = 0;
+  // PIC initialization tracking — counts how many ICW1 writes we saw.
+  uint32_t masterPicIcw1Writes = 0;
+  uint32_t slavePicIcw1Writes = 0;
+  uint8_t masterPicIcw2Value = 0;
+  uint8_t slavePicIcw2Value = 0;
+  // IOAPIC redirection table snapshot at summary time.
+  uint64_t ioApicRedir[24]{};
+  // WHP IOAPIC GPA probe result: 0=not probed, 1=unmap succeeded (WHP had it
+  // mapped), 2=unmap failed (was genuinely unmapped), 3=remap succeeded.
+  int whpIoApicGpaProbe = 0;
+  // WHP MMIO gap coverage scan. Probes every 64-KiB-aligned page inside the
+  // MMIO gap [0xFEC00000, 0xFEF00000) via WHvUnmapGpaRange. Bit N is set
+  // when the page at (0xFEC00000 + N*0x10000) was mapped by WHP.
+  uint64_t whpMmioGapBitmap = 0;
+  // Whether the TPM2 ACPI table was included in the fw_cfg payload.
+  bool tpm2TableEnabled = false;
   // TPM 2.0 event log advertisement from the ACPI TPM2 table. Non-zero
   // when the VM populated firmwareLowScratch with a TCG_EfiSpecIDEvent03
   // header and pointed LAML/LASA at it.
@@ -329,6 +351,12 @@ struct VirtualMachineOptions {
   // this so the firmware lights up GOP. Fast unit tests opt out so they
   // don't allocate the extra mapping or wait for OVMF's VGA scan.
   bool enableFramebuffer = true;
+  // Include the TPM2 ACPI table in the fw_cfg payload. When WHP's LAPIC
+  // emulation maps dummy pages over [0xFEC00000, 0xFEF00000), the TPM CRB
+  // device is unreachable and advertising it via ACPI causes winload's
+  // SpacebootInitialize to return STATUS_ILLEGAL_FUNCTION (0xC00000B9).
+  // Default off until the TPM CRB is genuinely functional.
+  bool enableTpm2Table = false;
   VmNetworkMode networkMode = VmNetworkMode::Disabled;
 };
 
@@ -482,6 +510,8 @@ private:
   PcIoDevices pcIo_;
   Ps2Controller ps2_;
   IoApic ioApic_;
+  int whpIoApicGpaProbeResult_ = 0;
+  uint64_t whpMmioGapBitmap_ = 0;
   HpetDevice hpet_;
   Tpm2CrbDevice tpm_;
   // True once the firmwareLowScratch region has been seeded with a
@@ -489,6 +519,7 @@ private:
   // this to decide whether to populate the LAML/LASA fields of the TPM2
   // table so winload's measured-boot path can locate the pre-boot log.
   bool tpmEventLogPopulated_ = false;
+  bool tpm2TableEnabled_ = false;
   uint32_t tpmEventLogBytesWritten_ = 0;
   BochsVbeDevice vbe_;
   IoBus bus_;

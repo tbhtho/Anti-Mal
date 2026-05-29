@@ -45,10 +45,34 @@ public:
   void SetAcpiTablesEnabled(bool enabled) noexcept {
     acpiTablesEnabled_ = enabled;
   }
+  // Control whether the TPM2 ACPI table is included in the fw_cfg payload.
+  // When WHP's LAPIC emulation maps dummy pages over the MMIO gap
+  // [0xFEC00000, 0xFEF00000), the TPM CRB device is unreachable even after
+  // relocation — OVMF never initializes it because Tcg2Pei uses a hardcoded
+  // PCD address that also falls in the dummy zone. Advertising a TPM2 ACPI
+  // table for a non-functional device causes winload's SpacebootInitialize
+  // to return STATUS_ILLEGAL_FUNCTION (0xC00000B9). Disabling the table
+  // makes the OS skip the measured-boot path entirely.
+  void SetTpm2TableEnabled(bool enabled) noexcept {
+    tpm2TableEnabled_ = enabled;
+    RebuildAcpi();
+  }
+  // Override the MMIO base addresses advertised in the ACPI tables (MADT,
+  // HPET, TPM2). VirtualMachine relocates these away from the canonical
+  // GPAs (0xFEC00000, 0xFED00000, 0xFED40000) because WHP's Local APIC
+  // emulation silently maps dummy pages there, stealing guest accesses
+  // from our software IOAPIC/HPET/TPM emulators. Must be called before
+  // SetProcessorCount / SetTpmEventLog so the rebuilt tables pick them up.
+  void SetMmioBaseAddresses(uint64_t ioApicBase, uint64_t hpetBase,
+                            uint64_t tpmCrbBase) {
+    ioApicBase_ = ioApicBase;
+    hpetBase_ = hpetBase;
+    tpmCrbBase_ = tpmCrbBase;
+    RebuildAcpi();
+  }
   void SetProcessorCount(uint32_t count) {
     processorCount_ = count == 0 ? 1u : count;
-    acpi_ = BuildPcAcpiTables(processorCount_, /*includeDbgp=*/false,
-                              tpmEventLogSize_, tpmEventLogGpa_);
+    RebuildAcpi();
     cpuHotplugSelectionValid_ = cpuHotplugSelected_ < processorCount_;
   }
   // Set the TPM 2.0 event log advertisement that the ACPI builder feeds into
@@ -59,8 +83,7 @@ public:
   void SetTpmEventLog(uint64_t gpa, uint32_t size) {
     tpmEventLogGpa_ = gpa;
     tpmEventLogSize_ = size;
-    acpi_ = BuildPcAcpiTables(processorCount_, /*includeDbgp=*/false,
-                              tpmEventLogSize_, tpmEventLogGpa_);
+    RebuildAcpi();
   }
   const std::array<uint32_t, 128> &CmosReadHistogram() const noexcept {
     return cmosReadHistogram_;
@@ -119,6 +142,12 @@ public:
   uint32_t OnRead(uint16_t port, uint8_t accessSize) override;
 
 private:
+  void RebuildAcpi() {
+    acpi_ = BuildPcAcpiTables(processorCount_, /*includeDbgp=*/false,
+                              tpmEventLogSize_, tpmEventLogGpa_,
+                              ioApicBase_, hpetBase_, tpmCrbBase_,
+                              tpm2TableEnabled_);
+  }
   uint8_t ReadCmos(uint8_t index) const;
   uint32_t ReadPciConfigDword() const;
   void WritePciAddressWindow(uint16_t port, uint32_t value,
@@ -166,6 +195,10 @@ public:
   uint8_t SlavePicVectorBase() const noexcept { return slavePicVectorBase_; }
   uint8_t MasterPicMask() const noexcept { return masterPicMask_; }
   uint8_t SlavePicMask() const noexcept { return slavePicMask_; }
+  uint32_t MasterPicIcw1Writes() const noexcept { return masterPicIcw1Writes_; }
+  uint32_t SlavePicIcw1Writes() const noexcept { return slavePicIcw1Writes_; }
+  uint8_t MasterPicIcw2Value() const noexcept { return masterPicIcw2Value_; }
+  uint8_t SlavePicIcw2Value() const noexcept { return slavePicIcw2Value_; }
   uint32_t VgaBar0() const noexcept { return vgaBar0_; }
   bool VgaBar0Sizing() const noexcept { return vgaBar0Sizing_; }
 
@@ -184,6 +217,11 @@ private:
   uint8_t slavePicVectorBase_ = 0;
   uint8_t masterPicInitStep_ = 0;
   uint8_t slavePicInitStep_ = 0;
+  // Diagnostic counters — how many ICW1 (init) sequences the guest started.
+  uint32_t masterPicIcw1Writes_ = 0;
+  uint32_t slavePicIcw1Writes_ = 0;
+  uint8_t masterPicIcw2Value_ = 0;
+  uint8_t slavePicIcw2Value_ = 0;
   uint8_t port92_ = 0x02; // A20 enabled.
   uint32_t pciConfigAddress_ = 0;
   uint16_t ideCommand_ = 0x0001; // IO-space enabled; BMDMA not emulated yet.
@@ -206,6 +244,10 @@ private:
   uint8_t cpuHotplugCommand_ = 0;
   uint16_t fwCfgSelector_ = 0;
   size_t fwCfgOffset_ = 0;
+  uint64_t ioApicBase_ = 0xFEC00000ull;
+  uint64_t hpetBase_ = 0xFED00000ull;
+  uint64_t tpmCrbBase_ = 0xFED40000ull;
+  bool tpm2TableEnabled_ = true;
   PcIoMemoryLayout memory_{};
   AcpiBuildArtifacts acpi_;
   std::vector<uint8_t> smbiosTables_;

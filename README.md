@@ -2,7 +2,7 @@
 
 AntiMal is a defensive malware-analysis scaffold for Windows. The long-term goal is a local, open-source interactive sandbox for safely detonating suspicious Windows binaries without relying on Windows Sandbox, VirtualBox, VMware, or commercial services.
 
-Overall progress: [██████████▌░░░░░░░] 52%
+Overall progress: [███████████░░░░░░░] 54%
 
 ## Current Status
 
@@ -74,6 +74,18 @@ Recent in-house tooling additions (one session, three pushed commits):
 - `AntiMal.HostCli.exe base inspect` now lists every object under `\Objects`, not just `{bootmgr}` and `{default}`, with a full element inventory per object. `BcdObjectAlias` resolves `{dbgsettings}`, `{globalsettings}`, `{bootloadersettings}`, `{emssettings}`, `{resumeloadersettings}`, and `{defaultbootentry}` for readability.
 - Post-run VM diagnostics now classify the recorded IDE read trace by known ESP/Windows boot-file extents, FAT32/NTFS metadata, partition residuals, and disk/GPT metadata. `vm-diagnostics.txt` prints compact Windows residual LBA ranges plus a bounded NTFS run-owner scan for those ranges; the boot-completion event mirrors compact `ideReadAttribution`, `ideWindowsResidualRangeCount`, and `ideWindowsResidualOwners` details.
 - The same post-run path attributes IDE writes, snapshots ESP `bootstat.dat`, and labels the oldest-to-newest tail of the final disk accesses with known-file, filesystem-metadata, partition-residual, and residual-owner context. That tail is now written to `vm-diagnostics.txt` and summarized as `ideAccessTailAttribution` on `vm.boot.completed`.
+
+Recent in-house hypervisor additions (this session):
+
+- Root-caused why the software IOAPIC/HPET/TPM CRB emulators were never hit: WHP's Local APIC emulation (xAPIC mode) silently maps internal dummy RAM across the entire conventional MMIO gap `[0xFEC00000, 0xFEF00000)`. `WHvUnmapGpaRange` reports success but guest accesses to those pages are still absorbed without VM exits, so our emulators saw nothing. The new `whpMmioGapBitmap` diagnostic probes the gap at 64-KiB stride and reports exactly which pages WHP claims.
+- Relocated the MMIO devices below the dummy zone. `firmwareLowScratch_` now ends 512 KiB earlier (`0xFEB80000`), opening a clean gap at `[0xFEB80000, 0xFEC00000)`: IOAPIC → `0xFEB80000`, HPET → `0xFEB90000`, TPM CRB → `0xFEBA0000`. `PcIoDevices::SetMmioBaseAddresses` rebuilds the MADT/HPET/TPM2 ACPI tables to advertise the relocated bases so firmware and the OS agree with the emulators. The `0xFEB00000` TPM event log stays inside the shortened scratch.
+- Made the TPM2 ACPI table opt-in (`VirtualMachineOptions::enableTpm2Table`, default off). Advertising a TPM that WHP makes unreachable caused winload's `SpacebootInitialize` to return `STATUS_ILLEGAL_FUNCTION` (`0xC00000B9`); omitting the table makes the OS skip the measured-boot path entirely.
+- Added the overlay-only `ANTIMAL_PROBE_PATCH_SPACEBOOT` probe. It binary-patches the 5-byte CALL inside `SpacebootInitialize` (offset `0x6EAD0` in the 26100-era `winload.efi`) to `MOV EAX, STATUS_NOT_FOUND`, forcing the "not applicable" fallback so winload skips the BootEnvironment/SystemGuard phase that produces `0xc0430001`/`0xc0000225`. Idempotent; logs the bytes found when the build differs.
+- The overlay hive patcher can now grow a hive when existing free cells are exhausted. `MutableHiveView::GrowHive` appends a new `hbin` within the original file allocation (recomputing the regf data length + checksum) and `AllocateCell` synthesizes a free cell from zero-filled hbin tails. `UpsertBcdElementRaw` adapts to the stored element size (1-byte vs 8-byte booleans).
+- Aggressive CI policy-off now also zeros `VbsSiPolicy.p7b` and `DriverSiPolicy.p7b` on both the ESP and the Windows partition. Added `safeboot`/`winpe`/`disableelam` BCD element decoding, plus SafeBoot registry-path and `ntoskrnl.exe`/`hal.dll`/`ci.dll` existence checks in base inspection.
+- New run-report diagnostics: PIC ICW1 write counts + ICW2 values, total BSP memory-access exits with first/last GPA, the IOAPIC redirection-table snapshot, the WHP MMIO-gap bitmap, and the relocated device bases.
+
+No new visible boot gate beyond the 52% post-CI Kernel.BootEnvironment mark yet — the bump to 54% reflects this infrastructure: the MMIO-interference fix is a genuine unblock for the software devices, and the Spaceboot patch is a new concrete angle on the pre-kernel winload abort.
 
 Latest local probe:
 
