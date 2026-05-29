@@ -23,6 +23,7 @@ struct AcpiTableOffsets {
   uint32_t dbg2 = 0;
   uint32_t tpm2 = 0;
   uint32_t rsdt = 0;
+  uint32_t xsdt = 0;
 };
 
 struct AcpiBuildArtifacts {

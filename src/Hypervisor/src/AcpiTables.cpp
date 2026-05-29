@@ -731,6 +731,21 @@ uint32_t AppendRsdt(std::vector<uint8_t> &out,
   return offset;
 }
 
+// XSDT: the ACPI 2.0+ root table with 64-bit entry pointers. Modern Windows
+// (and OVMF's table installer) iterate the XSDT, not the legacy RSDT, so this
+// is required for the guest to discover the MADT/FADT/etc. Entry values are
+// written as the in-blob offsets and relocated to runtime addresses by the
+// table-loader's ADD_POINTER commands (size 8).
+uint32_t AppendXsdt(std::vector<uint8_t> &out,
+                    const std::vector<uint32_t> &tableOffsets) {
+  const auto offset = BeginSdt(out, "XSDT", 1);
+  for (uint32_t tableOffset : tableOffsets) {
+    PutLe64(out, tableOffset);
+  }
+  EndSdt(out, offset);
+  return offset;
+}
+
 void AppendLoaderName(std::vector<uint8_t> &entry, const char *name) {
   const size_t start = entry.size();
   entry.resize(start + 56, 0);
@@ -779,14 +794,19 @@ void LoaderAddChecksum(std::vector<uint8_t> &out, const char *file,
   AppendLoaderEntry(out, entry);
 }
 
-std::vector<uint8_t> BuildRsdp(uint32_t rsdtOffset) {
+std::vector<uint8_t> BuildRsdp(uint32_t rsdtOffset, uint32_t xsdtOffset) {
   std::vector<uint8_t> out;
-  AppendFixedAscii(out, "RSD PTR ", 8, '\0');
-  out.push_back(0); // Checksum patched by table-loader.
-  AppendFixedAscii(out, "AMAL", 6);
-  out.push_back(0); // ACPI 1.0 RSDP.
-  PutLe32(out, rsdtOffset);
-  out[8] = ChecksumByte(out.data(), out.size());
+  AppendFixedAscii(out, "RSD PTR ", 8, '\0'); // 0..7  signature
+  out.push_back(0);                  // 8      checksum (loader recomputes)
+  AppendFixedAscii(out, "AMAL", 6);  // 9..14  OEMID
+  out.push_back(2);                  // 15     revision = ACPI 2.0+
+  PutLe32(out, rsdtOffset);          // 16..19 RsdtAddress (loader relocates)
+  PutLe32(out, 36);                  // 20..23 Length
+  PutLe64(out, xsdtOffset);          // 24..31 XsdtAddress (loader relocates)
+  out.push_back(0);                  // 32     ExtendedChecksum (loader recomputes)
+  out.insert(out.end(), 3, 0);       // 33..35 reserved
+  out[8] = ChecksumByte(out.data(), 20);          // ACPI 1.0 checksum (first 20)
+  out[32] = ChecksumByte(out.data(), out.size()); // extended checksum (all 36)
   return out;
 }
 
@@ -797,7 +817,8 @@ std::vector<uint8_t> BuildTableLoader(const AcpiTableOffsets &offsets,
   LoaderAllocate(out, kAcpiTablesFile, 64, kLoaderZoneFseg);
   LoaderAllocate(out, kRsdpFile, 16, kLoaderZoneFseg);
 
-  LoaderAddPointer(out, kRsdpFile, kAcpiTablesFile, 16, 4);
+  LoaderAddPointer(out, kRsdpFile, kAcpiTablesFile, 16, 4);  // RSDP RsdtAddress
+  LoaderAddPointer(out, kRsdpFile, kAcpiTablesFile, 24, 8);  // RSDP XsdtAddress
   LoaderAddPointer(out, kAcpiTablesFile, kAcpiTablesFile, offsets.fadt + 36, 4);
   LoaderAddPointer(out, kAcpiTablesFile, kAcpiTablesFile, offsets.fadt + 40, 4);
   const uint32_t rsdtLength = AcpiTableLength(tables, offsets.rsdt);
@@ -805,6 +826,13 @@ std::vector<uint8_t> BuildTableLoader(const AcpiTableOffsets &offsets,
        entryOffset += 4) {
     LoaderAddPointer(out, kAcpiTablesFile, kAcpiTablesFile,
                      offsets.rsdt + entryOffset, 4);
+  }
+  // Relocate the XSDT's 64-bit entry pointers (the table list Windows uses).
+  const uint32_t xsdtLength = AcpiTableLength(tables, offsets.xsdt);
+  for (uint32_t entryOffset = 36; entryOffset + 8 <= xsdtLength;
+       entryOffset += 8) {
+    LoaderAddPointer(out, kAcpiTablesFile, kAcpiTablesFile,
+                     offsets.xsdt + entryOffset, 8);
   }
 
   LoaderAddChecksum(out, kAcpiTablesFile, offsets.dsdt + 9, offsets.dsdt,
@@ -831,7 +859,10 @@ std::vector<uint8_t> BuildTableLoader(const AcpiTableOffsets &offsets,
   }
   LoaderAddChecksum(out, kAcpiTablesFile, offsets.rsdt + 9, offsets.rsdt,
                     AcpiTableLength(tables, offsets.rsdt));
-  LoaderAddChecksum(out, kRsdpFile, 8, 0, 20);
+  LoaderAddChecksum(out, kAcpiTablesFile, offsets.xsdt + 9, offsets.xsdt,
+                    AcpiTableLength(tables, offsets.xsdt));
+  LoaderAddChecksum(out, kRsdpFile, 8, 0, 20);   // ACPI 1.0 checksum (first 20)
+  LoaderAddChecksum(out, kRsdpFile, 32, 0, 36);  // ACPI 2.0 extended checksum
   return out;
 }
 
@@ -928,8 +959,10 @@ AcpiBuildArtifacts BuildPcAcpiTables(uint32_t processorCount, bool includeDbgp,
     rsdtEntries.push_back(artifacts.offsets.tpm2);
   }
   artifacts.offsets.rsdt = AppendRsdt(tables, rsdtEntries);
+  artifacts.offsets.xsdt = AppendXsdt(tables, rsdtEntries);
 
-  artifacts.rsdp = BuildRsdp(artifacts.offsets.rsdt);
+  artifacts.rsdp =
+      BuildRsdp(artifacts.offsets.rsdt, artifacts.offsets.xsdt);
   artifacts.tableLoader =
       BuildTableLoader(artifacts.offsets, artifacts.tables, artifacts.rsdp);
   return artifacts;

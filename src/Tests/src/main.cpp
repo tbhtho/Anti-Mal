@@ -738,11 +738,17 @@ void TestAcpiTables() {
   Expect(!acpi.tableLoader.empty(), "ACPI: table-loader produced");
   Expect(acpi.tableLoader.size() % 128 == 0,
          "ACPI: table-loader entries are 128-byte records");
-  Expect(acpi.rsdp.size() == 20, "ACPI: ACPI 1.0 RSDP fw_cfg length");
+  Expect(acpi.rsdp.size() == 36, "ACPI: ACPI 2.0 RSDP fw_cfg length");
   Expect(std::memcmp(acpi.rsdp.data(), "RSD PTR ", 8) == 0,
          "ACPI: RSDP signature");
+  Expect(acpi.rsdp[15] == 2, "ACPI: RSDP advertises ACPI 2.0 revision");
+  Expect(ReadLe32(acpi.rsdp, 20) == 36, "ACPI: RSDP length field is 36");
+  Expect(ReadLe64(acpi.rsdp, 24) == acpi.offsets.xsdt,
+         "ACPI: RSDP XsdtAddress points to XSDT offset");
+  Expect(antimal::hv::AcpiChecksumValid(acpi.rsdp.data(), 20),
+         "ACPI: RSDP legacy checksum valid before relocation");
   Expect(antimal::hv::AcpiChecksumValid(acpi.rsdp.data(), acpi.rsdp.size()),
-         "ACPI: RSDP checksum valid before relocation");
+         "ACPI: RSDP extended checksum valid before relocation");
 
   auto tableOk = [&](uint32_t offset, const char *sig) {
     const uint32_t length = antimal::hv::AcpiTableLength(acpi.tables, offset);
@@ -764,6 +770,7 @@ void TestAcpiTables() {
   tableOk(acpi.offsets.dbg2, "DBG2");
   tableOk(acpi.offsets.tpm2, "TPM2");
   tableOk(acpi.offsets.rsdt, "RSDT");
+  tableOk(acpi.offsets.xsdt, "XSDT");
   Expect(acpi.offsets.dbgp == 0, "ACPI: DBGP is opt-in by default");
 
   Expect(ReadLe32(acpi.tables, acpi.offsets.fadt + 36) == acpi.offsets.facs,
@@ -860,6 +867,13 @@ void TestAcpiTables() {
              ReadLe32(acpi.tables, acpi.offsets.rsdt + 56) == acpi.offsets.dbg2 &&
              ReadLe32(acpi.tables, acpi.offsets.rsdt + 60) == acpi.offsets.tpm2,
          "ACPI: RSDT references SPCR, DBG2, and TPM2");
+  // XSDT (ACPI 2.0): seven 64-bit entries (36-byte header + 7*8).
+  Expect(ReadLe32(acpi.tables, acpi.offsets.xsdt + 4) == 92,
+         "ACPI: XSDT includes seven 64-bit table pointers");
+  Expect(ReadLe64(acpi.tables, acpi.offsets.xsdt + 36) == acpi.offsets.fadt,
+         "ACPI: XSDT first entry points to FADT");
+  Expect(ReadLe64(acpi.tables, acpi.offsets.xsdt + 44) == acpi.offsets.madt,
+         "ACPI: XSDT second entry points to MADT (APIC)");
 
   const auto acpiDbgp = antimal::hv::BuildPcAcpiTables(1, true);
   const uint32_t dbgpLen =
