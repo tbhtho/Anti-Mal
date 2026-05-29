@@ -8282,6 +8282,22 @@ std::string FormatVmDiagnostics(const hv::VmRunSummary &vm) {
     }
     out << "fatalRip: 0x" << std::hex << std::uppercase << vm.fatalRip
         << std::dec << "\n";
+    if (vm.bugCheckDataValid) {
+      out << "bugCheckData: code=0x" << std::hex << std::uppercase
+          << vm.bugCheckData[0] << " p1=0x" << vm.bugCheckData[1] << " p2=0x"
+          << vm.bugCheckData[2] << " p3=0x" << vm.bugCheckData[3] << " p4=0x"
+          << vm.bugCheckData[4] << std::dec << "\n";
+    }
+    if (vm.deepStackCount > 0) {
+      out << "deepStackImageBase: 0x" << std::hex << std::uppercase
+          << vm.deepStackImageBase << std::dec << "\n";
+      out << "deepStackRvas:";
+      for (uint32_t i = 0; i < vm.deepStackCount; ++i) {
+        out << " 0x" << std::hex << std::uppercase << vm.deepStackRvas[i]
+            << std::dec;
+      }
+      out << "\n";
+    }
     out << "fatalCsSelector: 0x" << std::hex << std::uppercase
         << vm.fatalCsSelector << std::dec << "\n";
     if (vm.fatalRipBytesValid) {

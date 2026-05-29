@@ -1374,6 +1374,37 @@ VmRunSummary VirtualMachine::RunLoop(
                                      &summary.fatalStackReturnImage[slot]);
           }
         }
+        // Deep stack scan: collect every kernel-image return pointer on the BSP
+        // stack as RVAs (the call chain). Plus an optional KiBugCheckData read
+        // (ANTIMAL_BUGCHECK_DATA_RVA) to recover the bugcheck code + params.
+        if (summary.fatalRipImage.valid && summary.fatalRipImage.base != 0) {
+          const uint64_t kbase = summary.fatalRipImage.base;
+          const uint64_t ksize = summary.fatalRipImage.sizeOfImage;
+          summary.deepStackImageBase = kbase;
+          std::array<uint8_t, 0x1000> stk{};
+          if (summary.fatalRsp != 0 &&
+              ReadGuestMemory(summary.fatalRsp, stk.data(), stk.size())) {
+            for (size_t off = 0;
+                 off + 8 <= stk.size() && summary.deepStackCount < 64;
+                 off += 8) {
+              uint64_t v = 0;
+              std::memcpy(&v, stk.data() + off, sizeof(v));
+              if (v >= kbase && v < kbase + ksize) {
+                summary.deepStackRvas[summary.deepStackCount++] = v - kbase;
+              }
+            }
+          }
+          if (const char *rvaEnv = std::getenv("ANTIMAL_BUGCHECK_DATA_RVA")) {
+            const uint64_t bcRva =
+                std::strtoull(rvaEnv, nullptr, 0);
+            uint64_t bc[5] = {0, 0, 0, 0, 0};
+            if (bcRva != 0 &&
+                ReadGuestMemory(kbase + bcRva, bc, sizeof(bc))) {
+              summary.bugCheckDataValid = true;
+              std::memcpy(summary.bugCheckData, bc, sizeof(bc));
+            }
+          }
+        }
       }
     } catch (...) {
       summary.fatalRip = vcpu_.LastExit().VpContext.Rip;
@@ -1385,6 +1416,7 @@ VmRunSummary VirtualMachine::RunLoop(
        !summary.hostStopRequested; ++step) {
     if (std::chrono::steady_clock::now() >= deadline) {
       summary.timedOut = true;
+      captureFatalState();
       break;
     }
     if (pcIo_.ShutdownRequested()) {

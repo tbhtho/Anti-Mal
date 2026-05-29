@@ -242,6 +242,15 @@ struct VmRunSummary {
   uint64_t fatalStackReturnWindowBase[4]{};
   uint8_t fatalStackReturnBytes[4][32]{};
   VmGuestImageInfo fatalStackReturnImage[4];
+  // Deep stack scan: every kernel-image pointer found in the BSP stack at the
+  // capture point, as RVAs relative to deepStackImageBase. Resolves the full
+  // call chain (e.g. who called KeBugCheckEx) when symbolized against the PDB.
+  uint64_t deepStackImageBase = 0;
+  uint32_t deepStackCount = 0;
+  uint64_t deepStackRvas[64]{};
+  // KiBugCheckData readout [code, p1..p4], gated by ANTIMAL_BUGCHECK_DATA_RVA.
+  bool bugCheckDataValid = false;
+  uint64_t bugCheckData[5]{};
   uint64_t fatalRax = 0;
   uint64_t fatalRbx = 0;
   uint64_t fatalRcx = 0;
