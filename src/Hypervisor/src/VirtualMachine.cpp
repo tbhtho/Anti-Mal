@@ -678,7 +678,14 @@ bool VirtualMachine::TryEmulateSimpleMmioAccess(
 }
 
 bool VirtualMachine::IdentifyGuestImage(uint64_t gva, VmGuestImageInfo *info) {
-  if (!info || gva == 0 || gva == UINT64_MAX || (gva >> 48) != 0) {
+  // Accept both low (user, bits 48-63 clear) and high-canonical (kernel, bits
+  // 48-63 set) addresses; reject only non-canonical ones. The old guard
+  // (gva>>48)!=0 rejected EVERY kernel address, so a stall RIP in ntoskrnl/a
+  // driver (0xFFFFF80x...) never got its module/PDB resolved -- which is exactly
+  // what we need to identify a Phase-1 kernel spin. The MZ scan-back below walks
+  // down from the page, so high-canonical input is required to find the module.
+  const bool canonical = (gva >> 47) == 0 || (gva >> 47) == 0x1FFFFull;
+  if (!info || gva == 0 || gva == UINT64_MAX || !canonical) {
     return false;
   }
 

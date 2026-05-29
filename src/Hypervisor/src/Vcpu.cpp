@@ -167,6 +167,16 @@ CpuidExitResult Vcpu::EmulateCpuidExit() {
   switch (leaf) {
   case 0x00000001u:
     rcx &= ~(1u << 31); // Hide synthetic MSRs until we emulate them.
+    // Force the guest onto the APIC + timer modes our hypervisor actually
+    // emulates. WHP's local-APIC emulation is xApic (MMIO), so we must NOT let
+    // the kernel switch to x2APIC (ECX[21]) — in x2APIC mode all LAPIC access
+    // is via MSRs 0x800-0x8FF that WHP's xApic emulation does not service, which
+    // silently breaks the LAPIC timer + IPIs and deadlocks early Phase-1 sync.
+    // Likewise hide the TSC-deadline timer (ECX[24]) so the kernel programs the
+    // periodic/one-shot LVT timer (which the watchdog reads + injects) instead
+    // of an MSR deadline WHP never fires.
+    rcx &= ~(1u << 21); // x2APIC
+    rcx &= ~(1u << 24); // TSC-Deadline timer
     rbx = (rbx & ~0xFF000000u) | ((index_ & 0xFFu) << 24);
     rbx = (rbx & ~0x00FF0000u) |
           ((std::min<uint32_t>(processorCount_, 0xFFu) & 0xFFu) << 16);
