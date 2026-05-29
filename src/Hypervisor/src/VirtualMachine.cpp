@@ -7,6 +7,7 @@
 #include <atomic>
 #include <chrono>
 #include <cctype>
+#include <cstdlib>
 #include <cstring>
 #include <sstream>
 #include <stop_token>
@@ -1238,6 +1239,11 @@ VmRunSummary VirtualMachine::RunLoop(
   uint64_t lastReinjectedFaultRip = 0;
   uint64_t lastReinjectedFaultCr2 = ~0ull;
   int reinjectedFaultStreak = 0;
+  // Opt-in: NOP OVMF's runtime tick-wait spin in guest RAM when the kernel hits
+  // it (a UEFI runtime service whose firmware tick freezes once the OS owns the
+  // interrupt controllers). See fwSpinPatches in the summary.
+  const bool kFwSpinNop =
+      std::getenv("ANTIMAL_PROBE_FWSPIN_NOP") != nullptr;
   int stepsSinceProgress = 0;
   uint64_t lastIdeCommands = 0;
   const auto runStarted = std::chrono::steady_clock::now();
@@ -1607,6 +1613,44 @@ VmRunSummary VirtualMachine::RunLoop(
         summary.lastCanceledRip = cancelRip;
         summary.lastCanceledOpcode = opcode;
         summary.lastCanceledAtHlt = canceledAtHlt;
+
+        // OVMF runtime tick-wait bypass. The Windows kernel calls a UEFI runtime
+        // service; OVMF's runtime driver spins "wait until *tick changes" but the
+        // tick is frozen (OVMF's timer ISR no longer runs once the OS owns the
+        // PIC/APIC) -> deadlock. Detect the exact signature
+        //   cmp rdx,rax; jne +4; pause; jmp -0x14; leave; ret
+        //   (48 39 C2 75 04 F3 90 EB EC C9 C3)
+        // around the canceled RIP and NOP the back-jump (EB EC -> 90 90) in
+        // guest RAM so the wait falls through to leave;ret and returns. Patch is
+        // in disposable guest RAM only; self-limiting (after the patch the bytes
+        // are 90 90, so the signature no longer matches).
+        if (kFwSpinNop) {
+          static const uint8_t kSig[] = {0x48, 0x39, 0xC2, 0x75, 0x04, 0xF3,
+                                         0x90, 0xEB, 0xEC, 0xC9, 0xC3};
+          std::array<uint8_t, 0x40> win{};
+          const uint64_t winBase = cancelRip > 0x20 ? cancelRip - 0x20 : 0;
+          if (ReadGuestMemory(winBase, win.data(), win.size())) {
+            for (size_t i = 0; i + sizeof(kSig) <= win.size(); ++i) {
+              if (std::memcmp(win.data() + i, kSig, sizeof(kSig)) == 0) {
+                const uint64_t jmpGva = winBase + i + 7; // EB EC offset
+                // Write at the physical level: runtime code pages are mapped
+                // read-only/execute, so a write-honoring path would fault. We
+                // are the hypervisor -> patch the backing page directly.
+                uint64_t gpa = 0;
+                if (vcpu_.TryTranslateGva(jmpGva, false, &gpa)) {
+                  if (auto *p = HostPointerForGpa(gpa, 2)) {
+                    p[0] = 0x90;
+                    p[1] = 0x90;
+                    ++summary.fwSpinPatches;
+                    summary.lastFwSpinPatchGva = jmpGva;
+                    madeProgress = true;
+                  }
+                }
+                break;
+              }
+            }
+          }
+        }
 
         if (canceledAtHlt || interruptsEnabled) {
           if (canceledAtHlt) {

@@ -163,6 +163,13 @@ struct VmRunSummary {
   uint64_t pageFaultsReinjected = 0;
   uint64_t lastReinjectedFaultGva = 0;
   uint32_t lastReinjectedFaultErrorCode = 0;
+  // Guest-RAM patches applied to OVMF's runtime "wait for tick to change" spin
+  // (the Windows kernel calls a UEFI runtime service whose tick-wait deadlocks
+  // because OVMF's timer ISR stops once the OS owns the interrupt controllers).
+  // Gated by ANTIMAL_PROBE_FWSPIN_NOP; patches the back-jump to NOPs so the wait
+  // returns. Touches disposable guest RAM only, never the base VHDX.
+  uint64_t fwSpinPatches = 0;
+  uint64_t lastFwSpinPatchGva = 0;
   uint32_t mmioReads = 0;
   uint32_t mmioWrites = 0;
   // Total WHvRunVpExitReasonMemoryAccess exits on the BSP, regardless of

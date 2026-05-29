@@ -181,6 +181,13 @@ private:
   bool lastPm1HostStopRequested_ = false;
   uint16_t pm1Control_ = 0;
   uint64_t pm1SleepRequestCount_ = 0;
+  // PM1a status (port kPmIoBase+0x00). Bit 0 = TMR_STS, set (sticky) when the
+  // ACPI PM timer's MSB (bit 23 of the 24-bit counter) toggles, cleared by a
+  // write-1. Modelling it lets OVMF runtime / the OS poll PM1 status (e.g. a
+  // PM-timer-overflow wait) and actually see the bit, instead of reading a
+  // permanent 0 and spinning forever.
+  bool pm1TmrSts_ = false;
+  uint32_t pm1TmrLastMsb_ = 0;
 
 public:
   // Returns the 8-bit vector base the guest programmed into the master 8259

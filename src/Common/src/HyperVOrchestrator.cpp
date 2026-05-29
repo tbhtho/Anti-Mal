@@ -8388,6 +8388,9 @@ std::string FormatVmDiagnostics(const hv::VmRunSummary &vm) {
       << vm.lastReinjectedFaultGva << std::dec << "\n";
   out << "lastReinjectedFaultErrorCode: 0x" << std::hex << std::uppercase
       << vm.lastReinjectedFaultErrorCode << std::dec << "\n";
+  out << "fwSpinPatches: " << vm.fwSpinPatches << "\n";
+  out << "lastFwSpinPatchGva: 0x" << std::hex << std::uppercase
+      << vm.lastFwSpinPatchGva << std::dec << "\n";
   out << "keyboardScancodesInjected: " << vm.keyboardScancodesInjected << "\n";
   out << "ps2StatusReads: " << vm.ps2StatusReads << "\n";
   out << "ps2DataReads: " << vm.ps2DataReads << "\n";

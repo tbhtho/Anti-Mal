@@ -495,6 +495,15 @@ void PcIoDevices::OnWrite(uint16_t port, uint32_t value, uint8_t accessSize) {
     // as shutdown for us). OVMF's ResetSystemRuntimeDxe writes here when
     // RT->ResetSystem(EfiResetShutdown) is invoked, then spins waiting
     // for the host to halt the vCPU.
+    if (port >= kPmIoBase && port < kPmIoBase + 0x02) {
+      // PM1a status block: write-1-to-clear. Clearing TMR_STS (bit 0) lets the
+      // next PM-timer MSB toggle re-arm it, so a poller can wait for the *next*
+      // overflow (ACPI write-1-to-clear semantics).
+      if (value & 0x0001u) {
+        pm1TmrSts_ = false;
+      }
+      return;
+    }
     if (port >= kPmIoBase + 0x04 && port < kPmIoBase + 0x06) {
       const uint8_t offset =
           static_cast<uint8_t>(port - (kPmIoBase + 0x04));
@@ -1137,6 +1146,22 @@ uint32_t PcIoDevices::ReadPmIo(uint16_t port, uint8_t accessSize) {
     const uint32_t value = CurrentPmTimer();
     const uint8_t shift = static_cast<uint8_t>((port - kPmTimerPort) * 8u);
     return value >> shift;
+  }
+  if (port >= kPmIoBase && port < kPmIoBase + 0x02) {
+    // PM1a status. Bit 0 = TMR_STS: set (sticky) when the PM timer's MSB
+    // (bit 23 of the 24-bit counter) toggles. Without this the register reads a
+    // permanent 0 and any PM1-status poll (a PM-timer-overflow wait, as the
+    // OS-called OVMF runtime path does) spins forever. Cleared by write-1.
+    const uint32_t timer = CurrentPmTimer();
+    const uint32_t msb = (timer >> 23) & 1u;
+    if (msb != pm1TmrLastMsb_) {
+      pm1TmrLastMsb_ = msb;
+      pm1TmrSts_ = true;
+    }
+    const uint16_t status = pm1TmrSts_ ? 0x0001u : 0x0000u;
+    const uint8_t shift = static_cast<uint8_t>((port - kPmIoBase) * 8u);
+    const uint32_t mask = accessSize == 1 ? 0xFFu : 0xFFFFu;
+    return (static_cast<uint32_t>(status) >> shift) & mask;
   }
   return 0;
 }
