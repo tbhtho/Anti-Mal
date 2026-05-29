@@ -4417,6 +4417,7 @@ struct BootOverlayPatchResult {
   bool spacebootPatchApplied = false;
   bool ciBypassPatchProbeEnabled = false;
   bool ciBypassWinloadPatched = false;
+  bool winloadVoiceStubWritten = false;
   int ciBypassBootmgrFilesPatched = 0;
   std::vector<std::string> notes;
 };
@@ -5588,6 +5589,39 @@ bool ForceFunctionReturnZero(std::vector<uint8_t> &image, size_t fo,
   return true;
 }
 
+// Overwrite a function prologue with an arbitrary verified machine-code stub
+// (used to give winload a "voice"): verifies the expected prologue, writes the
+// stub bytes over the function entry, repairs the PE checksum. Idempotent on the
+// stub's first 8 bytes. Returns false on prologue mismatch / out-of-range.
+bool WriteFunctionStub(std::vector<uint8_t> &image, size_t fo,
+                       const uint8_t *expectedPrologue, size_t expectedLen,
+                       const uint8_t *stub, size_t stubLen, const char *label,
+                       std::vector<std::string> *notes) {
+  if (fo + stubLen > image.size()) {
+    if (notes)
+      notes->push_back(std::string(label) + ": stub offset out of range");
+    return false;
+  }
+  if (stubLen >= 8 && std::memcmp(image.data() + fo, stub, 8) == 0) {
+    if (notes)
+      notes->push_back(std::string(label) + ": already patched (idempotent)");
+    return true;
+  }
+  if (std::memcmp(image.data() + fo, expectedPrologue, expectedLen) != 0) {
+    char hex[64];
+    snprintf(hex, sizeof(hex), "%02X %02X %02X %02X %02X %02X", image[fo],
+             image[fo + 1], image[fo + 2], image[fo + 3], image[fo + 4],
+             image[fo + 5]);
+    if (notes)
+      notes->push_back(std::string(label) + ": unexpected prologue " + hex +
+                       " (build mismatch) -- not patched");
+    return false;
+  }
+  std::memcpy(image.data() + fo, stub, stubLen);
+  RecomputePeImageChecksum(image);
+  return true;
+}
+
 // Overlay-only code-integrity bypass for boot probes (gate:
 // ANTIMAL_PROBE_PATCH_CI_BYPASS):
 //   (1) winload.efi OslpLoadRevocationLists (RVA 0x1A790 / fo 0x19B90) ->
@@ -5624,6 +5658,28 @@ void ApplyCiBypassPatch(hv::IBlockDevice &disk, Fat32OverlayEditor &fat,
   static constexpr size_t kOslCiInitFo = 0x1697C;       // OslInitializeCodeIntegrity
   static constexpr size_t kWinloadValidateFo = 0x195FB0; // ImgpValidateImageHash
   static const uint8_t kWinloadProl[5] = {0x48, 0x8B, 0xC4, 0x4C, 0x89};
+
+  // Voice mode (ANTIMAL_PROBE_WINLOAD_VOICE): instead of bypassing CI, leave
+  // winload's CI subsystem running NATURALLY (so it reaches its real abort) and
+  // overwrite OslFatalErrorEx (RVA 0x14C5C / fo 0x1405C) with a stub that emits
+  // its 4 args (errorCode|fileId|status|arg4) to OVMF debugcon port 0x402, then
+  // halts. The host captures 0x402 -> serial-firmware.log, surfacing winload's
+  // EXACT failing category + NTSTATUS without a full KD client. The bootmgr-verify
+  // bypass below is still required so the modified winload loads. Stub is hand-
+  // assembled + capstone-verified (see C:\Temp\make_stub.py); prologue checked.
+  const bool voiceMode = EnvFlagEnabled("ANTIMAL_PROBE_WINLOAD_VOICE");
+  static constexpr size_t kOslFatalErrorExFo = 0x1405C;  // OslFatalErrorEx
+  static const uint8_t kFatalProl[6] = {0x48, 0x89, 0x5C, 0x24, 0x10, 0x4C};
+  static const uint8_t kVoiceStub[] = {
+      0x41, 0x89, 0xCA, 0x41, 0x89, 0xD3, 0x44, 0x89, 0xC3, 0x44, 0x89, 0xCE,
+      0x66, 0xBA, 0x02, 0x04, 0xB0, 0x5A, 0xEE, 0xEE, 0xEE, 0xEE, 0x44, 0x89,
+      0xD0, 0xEE, 0xC1, 0xE8, 0x08, 0xEE, 0xC1, 0xE8, 0x08, 0xEE, 0xC1, 0xE8,
+      0x08, 0xEE, 0xB0, 0x7C, 0xEE, 0x44, 0x89, 0xD8, 0xEE, 0xC1, 0xE8, 0x08,
+      0xEE, 0xC1, 0xE8, 0x08, 0xEE, 0xC1, 0xE8, 0x08, 0xEE, 0xB0, 0x7C, 0xEE,
+      0x89, 0xD8, 0xEE, 0xC1, 0xE8, 0x08, 0xEE, 0xC1, 0xE8, 0x08, 0xEE, 0xC1,
+      0xE8, 0x08, 0xEE, 0xB0, 0x7C, 0xEE, 0x89, 0xF0, 0xEE, 0xC1, 0xE8, 0x08,
+      0xEE, 0xC1, 0xE8, 0x08, 0xEE, 0xC1, 0xE8, 0x08, 0xEE, 0xB0, 0x0A, 0xEE,
+      0xB0, 0x5A, 0xEE, 0xEE, 0xEE, 0xEE, 0xEB, 0xFE};
   const auto windows =
       std::find_if(partitions.begin(), partitions.end(),
                    [](const GptPartitionLite &p) {
@@ -5638,19 +5694,37 @@ void ApplyCiBypassPatch(hv::IBlockDevice &disk, Fat32OverlayEditor &fat,
     } else if (const auto entry = ntfs.FindPath("Windows\\System32\\winload.efi")) {
       auto bytes = ntfs.ReadFile(*entry, kMaxImage);
       if (bytes.size() == entry->size) {
-        const bool p1 = ForceFunctionReturnZero(
-            bytes, kOslCiInitFo, kWinloadProl, 5,
-            "winload OslInitializeCodeIntegrity", &result->notes);
-        const bool p2 = ForceFunctionReturnZero(
-            bytes, kWinloadValidateFo, kWinloadProl, 5,
-            "winload ImgpValidateImageHash", &result->notes);
-        if ((p1 || p2) && ntfs.WriteFileSameSize(*entry, bytes)) {
-          result->ciBypassWinloadPatched = true;
-          result->notes.push_back(
-              "winload.efi CI-init + image-hash validation forced to "
-              "STATUS_SUCCESS");
-        } else if (p1 || p2) {
-          result->notes.push_back("CI-bypass: winload WriteFileSameSize failed");
+        if (voiceMode) {
+          const bool pv = WriteFunctionStub(
+              bytes, kOslFatalErrorExFo, kFatalProl, 6, kVoiceStub,
+              sizeof(kVoiceStub), "winload OslFatalErrorEx voice",
+              &result->notes);
+          if (pv && ntfs.WriteFileSameSize(*entry, bytes)) {
+            result->winloadVoiceStubWritten = true;
+            result->notes.push_back(
+                "winload.efi OslFatalErrorEx replaced with voice stub (emits "
+                "ZZZZ errorCode|fileId|status|arg4 to debugcon 0x402; CI left "
+                "intact so winload reaches its real abort)");
+          } else if (pv) {
+            result->notes.push_back(
+                "CI-bypass: winload voice WriteFileSameSize failed");
+          }
+        } else {
+          const bool p1 = ForceFunctionReturnZero(
+              bytes, kOslCiInitFo, kWinloadProl, 5,
+              "winload OslInitializeCodeIntegrity", &result->notes);
+          const bool p2 = ForceFunctionReturnZero(
+              bytes, kWinloadValidateFo, kWinloadProl, 5,
+              "winload ImgpValidateImageHash", &result->notes);
+          if ((p1 || p2) && ntfs.WriteFileSameSize(*entry, bytes)) {
+            result->ciBypassWinloadPatched = true;
+            result->notes.push_back(
+                "winload.efi CI-init + image-hash validation forced to "
+                "STATUS_SUCCESS");
+          } else if (p1 || p2) {
+            result->notes.push_back(
+                "CI-bypass: winload WriteFileSameSize failed");
+          }
         }
       }
     } else {
@@ -5658,9 +5732,17 @@ void ApplyCiBypassPatch(hv::IBlockDevice &disk, Fat32OverlayEditor &fat,
     }
   }
 
-  // (2) bootmgr copies on the ESP.
-  static constexpr size_t kValidateFo = 0x1AB218;
+  // (2) bootmgr copies on the ESP. Always bypass ImgpValidateImageHash (so the
+  //     byte-modified winload loads). In voice mode ALSO overwrite BmFatalErrorEx
+  //     (RVA 0x46624 / fo 0x45A24) with the voice stub: BmpLaunchBootEntry calls
+  //     BmFatalErrorEx(4, v15, 0) where v15 == the NTSTATUS winload returned, so
+  //     the stub emits winload's actual returned status (in edx/arg2) to debugcon
+  //     0x402 -> serial-firmware.log. (winload itself never calls OslFatalErrorEx
+  //     at this abort -- it returns the error up to bootmgr.)
+  static constexpr size_t kValidateFo = 0x1AB218;       // ImgpValidateImageHash
+  static constexpr size_t kBmFatalErrorExFo = 0x45A24;  // BmFatalErrorEx
   static const uint8_t kBootmgrProl[5] = {0x48, 0x8B, 0xC4, 0x4C, 0x89};
+  static const uint8_t kBmFatalProl[6] = {0x48, 0x8B, 0xC4, 0x48, 0x89, 0x58};
   for (const char *path :
        {"EFI\\BOOT\\BOOTX64.EFI", "EFI\\Microsoft\\Boot\\bootmgfw.efi"}) {
     const auto entry = fat.FindPath(path);
@@ -5674,12 +5756,22 @@ void ApplyCiBypassPatch(hv::IBlockDevice &disk, Fat32OverlayEditor &fat,
                               " read failed");
       continue;
     }
-    if (ForceFunctionReturnZero(bytes, kValidateFo, kBootmgrProl, 5, path,
-                                &result->notes)) {
+    bool changed = ForceFunctionReturnZero(bytes, kValidateFo, kBootmgrProl, 5,
+                                           path, &result->notes);
+    if (voiceMode) {
+      const std::string label = std::string(path) + " BmFatalErrorEx voice";
+      if (WriteFunctionStub(bytes, kBmFatalErrorExFo, kBmFatalProl, 6, kVoiceStub,
+                            sizeof(kVoiceStub), label.c_str(), &result->notes))
+        changed = true;
+    }
+    if (changed) {
       if (fat.WriteFileSameSize(*entry, bytes)) {
         ++result->ciBypassBootmgrFilesPatched;
-        result->notes.push_back(std::string(path) +
-                                " ImgpValidateImageHash forced to STATUS_SUCCESS");
+        result->notes.push_back(
+            std::string(path) +
+            (voiceMode
+                 ? " ImgpValidateImageHash->SUCCESS + BmFatalErrorEx voice stub"
+                 : " ImgpValidateImageHash forced to STATUS_SUCCESS"));
       } else {
         result->notes.push_back(std::string("CI-bypass: ") + path +
                                 " WriteFileSameSize failed");
@@ -6121,6 +6213,8 @@ BootOverlayPatchDetails(const BootOverlayPatchResult &patch) {
        patch.ciBypassPatchProbeEnabled ? "true" : "false"},
       {"ciBypassWinloadPatched",
        patch.ciBypassWinloadPatched ? "true" : "false"},
+      {"winloadVoiceStubWritten",
+       patch.winloadVoiceStubWritten ? "true" : "false"},
       {"ciBypassBootmgrFilesPatched",
        std::to_string(patch.ciBypassBootmgrFilesPatched)},
       {"scope", "overlay-only"}};
