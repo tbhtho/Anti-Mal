@@ -348,12 +348,11 @@ std::vector<uint8_t> BuildDsdtAml(uint32_t processorCount) {
   // platform it chose the APIC interrupt model. CRITICAL: if \_PIC is absent,
   // an OS running in APIC mode interprets PCI0._PRT source indices as legacy
   // 8259 PIC IRQs and routes PCI device interrupts to the (masked) PICs instead
-  // of the IOAPIC. That is exactly what bit us: with both PICs masked (pure
-  // APIC mode), the IDE controller's interrupt (PCI0._PRT dev1 INTA -> 14) was
-  // routed to the dead PIC, IOAPIC RTE[14] was left masked (0x100FF), all
-  // 64388 IDE completion IRQs were dropped, and atapi's StartDevice hung
-  // waiting for an interrupt that never arrived -> INACCESSIBLE_BOOT_DEVICE
-  // (0x7B, STATUS_OBJECT_NAME_NOT_FOUND, boot disk device never created).
+  // of the IOAPIC -- those interrupts then vanish into the dead PIC. The IDE no
+  // longer rides _PRT (it is compat-mode and uses legacy IRQ14/15 via the MADT
+  // identity mapping -- see PCI0._PRT below), but any PCI device that does use an
+  // INTx pin (e.g. the VGA on dev 2 -> GSI10) still depends on \_PIC being
+  // present so its _PRT GSI is programmed on the IOAPIC, not the masked PIC.
   // Encoding: MethodOp(0x14) PkgLen(6) "_PIC"(5F 50 49 43) MethodFlags(0x01 =
   // 1 arg, not serialized) with an empty body -- Windows only requires the
   // method to exist and be callable; our _PRT already returns hardwired GSIs.
@@ -394,10 +393,18 @@ std::vector<uint8_t> BuildDsdtAml(uint32_t processorCount) {
                                     0xFEBFFFFF, 0, 0x7EC00000, 0x01);
   AppendEndTag(pciResources);
   AppendName(pciTerms, "_CRS", ResourceTemplate(pciResources));
+  // _PRT maps PCI INTx pins to GSIs. The compat-mode IDE (dev 1) uses the
+  // LEGACY IRQ14/15 lines directly (config Interrupt Pin = 0, no PCI INTx), and
+  // those legacy IRQs map to GSI14/15 via the MADT's identity mapping -- NOT via
+  // _PRT. So dev 1 must NOT appear here: a dev1-INTA->GSI14 / dev1-INTB->GSI15
+  // entry makes Windows reserve GSI14/15 for the PCI interrupt pool, which then
+  // collides with the IDE channel's legacy IRQ14 claim -- the PCIIDE\IDEChannel
+  // devnode then fails to start with CM_PROB_NORMAL_CONFLICT (prob=12, observed
+  // run 77cda7d0), atapi never binds, the boot disk is never enumerated -> 0x7B.
+  // (Those dev1 entries were a leftover from an abandoned approach that drove
+  // the IDE interrupt through PCI INTA.) Only the VGA (dev 2) remains.
   AppendName(pciTerms, "_PRT",
-             PackageObject({PciRoutingEntry(1, 0, 14),
-                            PciRoutingEntry(1, 1, 15),
-                            PciRoutingEntry(2, 0, 10)}));
+             PackageObject({PciRoutingEntry(2, 0, 10)}));
 
   std::vector<uint8_t> isaTerms;
   AppendName(isaTerms, "_ADR", IntegerObject(0x00010000u));
