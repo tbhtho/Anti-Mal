@@ -275,6 +275,13 @@ struct VmRunSummary {
   // Full devnode instance-path dump (capped): shows whether PCI0/the PCI bus
   // and its child devices are enumerated at all, vs. the IDE being skipped.
   std::string pnpAllNodes;
+  // The PCIIDE\IDEChannel devnode's resource REQUIREMENTS (ResourceRequirements
+  // @ _DEVICE_NODE+0x1B8, an _IO_RESOURCE_REQUIREMENTS_LIST) + its assigned
+  // ResourceList/Translated pointers. The resource map proved NO device owns the
+  // legacy IDE ports/IRQ14, so the prob=12 is a requirements-can't-be-satisfied
+  // failure -- this shows WHAT the channel asks for (e.g. a relocatable
+  // bus-master IO block we don't advertise) so the fix is evidence-based.
+  std::string pnpIdeChannelReq;
   // Per-devnode assigned-resource map (ResourceList @ _DEVICE_NODE+0x1A0,
   // parsed as CM_RESOURCE_LIST): "[ip io=1F0+8,3F6+1 irq=14]". Answers which
   // STARTED device owns the legacy IDE ports / IRQ14 that the PCIIDE\IDEChannel

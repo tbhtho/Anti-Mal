@@ -1669,6 +1669,70 @@ VmRunSummary VirtualMachine::RunLoop(
                     }
                   }
                 }
+                // The IDEChannel failed prob=12 but NO device owns its resources
+                // -> dump its ResourceRequirements (+0x1B8) to see WHAT it asks
+                // for that cannot be satisfied. _IO_RESOURCE_REQUIREMENTS_LIST:
+                // ListSize@0x0, AlternativeLists@0x1C, first IO_RESOURCE_LIST
+                // @0x20 (Count@0x24, descriptors@0x28). Each IO_RESOURCE_DESCRIPTOR
+                // is 0x20 bytes: Type@0x01 (1=Port,2=Interrupt), union@0x08 (Port:
+                // Length@0x08, MinAddr@0x10 u64; Interrupt: MinVector@0x08). Also
+                // capture the assigned ResourceList ptr (+0x1A0, expect NULL) and
+                // raw hex as a parser-independent fallback.
+                if (std::strstr(ip, "IDEChannel") &&
+                    summary.pnpIdeChannelReq.empty()) {
+                  uint64_t rlPtr = 0, rrPtr = 0;
+                  ReadGuestMemory(node + 0x1A0, &rlPtr, sizeof(rlPtr));
+                  ReadGuestMemory(node + 0x1B8, &rrPtr, sizeof(rrPtr));
+                  auto hx = [](uint64_t v) {
+                    static const char *d = "0123456789ABCDEF";
+                    std::string h = "0x";
+                    for (int i = 15; i >= 0; --i) {
+                      h += d[(v >> (i * 4)) & 0xF];
+                    }
+                    return h;
+                  };
+                  std::string s = "rlPtr=" + hx(rlPtr) + " rrPtr=" + hx(rrPtr);
+                  if (rrPtr != 0) {
+                    std::array<uint8_t, 0xC0> rb{};
+                    if (ReadGuestMemory(rrPtr, rb.data(), rb.size())) {
+                      uint32_t alt = 0, cnt = 0;
+                      std::memcpy(&alt, rb.data() + 0x1C, 4);
+                      std::memcpy(&cnt, rb.data() + 0x24, 4);
+                      s += " alt=" + std::to_string(alt) +
+                           " count=" + std::to_string(cnt) + " req:";
+                      size_t pd = 0x28;
+                      for (uint32_t i = 0;
+                           i < cnt && i < 12 && pd + 0x20 <= rb.size(); ++i) {
+                        const uint8_t type = rb[pd + 1];
+                        if (type == 1) {
+                          uint32_t len = 0;
+                          uint64_t mn = 0;
+                          std::memcpy(&len, rb.data() + pd + 0x08, 4);
+                          std::memcpy(&mn, rb.data() + pd + 0x10, 8);
+                          char b[48];
+                          std::snprintf(b, sizeof(b), " io@%llX+%X",
+                                        static_cast<unsigned long long>(mn),
+                                        len);
+                          s += b;
+                        } else if (type == 2) {
+                          uint32_t mv = 0;
+                          std::memcpy(&mv, rb.data() + pd + 0x08, 4);
+                          s += " irq=" + std::to_string(mv);
+                        } else if (type != 0) {
+                          s += " t" + std::to_string(type);
+                        }
+                        pd += 0x20;
+                      }
+                      s += " hex:";
+                      for (size_t k = 0; k < 0x70 && k < rb.size(); ++k) {
+                        char b[4];
+                        std::snprintf(b, sizeof(b), "%02X", rb[k]);
+                        s += b;
+                      }
+                    }
+                  }
+                  summary.pnpIdeChannelReq = s;
+                }
               }
               summary.pnpVisitedNodes = visited;
               summary.pnpProblemNodes = probNodes;
