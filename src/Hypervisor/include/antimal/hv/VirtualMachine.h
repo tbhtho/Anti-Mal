@@ -275,6 +275,12 @@ struct VmRunSummary {
   // Full devnode instance-path dump (capped): shows whether PCI0/the PCI bus
   // and its child devices are enumerated at all, vs. the IDE being skipped.
   std::string pnpAllNodes;
+  // Per-devnode assigned-resource map (ResourceList @ _DEVICE_NODE+0x1A0,
+  // parsed as CM_RESOURCE_LIST): "[ip io=1F0+8,3F6+1 irq=14]". Answers which
+  // STARTED device owns the legacy IDE ports / IRQ14 that the PCIIDE\IDEChannel
+  // (prob=12 CM_PROB_NORMAL_CONFLICT) is fighting over -- the ground truth the
+  // resource-guessing fixes were missing.
+  std::string pnpResourceMap;
   uint64_t fatalRax = 0;
   uint64_t fatalRbx = 0;
   uint64_t fatalRcx = 0;

@@ -1521,7 +1521,7 @@ VmRunSummary VirtualMachine::RunLoop(
               int sp = 0;
               stk[sp++] = rootNode;
               uint32_t visited = 0;
-              std::string probNodes, ideNodes, allNodes;
+              std::string probNodes, ideNodes, allNodes, resMap;
               while (sp > 0 && visited < 1024) {
                 const uint64_t node = stk[--sp];
                 if (node == 0) {
@@ -1582,11 +1582,99 @@ VmRunSummary VirtualMachine::RunLoop(
                   }
                   allNodes += ' ';
                 }
+                // Parse this devnode's ASSIGNED CM_RESOURCE_LIST (ResourceList @
+                // _DEVICE_NODE+0x1A0) for the IO ports + IRQs it OWNS. This is the
+                // ground truth for the IDEChannel's prob=12 NORMAL_CONFLICT: it
+                // names which started device holds 0x1F0/0x3F6/IRQ14. Layout:
+                // CM_RESOURCE_LIST{ Count@0x0; CM_FULL_RESOURCE_DESCRIPTOR[] } where
+                // each full desc = InterfaceType@0x0, BusNumber@0x4, then
+                // CM_PARTIAL_RESOURCE_LIST{ Version@0x0,Revision@0x2,Count@0x4,
+                // descriptors@0x8 }. Each CM_PARTIAL_RESOURCE_DESCRIPTOR is 0x14
+                // bytes: Type@0x0(1=Port,2=Interrupt), Share@0x1, Flags@0x2, union
+                // @0x4 (Port:{Start u64@0x4, Length u32@0xC}; Interrupt:{Level
+                // u16@0x4, Vector u32@0x8}).
+                uint64_t resListPtr = 0;
+                ReadGuestMemory(node + 0x1A0, &resListPtr, sizeof(resListPtr));
+                if (resListPtr != 0 && resMap.size() < 1800) {
+                  std::array<uint8_t, 0x140> rb{};
+                  if (ReadGuestMemory(resListPtr, rb.data(), rb.size())) {
+                    auto rd16 = [&](size_t o) -> uint16_t {
+                      uint16_t v = 0;
+                      if (o + 2 <= rb.size())
+                        std::memcpy(&v, rb.data() + o, 2);
+                      return v;
+                    };
+                    auto rd32 = [&](size_t o) -> uint32_t {
+                      uint32_t v = 0;
+                      if (o + 4 <= rb.size())
+                        std::memcpy(&v, rb.data() + o, 4);
+                      return v;
+                    };
+                    auto rd64 = [&](size_t o) -> uint64_t {
+                      uint64_t v = 0;
+                      if (o + 8 <= rb.size())
+                        std::memcpy(&v, rb.data() + o, 8);
+                      return v;
+                    };
+                    std::string res;
+                    bool ideRel = std::strstr(ip, "7111") != nullptr ||
+                                  std::strstr(ip, "IDEChannel") != nullptr;
+                    size_t off = 4;
+                    const uint32_t fullCount = rd32(0);
+                    for (uint32_t f = 0;
+                         f < fullCount && f < 4 && off + 0x10 <= rb.size(); ++f) {
+                      const size_t prl = off + 8;
+                      const uint32_t pcount = rd32(prl + 4);
+                      size_t pd = prl + 8;
+                      for (uint32_t p = 0;
+                           p < pcount && p < 16 && pd + 0x14 <= rb.size(); ++p) {
+                        const uint8_t type = rb[pd];
+                        if (type == 1) {
+                          const uint64_t start = rd64(pd + 4);
+                          const uint32_t len = rd32(pd + 0xC);
+                          char b[40];
+                          std::snprintf(b, sizeof(b), "io=%llX+%X ",
+                                        static_cast<unsigned long long>(start),
+                                        len);
+                          res += b;
+                          if (start == 0x1F0 || start == 0x3F6 ||
+                              start == 0x170 || start == 0x376) {
+                            ideRel = true;
+                          }
+                        } else if (type == 2) {
+                          const uint16_t level = rd16(pd + 4);
+                          char b[24];
+                          std::snprintf(b, sizeof(b), "irq=%u ",
+                                        static_cast<unsigned>(level));
+                          res += b;
+                          if (level == 14 || level == 15) {
+                            ideRel = true;
+                          }
+                        }
+                        pd += 0x14;
+                      }
+                      off = pd;
+                    }
+                    // Emit every device that owns any IO/IRQ resource. Known
+                    // devices (PIC io=20+2, TIMR io=40+4, COM1 io=3F8+8 irq=4,
+                    // ...) validate the parser's descriptor stride; a '*' marks
+                    // the IDE-relevant ones so the 0x1F0/0x3F6/IRQ14 owner stands
+                    // out against the rest of the map.
+                    if (!res.empty()) {
+                      char shortIp[52] = {0};
+                      std::strncpy(shortIp, ip, sizeof(shortIp) - 1);
+                      resMap += ideRel ? "[*" : "[";
+                      resMap += shortIp;
+                      resMap += " " + res + "] ";
+                    }
+                  }
+                }
               }
               summary.pnpVisitedNodes = visited;
               summary.pnpProblemNodes = probNodes;
               summary.pnpIdeNodes = ideNodes;
               summary.pnpAllNodes = allNodes;
+              summary.pnpResourceMap = resMap;
             }
           }
         }
