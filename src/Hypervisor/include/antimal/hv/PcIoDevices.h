@@ -259,16 +259,27 @@ private:
   uint8_t port92_ = 0x02; // A20 enabled.
   uint32_t pciConfigAddress_ = 0;
   uint16_t ideCommand_ = 0x0001; // IO-space enabled; BMDMA not emulated yet.
+  // PIIX4 IDE Timing register (PCI config 0x40-0x43): IDETIM_P @0x40-0x41,
+  // IDETIM_S @0x42-0x43. Bit 15 of each is "IDE Decode Enable". intelide's
+  // PciIdeChannelEnabled callback reads exactly these bits to decide which
+  // channels exist; a channel reading decode-disabled gets NO channel PDO, so
+  // ataport never binds, never issues IDENTIFY, the boot disk is never
+  // enumerated -> INACCESSIBLE_BOOT_DEVICE (0x7B). A real platform BIOS sets
+  // these during POST; OVMF drives ATA via its own legacy path and never
+  // touches IDETIM, so we default it to "primary channel decode-enabled"
+  // (0x00008000) as if the BIOS had. Secondary stays disabled -- the disk is on
+  // the primary channel and the secondary is empty (nullptr controller).
+  uint32_t ideTimingReg_ = 0x00008000u;
   std::array<uint32_t, 5> ideBarWriteValues_{0x000001F1u, 0x000003F5u,
                                              0x00000171u, 0x00000375u,
                                              0x0000C001u};
   std::array<bool, 5> ideBarSizing_{};
-  // Bus-master IDE (BMDMA / BAR4). Win11's intelide miniport expects a real
-  // PIIX4 IDE (prog-if 0x80) with a working BMDMA register block; without it
-  // pciide/intelide never create the IDE channels so atapi never attaches and
-  // the boot disk is never enumerated (INACCESSIBLE_BOOT_DEVICE 0x7B). BAR4 is
-  // OS-relocatable, so the host re-attaches the 16-port block whenever the
-  // guest reassigns it (ConsumeBmdmaAttachDirty).
+  // Bus-master IDE (BMDMA / BAR4). Dormant: BAR4 reads 0 (no DMA advertised) so
+  // the guest never locates this block; the handlers stay compiled for a future
+  // real PRD DMA engine. NOTE: the earlier theory that intelide needs BMDMA to
+  // create channels was WRONG -- the channels are gated by IDETIM decode-enable
+  // (see ideTimingReg_), not bus-master. BAR4 is OS-relocatable, so the host
+  // re-attaches the 16-port block whenever the guest reassigns it.
   uint16_t ideBmdmaBase_ = 0xC000;        // current guest-assigned BMDMA base.
   bool ideBmdmaAttachDirty_ = false;      // base changed -> host must re-attach.
   std::array<uint8_t, 16> bmdmaRegs_{};   // BMICX/BMISX/BMIDTPX, both channels.

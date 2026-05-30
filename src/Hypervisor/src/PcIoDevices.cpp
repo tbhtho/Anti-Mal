@@ -1035,6 +1035,14 @@ void PcIoDevices::WritePciConfigData(uint16_t port, uint32_t value,
           ((current & ~mask) | ((value << shift) & mask)) & 0x0005u);
       return;
     }
+    if (reg == 0x40) {
+      // PIIX4 IDE Timing register is read/write. intelide does a read-modify-
+      // write to program per-drive PIO timing after the channel is created; let
+      // it stick so its readback matches (the decode-enable bit 15 it reads back
+      // stays set because it ORs onto our default). See ideTimingReg_.
+      ideTimingReg_ = (ideTimingReg_ & ~mask) | ((value << shift) & mask);
+      return;
+    }
     if (reg >= 0x10 && reg <= 0x20) {
       const size_t index = static_cast<size_t>((reg - 0x10) / 4u);
       if (index < ideBarWriteValues_.size()) {
@@ -1156,6 +1164,14 @@ uint32_t PcIoDevices::ReadPciConfigDword() const {
       // atapi never attaches (kernel issues 0 IDENTIFYs -> 0x7B). INT line 0xFF
       // = "not connected to a PCI interrupt router".
       return 0x000000FFu; // INT line 0xFF (none), INT pin 0 (no PCI INTx).
+    case 0x40:
+      // PIIX4 IDE Timing register (IDETIM_P @0x40-0x41, IDETIM_S @0x42-0x43).
+      // Bit 15 of IDETIM_P = primary "IDE Decode Enable". intelide reads this to
+      // decide the primary channel exists and create its channel PDO. Default
+      // 0x00008000 = primary decode-enabled, secondary disabled (empty channel).
+      // Without this the guest reads 0 -> both channels "disabled" -> no channel
+      // PDOs -> ataport never probes the disk -> 0x7B INACCESSIBLE_BOOT_DEVICE.
+      return ideTimingReg_;
     default:
       return 0;
     }

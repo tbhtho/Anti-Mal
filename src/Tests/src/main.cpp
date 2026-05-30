@@ -1252,6 +1252,22 @@ void TestPcIoIdePciResources() {
   select(0x3C);
   Expect(pc.OnRead(0xCFC, 4) == 0x000000FFu,
          "PCI IDE: compat-mode reports no PCI INTx (pin 0, line 0xFF)");
+
+  // PIIX4 IDE Timing register (0x40): bit 15 = primary "IDE Decode Enable".
+  // intelide reads this to decide the primary channel exists and create its
+  // channel PDO; without it the boot disk is never enumerated (0x7B). Default
+  // 0x00008000 = primary enabled, secondary disabled (empty channel).
+  select(0x40);
+  Expect((pc.OnRead(0xCFC, 4) & 0x00008000u) != 0,
+         "PCI IDE: IDETIM primary decode-enable set (channel enumerates)");
+  Expect((pc.OnRead(0xCFC, 4) & 0x80000000u) == 0,
+         "PCI IDE: IDETIM secondary decode-disable (empty channel)");
+
+  // IDETIM is read/write so intelide's read-modify-write of the per-drive PIO
+  // timing fields sticks and its decode-enable readback stays set.
+  pc.OnWrite(0xCFC, 0x0000A30Fu, 4); // set some primary timing bits, keep bit15.
+  Expect(pc.OnRead(0xCFC, 4) == 0x0000A30Fu,
+         "PCI IDE: IDETIM register is read/write (timing fields persist)");
 }
 
 void TestIdeIdentifyDevice() {
