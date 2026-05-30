@@ -1831,6 +1831,12 @@ VmRunSummary VirtualMachine::RunLoop(
       if (ahci_) {
         ahci_->Reset();
       }
+      // Rewind the page-table-assist bump allocator: it advances as we hand out
+      // assist pages during early boot, and the next boot's firmware/loader page-
+      // table setup needs the full pool again. Not rewinding it leaves the second
+      // boot's assist depleted -> a bad/missing page-table page -> a corrupt PTE
+      // -> 0x1A MEMORY_MANAGEMENT (p1=0x404).
+      pageTableAssistNext_ = pageTableAssistBase_;
       vcpu_.SetX86ResetState();
       (void)vcpu_.TrySetStartupSuspended(false);
       continue;
