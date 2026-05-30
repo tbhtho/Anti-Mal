@@ -1496,6 +1496,89 @@ VmRunSummary VirtualMachine::RunLoop(
               }
             }
           }
+          // PnP devnode tree walk: the drivers load (PsLoadedModuleList) but the
+          // IDE device stack never starts -- this reads WHY, via each devnode's
+          // CM_PROB_* problem code. IopRootDeviceNode (kbase+rva) is a
+          // _DEVICE_NODE*; each node has Sibling@0x0, Child@0x8,
+          // InstancePath(UNICODE_STRING)@0x28, CompletionStatus@0x188,
+          // Problem@0x194. Iterative DFS; collect problem nodes + IDE/ATA nodes.
+          if (const char *dnEnv =
+                  std::getenv("ANTIMAL_IOPROOTDEVICENODE_RVA")) {
+            const uint64_t dnRva = std::strtoull(dnEnv, nullptr, 0);
+            uint64_t rootNode = 0;
+            if (dnRva != 0 &&
+                ReadGuestMemory(kbase + dnRva, &rootNode, sizeof(rootNode)) &&
+                rootNode != 0) {
+              auto hex32 = [](uint32_t v) {
+                static const char *d = "0123456789ABCDEF";
+                std::string h = "0x";
+                for (int i = 7; i >= 0; --i) {
+                  h += d[(v >> (i * 4)) & 0xF];
+                }
+                return h;
+              };
+              std::array<uint64_t, 256> stk{};
+              int sp = 0;
+              stk[sp++] = rootNode;
+              uint32_t visited = 0;
+              std::string probNodes, ideNodes;
+              while (sp > 0 && visited < 1024) {
+                const uint64_t node = stk[--sp];
+                if (node == 0) {
+                  continue;
+                }
+                ++visited;
+                uint64_t sibling = 0, child = 0;
+                ReadGuestMemory(node + 0x00, &sibling, sizeof(sibling));
+                ReadGuestMemory(node + 0x08, &child, sizeof(child));
+                if (sibling != 0 && sp < 254) {
+                  stk[sp++] = sibling;
+                }
+                if (child != 0 && sp < 254) {
+                  stk[sp++] = child;
+                }
+                uint16_t ipLen = 0;
+                uint64_t ipBuf = 0;
+                uint32_t problem = 0, cstat = 0;
+                ReadGuestMemory(node + 0x28, &ipLen, sizeof(ipLen));
+                ReadGuestMemory(node + 0x30, &ipBuf, sizeof(ipBuf));
+                ReadGuestMemory(node + 0x194, &problem, sizeof(problem));
+                ReadGuestMemory(node + 0x188, &cstat, sizeof(cstat));
+                char ip[160] = {0};
+                if (ipBuf != 0 && ipLen >= 2) {
+                  const uint16_t nb = ipLen > 318 ? 318 : ipLen;
+                  std::array<uint16_t, 160> wb{};
+                  if (ReadGuestMemory(ipBuf, wb.data(), nb)) {
+                    const size_t chars = static_cast<size_t>(nb) / 2;
+                    for (size_t i = 0; i < chars && i < 159; ++i) {
+                      ip[i] = (wb[i] >= 0x20 && wb[i] < 0x7F)
+                                  ? static_cast<char>(wb[i])
+                                  : '?';
+                    }
+                  }
+                }
+                const bool ideRelated =
+                    std::strstr(ip, "7111") || std::strstr(ip, "PCIIDE") ||
+                    std::strstr(ip, "ATAPI") || std::strstr(ip, "Ide") ||
+                    std::strstr(ip, "IDE");
+                if (problem != 0 && probNodes.size() < 1400) {
+                  probNodes += '[';
+                  probNodes += (ip[0] ? ip : "<noip>");
+                  probNodes += " prob=" + std::to_string(problem) +
+                               " cstat=" + hex32(cstat) + "] ";
+                }
+                if (ideRelated && ideNodes.size() < 1400) {
+                  ideNodes += '[';
+                  ideNodes += (ip[0] ? ip : "<noip>");
+                  ideNodes += " prob=" + std::to_string(problem) +
+                              " cstat=" + hex32(cstat) + "] ";
+                }
+              }
+              summary.pnpVisitedNodes = visited;
+              summary.pnpProblemNodes = probNodes;
+              summary.pnpIdeNodes = ideNodes;
+            }
+          }
         }
       }
     } catch (...) {
