@@ -1438,6 +1438,72 @@ void TestAhciReadSectors() {
          "AHCI READ: full sector pattern landed");
 }
 
+// Regression for the 28-bit READ DMA (0xC8) LBA decode: LBA bits 27:24 live in
+// the Device register (CFIS byte 7) low nibble, not in the 48-bit "exp" bytes.
+// Decoding 0xC8 as 48-bit drops those bits, so any read at LBA >= 16M sectors
+// (>= 8 GiB, e.g. the SYSTEM hive) returns the wrong sectors (boot 0xc000000f).
+void TestAhciReadDma28HighLba() {
+  using namespace antimal::hv;
+  // Formula-backed virtual disk: each sector's first 8 bytes are its own LBA, so
+  // we can probe a high LBA without allocating gigabytes.
+  struct LbaPatternDisk final : IBlockDevice {
+    uint64_t SectorCount() const noexcept override { return 0x10000000ull; }
+    bool ReadSectors(uint64_t lba, uint16_t count, uint8_t *out) override {
+      for (uint16_t i = 0; i < count; ++i) {
+        const uint64_t l = lba + i;
+        uint8_t *p = out + static_cast<size_t>(i) * kSectorSize;
+        std::memset(p, 0, kSectorSize);
+        std::memcpy(p, &l, sizeof(l));
+      }
+      return true;
+    }
+    bool WriteSectors(uint64_t, uint16_t, const uint8_t *) override { return true; }
+    bool Flush() override { return true; }
+  } disk;
+  AhciController ahci(&disk);
+  const uint64_t ramBase = 0x00100000;
+  std::vector<uint8_t> ram(0x00010000, 0);
+  ahci.SetDmaMemory([&](uint64_t gpa, std::size_t len) -> uint8_t * {
+    if (gpa < ramBase || gpa + len > ramBase + ram.size()) {
+      return nullptr;
+    }
+    return ram.data() + static_cast<size_t>(gpa - ramBase);
+  });
+  const uint64_t abar = 0xFEBB0000;
+  ahci.SetAbarBase(abar);
+  auto wr = [&](uint32_t off, uint32_t v) { ahci.OnWrite(abar + off, 4, v); };
+  auto put32 = [&](uint64_t gpa, uint32_t v) {
+    uint8_t *p = ram.data() + static_cast<size_t>(gpa - ramBase);
+    p[0] = v & 0xFF; p[1] = (v >> 8) & 0xFF;
+    p[2] = (v >> 16) & 0xFF; p[3] = (v >> 24) & 0xFF;
+  };
+  const uint64_t clb = ramBase, ctba = ramBase + 0x2000, dataBuf = ramBase + 0x3000;
+  put32(clb + 0, (1u << 16) | 5u);
+  put32(clb + 8, static_cast<uint32_t>(ctba));
+  // READ DMA (0xC8, 28-bit), LBA 0x01234567 (bits 27:24 = 0x1 in the Device reg).
+  const uint64_t targetLba = 0x01234567ull;
+  ram[static_cast<size_t>(ctba - ramBase) + 0] = 0x27;
+  ram[static_cast<size_t>(ctba - ramBase) + 1] = 0x80;
+  ram[static_cast<size_t>(ctba - ramBase) + 2] = 0xC8;
+  ram[static_cast<size_t>(ctba - ramBase) + 4] = targetLba & 0xFF;        // LBA 7:0.
+  ram[static_cast<size_t>(ctba - ramBase) + 5] = (targetLba >> 8) & 0xFF; // LBA 15:8.
+  ram[static_cast<size_t>(ctba - ramBase) + 6] = (targetLba >> 16) & 0xFF;// LBA 23:16.
+  ram[static_cast<size_t>(ctba - ramBase) + 7] =
+      static_cast<uint8_t>(0x40u | ((targetLba >> 24) & 0x0F)); // LBA mode + 27:24.
+  ram[static_cast<size_t>(ctba - ramBase) + 12] = 1;            // count = 1.
+  put32(ctba + 0x80 + 0, static_cast<uint32_t>(dataBuf));
+  put32(ctba + 0x80 + 12, 512u - 1u);
+  wr(0x100 + 0x00, static_cast<uint32_t>(clb));
+  wr(0x04, 0x80000002u);
+  wr(0x100 + 0x18, 0x11u);
+  wr(0x100 + 0x38, 0x1u);
+  uint64_t gotLba = 0;
+  std::memcpy(&gotLba, ram.data() + static_cast<size_t>(dataBuf - ramBase),
+              sizeof(gotLba));
+  Expect(gotLba == targetLba,
+         "AHCI READ DMA 28-bit: LBA bits 27:24 decoded from Device register");
+}
+
 void TestIdeReadWriteSectors() {
   antimal::hv::MemoryBlockDevice disk(8);
   antimal::hv::IdeController ide(&disk);
@@ -3428,6 +3494,7 @@ int main() {
     TestIdeIdentifyDevice();
     TestAhciIdentifyCommand();
     TestAhciReadSectors();
+    TestAhciReadDma28HighLba();
     TestIdeReadWriteSectors();
     TestIdeSecondaryNoDeviceStatus();
     TestIdeAssertsInterrupt();

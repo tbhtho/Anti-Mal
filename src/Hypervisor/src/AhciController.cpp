@@ -208,14 +208,40 @@ void AhciController::RunCommandSlot(uint32_t slot) {
   // ATA command, bytes 4-6/8-10 the 48-bit LBA, bytes 12-13 the sector count.
   const uint8_t *cfis = ctbl;
   const uint8_t cmd = cfis[2];
-  const uint64_t lba = static_cast<uint64_t>(cfis[4]) |
-                       (static_cast<uint64_t>(cfis[5]) << 8) |
-                       (static_cast<uint64_t>(cfis[6]) << 16) |
-                       (static_cast<uint64_t>(cfis[8]) << 24) |
-                       (static_cast<uint64_t>(cfis[9]) << 32) |
-                       (static_cast<uint64_t>(cfis[10]) << 40);
-  uint32_t count = static_cast<uint32_t>(cfis[12]) |
-                   (static_cast<uint32_t>(cfis[13]) << 8);
+  // LBA/count decoding differs between 48-bit EXT commands and 28-bit commands.
+  // EXT (0x24/0x25/0x34/0x35): LBA is bytes 4-6 + 8-10 (48-bit), count is the
+  // 16-bit field bytes 12-13 (0 -> 65536). 28-bit (0xC8/0xCA/0x20/0x30): LBA is
+  // bytes 4-6 PLUS bits 27:24 in the Device register (byte 7, low nibble), and
+  // count is the 8-bit field byte 12 (0 -> 256). Decoding a 28-bit command as
+  // 48-bit silently drops LBA bits 27:24 -> any read at LBA >= 16M sectors
+  // (>= 8 GiB into the disk, e.g. the SYSTEM hive deep in the Windows partition)
+  // returns the wrong sectors -> "registry hive contains errors" (0xc000000f).
+  const bool isExt =
+      (cmd == 0x25 || cmd == 0x35 || cmd == 0x24 || cmd == 0x34);
+  uint64_t lba;
+  uint32_t count;
+  if (isExt) {
+    lba = static_cast<uint64_t>(cfis[4]) |
+          (static_cast<uint64_t>(cfis[5]) << 8) |
+          (static_cast<uint64_t>(cfis[6]) << 16) |
+          (static_cast<uint64_t>(cfis[8]) << 24) |
+          (static_cast<uint64_t>(cfis[9]) << 32) |
+          (static_cast<uint64_t>(cfis[10]) << 40);
+    count = static_cast<uint32_t>(cfis[12]) |
+            (static_cast<uint32_t>(cfis[13]) << 8);
+    if (count == 0) {
+      count = 65536;
+    }
+  } else {
+    lba = static_cast<uint64_t>(cfis[4]) |
+          (static_cast<uint64_t>(cfis[5]) << 8) |
+          (static_cast<uint64_t>(cfis[6]) << 16) |
+          (static_cast<uint64_t>(cfis[7] & 0x0F) << 24);
+    count = cfis[12];
+    if (count == 0) {
+      count = 256;
+    }
+  }
   uint8_t *prdt = ctbl + 0x80;
 
   // Scatter `src` across the PRDT (device->host), returning bytes moved.
@@ -272,9 +298,6 @@ void AhciController::RunCommandSlot(uint32_t slot) {
   case 0xC8: // READ DMA (28-bit).
   case 0x24: { // READ SECTORS EXT.
     ++readCommands_;
-    if (count == 0) {
-      count = (cmd == 0x25 || cmd == 0x24) ? 65536u : 256u;
-    }
     std::vector<uint8_t> buf(static_cast<size_t>(count) * IBlockDevice::kSectorSize);
     if (disk_ &&
         disk_->ReadSectors(lba, static_cast<uint16_t>(std::min<uint32_t>(count, 0xFFFF)),
@@ -291,9 +314,6 @@ void AhciController::RunCommandSlot(uint32_t slot) {
   case 0xCA: // WRITE DMA (28-bit).
   case 0x34: { // WRITE SECTORS EXT.
     ++writeCommands_;
-    if (count == 0) {
-      count = (cmd == 0x35 || cmd == 0x34) ? 65536u : 256u;
-    }
     std::vector<uint8_t> buf(static_cast<size_t>(count) * IBlockDevice::kSectorSize);
     prdbc = gather(buf.data(), buf.size());
     if (disk_ &&
