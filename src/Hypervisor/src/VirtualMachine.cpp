@@ -1460,6 +1460,16 @@ VmRunSummary VirtualMachine::RunLoop(
             const uint64_t plmRva = std::strtoull(plmEnv, nullptr, 0);
             uint64_t flink = 0;
             const uint64_t head = kbase + plmRva;
+            // For an exception bugcheck (0x7E: p2 = faulting RIP), find which
+            // loaded module's image range contains it -> names the faulting
+            // driver. (0x7E p1=exception code, p2=address, p3=exc record,
+            // p4=context.)
+            const uint32_t bcCode =
+                summary.bugCheckDataValid
+                    ? static_cast<uint32_t>(summary.bugCheckData[0] & 0xFFFFFFFFull)
+                    : 0;
+            const uint64_t faultRip =
+                (bcCode == 0x7Eull) ? summary.bugCheckData[2] : 0;
             if (plmRva != 0 && ReadGuestMemory(head, &flink, sizeof(flink))) {
               std::string list;
               uint32_t count = 0;
@@ -1486,6 +1496,23 @@ VmRunSummary VirtualMachine::RunLoop(
                   list += ' ';
                 }
                 list += (nm[0] != 0 ? nm : "<noname>");
+                // Match the faulting RIP (0x7E p2) to this module's image range
+                // (DllBase @0x30, SizeOfImage @0x40) to name the culprit driver.
+                if (faultRip != 0 && summary.faultingModule.empty()) {
+                  uint64_t dllBase = 0;
+                  uint32_t sizeOfImage = 0;
+                  ReadGuestMemory(node + 0x30, &dllBase, sizeof(dllBase));
+                  ReadGuestMemory(node + 0x40, &sizeOfImage, sizeof(sizeOfImage));
+                  if (dllBase != 0 && sizeOfImage != 0 && faultRip >= dllBase &&
+                      faultRip < dllBase + sizeOfImage) {
+                    char off[32];
+                    std::snprintf(off, sizeof(off), "+0x%llX",
+                                  static_cast<unsigned long long>(faultRip -
+                                                                  dllBase));
+                    summary.faultingModule =
+                        std::string(nm[0] != 0 ? nm : "<noname>") + off;
+                  }
+                }
                 uint64_t next = 0;
                 if (!ReadGuestMemory(node, &next, sizeof(next))) {
                   break;

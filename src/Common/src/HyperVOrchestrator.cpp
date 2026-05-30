@@ -8291,6 +8291,9 @@ std::string FormatVmDiagnostics(const hv::VmRunSummary &vm) {
     if (!vm.bootDeviceFailPath.empty()) {
       out << "bugCheckP1String: " << vm.bootDeviceFailPath << "\n";
     }
+    if (!vm.faultingModule.empty()) {
+      out << "faultingModule: " << vm.faultingModule << "\n";
+    }
     if (vm.loadedModuleCount > 0) {
       out << "loadedModuleCount: " << vm.loadedModuleCount << "\n";
       out << "loadedModules: " << vm.loadedModules << "\n";

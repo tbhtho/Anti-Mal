@@ -269,6 +269,10 @@ struct VmRunSummary {
   // For 0x7B, bugcheck p1 interpreted as a PUNICODE_STRING: the device/ARC path
   // the I/O manager failed to open (empty if p1 was not a valid UNICODE_STRING).
   std::string bootDeviceFailPath;
+  // For exception bugchecks (0x7E SYSTEM_THREAD_EXCEPTION_NOT_HANDLED), the
+  // loaded module whose [DllBase, DllBase+SizeOfImage) contains the faulting RIP
+  // (bugcheck p2), as "name+0xOFFSET" -- names the driver/component that threw.
+  std::string faultingModule;
   // PnP devnode tree walk (gated by ANTIMAL_IOPROOTDEVICENODE_RVA): devnodes
   // with a non-zero CM_PROB_* problem code, and any IDE/ATA-related devnodes,
   // each as "[instancePath prob=N cstat=0xXXXXXXXX]". Tells WHY the IDE device
