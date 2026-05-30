@@ -912,14 +912,25 @@ uint32_t AcpiEisaId(const char id[8]) {
     }
     return 0;
   };
-  const uint32_t vendor =
-      ((static_cast<uint32_t>(id[0] - '@') & 0x1Fu) << 26) |
-      ((static_cast<uint32_t>(id[1] - '@') & 0x1Fu) << 21) |
-      ((static_cast<uint32_t>(id[2] - '@') & 0x1Fu) << 16);
-  const uint32_t product =
-      (hex(id[3]) << 12) | (hex(id[4]) << 8) | (hex(id[5]) << 4) |
-      hex(id[6]);
-  return vendor | product;
+  // ACPI _HID EISAID layout (ACPI spec 6.1.5): the 3-letter vendor is
+  // bit-packed into the LOW two bytes and the 4-hex product ID into the HIGH
+  // two bytes, so the little-endian DWORD's bytes read back as
+  // [vendor0, vendor1, productHi, productLo] -- exactly what the OS ACPI
+  // decoder expects. "PNP0A03" -> 0x030AD041.
+  //
+  // The previous code packed the vendor into the HIGH bits (vendor<<16..26 |
+  // product), yielding 0x41D00A03, whose bytes decode to garbage "@XJD041".
+  // Result: the OS never recognized PNP0A03 as the PCI root, pci.sys never
+  // enumerated the PCI bus, the IDE controller was never created as a PnP
+  // device, the boot disk never appeared -> INACCESSIBLE_BOOT_DEVICE (0x7B).
+  const uint32_t c1 = static_cast<uint32_t>(id[0] - '@') & 0x1Fu;
+  const uint32_t c2 = static_cast<uint32_t>(id[1] - '@') & 0x1Fu;
+  const uint32_t c3 = static_cast<uint32_t>(id[2] - '@') & 0x1Fu;
+  const uint32_t b0 = (c1 << 2) | (c2 >> 3);
+  const uint32_t b1 = ((c2 & 0x7u) << 5) | c3;
+  const uint32_t b2 = (hex(id[3]) << 4) | hex(id[4]);
+  const uint32_t b3 = (hex(id[5]) << 4) | hex(id[6]);
+  return b0 | (b1 << 8) | (b2 << 16) | (b3 << 24);
 }
 
 bool AcpiChecksumValid(const uint8_t *bytes, size_t size) {
