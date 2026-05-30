@@ -419,7 +419,7 @@ void VirtualMachine::AttachDefaultDevices() {
   bus_.Attach(&pcIo_, 0xED, 0xED);    // firmware delay port
   bus_.Attach(&pcIo_, 0x510, 0x511);  // QEMU fw_cfg selector/data
   bus_.Attach(&pcIo_, 0xAF00, 0xAF1F); // PIIX4/QEMU CPU hotplug block
-  bus_.Attach(&pcIo_, 0xCF8, 0xCFF);  // PCI config mechanism #1
+  bus_.Attach(&pcIo_, 0xCF8, 0xCFF);  // PCI config #1 (0xCF9 = reset control)
   bus_.Attach(&pcIo_, 0xB000, 0xB0FF); // PIIX4 ACPI PM IO
   if (framebuffer_) {
     bus_.Attach(&vbe_, BochsVbeDevice::kIndexPort,
@@ -1800,6 +1800,11 @@ VmRunSummary VirtualMachine::RunLoop(
       summary.fatalCsSelector = vcpu_.LastExit().VpContext.Cs.Selector;
     }
   };
+  // VM warm-reset bookkeeping. Windows reboots during normal first-boot (after
+  // device specialize) to continue to OOBE/login; the cap is a backstop against
+  // a genuine reboot loop (a real crash that keeps re-bugchecking).
+  constexpr int kMaxGuestReboots = 10;
+  int guestReboots = 0;
   for (int step = 0; step < maxSteps && !summary.fatal && !summary.idleLoop &&
        !summary.halted && !summary.timedOut && !summary.guestShutdown &&
        !summary.hostStopRequested; ++step) {
@@ -1807,6 +1812,28 @@ VmRunSummary VirtualMachine::RunLoop(
       summary.timedOut = true;
       captureFatalState();
       break;
+    }
+    // Guest-initiated platform reset (0xCF9): perform a VM warm-reset so the
+    // guest's reboot actually happens. Restore device power-on state, put the
+    // BSP back at the OVMF reset vector, and re-enter -- OVMF re-runs and the
+    // guest continues its boot (e.g. specialize -> reboot -> OOBE/login). RAM
+    // and the COW disk overlay persist across the reset (warm reboot), so the
+    // guest's on-disk setup progress carries forward.
+    if (pcIo_.ConsumeResetRequest()) {
+      if (++guestReboots > kMaxGuestReboots) {
+        summary.guestReboots = guestReboots - 1;
+        summary.guestShutdown = true;
+        summary.halted = true;
+        break;
+      }
+      summary.guestReboots = guestReboots;
+      ioApic_.Reset();
+      if (ahci_) {
+        ahci_->Reset();
+      }
+      vcpu_.SetX86ResetState();
+      (void)vcpu_.TrySetStartupSuspended(false);
+      continue;
     }
     if (pcIo_.ShutdownRequested()) {
       summary.guestShutdown = true;

@@ -8470,6 +8470,7 @@ std::string FormatVmDiagnostics(const hv::VmRunSummary &vm) {
   out << "ahciInterruptsRequested: " << vm.ahciInterruptsRequested << "\n";
   out << "ahciInterruptsInjected: " << vm.ahciInterruptsInjected << "\n";
   out << "ahciInterruptsFailed: " << vm.ahciInterruptsFailed << "\n";
+  out << "guestReboots: " << vm.guestReboots << "\n";
   if (vm.ideSawRead) {
     out << "ideReadLbaRange: " << vm.ideMinReadLba << "-"
         << vm.ideMaxReadEndLba << "\n";

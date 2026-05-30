@@ -63,6 +63,22 @@ public:
   bool OnRead(uint64_t gpa, uint8_t accessSize, uint64_t *outValue) override;
   bool OnWrite(uint64_t gpa, uint8_t accessSize, uint64_t value) override;
 
+  // Restore the power-on register state for a guest reboot. Keeps the attached
+  // disk, the DMA accessor, the ABAR base (the guest re-assigns BAR5 on the next
+  // boot), and the cumulative diagnostic counters; clears the HBA/port registers
+  // and the interrupt latch so OVMF's AhciBusDxe re-initializes from scratch.
+  void Reset() noexcept {
+    ghc_ = 0;
+    hbaIs_ = 0;
+    pxClb_ = pxClbu_ = pxFb_ = pxFbu_ = 0;
+    pxIs_ = pxIe_ = pxCmd_ = 0;
+    pxTfd_ = 0x00000050u; // DRDY | DSC.
+    pxSig_ = 0x00000101u; // SATA disk signature.
+    pxSsts_ = 0x00000123u; // DET=3, SPD=2, IPM=1 (device present).
+    pxSctl_ = pxSerr_ = pxSact_ = pxCi_ = 0;
+    interruptPending_ = false;
+  }
+
   // PCI INTx assertion latch, polled by the host run loop (like IdeController).
   bool InterruptPending() const noexcept { return interruptPending_; }
   bool ConsumeInterrupt() noexcept {

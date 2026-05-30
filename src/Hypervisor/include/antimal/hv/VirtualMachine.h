@@ -88,6 +88,10 @@ struct VmRunSummary {
   // (EfiResetShutdown) from bootmgr or the OS). The run loop exits cleanly
   // when this fires instead of timing out.
   bool guestShutdown = false;
+  // Count of guest-initiated platform resets the VM serviced as warm-reboots
+  // (0xCF9 reset). Windows' normal first-boot flow reboots after specialize, so
+  // a non-zero count here means the VM carried the guest through a reboot.
+  int guestReboots = 0;
   uint8_t guestShutdownSleepType = 0;
   bool pm1SleepEnable = false;
   bool pm1HostStopRequested = false;

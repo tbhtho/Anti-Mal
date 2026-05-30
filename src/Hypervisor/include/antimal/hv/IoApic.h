@@ -65,6 +65,18 @@ public:
   uint32_t IndirectRead(uint8_t index) const;
   void IndirectWrite(uint8_t index, uint32_t value);
 
+  // Restore the power-on state for a guest reboot: every redirection entry
+  // masked, IOREGSEL cleared, per-GSI write counts cleared. Cumulative delivery
+  // counters are kept so the run summary reflects the whole session. The guest's
+  // HAL re-programs the table from scratch on the next boot.
+  void Reset() noexcept {
+    for (auto &entry : redirection_) {
+      entry = (1ull << 16); // bit 16 = mask (power-on default).
+    }
+    ioRegSel_ = 0;
+    writeCount_.fill(0);
+  }
+
   uint32_t IoApicId() const noexcept { return ioApicId_; }
   uint64_t RedirectionEntry(uint32_t i) const noexcept {
     return i < kRedirectionEntries ? redirection_[i] : 0;

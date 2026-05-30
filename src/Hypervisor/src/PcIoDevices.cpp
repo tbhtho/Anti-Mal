@@ -33,6 +33,7 @@ constexpr uint32_t kIdeBusMasterBar = 0x0000C001u;
 constexpr uint16_t kVgaLegacyBase = 0x3C0;
 constexpr uint16_t kVgaLegacyLast = 0x3DF;
 constexpr uint16_t kDebugConPort = 0x402;
+constexpr uint16_t kResetControlPort = 0x0CF9; // ICH9/PIIX reset control.
 constexpr uint16_t kFwCfgSelector = 0x510;
 constexpr uint16_t kFwCfgData = 0x511;
 constexpr uint16_t kCpuHotplugBase = 0xAF00;
@@ -472,6 +473,18 @@ uint8_t PcIoDevices::E820Byte(size_t offset) const {
 
 void PcIoDevices::OnWrite(uint16_t port, uint32_t value, uint8_t accessSize) {
   const uint8_t byte = static_cast<uint8_t>(value & 0xFFu);
+  if (port == kResetControlPort) {
+    // ICH9/PIIX reset-control register (0xCF9). A write with the reset bit
+    // (bit 2, 0x04) set triggers a host/CPU reset: 0x06 = warm (assert INIT),
+    // 0x0E = cold. This is how OVMF's runtime ResetSystem and thus Windows'
+    // reboot actually reset the platform. Latch it; the run loop turns it into a
+    // VM warm-reset (re-runs OVMF) instead of letting ResetSystem no-op into a
+    // 0x7E. Bit-1-only writes (0x02, "system reset enable") just arm it.
+    if ((byte & 0x04u) != 0) {
+      resetRequested_ = true;
+    }
+    return;
+  }
   if (OwnsBmdma(port)) {
     WriteBmdma(port, value, accessSize);
     return;
@@ -778,6 +791,12 @@ void PcIoDevices::WritePicData(bool master, uint8_t value) {
 }
 
 uint32_t PcIoDevices::OnRead(uint16_t port, uint8_t accessSize) {
+  if (port == kResetControlPort) {
+    // Reset-control register reads back as 0 (reset not in progress / bit 2
+    // self-clears). Returning a defined value keeps probes off the 0xFF "absent"
+    // sentinel.
+    return 0;
+  }
   if (OwnsBmdma(port)) {
     return ReadBmdma(port, accessSize);
   }

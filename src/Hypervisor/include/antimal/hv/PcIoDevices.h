@@ -173,6 +173,18 @@ public:
     return dirty;
   }
 
+  // Guest-initiated platform reset. Windows/OVMF reboot by writing the ICH9/PIIX
+  // reset-control register at port 0xCF9 with the reset bit (bit 2) set
+  // (0x06 = warm, 0x0E = cold). The host run loop calls ConsumeResetRequest()
+  // each iteration and, if true, performs a VM warm-reset (re-runs OVMF) so the
+  // guest's reboot actually happens instead of the UEFI ResetSystem no-op that
+  // drops Windows into an int 3 -> 0x7E.
+  bool ConsumeResetRequest() noexcept {
+    const bool req = resetRequested_;
+    resetRequested_ = false;
+    return req;
+  }
+
 private:
   uint32_t ReadBmdma(uint16_t port, uint8_t accessSize) const;
   void WriteBmdma(uint16_t port, uint32_t value, uint8_t accessSize);
@@ -312,6 +324,7 @@ private:
   uint32_t ahciAbar_ = 0xFEBB0000u;
   bool ahciAbarSizing_ = false;
   bool ahciAbarDirty_ = false;
+  bool resetRequested_ = false; // guest wrote 0xCF9 reset bit -> warm-reset the VM.
   bool vgaControllerPresent_ = false;
   bool acpiTablesEnabled_ = true;
   uint32_t processorCount_ = 1;
