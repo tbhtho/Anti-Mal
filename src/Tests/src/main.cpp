@@ -29,6 +29,7 @@
 #include "antimal/hv/MmioEmulator.h"
 #include "antimal/hv/PcIoDevices.h"
 #include "antimal/hv/SerialConsole.h"
+#include "antimal/hv/AhciController.h"
 #include "antimal/hv/StorageController.h"
 #include "antimal/hv/Tpm2CrbDevice.h"
 #include "antimal/hv/Vcpu.h"
@@ -1290,6 +1291,153 @@ void TestIdeIdentifyDevice() {
   Expect(sectors == 2048, "IDE identify: total sector count");
 }
 
+void TestPcIoAhciPciResources() {
+  antimal::hv::PcIoDevices pc;
+  pc.SetAhciControllerPresent(true);
+  auto select = [&](uint8_t reg) {
+    pc.OnWrite(0xCF8, 0x80001800u | reg, 4); // bus 0, device 3, function 0.
+  };
+  select(0x00);
+  Expect(pc.OnRead(0xCFC, 4) == 0x29228086u,
+         "PCI AHCI: exposes ICH9 AHCI identifier (8086:2922)");
+  select(0x08);
+  Expect(pc.OnRead(0xCFC, 4) == 0x01060102u,
+         "PCI AHCI: mass storage / SATA / AHCI prog-if (01/06/01)");
+  select(0x24); // BAR5 / ABAR.
+  Expect((pc.OnRead(0xCFC, 4) & 0xFFFFF000u) != 0,
+         "PCI AHCI: BAR5 reports an MMIO base");
+  pc.OnWrite(0xCFC, 0xFFFFFFFFu, 4); // sizing probe.
+  Expect(pc.OnRead(0xCFC, 4) == 0xFFFFF000u,
+         "PCI AHCI: BAR5 reports a 4 KiB size mask under sizing");
+  pc.OnWrite(0xCFC, 0x90000000u, 4); // assign a base.
+  Expect(pc.AhciAbarBase() == 0x90000000u,
+         "PCI AHCI: BAR5 assignment latches the ABAR base");
+  Expect(pc.ConsumeAhciAbarDirty(),
+         "PCI AHCI: BAR5 assignment flags the host to relocate ABAR");
+  select(0x3C);
+  Expect((pc.OnRead(0xCFC, 4) & 0x0000FF00u) == 0x00000100u,
+         "PCI AHCI: reports Interrupt Pin INTA (PCI-native interrupt)");
+}
+
+void TestAhciIdentifyCommand() {
+  using namespace antimal::hv;
+  MemoryBlockDevice disk(4096); // 4096 sectors.
+  AhciController ahci(&disk);
+  // Fake guest RAM window [ramBase, ramBase+size) backing the DMA accessor.
+  const uint64_t ramBase = 0x00100000;
+  std::vector<uint8_t> ram(0x00020000, 0);
+  ahci.SetDmaMemory([&](uint64_t gpa, std::size_t len) -> uint8_t * {
+    if (gpa < ramBase || gpa + len > ramBase + ram.size()) {
+      return nullptr;
+    }
+    return ram.data() + static_cast<size_t>(gpa - ramBase);
+  });
+  const uint64_t abar = 0xFEBB0000;
+  ahci.SetAbarBase(abar);
+  auto wr = [&](uint32_t off, uint32_t v) { ahci.OnWrite(abar + off, 4, v); };
+  auto rd = [&](uint32_t off) -> uint32_t {
+    uint64_t v = 0;
+    ahci.OnRead(abar + off, 4, &v);
+    return static_cast<uint32_t>(v);
+  };
+  auto put32 = [&](uint64_t gpa, uint32_t v) {
+    uint8_t *p = ram.data() + static_cast<size_t>(gpa - ramBase);
+    p[0] = v & 0xFF; p[1] = (v >> 8) & 0xFF;
+    p[2] = (v >> 16) & 0xFF; p[3] = (v >> 24) & 0xFF;
+  };
+  // The device must report present (signature + ready task file).
+  Expect(rd(0x100 + 0x24) == 0x00000101u, "AHCI: port reports SATA disk signature");
+  Expect((rd(0x100 + 0x28) & 0xF) == 0x3u, "AHCI: port detects device present (DET=3)");
+
+  const uint64_t clb = ramBase + 0x0000;   // command list.
+  const uint64_t fb = ramBase + 0x1000;    // FIS receive.
+  const uint64_t ctba = ramBase + 0x2000;  // command table.
+  const uint64_t dataBuf = ramBase + 0x3000;
+  // Command header slot 0: PRDTL=1, CFL=5 DWORDs; CTBA -> command table.
+  put32(clb + 0, (1u << 16) | 5u);
+  put32(clb + 8, static_cast<uint32_t>(ctba));
+  put32(clb + 12, 0);
+  // Command FIS: Host-to-Device Register FIS, command 0xEC (IDENTIFY DEVICE).
+  ram[static_cast<size_t>(ctba - ramBase) + 0] = 0x27;
+  ram[static_cast<size_t>(ctba - ramBase) + 1] = 0x80;
+  ram[static_cast<size_t>(ctba - ramBase) + 2] = 0xEC;
+  // PRDT entry 0 (at command table + 0x80): 512-byte buffer at dataBuf.
+  put32(ctba + 0x80 + 0, static_cast<uint32_t>(dataBuf));
+  put32(ctba + 0x80 + 4, 0);
+  put32(ctba + 0x80 + 12, 512u - 1u); // DBC = bytes-1.
+  // Program the port and issue.
+  wr(0x100 + 0x00, static_cast<uint32_t>(clb)); // PxCLB.
+  wr(0x100 + 0x08, static_cast<uint32_t>(fb));   // PxFB.
+  wr(0x100 + 0x14, 0xFFFFFFFFu);                 // PxIE.
+  wr(0x04, 0x80000002u);                         // GHC: AE | IE.
+  wr(0x100 + 0x18, 0x11u);                       // PxCMD: ST | FRE.
+  wr(0x100 + 0x38, 0x1u);                        // PxCI: issue slot 0.
+
+  const uint16_t word0 = static_cast<uint16_t>(
+      ram[static_cast<size_t>(dataBuf - ramBase)] |
+      (ram[static_cast<size_t>(dataBuf - ramBase) + 1] << 8));
+  Expect(word0 == 0x0040, "AHCI IDENTIFY: fixed-disk word 0 in PRDT buffer");
+  Expect(ahci.IdentifyCommands() == 1, "AHCI IDENTIFY: command counted");
+  Expect((rd(0x100 + 0x38) & 0x1u) == 0,
+         "AHCI IDENTIFY: PxCI slot cleared on completion");
+  Expect((rd(0x100 + 0x10) & 0x1u) != 0,
+         "AHCI IDENTIFY: PxIS DHRS set (D2H register FIS posted)");
+  Expect(ahci.InterruptPending(),
+         "AHCI IDENTIFY: interrupt asserted to the host");
+  // The D2H Register FIS landed in the FIS-receive area at PxFB + 0x40.
+  Expect(ram[static_cast<size_t>(fb - ramBase) + 0x40] == 0x34,
+         "AHCI IDENTIFY: D2H Register FIS type in FIS-receive area");
+}
+
+void TestAhciReadSectors() {
+  using namespace antimal::hv;
+  MemoryBlockDevice disk(64);
+  // Seed sector 7 with a recognizable pattern.
+  std::array<uint8_t, IBlockDevice::kSectorSize> sector{};
+  for (size_t i = 0; i < sector.size(); ++i) {
+    sector[i] = static_cast<uint8_t>(0xA0 + (i & 0x1F));
+  }
+  disk.WriteSectors(7, 1, sector.data());
+  AhciController ahci(&disk);
+  const uint64_t ramBase = 0x00100000;
+  std::vector<uint8_t> ram(0x00020000, 0);
+  ahci.SetDmaMemory([&](uint64_t gpa, std::size_t len) -> uint8_t * {
+    if (gpa < ramBase || gpa + len > ramBase + ram.size()) {
+      return nullptr;
+    }
+    return ram.data() + static_cast<size_t>(gpa - ramBase);
+  });
+  const uint64_t abar = 0xFEBB0000;
+  ahci.SetAbarBase(abar);
+  auto wr = [&](uint32_t off, uint32_t v) { ahci.OnWrite(abar + off, 4, v); };
+  auto put32 = [&](uint64_t gpa, uint32_t v) {
+    uint8_t *p = ram.data() + static_cast<size_t>(gpa - ramBase);
+    p[0] = v & 0xFF; p[1] = (v >> 8) & 0xFF;
+    p[2] = (v >> 16) & 0xFF; p[3] = (v >> 24) & 0xFF;
+  };
+  const uint64_t clb = ramBase, ctba = ramBase + 0x2000, dataBuf = ramBase + 0x3000;
+  put32(clb + 0, (1u << 16) | 5u);
+  put32(clb + 8, static_cast<uint32_t>(ctba));
+  // READ DMA EXT (0x25), LBA 7, count 1.
+  ram[static_cast<size_t>(ctba - ramBase) + 0] = 0x27;
+  ram[static_cast<size_t>(ctba - ramBase) + 1] = 0x80;
+  ram[static_cast<size_t>(ctba - ramBase) + 2] = 0x25;
+  ram[static_cast<size_t>(ctba - ramBase) + 4] = 7; // LBA 7:0.
+  ram[static_cast<size_t>(ctba - ramBase) + 12] = 1; // count low.
+  put32(ctba + 0x80 + 0, static_cast<uint32_t>(dataBuf));
+  put32(ctba + 0x80 + 12, 512u - 1u);
+  wr(0x100 + 0x00, static_cast<uint32_t>(clb));
+  wr(0x04, 0x80000002u);
+  wr(0x100 + 0x18, 0x11u);
+  wr(0x100 + 0x38, 0x1u);
+  Expect(ahci.ReadCommands() == 1, "AHCI READ: command counted");
+  Expect(ahci.SectorsRead() == 1, "AHCI READ: one sector moved");
+  Expect(ram[static_cast<size_t>(dataBuf - ramBase)] == 0xA0,
+         "AHCI READ: sector data DMA'd into the PRDT buffer");
+  Expect(ram[static_cast<size_t>(dataBuf - ramBase) + 31] == 0xBF,
+         "AHCI READ: full sector pattern landed");
+}
+
 void TestIdeReadWriteSectors() {
   antimal::hv::MemoryBlockDevice disk(8);
   antimal::hv::IdeController ide(&disk);
@@ -2449,9 +2597,17 @@ void TestWhpOvmfBootWithIdeDisk() {
               << static_cast<int>(summary.lastCanceledOpcode) << std::dec
               << " hlt: " << (summary.lastCanceledAtHlt ? "yes" : "no")
               << "\n"
-              << "  IDE commands: " << summary.ideCommandsIssued << "\n"
-              << "  IDE identify: " << summary.ideIdentifyCommands << "\n"
-              << "  IDE reads: " << summary.ideReadCommands << "\n";
+              << "  AHCI abar: 0x" << std::hex << std::uppercase
+              << summary.ahciAbarBase << std::dec << "\n"
+              << "  AHCI commands: " << summary.ahciCommandsIssued << "\n"
+              << "  AHCI identify: " << summary.ahciIdentifyCommands << "\n"
+              << "  AHCI reads: " << summary.ahciReadCommands
+              << " sectors: " << summary.ahciSectorsRead << "\n"
+              << "  AHCI ci writes: " << summary.ahciCiWrites
+              << " portcmd writes: " << summary.ahciPortCmdWrites << "\n"
+              << "  AHCI unknown cmds: " << summary.ahciUnknownCommands
+              << " last cmd: 0x" << std::hex << std::uppercase
+              << summary.ahciLastCommand << std::dec << "\n";
     const std::string &previewSource = summary.firmwareDebugOutput.empty()
                                            ? summary.serialOutput
                                            : summary.firmwareDebugOutput;
@@ -2461,15 +2617,19 @@ void TestWhpOvmfBootWithIdeDisk() {
       std::replace(preview.begin(), preview.end(), '\r', '\n');
       std::cout << "  serial preview:\n" << preview << "\n";
     }
-    Expect(summary.steps > 0, "WHP OVMF + IDE: at least one exit occurred");
+    Expect(summary.steps > 0, "WHP OVMF + AHCI: at least one exit occurred");
     Expect(!summary.exitHistogram.empty(),
-           "WHP OVMF + IDE: exit histogram populated");
-    Expect(!summary.fatal, "WHP OVMF + IDE: no fatal exit");
-    Expect(summary.ideIdentifyCommands > 0,
-           "WHP OVMF + IDE: IDENTIFY DEVICE completed");
+           "WHP OVMF + AHCI: exit histogram populated");
+    Expect(!summary.fatal, "WHP OVMF + AHCI: no fatal exit");
+    // The boot disk is on the AHCI HBA now (PCI-native). OVMF's AhciBusDxe
+    // enumerates the port and issues IDENTIFY DEVICE through our emulated HBA;
+    // a non-zero count proves the command-list/FIS/PRDT engine works end to end
+    // with real firmware before we spend a full Windows boot cycle on it.
+    Expect(summary.ahciIdentifyCommands > 0,
+           "WHP OVMF + AHCI: IDENTIFY DEVICE completed via AHCI");
   } catch (const antimal::hv::WhpError &ex) {
     ++g_failed;
-    std::cerr << "FAIL: WHP OVMF + IDE threw WhpError: " << ex.what() << "\n";
+    std::cerr << "FAIL: WHP OVMF + AHCI threw WhpError: " << ex.what() << "\n";
   }
 }
 
@@ -3263,8 +3423,11 @@ int main() {
     TestBochsVbeDataPortAliases();
     TestPcIoVgaBarSizing();
     TestPcIoIdePciResources();
+    TestPcIoAhciPciResources();
     TestHpetMmioCounter();
     TestIdeIdentifyDevice();
+    TestAhciIdentifyCommand();
+    TestAhciReadSectors();
     TestIdeReadWriteSectors();
     TestIdeSecondaryNoDeviceStatus();
     TestIdeAssertsInterrupt();

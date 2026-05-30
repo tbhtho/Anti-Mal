@@ -8451,6 +8451,22 @@ std::string FormatVmDiagnostics(const hv::VmRunSummary &vm) {
   out << "ideAbortedCommands: " << vm.ideAbortedCommands << "\n";
   out << "ideSectorsRead: " << vm.ideSectorsRead << "\n";
   out << "ideSectorsWritten: " << vm.ideSectorsWritten << "\n";
+  out << "ahciAbarBase: 0x" << std::hex << std::uppercase << vm.ahciAbarBase
+      << std::dec << "\n";
+  out << "ahciCommandsIssued: " << vm.ahciCommandsIssued << "\n";
+  out << "ahciIdentifyCommands: " << vm.ahciIdentifyCommands << "\n";
+  out << "ahciReadCommands: " << vm.ahciReadCommands << "\n";
+  out << "ahciWriteCommands: " << vm.ahciWriteCommands << "\n";
+  out << "ahciSectorsRead: " << vm.ahciSectorsRead << "\n";
+  out << "ahciSectorsWritten: " << vm.ahciSectorsWritten << "\n";
+  out << "ahciUnknownCommands: " << vm.ahciUnknownCommands << "\n";
+  out << "ahciLastCommand: 0x" << std::hex << std::uppercase
+      << vm.ahciLastCommand << std::dec << "\n";
+  out << "ahciPortCmdWrites: " << vm.ahciPortCmdWrites << "\n";
+  out << "ahciCiWrites: " << vm.ahciCiWrites << "\n";
+  out << "ahciInterruptsRequested: " << vm.ahciInterruptsRequested << "\n";
+  out << "ahciInterruptsInjected: " << vm.ahciInterruptsInjected << "\n";
+  out << "ahciInterruptsFailed: " << vm.ahciInterruptsFailed << "\n";
   if (vm.ideSawRead) {
     out << "ideReadLbaRange: " << vm.ideMinReadLba << "-"
         << vm.ideMaxReadEndLba << "\n";

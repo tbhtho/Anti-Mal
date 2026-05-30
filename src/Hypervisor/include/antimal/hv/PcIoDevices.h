@@ -36,6 +36,9 @@ public:
   void SetIdeControllerPresent(bool present) noexcept {
     ideControllerPresent_ = present;
   }
+  void SetAhciControllerPresent(bool present) noexcept {
+    ahciControllerPresent_ = present;
+  }
   void SetVgaControllerPresent(bool present) noexcept {
     vgaControllerPresent_ = present;
   }
@@ -156,6 +159,19 @@ public:
   // pci.sys never enumerates the device; climbs high once pci.sys + pciide
   // probe it.
   uint32_t IdeConfigSelects() const noexcept { return ideConfigSelects_; }
+
+  // AHCI HBA memory window (PCI BAR5 / ABAR), assigned by the guest's PCI
+  // enumeration. After each IO exit the host calls ConsumeAhciAbarDirty() and,
+  // if true, points the AhciController's MMIO block at AhciAbarBase() so it
+  // follows the guest's BAR5 assignment (MmioBus queries the base per-access).
+  uint64_t AhciAbarBase() const noexcept {
+    return static_cast<uint64_t>(ahciAbar_ & 0xFFFFF000u);
+  }
+  bool ConsumeAhciAbarDirty() noexcept {
+    const bool dirty = ahciAbarDirty_;
+    ahciAbarDirty_ = false;
+    return dirty;
+  }
 
 private:
   uint32_t ReadBmdma(uint16_t port, uint8_t accessSize) const;
@@ -289,6 +305,13 @@ private:
   bool vgaBar0Sizing_ = false;
   std::string debugOutput_;
   bool ideControllerPresent_ = false;
+  bool ahciControllerPresent_ = false;
+  // AHCI HBA memory window (PCI BAR5 / ABAR). A 32-bit, non-prefetchable memory
+  // BAR sized to 4 KiB; the guest's PCI enumeration assigns its base. Default
+  // base is a placeholder inside the PCI MMIO window until the guest assigns it.
+  uint32_t ahciAbar_ = 0xFEBB0000u;
+  bool ahciAbarSizing_ = false;
+  bool ahciAbarDirty_ = false;
   bool vgaControllerPresent_ = false;
   bool acpiTablesEnabled_ = true;
   uint32_t processorCount_ = 1;

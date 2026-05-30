@@ -402,9 +402,13 @@ std::vector<uint8_t> BuildDsdtAml(uint32_t processorCount) {
   // devnode then fails to start with CM_PROB_NORMAL_CONFLICT (prob=12, observed
   // run 77cda7d0), atapi never binds, the boot disk is never enumerated -> 0x7B.
   // (Those dev1 entries were a leftover from an abandoned approach that drove
-  // the IDE interrupt through PCI INTA.) Only the VGA (dev 2) remains.
+  // the IDE interrupt through PCI INTA.) The VGA (dev 2 INTA -> GSI10) and the
+  // AHCI SATA HBA (dev 3 INTA -> GSI11) are PCI-native and DO ride _PRT: their
+  // INTx interrupts arbitrate in PCI scope, which is exactly why AHCI works
+  // where the compat IDE's ISA IRQ14 could not be granted.
   AppendName(pciTerms, "_PRT",
-             PackageObject({PciRoutingEntry(2, 0, 10)}));
+             PackageObject({PciRoutingEntry(2, 0, 10),
+                            PciRoutingEntry(3, 0, 11)}));
 
   std::vector<uint8_t> isaTerms;
   AppendName(isaTerms, "_ADR", IntegerObject(0x00010000u));
@@ -423,6 +427,15 @@ std::vector<uint8_t> BuildDsdtAml(uint32_t processorCount) {
   AppendName(vgaTerms, "_STA", IntegerObject(0x0F));
   const auto vga = DeviceObject("VGA_", vgaTerms);
   pciTerms.insert(pciTerms.end(), vga.begin(), vga.end());
+
+  // AHCI SATA controller at PCI 00:03.0 (8086:2922). Declared so the _PRT
+  // dev-3 INTA->GSI11 routing has a matching namespace device; storahci binds
+  // the PCI-enumerated function and drives the boot disk.
+  std::vector<uint8_t> ahciTerms;
+  AppendName(ahciTerms, "_ADR", IntegerObject(0x00030000u));
+  AppendName(ahciTerms, "_STA", IntegerObject(0x0F));
+  const auto ahci = DeviceObject("SATA", ahciTerms);
+  pciTerms.insert(pciTerms.end(), ahci.begin(), ahci.end());
 
   const auto pci = DeviceObject("PCI0", pciTerms);
   sbTerms.insert(sbTerms.end(), pci.begin(), pci.end());

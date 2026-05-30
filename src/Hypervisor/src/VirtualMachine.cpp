@@ -48,6 +48,10 @@ constexpr uint64_t kIoApicRelocBase = 0xFEB80000ull;
 constexpr uint64_t kHpetRelocBase   = 0xFEB90000ull;
 constexpr uint64_t kTpmCrbRelocBase = 0xFEBA0000ull;
 
+// AHCI PCI INTx is routed to GSI 11 via PCI0._PRT (dev 3 INTA). A free GSI
+// distinct from the legacy ISA lines and the VGA's GSI 10.
+constexpr uint8_t kAhciGsi = 11;
+
 // TPM 2.0 event log buffer location in guest physical memory. Sits in the
 // firmwareLowScratch_ RAM mapping (0xFC000000-0xFEC00000) so the guest OS
 // reads it as ordinary RAM. We pre-populate the first record with the TCG
@@ -372,7 +376,12 @@ VirtualMachine::VirtualMachine(const std::filesystem::path &firmwarePath,
   mmioBus_.Attach(&tpm_);
   AttachDefaultDevices();
   if (ideDisk) {
-    AttachIdeDisk(ideDisk);
+    // Attach the boot disk to the AHCI HBA (PCI-native), not the legacy IDE.
+    // The compat-mode IDE channel could not get its InterfaceType=Isa resources
+    // (0x1F0/0x3F6/IRQ14) arbitrated in PCI scope (CM_PROB_NORMAL_CONFLICT);
+    // AHCI's resources are all PCI-type and arbitrate where the device lives.
+    // OVMF's AhciBusDxe and Windows' storahci.sys both drive the disk via AHCI.
+    AttachAhciDisk(ideDisk);
   }
 }
 
@@ -449,6 +458,22 @@ void VirtualMachine::AttachIdeDisk(IBlockDevice *disk) {
   bus_.Attach(secondaryIde_.get(), static_cast<uint16_t>(bmBase + 8),
               static_cast<uint16_t>(bmBase + 15));
   pcIo_.ConsumeBmdmaAttachDirty();
+}
+
+void VirtualMachine::AttachAhciDisk(IBlockDevice *disk) {
+  // PCI-native AHCI SATA controller (dev 3, 8086:2922). Its single MMIO block
+  // (ABAR / BAR5) is OS-relocatable; MmioBus queries MmioBase() per access, so
+  // updating the AhciController's base when the guest assigns BAR5 relocates the
+  // block live. The DMA accessor (HostPointerForGpa) lets the HBA walk the guest
+  // command list / FISes / PRDT and move sectors between disk and guest RAM.
+  pcIo_.SetAhciControllerPresent(true);
+  ahci_ = std::make_unique<AhciController>(disk);
+  ahci_->SetDmaMemory([this](uint64_t gpa, std::size_t len) -> uint8_t * {
+    return HostPointerForGpa(gpa, len);
+  });
+  ahci_->SetAbarBase(pcIo_.AhciAbarBase());
+  mmioBus_.Attach(ahci_.get());
+  pcIo_.ConsumeAhciAbarDirty();
 }
 
 uint8_t *VirtualMachine::HostPointerForGpa(uint64_t gpa,
@@ -1855,6 +1880,12 @@ VmRunSummary VirtualMachine::RunLoop(
           }
         }
       }
+      // AHCI ABAR (BAR5) relocation: when the guest's PCI enumeration assigns
+      // the HBA's MMIO base, point the AhciController's MMIO block at it. MmioBus
+      // queries MmioBase() per access, so no re-attach is needed -- just update.
+      if (pcIo_.ConsumeAhciAbarDirty() && ahci_) {
+        ahci_->SetAbarBase(pcIo_.AhciAbarBase());
+      }
       vcpu_.AdvanceRip(instrLen != 0 ? instrLen : io.InstructionByteCount);
       break;
     }
@@ -2193,6 +2224,21 @@ VmRunSummary VirtualMachine::RunLoop(
     tryRaiseIdeIrq(ide_.get());
     tryRaiseIdeIrq(secondaryIde_.get());
 
+    // AHCI raises a PCI INTx interrupt routed (via PCI0._PRT, dev 3 INTA) to
+    // GSI 11. Unlike the IDE's legacy IRQ14, this is a PCI-scope interrupt: the
+    // guest programs IOAPIC RTE[11] when storahci connects it, and we assert it
+    // on AHCI command completion. The IOAPIC path (not the PIC) carries it.
+    if (ahci_ && ahci_->InterruptPending()) {
+      ++summary.ahciInterruptsRequested;
+      const auto backend = tryRaiseLegacyIrq(kAhciGsi);
+      if (backend != IrqDeliveryBackend::Failed) {
+        ++summary.ahciInterruptsInjected;
+        ahci_->ConsumeInterrupt();
+      } else {
+        ++summary.ahciInterruptsFailed;
+      }
+    }
+
     if (pcIo_.PitInterruptPending()) {
       const auto backend = tryRaiseLegacyIrq(0);
       if (backend != IrqDeliveryBackend::Failed) {
@@ -2472,6 +2518,19 @@ VmRunSummary VirtualMachine::RunLoop(
   };
   collectIde(ide_);
   collectIde(secondaryIde_);
+  if (ahci_) {
+    summary.ahciCommandsIssued = ahci_->CommandsIssued();
+    summary.ahciIdentifyCommands = ahci_->IdentifyCommands();
+    summary.ahciReadCommands = ahci_->ReadCommands();
+    summary.ahciWriteCommands = ahci_->WriteCommands();
+    summary.ahciSectorsRead = ahci_->SectorsRead();
+    summary.ahciSectorsWritten = ahci_->SectorsWritten();
+    summary.ahciUnknownCommands = ahci_->UnknownCommands();
+    summary.ahciLastCommand = ahci_->LastCommand();
+    summary.ahciPortCmdWrites = ahci_->PortCmdWrites();
+    summary.ahciCiWrites = ahci_->CiWrites();
+    summary.ahciAbarBase = ahci_->AbarBase();
+  }
   summary.ioApicRaises = ioApic_.RaiseCount();
   summary.ioApicDeliveries = ioApic_.Deliveries();
   summary.ioApicMaskedDrops = ioApic_.MaskedDrops();

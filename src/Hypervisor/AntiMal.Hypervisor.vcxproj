@@ -37,6 +37,7 @@
     <ClInclude Include="include\antimal\hv\AcpiTables.h" />
     <ClInclude Include="include\antimal\hv\BlockDevice.h" />
     <ClInclude Include="include\antimal\hv\BochsVbe.h" />
+    <ClInclude Include="include\antimal\hv\AhciController.h" />
     <ClInclude Include="include\antimal\hv\Device.h" />
     <ClInclude Include="include\antimal\hv\Firmware.h" />
     <ClInclude Include="include\antimal\hv\GuestMemory.h" />
@@ -59,6 +60,7 @@
   </ItemGroup>
   <ItemGroup>
     <ClCompile Include="src\AcpiTables.cpp" />
+    <ClCompile Include="src\AhciController.cpp" />
     <ClCompile Include="src\BlockDevice.cpp" />
     <ClCompile Include="src\BochsVbe.cpp" />
     <ClCompile Include="src\Firmware.cpp" />

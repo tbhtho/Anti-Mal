@@ -1080,6 +1080,27 @@ void PcIoDevices::WritePciConfigData(uint16_t port, uint32_t value,
       vgaBar0_ = static_cast<uint32_t>(BochsVbeDevice::kFramebufferGpa) | 0x08u;
     }
   }
+
+  // AHCI BAR5 (ABAR): the guest's PCI enumeration sizes then assigns the HBA's
+  // MMIO base. On the all-ones sizing probe latch the sizing flag (so the read
+  // returns the 4 KiB size mask); on a real assignment latch the base and flag
+  // the host to point the AhciController's MMIO block at it.
+  if (ahciControllerPresent_ && bus == 0 && device == 3 && function == 0 &&
+      reg == 0x24) {
+    const uint32_t v = (ahciAbar_ & ~mask) | ((value << shift) & mask);
+    if ((v & 0xFFFFF000u) == 0xFFFFF000u) {
+      ahciAbarSizing_ = true;
+      return;
+    }
+    ahciAbarSizing_ = false;
+    const uint32_t newBase = v & 0xFFFFF000u;
+    if (newBase != 0 && newBase != (ahciAbar_ & 0xFFFFF000u)) {
+      ahciAbar_ = newBase;
+      ahciAbarDirty_ = true;
+    } else {
+      ahciAbar_ = v;
+    }
+  }
 }
 
 uint32_t PcIoDevices::ReadPciConfigDword() const {
@@ -1224,6 +1245,39 @@ uint32_t PcIoDevices::ReadPciConfigDword() const {
       return 0x00000000u; // No interrupt routing.
     default:
       return 0;
+    }
+  }
+
+  if (ahciControllerPresent_ && device == 3 && function == 0) {
+    // ICH9-style AHCI SATA controller (8086:2922). PCI-native storage: a single
+    // MMIO register block (ABAR / BAR5) + a PCI INTx interrupt + DMA, with NO
+    // legacy ISA ports/IRQ. storahci.sys binds 8086:2922. Resources are all
+    // PCI-type, so the port arbitrates in PCI scope (unlike the compat IDE
+    // channel's InterfaceType=Isa resources that hit CM_PROB_NORMAL_CONFLICT).
+    switch (reg) {
+    case 0x00:
+      return 0x29228086u; // Vendor 0x8086, Device 0x2922 (ICH9 AHCI).
+    case 0x04:
+      // Command: Memory Space Enable (bit1) + Bus Master Enable (bit2) so the
+      // ABAR MMIO decodes and the HBA can DMA. Status: no capability list.
+      return 0x00000006u;
+    case 0x08:
+      // Class 0x01 (mass storage), subclass 0x06 (SATA), prog-if 0x01 (AHCI),
+      // revision 0x02.
+      return 0x01060102u;
+    case 0x0C:
+      return 0x00000000u; // Type-0 header, single function.
+    case 0x24:
+      // BAR5 = ABAR: 32-bit non-prefetchable memory BAR, 4 KiB. During sizing
+      // (guest wrote all-ones) report the 4 KiB size mask; otherwise the base.
+      return ahciAbarSizing_ ? 0xFFFFF000u : (ahciAbar_ & 0xFFFFF000u);
+    case 0x3C:
+      // Interrupt Pin = INTA (0x01); line 0xFF (the OS routes via PCI0._PRT in
+      // ACPI/APIC mode -> dev 3 INTA -> GSI). The AHCI interrupt is a PCI INTx,
+      // arbitrated in PCI scope -- exactly what the compat IDE could not do.
+      return 0x000001FFu;
+    default:
+      return 0; // BAR0-4, subsystem, cap pointer: unimplemented/zero.
     }
   }
 

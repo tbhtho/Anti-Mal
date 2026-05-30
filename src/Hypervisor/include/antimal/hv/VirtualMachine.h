@@ -7,6 +7,7 @@
 #include "antimal/hv/BlockDevice.h"
 #include "antimal/hv/BochsVbe.h"
 #include "antimal/hv/Firmware.h"
+#include "antimal/hv/AhciController.h"
 #include "antimal/hv/GuestMemory.h"
 #include "antimal/hv/Hpet.h"
 #include "antimal/hv/IoApic.h"
@@ -111,6 +112,9 @@ struct VmRunSummary {
   int ideInterruptsIoApic = 0;
   int ideInterruptsPicFallback = 0;
   int ideInterruptsPending = 0;
+  int ahciInterruptsRequested = 0;
+  int ahciInterruptsInjected = 0;
+  int ahciInterruptsFailed = 0;
   int pitInterruptsFailed = 0;
   int pitInterruptsIoApic = 0;
   int pitInterruptsPicFallback = 0;
@@ -385,6 +389,18 @@ struct VmRunSummary {
   uint32_t ideAbortedCommands = 0;
   uint64_t ideSectorsRead = 0;
   uint64_t ideSectorsWritten = 0;
+  // AHCI HBA activity (the PCI-native storage path that replaces compat IDE).
+  uint64_t ahciCommandsIssued = 0;
+  uint32_t ahciIdentifyCommands = 0;
+  uint32_t ahciReadCommands = 0;
+  uint32_t ahciWriteCommands = 0;
+  uint64_t ahciSectorsRead = 0;
+  uint64_t ahciSectorsWritten = 0;
+  uint32_t ahciUnknownCommands = 0;
+  uint32_t ahciLastCommand = 0;
+  uint32_t ahciPortCmdWrites = 0;
+  uint32_t ahciCiWrites = 0;
+  uint64_t ahciAbarBase = 0;
   uint64_t pitIrqsDelivered = 0;
   uint64_t rtcIrqsDelivered = 0;
   uint32_t framesCaptured = 0;
@@ -539,6 +555,7 @@ private:
                            keyboardBursts = {});
   void AttachDefaultDevices();
   void AttachIdeDisk(IBlockDevice *disk);
+  void AttachAhciDisk(IBlockDevice *disk);
   uint8_t *HostPointerForGpa(uint64_t gpa, size_t length) noexcept;
   bool ReadGuestMemory(uint64_t gva, void *buffer, size_t length);
   bool ReadGuestMemoryFor(Vcpu &vcpu, uint64_t gva, void *buffer,
@@ -587,6 +604,7 @@ private:
   MmioEmulator mmioEmulator_;
   std::unique_ptr<IdeController> ide_;
   std::unique_ptr<IdeController> secondaryIde_;
+  std::unique_ptr<AhciController> ahci_;
   uint64_t pageTableAssistBase_ = 0;
   uint64_t pageTableAssistNext_ = 0;
   uint64_t pageTableAssistLimit_ = 0;
