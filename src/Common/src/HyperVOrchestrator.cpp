@@ -8288,6 +8288,13 @@ std::string FormatVmDiagnostics(const hv::VmRunSummary &vm) {
           << vm.bugCheckData[2] << " p3=0x" << vm.bugCheckData[3] << " p4=0x"
           << vm.bugCheckData[4] << std::dec << "\n";
     }
+    if (!vm.bootDeviceFailPath.empty()) {
+      out << "bugCheckP1String: " << vm.bootDeviceFailPath << "\n";
+    }
+    if (vm.loadedModuleCount > 0) {
+      out << "loadedModuleCount: " << vm.loadedModuleCount << "\n";
+      out << "loadedModules: " << vm.loadedModules << "\n";
+    }
     if (vm.deepStackCount > 0) {
       out << "deepStackImageBase: 0x" << std::hex << std::uppercase
           << vm.deepStackImageBase << std::dec << "\n";

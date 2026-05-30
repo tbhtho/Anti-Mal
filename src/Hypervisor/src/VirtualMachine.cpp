@@ -1422,6 +1422,80 @@ VmRunSummary VirtualMachine::RunLoop(
               std::memcpy(summary.bugCheckData, bc, sizeof(bc));
             }
           }
+          // PsLoadedModuleList walk: enumerate the loaded kernel modules at the
+          // bugcheck (name + base + load order). This answers the decisive 0x7B
+          // question -- did pciide/atapi/intelide/ataport/disk actually LOAD --
+          // entirely from guest memory, no kernel debugger needed. RVA is
+          // build-specific (ntoskrnl PDB); pass ANTIMAL_PSLOADEDMODULELIST_RVA.
+          // _LIST_ENTRY head; each node is a _KLDR_DATA_TABLE_ENTRY with
+          // InLoadOrderLinks@0x0, DllBase@0x30, SizeOfImage@0x40,
+          // BaseDllName(UNICODE_STRING)@0x58 (Length@0x58, Buffer@0x60).
+          if (const char *plmEnv =
+                  std::getenv("ANTIMAL_PSLOADEDMODULELIST_RVA")) {
+            const uint64_t plmRva = std::strtoull(plmEnv, nullptr, 0);
+            uint64_t flink = 0;
+            const uint64_t head = kbase + plmRva;
+            if (plmRva != 0 && ReadGuestMemory(head, &flink, sizeof(flink))) {
+              std::string list;
+              uint32_t count = 0;
+              for (uint64_t node = flink;
+                   node != head && node != 0 && count < 192; ++count) {
+                uint16_t nameLen = 0;
+                uint64_t nameBuf = 0;
+                ReadGuestMemory(node + 0x58, &nameLen, sizeof(nameLen));
+                ReadGuestMemory(node + 0x60, &nameBuf, sizeof(nameBuf));
+                char nm[64] = {0};
+                if (nameBuf != 0 && nameLen >= 2) {
+                  const uint16_t nbytes = nameLen > 126 ? 126 : nameLen;
+                  std::array<uint16_t, 64> wbuf{};
+                  if (ReadGuestMemory(nameBuf, wbuf.data(), nbytes)) {
+                    const size_t chars = static_cast<size_t>(nbytes) / 2;
+                    for (size_t i = 0; i < chars && i < 63; ++i) {
+                      nm[i] = (wbuf[i] >= 0x20 && wbuf[i] < 0x7F)
+                                  ? static_cast<char>(wbuf[i])
+                                  : '?';
+                    }
+                  }
+                }
+                if (!list.empty()) {
+                  list += ' ';
+                }
+                list += (nm[0] != 0 ? nm : "<noname>");
+                uint64_t next = 0;
+                if (!ReadGuestMemory(node, &next, sizeof(next))) {
+                  break;
+                }
+                node = next;
+              }
+              summary.loadedModules = list;
+              summary.loadedModuleCount = count;
+            }
+          }
+          // Interpret bugcheck p1 as a PUNICODE_STRING for 0x7B: the I/O manager
+          // frequently passes the ARC/NT device path it failed to open. Reading
+          // it tells us WHAT the kernel was waiting for (vs. assuming the IDE).
+          if (summary.bugCheckDataValid &&
+              (summary.bugCheckData[0] & 0xFFFFFFFFull) == 0x7Bull) {
+            const uint64_t p1 = summary.bugCheckData[1];
+            uint16_t len = 0;
+            uint64_t buf = 0;
+            if (p1 != 0 && ReadGuestMemory(p1, &len, sizeof(len)) &&
+                ReadGuestMemory(p1 + 0x8, &buf, sizeof(buf)) && len >= 2 &&
+                len <= 520 && buf != 0) {
+              const uint16_t nbytes = len > 510 ? 510 : len;
+              std::array<uint16_t, 256> wbuf{};
+              if (ReadGuestMemory(buf, wbuf.data(), nbytes)) {
+                std::string s;
+                const size_t chars = static_cast<size_t>(nbytes) / 2;
+                for (size_t i = 0; i < chars && i < 255; ++i) {
+                  s += (wbuf[i] >= 0x20 && wbuf[i] < 0x7F)
+                           ? static_cast<char>(wbuf[i])
+                           : '?';
+                }
+                summary.bootDeviceFailPath = s;
+              }
+            }
+          }
         }
       }
     } catch (...) {

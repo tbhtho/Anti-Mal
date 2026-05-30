@@ -257,6 +257,14 @@ struct VmRunSummary {
   // KiBugCheckData readout [code, p1..p4], gated by ANTIMAL_BUGCHECK_DATA_RVA.
   bool bugCheckDataValid = false;
   uint64_t bugCheckData[5]{};
+  // PsLoadedModuleList walk (gated by ANTIMAL_PSLOADEDMODULELIST_RVA): the
+  // space-separated, load-ordered list of kernel modules present at the
+  // bugcheck. The decisive 0x7B evidence -- did pciide/atapi/intelide load?
+  std::string loadedModules;
+  uint32_t loadedModuleCount = 0;
+  // For 0x7B, bugcheck p1 interpreted as a PUNICODE_STRING: the device/ARC path
+  // the I/O manager failed to open (empty if p1 was not a valid UNICODE_STRING).
+  std::string bootDeviceFailPath;
   uint64_t fatalRax = 0;
   uint64_t fatalRbx = 0;
   uint64_t fatalRcx = 0;
