@@ -8299,6 +8299,7 @@ std::string FormatVmDiagnostics(const hv::VmRunSummary &vm) {
       out << "pnpVisitedNodes: " << vm.pnpVisitedNodes << "\n";
       out << "pnpProblemNodes: " << vm.pnpProblemNodes << "\n";
       out << "pnpIdeNodes: " << vm.pnpIdeNodes << "\n";
+      out << "pnpAllNodes: " << vm.pnpAllNodes << "\n";
     }
     if (vm.deepStackCount > 0) {
       out << "deepStackImageBase: 0x" << std::hex << std::uppercase

@@ -1521,7 +1521,7 @@ VmRunSummary VirtualMachine::RunLoop(
               int sp = 0;
               stk[sp++] = rootNode;
               uint32_t visited = 0;
-              std::string probNodes, ideNodes;
+              std::string probNodes, ideNodes, allNodes;
               while (sp > 0 && visited < 1024) {
                 const uint64_t node = stk[--sp];
                 if (node == 0) {
@@ -1573,10 +1573,20 @@ VmRunSummary VirtualMachine::RunLoop(
                   ideNodes += " prob=" + std::to_string(problem) +
                               " cstat=" + hex32(cstat) + "] ";
                 }
+                // Full tree dump (capped): tells whether PCI0 / the PCI bus and
+                // its devices are enumerated at all vs. the IDE being skipped.
+                if (allNodes.size() < 3000 && ip[0] != 0) {
+                  allNodes += ip;
+                  if (problem != 0) {
+                    allNodes += "(p" + std::to_string(problem) + ")";
+                  }
+                  allNodes += ' ';
+                }
               }
               summary.pnpVisitedNodes = visited;
               summary.pnpProblemNodes = probNodes;
               summary.pnpIdeNodes = ideNodes;
+              summary.pnpAllNodes = allNodes;
             }
           }
         }

@@ -272,6 +272,9 @@ struct VmRunSummary {
   uint32_t pnpVisitedNodes = 0;
   std::string pnpProblemNodes;
   std::string pnpIdeNodes;
+  // Full devnode instance-path dump (capped): shows whether PCI0/the PCI bus
+  // and its child devices are enumerated at all, vs. the IDE being skipped.
+  std::string pnpAllNodes;
   uint64_t fatalRax = 0;
   uint64_t fatalRbx = 0;
   uint64_t fatalRcx = 0;
