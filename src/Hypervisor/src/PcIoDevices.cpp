@@ -1123,12 +1123,14 @@ uint32_t PcIoDevices::ReadPciConfigDword() const {
     case 0x04:
       return ideCommand_; // IO enabled; BMDMA stays off until emulated.
     case 0x08:
-      // IDE storage class 0x01, subclass 0x01, prog-if 0x80 = compatibility-mode
-      // channels (fixed ISA ports 0x1F0/0x3F6 + legacy IRQ14/15) WITH bus-master
-      // DMA. Matches a real PIIX4 IDE (8086:7111). The BMDMA register block
-      // (BAR4) is emulated by the IdeController with a real PRD DMA engine, so
-      // OVMF and Windows pciide/intelide both drive the disk via DMA. Rev 0x01.
-      return 0x01018001u;
+      // IDE storage class 0x01, subclass 0x01, prog-if 0x00 = pure legacy
+      // compatibility mode (fixed ISA ports 0x1F0/0x3F6 + legacy IRQ14/15, PIO,
+      // no bus-master BAR). Now that the EISAID encoder bug is fixed and the IDE
+      // actually enumerates as a PnP device, present the SIMPLEST controller:
+      // the bus-master BAR4 (prog-if 0x80) was added on a wrong diagnosis and
+      // introduces a resource the PnP arbiter flagged as CM_PROB_NORMAL_CONFLICT
+      // (prob=12). PIO compat is the minimal conflict-free config. Rev 0x01.
+      return 0x01010001u;
     case 0x0C:
       return 0x00000000u; // Type-0 header.
     case 0x10:
@@ -1140,15 +1142,8 @@ uint32_t PcIoDevices::ReadPciConfigDword() const {
       // Reading 0 tells pci.sys these BARs are absent.
       return 0;
     case 0x20:
-      // BAR4: bus-master IDE (BMDMA) register block, a 16-byte IO BAR. During
-      // sizing the guest writes all-ones; report the 16-byte IO size mask.
-      // Otherwise report the current base | IO indicator. The actual BMDMA
-      // ports are served by the IdeController (the VM routes them to it and
-      // re-attaches when this BAR is relocated).
-      if (ideBarSizing_[4]) {
-        return 0xFFFFFFF1u;
-      }
-      return (static_cast<uint32_t>(ideBmdmaBase_) & 0xFFF0u) | 0x1u;
+      // BAR4 absent: PIO compat-mode IDE has no bus-master register block.
+      return 0;
     case 0x3C:
       // Compatibility-mode IDE uses the dedicated legacy IRQ14/15 lines, NOT a
       // PCI INTx interrupt. A real PIIX-class IDE function in compat mode

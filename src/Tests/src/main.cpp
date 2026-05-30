@@ -1231,16 +1231,12 @@ void TestPcIoIdePciResources() {
          "PCI IDE: exposes Intel PIIX4 IDE identifier");
 
   select(0x08);
-  // Compatibility-mode IDE WITH bus-master DMA: class 01/01, prog-if 0x80 (fixed
-  // ISA command/control ports + legacy IRQ14/15, plus a PCI-mapped BMDMA block
-  // at BAR4 backed by a real PRD DMA engine in the IdeController). Matches a real
-  // PIIX4 IDE (8086:7111), which Windows' intelide miniport requires before it
-  // creates the IDE channels (else atapi never attaches -> 0x7B).
-  Expect(pc.OnRead(0xCFC, 4) == 0x01018001u,
-         "PCI IDE: reports compat-mode IDE storage class with BM (prog-if 0x80)");
+  // Pure legacy compatibility-mode IDE: class 01/01, prog-if 0x00 (fixed ISA
+  // ports + IRQ14/15, PIO, no bus-master BAR). Minimal conflict-free controller.
+  Expect(pc.OnRead(0xCFC, 4) == 0x01010001u,
+         "PCI IDE: reports compat-mode IDE storage class (prog-if 0x00)");
 
-  // Command/control BARs (0-3) stay unimplemented (legacy fixed ports); only
-  // BAR4 (BMDMA) is PCI-mapped.
+  // No PCI-mapped BARs at all (legacy fixed ports; no bus-master block).
   select(0x10);
   Expect(pc.OnRead(0xCFC, 4) == 0u,
          "PCI IDE: command BAR is unimplemented (compat fixed ports)");
@@ -1249,14 +1245,9 @@ void TestPcIoIdePciResources() {
   Expect(pc.OnRead(0xCFC, 4) == 0u,
          "PCI IDE: control BAR is unimplemented (compat fixed ports)");
 
-  // BAR4 is a 16-byte IO BAR for the bus-master DMA block.
   select(0x20);
-  Expect(pc.OnRead(0xCFC, 4) == 0x0000C001u,
-         "PCI IDE: bus-master BAR4 reports BMDMA IO base");
-  pc.OnWrite(0xCFC, 0xFFFFFFFFu, 4);
-  Expect(pc.OnRead(0xCFC, 4) == 0xFFFFFFF1u,
-         "PCI IDE: bus-master BAR4 reports 16-byte IO size mask under sizing");
-  pc.OnWrite(0xCFC, 0x0000C001u, 4); // restore the base after sizing.
+  Expect(pc.OnRead(0xCFC, 4) == 0u,
+         "PCI IDE: no bus-master BAR (PIO compat)");
 
   select(0x3C);
   Expect(pc.OnRead(0xCFC, 4) == 0x000000FFu,

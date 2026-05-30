@@ -647,14 +647,10 @@ IdeController::BuildIdentifyData(const IBlockDevice *disk) {
   PutAtaString(data, 10, 10, "AM0000000001");
   PutAtaString(data, 23, 4, "0001");
   PutAtaString(data, 27, 20, "AntiMal In-House IDE Disk");
-  PutWord(data, 49, 0x0300);      // Capabilities: DMA supported + LBA supported.
+  PutWord(data, 49, 0x0200);      // Capabilities: LBA supported (PIO, no DMA).
   PutWord(data, 53, 0x0007);      // Words 54-58, 64-70, 88 valid.
   PutWord(data, 60, static_cast<uint16_t>(lba28 & 0xFFFFu));
   PutWord(data, 61, static_cast<uint16_t>((lba28 >> 16) & 0xFFFFu));
-  // Multiword DMA: modes 0-2 supported (low byte 0x07), mode 2 selected/active
-  // (bit 10 = 0x0400). Paired with the controller's bus-master block + prog-if
-  // 0x80, this lets pciide/intelide (and OVMF) drive the disk via PRD DMA.
-  PutWord(data, 63, 0x0407);
   PutWord(data, 80, 0x007E);      // ATA-1 through ATA-6 supported.
   PutWord(data, 83, 0x4000);      // FLUSH CACHE supported bit area valid.
   return data;
