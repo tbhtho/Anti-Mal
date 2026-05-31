@@ -16,6 +16,8 @@
 
   // ---------- bridge ----------
   var nextReqId = 1, pending = new Map();
+  var state = { scans: [] };
+  var currentPage = 'dashboard';
   function send(cmd, args) {
     var reqId = nextReqId++;
     return new Promise(function (resolve) {
@@ -32,6 +34,8 @@
         var r = pending.get(m.reqId); if (r) { pending.delete(m.reqId); r(m); } return;
       }
       if (m.evt === 'log' && m.data) appendLog(m.data.level || 'INFO', m.data.msg || '');
+      if (m.evt === 'scan.result' && m.data) onScanResult(m.data);
+      if (m.evt === 'scan.progress' && m.data) onScanProgress(m.data);
       if (m.evt === 'run.status' && m.data) { /* P4 */ }
       if (m.evt === 'telemetry' && m.data) { /* P4 */ }
     });
@@ -129,7 +133,7 @@
         '<label><input type="checkbox" checked disabled> Flag threshold: <span class="mono" id="scan-flag">70</span></label>' +
         opts.map(function (o, i) { return '<label><input type="checkbox" ' + (i < 5 ? 'checked' : '') + '> ' + esc(o) + '</label>'; }).join('') +
         '</div></div>' +
-        '<div class="panel"><h2>Result</h2><p class="page-sub" style="margin:0">No scan yet. Pick a file to see hashes, entropy, PE info, imports, strings, IOCs, tags, and report links.</p></div>';
+        '<div class="panel"><h2>Result</h2><div id="scan-results"></div></div>';
     },
     vm: function () {
       var steps = [['OVMF firmware', 'done'], ['bootmgfw.efi', 'done'], ['winload.efi', 'done'], ['ntoskrnl', 'done'], ['AHCI storage mount', 'done'], ['win32k / GUI stack', 'done'], ['Getting Ready (OOBE)', 'done'], ['GuestAgent heartbeat', 'cur'], ['Artifact return', 'todo']];
@@ -182,6 +186,48 @@
     }
   };
 
+  // ---------- scan results (P3 live data over the bridge) ----------
+  function n(a) { return (a && a.length) || 0; }
+  function shortPath(p) { p = String(p || ''); var i = Math.max(p.lastIndexOf('/'), p.lastIndexOf('\\')); return i >= 0 ? p.slice(i + 1) : p; }
+  function scanRow(x) {
+    var sha = String(x.sha256 || '');
+    var tagNames = (x.tags || []).map(function (tg) { return tg && tg.tag; }).filter(Boolean);
+    return '<tr><td>' + riskChip(x.score | 0) + '</td><td>' + verdictBadge(x.verdict || '?') +
+      '</td><td>' + tags(tagNames) + '</td><td class="mono">' + esc(x.path || '') +
+      '</td><td class="mono">' + esc(sha.slice(0, 16)) + (sha ? '…' : '') + '</td></tr>';
+  }
+  function renderScans() {
+    var box = $('#scan-results'); if (!box) return;
+    if (!state.scans.length) {
+      box.innerHTML = '<p class="page-sub" style="margin:0">No scan yet. Pick a file to see hashes, entropy, PE info, imports, strings, IOCs, tags, and report links.</p>';
+      return;
+    }
+    var rows = state.scans.map(scanRow).join('');
+    var last = state.scans[state.scans.length - 1];
+    var io = last.iocs || {};
+    var detail = kv([
+      ['Path', last.path || '—'], ['SHA-256', last.sha256 || '—'],
+      ['Entropy', last.entropy != null ? Number(last.entropy).toFixed(3) : '—'],
+      ['PE file', last.isPe ? 'yes' : 'no'], ['Authenticode signed', last.authenticodeSigned ? 'yes' : 'no'],
+      ['Imports', n(last.imports)], ['Score', last.score | 0], ['Verdict', last.verdict || '—'],
+      ['URLs', n(io.urls)], ['IPs', n(io.ips)], ['Domains', n(io.domains)],
+      ['Registry paths', n(io.registryPaths)], ['Mutex hints', n(io.mutexHints)], ['Suspicious APIs', n(io.suspiciousApis)],
+      ['YARA matches', n(last.yaraMatches)], ['capa capabilities', n(last.capaCapabilities)],
+      ['DIE detections', n(last.dieDetections)], ['Intel hits', n(last.intelHits)]
+    ]);
+    box.innerHTML = '<table class="grid"><thead><tr><th>Score</th><th>Verdict</th><th>Tags</th><th>Path</th><th>SHA-256</th></tr></thead><tbody>' + rows + '</tbody></table>' +
+      '<h2 style="margin:16px 0 8px">Latest Result Detail</h2>' + detail;
+  }
+  function onScanResult(d) {
+    state.scans.push(d);
+    appendLog((d.score | 0) >= 70 ? 'WARN' : 'INFO',
+      'Scan: ' + String(d.verdict || '?') + ' (' + (d.score | 0) + ') ' + shortPath(d.path));
+    if (currentPage === 'scan') renderScans();
+  }
+  function onScanProgress(d) {
+    if (d && d.stage === 'done') appendLog('INFO', 'Scan complete (' + (d.count != null ? d.count : '?') + ' file(s)).');
+  }
+
   // ---------- mounts (per-page live data over the bridge) ----------
   function loadConfig() {
     send('config.get').then(function (r) {
@@ -196,11 +242,12 @@
       appendLog(r && r.ok ? 'INFO' : 'ERROR', r && r.ok ? 'Config loaded from host.' : 'Config load failed.');
     });
   }
-  var mounts = { config: loadConfig };
+  var mounts = { config: loadConfig, scan: renderScans };
 
   // ---------- router ----------
   function route(page) {
     if (!pages[page]) page = 'dashboard';
+    currentPage = page;
     $('#content').innerHTML = pages[page]();
     $all('#nav a').forEach(function (a) { a.classList.toggle('active', a.dataset.page === page); });
     wireContentActions();
@@ -212,8 +259,24 @@
     });
   }
   function onAction(cmd) {
-    var label = { 'scan.file': 'Scan File', 'scan.folder': 'Scan Folder', 'scan.computer': 'Scan Computer', 'detonate.selected': 'Detonate Selected' }[cmd] || cmd;
-    appendLog(cmd === 'detonate.selected' ? 'WARN' : 'INFO', label + ' requested — backend wiring lands in P3.');
+    var labels = { 'scan.file': 'Scan File', 'scan.folder': 'Scan Folder', 'scan.computer': 'Scan Computer', 'detonate.selected': 'Detonate Selected' };
+    var label = labels[cmd] || cmd;
+    if (cmd === 'scan.file' || cmd === 'scan.folder' || cmd === 'scan.computer') {
+      appendLog('INFO', label + ' — choose a target…');
+      send(cmd).then(function (r) {
+        if (!r || !r.ok) { appendLog('ERROR', label + ' failed: ' + String((r && r.error) || 'unknown')); return; }
+        var res = r.result || {};
+        if (res.cancelled) { appendLog('INFO', label + ' cancelled.'); return; }
+        appendLog('INFO', label + ' started.');
+        if (currentPage !== 'scan') route('scan');
+      });
+      return;
+    }
+    if (cmd === 'detonate.selected') {
+      appendLog('WARN', label + ' — dynamic execution wiring lands in P5.');
+      return;
+    }
+    appendLog('INFO', label + ' requested.');
   }
 
   // ---------- init ----------

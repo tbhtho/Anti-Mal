@@ -1,14 +1,24 @@
 #include "WebViewHost.h"
 
 #include <dwmapi.h>
+#include <shobjidl.h> // IFileOpenDialog / IShellItem (native file/folder picker)
 
 #include <cstdlib>
 #include <string>
+#include <thread>
+#include <utility>
 
 #include "antimal/Config.h"
 #include "antimal/FileUtil.h"
 #include "antimal/Json.h"
 #include "antimal/JsonValue.h"
+#include "antimal/Scanner.h"
+
+// CLSID_FileOpenDialog lives in uuid.lib; CoCreateInstance/CoInitializeEx in
+// ole32.lib. Both are MSVC default libs, but pin them so the native picker
+// links regardless of how a consumer overrides AdditionalDependencies.
+#pragma comment(lib, "ole32.lib")
+#pragma comment(lib, "uuid.lib")
 
 using Microsoft::WRL::Callback;
 using Microsoft::WRL::ComPtr;
@@ -62,6 +72,48 @@ std::wstring UserDataDir() {
   return dir;
 }
 
+// Native file/folder picker (Common Item Dialog). Returns the chosen filesystem
+// path, or empty on cancel/error. Must run on the UI (STA) thread.
+std::wstring PickPath(HWND owner, bool pickFolder) {
+  // Automation/headless hook: ANTIMAL_SCAN_PATH bypasses the interactive picker
+  // (scripted scans, tests, CI). When unset, the normal dialog shows.
+  {
+    wchar_t *over = nullptr;
+    size_t len = 0;
+    if (_wdupenv_s(&over, &len, L"ANTIMAL_SCAN_PATH") == 0 && over) {
+      std::wstring p(over);
+      free(over);
+      if (!p.empty()) {
+        return p;
+      }
+    }
+  }
+  ComPtr<IFileOpenDialog> dlg;
+  if (FAILED(CoCreateInstance(CLSID_FileOpenDialog, nullptr,
+                              CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&dlg)))) {
+    return std::wstring();
+  }
+  if (pickFolder) {
+    FILEOPENDIALOGOPTIONS opts = 0;
+    dlg->GetOptions(&opts);
+    dlg->SetOptions(opts | FOS_PICKFOLDERS);
+  }
+  if (FAILED(dlg->Show(owner))) {
+    return std::wstring(); // user cancelled
+  }
+  ComPtr<IShellItem> item;
+  if (FAILED(dlg->GetResult(&item))) {
+    return std::wstring();
+  }
+  PWSTR raw = nullptr;
+  if (FAILED(item->GetDisplayName(SIGDN_FILESYSPATH, &raw)) || !raw) {
+    return std::wstring();
+  }
+  std::wstring result(raw);
+  CoTaskMemFree(raw);
+  return result;
+}
+
 } // namespace
 
 LRESULT CALLBACK WebViewHost::WndProc(HWND hwnd, UINT msg, WPARAM wParam,
@@ -79,6 +131,15 @@ LRESULT CALLBACK WebViewHost::WndProc(HWND hwnd, UINT msg, WPARAM wParam,
       self->OnSize();
     }
     return 0;
+  case kEmitMessage: {
+    // A worker thread handed us a heap JSON envelope; forward it to the page.
+    auto *payload = reinterpret_cast<std::string *>(lParam);
+    if (self && self->webview_ && payload) {
+      self->webview_->PostWebMessageAsJson(Widen(*payload).c_str());
+    }
+    delete payload;
+    return 0;
+  }
   case WM_DESTROY:
     PostQuitMessage(0);
     return 0;
@@ -101,6 +162,17 @@ void WebViewHost::HandleWebMessage(ICoreWebView2 *sender,
   if (sender) {
     sender->PostWebMessageAsJson(Widen(reply).c_str());
   }
+}
+
+void WebViewHost::Emit(HWND hwnd, const std::string &evt,
+                       const std::string &dataJson) {
+  if (!hwnd) {
+    return;
+  }
+  std::string envelope =
+      "{\"evt\":" + JsonQuote(evt) + ",\"data\":" + dataJson + "}";
+  PostMessageW(hwnd, kEmitMessage, 0,
+               reinterpret_cast<LPARAM>(new std::string(std::move(envelope))));
 }
 
 HRESULT WebViewHost::OnControllerCreated(HRESULT result,
@@ -230,6 +302,50 @@ void WebViewHost::RegisterHandlers() {
     j += "}";
     return j;
   });
+
+  // P3: static scan. The native picker runs on this (UI/STA) thread; the scan
+  // itself runs on a detached worker that streams scan.result + scan.progress
+  // events back via Emit() (a stale HWND posts nowhere, so worker outliving the
+  // window is safe). Enrichment uses offline defaults -- YARA/capa/DIE are
+  // auto-skipped when their binaries are absent, so this never blocks on tools.
+  auto runScan = [this](bool pickFolder) -> std::string {
+    const std::wstring path = PickPath(hwnd_, pickFolder);
+    if (path.empty()) {
+      return std::string(R"({"cancelled":true})");
+    }
+    const HWND h = hwnd_;
+    const bool isFolder = pickFolder;
+    std::thread([h, path, isFolder]() {
+      CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+      WebViewHost::Emit(h, "scan.progress", R"({"stage":"start","pct":5})");
+      ScannerOptions opts;
+      if (isFolder) {
+        const std::vector<ScanResult> results = ScanPath(path, opts);
+        for (const auto &r : results) {
+          WebViewHost::Emit(h, "scan.result", ToJson(r));
+        }
+        WebViewHost::Emit(
+            h, "scan.progress",
+            std::string("{\"stage\":\"done\",\"pct\":100,\"count\":") +
+                std::to_string(results.size()) + "}");
+      } else {
+        const ScanResult r = ScanFile(path, opts);
+        WebViewHost::Emit(h, "scan.result", ToJson(r));
+        WebViewHost::Emit(h, "scan.progress",
+                          R"({"stage":"done","pct":100,"count":1})");
+      }
+      CoUninitialize();
+    }).detach();
+    return std::string(R"({"started":true})");
+  };
+
+  router_.Register("scan.file",
+                   [runScan](const JsonValue &) { return runScan(false); });
+  router_.Register("scan.folder",
+                   [runScan](const JsonValue &) { return runScan(true); });
+  // "Scan Computer" sweeps a chosen root recursively (same engine as folder).
+  router_.Register("scan.computer",
+                   [runScan](const JsonValue &) { return runScan(true); });
 }
 
 int WebViewHost::Run(HINSTANCE hInstance, int nCmdShow) {
