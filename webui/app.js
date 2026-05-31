@@ -39,8 +39,8 @@
       if (m.evt === 'reports.data' && m.data) onReportsData(m.data);
       if (m.evt === 'dashboard.data' && m.data) onDashboardData(m.data);
       if (m.evt === 'browser.data' && m.data) onBrowserData(m.data);
-      if (m.evt === 'run.status' && m.data) { /* P5 live status */ }
-      if (m.evt === 'telemetry' && m.data) { /* P4 */ }
+      if (m.evt === 'run.status' && m.data) onRunStatus(m.data);
+      if (m.evt === 'telemetry' && m.data) onTelemetry(m.data);
     });
   }
 
@@ -281,9 +281,11 @@
     var run = $('#dash-run');
     if (run) {
       run.innerHTML = kv([['Verdict', lr.verdict || '—'], ['Scanner', (lr.scannerVerdict || '—') + ' (' + (lr.score | 0) + ')'], ['Run ID', lr.runId || '—'], ['When', lr.when || '—']]) +
-        '<div class="actions" style="margin-top:12px"><button class="btn" data-open-run="' + esc(lr.runDir || '') + '">Open Run Folder</button></div>';
+        '<div class="actions" style="margin-top:12px"><button class="btn" data-open-run="' + esc(lr.runDir || '') + '">Open Run Folder</button><button class="btn primary" data-watch-run="' + esc(lr.runDir || '') + '">Watch Live Telemetry</button></div>';
       var ob = run.querySelector('[data-open-run]');
       if (ob) ob.onclick = function () { var p = ob.getAttribute('data-open-run'); if (!p) return; send('run.open', { runDir: p }).then(function (rr) { appendLog(rr && rr.ok ? 'INFO' : 'ERROR', rr && rr.ok ? 'Opened run folder.' : 'Open failed.'); }); };
+      var wb = run.querySelector('[data-watch-run]');
+      if (wb) wb.onclick = function () { var p = wb.getAttribute('data-watch-run'); appendLog('INFO', 'Live telemetry tail requested.'); send('run.watch', p ? { runDir: p } : {}); };
     }
     var m = d.metrics || {};
     var cards = [['Events', m.events | 0], ['Frames', m.frames | 0], ['Network Domains', m.domains | 0], ['Artifacts', m.artifacts | 0], ['MITRE', m.mitre | 0], ['Errors', m.errors | 0]];
@@ -291,6 +293,31 @@
     if (mt) mt.innerHTML = cards.map(function (c) { return '<div class="metric"><div class="k">' + esc(c[0]) + '</div><div class="v">' + esc(c[1]) + '</div></div>'; }).join('');
     renderEventFeed(d.events || []);
     appendLog('INFO', 'Dashboard loaded run ' + String(lr.runId || '').slice(0, 8) + ' (' + (m.events | 0) + ' events).');
+  }
+  // P5 live telemetry: a run.watch worker streams journal events here.
+  function onTelemetry(d) {
+    if (!d) return;
+    var cat = String(d.category || '?'), act = String(d.action || ''), tgt = String(d.target || '');
+    appendLog('INFO', 'EVT ' + cat + (act ? ' · ' + act : '') + (tgt ? ' · ' + shortPath(tgt) : ''));
+    var box = $('#dash-events'); if (!box) return;
+    var tbody = box.querySelector('tbody');
+    if (!tbody) {
+      box.innerHTML = '<table class="grid"><thead><tr><th>Time</th><th>Category</th><th>Action</th><th>PID</th><th>Image</th><th>Target</th><th>MITRE</th></tr></thead><tbody></tbody></table>';
+      tbody = box.querySelector('tbody');
+    }
+    var when = String(d.time || '').replace('T', ' ').replace('Z', '');
+    var tr = document.createElement('tr');
+    tr.innerHTML = '<td class="mono">' + esc(when) + '</td><td><span class="tag">' + esc(cat) + '</span></td><td>' + esc(act) +
+      '</td><td class="mono">' + esc(d.pid | 0) + '</td><td class="mono">' + esc(shortPath(d.image)) + '</td><td class="mono">' + esc(tgt) +
+      '</td><td>' + (d.mitre ? '<span class="tag">' + esc(d.mitre) + '</span>' : '') + '</td>';
+    tbody.insertBefore(tr, tbody.firstChild);
+  }
+  function onRunStatus(d) {
+    if (!d) return;
+    var s = String(d.state || '');
+    if (s === 'watching') appendLog('SAFE', 'Live telemetry: watching journal for events…');
+    else if (s === 'done') appendLog('INFO', 'Live telemetry ended (' + (d.streamed | 0) + ' events streamed).');
+    else if (s === 'no-run') appendLog('WARN', 'Live telemetry: no run available to watch.');
   }
   function loadDashboard() {
     renderDashResults();

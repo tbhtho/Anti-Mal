@@ -5,6 +5,7 @@
 #include <shobjidl.h> // IFileOpenDialog / IShellItem (native file/folder picker)
 
 #include <algorithm>
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <filesystem>
@@ -17,6 +18,7 @@
 
 #include "antimal/BrowserImpact.h"
 #include "antimal/Config.h"
+#include "antimal/EventJournal.h"
 #include "antimal/FileUtil.h"
 #include "antimal/Json.h"
 #include "antimal/JsonValue.h"
@@ -687,6 +689,79 @@ void WebViewHost::RegisterHandlers() {
       CoUninitialize();
     }).detach();
     return std::string(R"({"loading":true})");
+  });
+
+  // P5 (host->UI half of the live telemetry channel): tail a run's events.jsonl
+  // with EventJournalTailer and stream each new EventRecord to the page as a
+  // paced `telemetry` event, with run.status bookends. This is the exact path a
+  // live detonation will drive once the GuestAgent streams from inside the VM;
+  // here it also replays a completed run's journal. Worker thread; stops after
+  // a stretch of no growth (completed run) or a safety cap.
+  router_.Register("run.watch", [this](const JsonValue &args) -> std::string {
+    const HWND h = hwnd_;
+    const std::string argDir = args.At("runDir").AsString();
+    std::thread([h, argDir]() {
+      CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+      namespace fs = std::filesystem;
+      const AppConfig c = LoadConfig(DefaultConfigPath());
+      fs::path runDir = argDir.empty() ? FindNewestRun(c.workspaceRoot).dir
+                                       : fs::path(Widen(argDir));
+      // Same workspace-confinement guard as run.open: never tail a journal
+      // outside workspace_root, even if the page asks for an arbitrary path.
+      std::error_code ec;
+      const fs::path root = fs::weakly_canonical(c.workspaceRoot, ec);
+      const fs::path target =
+          runDir.empty() ? fs::path() : fs::weakly_canonical(runDir, ec);
+      const fs::path rel =
+          target.empty() ? fs::path() : fs::relative(target, root, ec);
+      const bool inside = !target.empty() && !ec && !rel.empty() &&
+                          rel.native().rfind(L"..", 0) != 0;
+      if (!inside) {
+        WebViewHost::Emit(h, "run.status", R"({"state":"no-run"})");
+        CoUninitialize();
+        return;
+      }
+      runDir = target;
+      const fs::path journal = runDir / L"events.jsonl";
+      EventJournalTailer tailer(journal);
+      WebViewHost::Emit(
+          h, "run.status",
+          std::string("{\"state\":\"watching\",\"journal\":") +
+              JsonQuote(Narrow(journal.wstring().c_str())) + "}");
+      int empties = 0, streamed = 0;
+      const int kMaxEmpties = 8;   // ~2s of no growth on a completed run -> stop
+      const int kMaxEvents = 5000; // safety cap
+      while (empties < kMaxEmpties && streamed < kMaxEvents) {
+        const std::vector<EventRecord> evs = tailer.PullNew();
+        if (evs.empty()) {
+          ++empties;
+          std::this_thread::sleep_for(std::chrono::milliseconds(250));
+          continue;
+        }
+        empties = 0;
+        for (const EventRecord &ev : evs) {
+          JsonObjectBuilder eo;
+          eo.AddString("time", ev.timestampUtc);
+          eo.AddString("source", ev.source);
+          eo.AddString("category", ev.category);
+          eo.AddString("action", ev.action);
+          eo.AddNumber("pid", ev.processId);
+          eo.AddString("image", ev.imagePath);
+          eo.AddString("target", ev.target);
+          eo.AddString("mitre", ev.mitre);
+          WebViewHost::Emit(h, "telemetry", eo.Finish());
+          if (++streamed >= kMaxEvents) {
+            break;
+          }
+          std::this_thread::sleep_for(std::chrono::milliseconds(140));
+        }
+      }
+      WebViewHost::Emit(h, "run.status",
+                        std::string("{\"state\":\"done\",\"streamed\":") +
+                            std::to_string(streamed) + "}");
+      CoUninitialize();
+    }).detach();
+    return std::string(R"({"watching":true})");
   });
 }
 
