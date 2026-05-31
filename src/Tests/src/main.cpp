@@ -1,3 +1,5 @@
+#include <stdexcept>
+#include "antimal/BridgeRouter.h"
 #include "antimal/BrowserImpact.h"
 #include "antimal/Config.h"
 #include "antimal/Crypto.h"
@@ -8,6 +10,7 @@
 #include "antimal/HyperVOrchestrator.h"
 #include "antimal/IntelLookup.h"
 #include "antimal/Json.h"
+#include "antimal/JsonValue.h"
 #include "antimal/PeParser.h"
 #include "antimal/Report.h"
 #include "antimal/Scanner.h"
@@ -3468,6 +3471,46 @@ void TestOrchestratorCreatesRawCowOverlay() {
 
 } // namespace
 
+void TestJsonValueParser() {
+  auto v = antimal::ParseJson(
+      R"({"cmd":"scan.file","reqId":7,"ok":true,"args":{"path":"C:\\a.exe"}})");
+  Expect(v.has_value(), "ParseJson: valid object parses");
+  Expect(v->IsObject(), "ParseJson: root is object");
+  Expect(v->At("cmd").AsString() == "scan.file", "ParseJson: string field");
+  Expect(v->At("reqId").AsInt64() == 7, "ParseJson: number field");
+  Expect(v->At("ok").AsBool(), "ParseJson: bool field");
+  Expect(v->At("args").At("path").AsString() == "C:\\a.exe",
+         "ParseJson: nested object + unescaped backslash");
+  Expect(!antimal::ParseJson("{bad json").has_value(),
+         "ParseJson: malformed rejected");
+  Expect(!antimal::ParseJson("").has_value(), "ParseJson: empty rejected");
+  Expect(v->At("missing").IsNull(), "ParseJson: missing field is Null");
+}
+
+void TestBridgeRouter() {
+  antimal::BridgeRouter router;
+  router.Register("ping", [](const antimal::JsonValue &) {
+    return std::string(R"({"pong":true})");
+  });
+  const auto reply = router.Handle(R"({"cmd":"ping","reqId":42,"args":{}})");
+  Expect(reply.find("\"reqId\":42") != std::string::npos, "router: echoes reqId");
+  Expect(reply.find("\"ok\":true") != std::string::npos, "router: ok=true");
+  Expect(reply.find("\"pong\":true") != std::string::npos,
+         "router: result embedded");
+  const auto unknown = router.Handle(R"({"cmd":"nope","reqId":1,"args":{}})");
+  Expect(unknown.find("\"ok\":false") != std::string::npos,
+         "router: unknown cmd -> ok=false");
+  const auto malformed = router.Handle("not json");
+  Expect(malformed.find("\"ok\":false") != std::string::npos,
+         "router: malformed envelope -> ok=false");
+  router.Register("boom", [](const antimal::JsonValue &) -> std::string {
+    throw std::runtime_error("kaboom");
+  });
+  const auto boom = router.Handle(R"({"cmd":"boom","reqId":9,"args":{}})");
+  Expect(boom.find("\"ok\":false") != std::string::npos,
+         "router: handler exception contained");
+}
+
 int main() {
   try {
     TestHashEntropyJson();
@@ -3495,6 +3538,8 @@ int main() {
     TestAhciIdentifyCommand();
     TestAhciReadSectors();
     TestAhciReadDma28HighLba();
+    TestJsonValueParser();
+    TestBridgeRouter();
     TestIdeReadWriteSectors();
     TestIdeSecondaryNoDeviceStatus();
     TestIdeAssertsInterrupt();

@@ -34,6 +34,7 @@
     </ClCompile>
   </ItemDefinitionGroup>
   <ItemGroup>
+    <ClInclude Include="include\antimal\BridgeRouter.h" />
     <ClInclude Include="include\antimal\BrowserImpact.h" />
     <ClInclude Include="include\antimal\Config.h" />
     <ClInclude Include="include\antimal\Crypto.h" />
@@ -46,6 +47,7 @@
     <ClInclude Include="include\antimal\HyperVOrchestrator.h" />
     <ClInclude Include="include\antimal\IntelLookup.h" />
     <ClInclude Include="include\antimal\Json.h" />
+    <ClInclude Include="include\antimal\JsonValue.h" />
     <ClInclude Include="include\antimal\PeParser.h" />
     <ClInclude Include="include\antimal\Report.h" />
     <ClInclude Include="include\antimal\Scanner.h" />
@@ -56,6 +58,7 @@
     <ClInclude Include="include\antimal\Types.h" />
   </ItemGroup>
   <ItemGroup>
+    <ClCompile Include="src\BridgeRouter.cpp" />
     <ClCompile Include="src\BrowserImpact.cpp" />
     <ClCompile Include="src\Config.cpp" />
     <ClCompile Include="src\Crypto.cpp" />
@@ -67,6 +70,7 @@
     <ClCompile Include="src\HyperVOrchestrator.cpp" />
     <ClCompile Include="src\IntelLookup.cpp" />
     <ClCompile Include="src\Json.cpp" />
+    <ClCompile Include="src\JsonValue.cpp" />
     <ClCompile Include="src\PeParser.cpp" />
     <ClCompile Include="src\Report.cpp" />
     <ClCompile Include="src\Scanner.cpp" />
