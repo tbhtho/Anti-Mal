@@ -9701,12 +9701,19 @@ DetonationResult InHouseOrchestrator::PrepareAndRun(
             needed > 1 && buf[0] != '\0') {
           const int seconds = std::atoi(buf);
           if (seconds >= 0 && seconds <= 600) {
-            request.keyboardInjectAfter =
-                std::chrono::milliseconds{static_cast<int64_t>(seconds) *
-                                          1000};
-            // Set-1 Enter make/break. This is a boot UI probe only; it does
-            // not authorize sample execution.
-            request.keyboardScancodes = {0x1C, 0x9C};
+            // Press Enter at the given second AND repeat across the next ~2 min
+            // so it lands once the Win11 lock screen is up, regardless of the
+            // (variable) time it renders -- a single shot misses when the lock
+            // screen appears later than expected. Dismisses the lock screen so
+            // AutoLogon proceeds to the desktop. Boot-UI probe only; does not
+            // authorize sample execution.
+            using namespace std::chrono;
+            const std::vector<uint8_t> enterKey{0x1C, 0x9C};
+            for (int off : {0, 15, 30, 45, 60, 80, 100, 130, 160}) {
+              request.keyboardBursts.push_back(
+                  {milliseconds{static_cast<int64_t>(seconds + off) * 1000},
+                   enterKey});
+            }
           }
         }
       }
