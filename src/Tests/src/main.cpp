@@ -3511,6 +3511,95 @@ void TestBridgeRouter() {
          "router: handler exception contained");
 }
 
+// Security hardening (live-sandbox-console P6): the bridge JSON parser + router
+// parse UI-controlled input, so they must never crash, stack-overflow, or
+// return a malformed reply on adversarial bytes. This is a deterministic
+// robustness/fuzz harness (no RNG -> reproducible).
+void TestBridgeFuzz() {
+  using antimal::BridgeRouter;
+  using antimal::JsonValue;
+  using antimal::ParseJson;
+
+  BridgeRouter router;
+  router.Register("echo", [](const JsonValue &args) {
+    // Touches args the way real handlers do; At() is null-safe.
+    return std::string("{\"len\":") +
+           std::to_string(args.At("path").AsString().size()) + "}";
+  });
+
+  // 1) Depth cap: pathological nesting is rejected, never a stack overflow.
+  {
+    std::string deepArr(5000, '[');
+    Expect(!ParseJson(deepArr).has_value(),
+           "fuzz: 5000-deep array rejected (depth cap, no overflow)");
+    std::string deepObj;
+    for (int i = 0; i < 5000; ++i) {
+      deepObj += "{\"a\":";
+    }
+    Expect(!ParseJson(deepObj).has_value(),
+           "fuzz: 5000-deep object rejected (depth cap)");
+  }
+
+  // 2) Size cap: oversized input is rejected before parsing.
+  {
+    std::string huge = "\"" + std::string(9 * 1024 * 1024, 'a') + "\"";
+    Expect(!ParseJson(huge).has_value(), "fuzz: 9MiB input rejected (size cap)");
+  }
+
+  // 3) Adversarial seeds: parse-or-reject without crashing; router ALWAYS
+  //    returns a well-formed reply object carrying a bool ok + reqId.
+  const char *seeds[] = {
+      "", " ", "\t\n", "null", "true", "0", "-", "1e999", "NaN", "[", "]",
+      "{", "}", "[,]", "{,}", "{:}", "{\"a\"}", "{\"a\":}", "\"unterminated",
+      "\"\\u00\"", "\"\\uZZZZ\"", "\"\\x41\"", "\"\\\"", "[1,2,3,]", "{\"a\":1,}",
+      "{\"cmd\":\"echo\",\"reqId\":1,\"args\":{\"path\":\"\\u0000\"}}",
+      "{\"cmd\":1,\"reqId\":\"x\"}", "{\"reqId\":[]}", "{\"cmd\":null}",
+      "{\"cmd\":\"echo\",\"reqId\":99,\"args\":{\"path\":12345}}",
+      "\xff\xfe\x01\x02", "{\"a\":\"\xc3\x28\"}"};
+  for (const char *s : seeds) {
+    (void)ParseJson(std::string(s)); // must not throw/crash
+    const std::string reply = router.Handle(std::string(s));
+    const auto pr = ParseJson(reply);
+    Expect(pr.has_value() && pr->IsObject(),
+           "fuzz: router reply is a valid JSON object");
+    Expect(pr->Has("ok") && pr->At("ok").IsBool(), "fuzz: reply has bool ok");
+    Expect(pr->Has("reqId"), "fuzz: reply has reqId");
+  }
+
+  // 4) Deterministic byte-mutation fuzz over a valid envelope (LCG, seeded).
+  const std::string base =
+      R"({"cmd":"echo","reqId":3,"args":{"path":"C:\\Users\\x\\a.exe"}})";
+  unsigned long lcg = 0x12345678u;
+  auto next = [&lcg]() {
+    lcg = lcg * 1103515245u + 12345u;
+    return static_cast<unsigned>((lcg >> 16) & 0x7fff);
+  };
+  int bad = 0;
+  for (int iter = 0; iter < 20000; ++iter) {
+    std::string m = base;
+    const int muts = 1 + static_cast<int>(next() % 6);
+    for (int k = 0; k < muts && !m.empty(); ++k) {
+      const int op = static_cast<int>(next() % 4);
+      const size_t pos = next() % m.size();
+      if (op == 0) {
+        m[pos] = static_cast<char>(next() & 0xff);
+      } else if (op == 1) {
+        m.erase(pos, 1 + (next() % 3));
+      } else if (op == 2) {
+        m.insert(pos, 1, static_cast<char>(next() & 0xff));
+      } else {
+        m[pos] = m[next() % m.size()];
+      }
+    }
+    (void)ParseJson(m); // must not crash
+    const auto pr = ParseJson(router.Handle(m));
+    if (!(pr.has_value() && pr->IsObject() && pr->Has("ok"))) {
+      ++bad;
+    }
+  }
+  Expect(bad == 0, "fuzz: 20000 mutated envelopes all yield valid replies");
+}
+
 int main() {
   try {
     TestHashEntropyJson();
@@ -3540,6 +3629,7 @@ int main() {
     TestAhciReadDma28HighLba();
     TestJsonValueParser();
     TestBridgeRouter();
+    TestBridgeFuzz();
     TestIdeReadWriteSectors();
     TestIdeSecondaryNoDeviceStatus();
     TestIdeAssertsInterrupt();
