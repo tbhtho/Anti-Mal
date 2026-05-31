@@ -9706,6 +9706,92 @@ DetonationResult InHouseOrchestrator::PrepareAndRun(
           }
         }
       }
+      // ANTIMAL_PROBE_OOBE_KEYS=<startSec>: blind-drive the Win11 OOBE to a
+      // LOCAL account via keyboard injection — the non-admin route to the
+      // desktop (the offline SAM has no account to enable, and 24H2 has no
+      // in-OOBE "skip network" button). At startSec the "Hi there" screen
+      // should be up; Enter clicks through region/keyboard, then at the network
+      // screen Shift+F10 opens a console and `start ms-cxh:localonly` jumps to
+      // local-account creation, which we type. Timings are generous because
+      // OOBE screens persist until input.
+      {
+        char buf[16]{};
+        size_t needed = 0;
+        if (getenv_s(&needed, buf, sizeof(buf), "ANTIMAL_PROBE_OOBE_KEYS") == 0 &&
+            needed > 1 && buf[0] != '\0') {
+          const int startSec = std::atoi(buf);
+          if (startSec > 0 && startSec <= 1800) {
+            using namespace std::chrono;
+            const auto base = milliseconds{static_cast<int64_t>(startSec) * 1000};
+            auto &bursts = request.keyboardBursts;
+            const std::vector<uint8_t> enter{0x1C, 0x9C};
+            // Append Set-1 make/break scancodes for an ASCII string (US layout;
+            // shift-wrapped for ':').
+            auto appendKeys = [](std::vector<uint8_t> &v, const std::string &s) {
+              auto makeCode = [](char c, bool &shift) -> int {
+                shift = false;
+                if (c >= 'a' && c <= 'z') {
+                  static const uint8_t L[] = {
+                      0x1E, 0x30, 0x2E, 0x20, 0x12, 0x21, 0x22, 0x23, 0x17,
+                      0x24, 0x25, 0x26, 0x32, 0x31, 0x18, 0x19, 0x10, 0x13,
+                      0x1F, 0x14, 0x16, 0x2F, 0x11, 0x2D, 0x15, 0x2C};
+                  return L[c - 'a'];
+                }
+                if (c >= '0' && c <= '9') {
+                  static const uint8_t D[] = {0x0B, 0x02, 0x03, 0x04, 0x05,
+                                              0x06, 0x07, 0x08, 0x09, 0x0A};
+                  return D[c - '0'];
+                }
+                switch (c) {
+                case ' ': return 0x39;
+                case '-': return 0x0C;
+                case '.': return 0x34;
+                case '\\': return 0x2B;
+                case '/': return 0x35;
+                case ':': shift = true; return 0x27;
+                default: return -1;
+                }
+              };
+              for (char c : s) {
+                bool shift = false;
+                const int code = makeCode(c, shift);
+                if (code < 0) continue;
+                if (shift) v.push_back(0x2A); // LShift make
+                v.push_back(static_cast<uint8_t>(code));
+                v.push_back(static_cast<uint8_t>(code | 0x80));
+                if (shift) v.push_back(0xAA); // LShift break
+              }
+            };
+            // Click through region / keyboard / 2nd-layout with the focused
+            // default button.
+            bursts.push_back({base, enter});
+            bursts.push_back({base + seconds{12}, enter});
+            bursts.push_back({base + seconds{22}, enter});
+            // Network screen -> Shift+F10 opens a console.
+            bursts.push_back(
+                {base + seconds{34}, std::vector<uint8_t>{0x2A, 0x44, 0xC4, 0xAA}});
+            // Run the 24H2 local-account OOBE shortcut.
+            {
+              std::vector<uint8_t> cmd;
+              appendKeys(cmd, "start ms-cxh:localonly");
+              cmd.push_back(0x1C);
+              cmd.push_back(0x9C);
+              bursts.push_back({base + seconds{38}, cmd});
+            }
+            // Local-account creation: name, then blank password confirmations.
+            {
+              std::vector<uint8_t> name;
+              appendKeys(name, "antimal");
+              name.push_back(0x1C);
+              name.push_back(0x9C);
+              bursts.push_back({base + seconds{56}, name});
+            }
+            for (int i = 0; i < 8; ++i) {
+              bursts.push_back({base + seconds{64 + i * 8}, enter});
+            }
+          }
+        }
+      }
       auto stopAfterGuestAgentProbe = std::make_shared<std::atomic_bool>(false);
       request.cancelRequested = stopAfterGuestAgentProbe;
       auto liveHostChannel = std::make_shared<hv::HostSerialChannel>();
