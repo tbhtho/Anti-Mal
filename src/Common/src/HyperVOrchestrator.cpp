@@ -9762,32 +9762,33 @@ DetonationResult InHouseOrchestrator::PrepareAndRun(
                 if (shift) v.push_back(0xAA); // LShift break
               }
             };
-            // Click through region / keyboard / 2nd-layout with the focused
-            // default button.
-            bursts.push_back({base, enter});
-            bursts.push_back({base + seconds{12}, enter});
-            bursts.push_back({base + seconds{22}, enter});
-            // Network screen -> Shift+F10 opens a console.
-            bursts.push_back(
-                {base + seconds{34}, std::vector<uint8_t>{0x2A, 0x44, 0xC4, 0xAA}});
-            // Run the 24H2 local-account OOBE shortcut.
-            {
-              std::vector<uint8_t> cmd;
-              appendKeys(cmd, "start ms-cxh:localonly");
-              cmd.push_back(0x1C);
-              cmd.push_back(0x9C);
-              bursts.push_back({base + seconds{38}, cmd});
-            }
-            // Local-account creation: name, then blank password confirmations.
-            {
-              std::vector<uint8_t> name;
-              appendKeys(name, "antimal");
-              name.push_back(0x1C);
-              name.push_back(0x9C);
-              bursts.push_back({base + seconds{56}, name});
-            }
-            for (int i = 0; i < 8; ++i) {
-              bursts.push_back({base + seconds{64 + i * 8}, enter});
+            // Timing-robust bypass. The un-accelerated VM's OOBE reaches the
+            // network/account screens at a VARIABLE time (observed ~330s one run,
+            // ~690s another) because the specialize-reboot count + render speed
+            // vary, so a single timed shot misses. `Shift+F10` -> `start
+            // ms-cxh:localonly` jumps to local-account creation from ANY
+            // interactive OOBE screen, so fire the whole bypass + account-create
+            // block at SEVERAL offsets spanning the window; whichever lands on a
+            // live OOBE screen wins, and extra firings hit the desktop harmlessly
+            // (Shift+F10 opens a console, the typed text/Enters are inert there).
+            const std::vector<uint8_t> shiftF10{0x2A, 0x44, 0xC4, 0xAA};
+            std::vector<uint8_t> cmd;
+            appendKeys(cmd, "start ms-cxh:localonly");
+            cmd.push_back(0x1C);
+            cmd.push_back(0x9C);
+            std::vector<uint8_t> name;
+            appendKeys(name, "antimal");
+            name.push_back(0x1C);
+            name.push_back(0x9C);
+            for (int off : {0, 150, 300, 450, 600}) {
+              const auto o = base + seconds{off};
+              bursts.push_back({o, enter});               // dismiss any focused button
+              bursts.push_back({o + seconds{4}, shiftF10}); // open a console
+              bursts.push_back({o + seconds{9}, cmd});      // ms-cxh:localonly
+              bursts.push_back({o + seconds{26}, name});    // local-account name
+              for (int i = 0; i < 6; ++i) {
+                bursts.push_back({o + seconds{34 + i * 6}, enter}); // finish flow
+              }
             }
           }
         }
