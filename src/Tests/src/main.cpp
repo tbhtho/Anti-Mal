@@ -1507,6 +1507,83 @@ void TestAhciReadDma28HighLba() {
          "AHCI READ DMA 28-bit: LBA bits 27:24 decoded from Device register");
 }
 
+// Security hardening (live-sandbox-console P6): the AHCI controller is the #1
+// VM-escape surface -- it moves bytes between the disk and *guest-supplied* DMA
+// addresses driven by a guest-built command list + PRDT. A malicious guest must
+// never be able to make the host read/write outside backed guest RAM. This
+// adversarial harness canaries the whole RAM and drives hostile commands
+// (out-of-range command-list base, out-of-range PRDT data base, max byte count
+// straddling the RAM end) then asserts no out-of-bounds host write occurred and
+// the DMA accessor rejected the bad ranges. Mirrors TestAhciReadSectors' setup.
+void TestAhciAdversarialDma() {
+  using namespace antimal::hv;
+  MemoryBlockDevice disk(64);
+  std::array<uint8_t, IBlockDevice::kSectorSize> sec{};
+  for (size_t i = 0; i < sec.size(); ++i) {
+    sec[i] = static_cast<uint8_t>(0xC0 + (i & 0x1F));
+  }
+  disk.WriteSectors(7, 1, sec.data());
+
+  AhciController ahci(&disk);
+  const uint64_t ramBase = 0x00100000;
+  std::vector<uint8_t> ram(0x00020000, 0x5A); // 0x5A canary over all guest RAM.
+  size_t dmaNull = 0;
+  ahci.SetDmaMemory([&](uint64_t gpa, std::size_t len) -> uint8_t * {
+    // Exactly the real bound: reject any range not fully inside guest RAM.
+    if (gpa < ramBase || len > ram.size() || gpa + len > ramBase + ram.size()) {
+      ++dmaNull;
+      return nullptr;
+    }
+    return ram.data() + static_cast<size_t>(gpa - ramBase);
+  });
+  const uint64_t abar = 0xFEBB0000;
+  ahci.SetAbarBase(abar);
+  auto wr = [&](uint32_t off, uint32_t v) { ahci.OnWrite(abar + off, 4, v); };
+  auto put32 = [&](uint64_t gpa, uint32_t v) {
+    uint8_t *p = ram.data() + static_cast<size_t>(gpa - ramBase);
+    p[0] = v & 0xFF; p[1] = (v >> 8) & 0xFF;
+    p[2] = (v >> 16) & 0xFF; p[3] = (v >> 24) & 0xFF;
+  };
+  const uint64_t clb = ramBase, ctba = ramBase + 0x2000;
+
+  // Case 1: command-list base points far outside guest RAM -> clean bail.
+  wr(0x04, 0x80000002u);       // GHC: AE | IE.
+  wr(0x100 + 0x18, 0x11u);     // PxCMD: ST | FRE.
+  wr(0x100 + 0x00, 0xFFFF0000u); // PxCLB out of range.
+  wr(0x100 + 0x38, 0x1u);      // PxCI slot 0.
+  Expect(ahci.CiWrites() >= 1, "AHCI adv: out-of-range CLB processed (counted)");
+
+  // Build a valid READ DMA EXT (LBA 7, count 1) command for cases 2-3.
+  put32(clb + 0, (1u << 16) | 5u);                 // prdtl=1, cfl=5 dwords.
+  put32(clb + 8, static_cast<uint32_t>(ctba));     // CTBA low.
+  const size_t c = static_cast<size_t>(ctba - ramBase);
+  ram[c + 0] = 0x27; ram[c + 1] = 0x80; ram[c + 2] = 0x25; // H2D, C=1, READ DMA EXT.
+  ram[c + 4] = 7; ram[c + 12] = 1;                  // LBA 7, count 1.
+  wr(0x100 + 0x00, static_cast<uint32_t>(clb));     // restore a valid PxCLB.
+
+  // Case 2: PRDT data base far out of range + max byte count (0x3FFFFF).
+  put32(ctba + 0x80 + 0, 0xEEEE0000u);
+  put32(ctba + 0x80 + 12, 0x3FFFFFu);
+  wr(0x100 + 0x38, 0x1u);
+  Expect(ram[static_cast<size_t>(0x110000 - 0x100000)] == 0x5A,
+         "AHCI adv: out-of-range PRDT data base did not corrupt host RAM");
+
+  // Case 3: PRDT data base 256B before RAM end + max byte count -> the 512B
+  // sector transfer straddles the end, so the accessor must refuse it whole
+  // (no partial over-write past the validated range).
+  const uint64_t nearEnd = ramBase + ram.size() - 256;
+  put32(ctba + 0x80 + 0, static_cast<uint32_t>(nearEnd));
+  put32(ctba + 0x80 + 12, 0x3FFFFFu);
+  wr(0x100 + 0x38, 0x1u);
+  Expect(ram[ram.size() - 1] == 0x5A,
+         "AHCI adv: max DBC straddling RAM end did not over-write");
+  Expect(ram[ram.size() - 256] == 0x5A,
+         "AHCI adv: partial transfer past validated range suppressed");
+
+  Expect(dmaNull >= 2,
+         "AHCI adv: DMA accessor rejected out-of-range guest addresses");
+}
+
 void TestIdeReadWriteSectors() {
   antimal::hv::MemoryBlockDevice disk(8);
   antimal::hv::IdeController ide(&disk);
@@ -3627,6 +3704,7 @@ int main() {
     TestAhciIdentifyCommand();
     TestAhciReadSectors();
     TestAhciReadDma28HighLba();
+    TestAhciAdversarialDma();
     TestJsonValueParser();
     TestBridgeRouter();
     TestBridgeFuzz();
