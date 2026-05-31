@@ -1127,14 +1127,11 @@ VmRunSummary VirtualMachine::RunLoop(
   // periodically so a Windows scheduler sees timer ticks.
   using namespace std::chrono_literals;
   constexpr auto kTimerInterval = 10ms;
-  // Force the main loop to iterate at least this often by cancelling a Run()
-  // that has gone this long without exiting (e.g. a guest pure-CPU spin). The
-  // main loop then pumps the clock and checks the deadline. Kept short so a
-  // spinning guest still gets clock ticks -- which lets the guest scheduler
-  // preempt the spinner and run the worker it is waiting on (the OOBE spin-wait
-  // that otherwise looked like a 1-CPU deadlock was really clock starvation
-  // from the host wedging here).
-  constexpr auto kWatchdogCancelAfter = 15ms;
+  // Reclaim control from a guest that has stopped taking VM exits (a pure-CPU
+  // spin) so the main loop can check the deadline and pump the clock. 750ms is
+  // a backstop for a genuine no-exit guest spin; normal boots exit far more
+  // often than this, so the cancel rarely fires.
+  constexpr auto kWatchdogCancelAfter = 750ms;
 
   std::atomic<bool> inRun{false};
   std::atomic<int> watchdogCancels{0};
@@ -1350,6 +1347,13 @@ VmRunSummary VirtualMachine::RunLoop(
     if (!images || images->size() >= limit) {
       return;
     }
+    // Hard wall-clock budget. This scan PE-parses every MZ-headed page via
+    // IdentifyGuestImage -> WHvTranslateGva, which becomes a multi-minute,
+    // 100%-CPU operation once the guest has populated low RAM (~230s into a
+    // Win11 boot -- it was wedging the whole run loop there). Bail rather than
+    // stall; a partial image list is fine for diagnostics.
+    const auto scanStart = std::chrono::steady_clock::now();
+    constexpr auto kScanBudget = std::chrono::milliseconds(150);
     const auto *lowBytes = lowRam_.HostPtr();
     for (uint64_t gpa = 0;
          lowBytes && gpa + kPageSize <= lowRam_.Size() &&
@@ -1369,6 +1373,11 @@ VmRunSummary VirtualMachine::RunLoop(
       if (IdentifyGuestImage(gpa, &image) && image.valid &&
           image.base == gpa) {
         images->push_back(std::move(image));
+      }
+      // Budget check after each (expensive) identify; the MZ-less pages above
+      // are a cheap host-memory scan and don't need it.
+      if (std::chrono::steady_clock::now() - scanStart > kScanBudget) {
+        break;
       }
     }
   };
@@ -2178,12 +2187,10 @@ VmRunSummary VirtualMachine::RunLoop(
       } catch (const WhpError &) {
         ++sameCanceledRipStreak;
       }
-      if (sameCanceledRipStreak >= 256) {
+      if (sameCanceledRipStreak >= 32) {
         // The vCPU is wedged at the same RIP across many cancellations even
-        // though it isn't sitting on a HLT -- give up. Threshold scaled to the
-        // shortened kWatchdogCancelAfter (15ms) so this still needs ~4s of an
-        // interrupts-disabled same-RIP spin before declaring a wedge -- long
-        // enough not to trip a legitimate brief IF=0 stretch.
+        // though it isn't sitting on a HLT -- give up (~24s at the 750ms cancel
+        // cadence, long enough not to trip a legitimate IF=0 stretch).
         summary.idleLoop = true;
       }
       break;
@@ -2209,8 +2216,12 @@ VmRunSummary VirtualMachine::RunLoop(
         (secondaryIde_ ? secondaryIde_->CommandsIssued() : 0);
     if (totalIdeCommands != lastIdeCommands) {
       lastIdeCommands = totalIdeCommands;
-      captureLowRamImages(&summary.observedImages, 256);
       madeProgress = true;
+      // Do NOT scan low RAM for PE images in the hot loop: captureLowRamImages
+      // PE-parses every MZ page via WHvTranslateGva and becomes a multi-minute
+      // 100%-CPU stall once OOBE has populated RAM, wedging the boot (this was
+      // the real "freeze", not a guest deadlock). The end-of-run captures still
+      // run, and are now time-bounded.
     }
 
     const auto kdBytes = com1_.PullSince(kdCom1Cursor);
