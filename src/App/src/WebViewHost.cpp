@@ -15,6 +15,7 @@
 #include <utility>
 #include <vector>
 
+#include "antimal/BrowserImpact.h"
 #include "antimal/Config.h"
 #include "antimal/FileUtil.h"
 #include "antimal/Json.h"
@@ -120,6 +121,46 @@ std::wstring PickPath(HWND owner, bool pickFolder) {
   std::wstring result(raw);
   CoTaskMemFree(raw);
   return result;
+}
+
+// Newest run dir (by report.json mtime) under workspaceRoot that holds a
+// report.json. Returns empty paths when none exist. Skips _-prefixed dirs
+// (_base, _intel_cache). Shared by dashboard.get + browser.get.
+struct NewestRun {
+  std::filesystem::path dir;
+  std::filesystem::path json;
+};
+NewestRun FindNewestRun(const std::filesystem::path &workspaceRoot) {
+  namespace fs = std::filesystem;
+  NewestRun best;
+  unsigned long long bestMtime = 0;
+  std::error_code ec;
+  if (fs::is_directory(workspaceRoot, ec)) {
+    for (const auto &e : fs::directory_iterator(workspaceRoot, ec)) {
+      if (!e.is_directory(ec)) {
+        continue;
+      }
+      const fs::path dir = e.path();
+      const std::wstring name = dir.filename().wstring();
+      if (name.empty() || name[0] == L'_') {
+        continue;
+      }
+      const fs::path json = dir / L"report.json";
+      WIN32_FILE_ATTRIBUTE_DATA fad{};
+      if (!GetFileAttributesExW(json.c_str(), GetFileExInfoStandard, &fad)) {
+        continue;
+      }
+      ULARGE_INTEGER t{};
+      t.LowPart = fad.ftLastWriteTime.dwLowDateTime;
+      t.HighPart = fad.ftLastWriteTime.dwHighDateTime;
+      if (t.QuadPart >= bestMtime) {
+        bestMtime = t.QuadPart;
+        best.dir = dir;
+        best.json = json;
+      }
+    }
+  }
+  return best;
 }
 
 // Local-time "YYYY-MM-DD HH:MM" of a file's last-write time; empty on error.
@@ -505,40 +546,15 @@ void WebViewHost::RegisterHandlers() {
       CoInitializeEx(nullptr, COINIT_MULTITHREADED);
       namespace fs = std::filesystem;
       const AppConfig c = LoadConfig(DefaultConfigPath());
-      fs::path bestDir, bestJson;
-      unsigned long long bestMtime = 0;
       std::error_code ec;
-      if (fs::is_directory(c.workspaceRoot, ec)) {
-        for (const auto &e : fs::directory_iterator(c.workspaceRoot, ec)) {
-          if (!e.is_directory(ec)) {
-            continue;
-          }
-          const fs::path dir = e.path();
-          const std::wstring name = dir.filename().wstring();
-          if (name.empty() || name[0] == L'_') {
-            continue;
-          }
-          const fs::path json = dir / L"report.json";
-          WIN32_FILE_ATTRIBUTE_DATA fad{};
-          if (!GetFileAttributesExW(json.c_str(), GetFileExInfoStandard,
-                                    &fad)) {
-            continue;
-          }
-          ULARGE_INTEGER t{};
-          t.LowPart = fad.ftLastWriteTime.dwLowDateTime;
-          t.HighPart = fad.ftLastWriteTime.dwHighDateTime;
-          if (t.QuadPart >= bestMtime) {
-            bestMtime = t.QuadPart;
-            bestDir = dir;
-            bestJson = json;
-          }
-        }
-      }
-      if (bestJson.empty()) {
+      const NewestRun nr = FindNewestRun(c.workspaceRoot);
+      if (nr.json.empty()) {
         WebViewHost::Emit(h, "dashboard.data", R"({"hasRun":false})");
         CoUninitialize();
         return;
       }
+      const fs::path bestDir = nr.dir;
+      const fs::path bestJson = nr.json;
       const AnalysisReport r = LoadReportBestEffort(bestJson);
       const std::string dirName = Narrow(bestDir.filename().wstring().c_str());
 
@@ -625,6 +641,49 @@ void WebViewHost::RegisterHandlers() {
           ",\"metrics\":" + met.Finish() + ",\"frames\":" + framesArr +
           ",\"events\":" + evArr + "}";
       WebViewHost::Emit(h, "dashboard.data", payload);
+      CoUninitialize();
+    }).detach();
+    return std::string(R"({"loading":true})");
+  });
+
+  // P7: browser-impact triage over the latest run's contacted domains.
+  // Decryption is OFF -- decrypting saved browser secrets is a deliberate,
+  // separately-gated action, never auto-run from the UI. Worker -> browser.data.
+  router_.Register("browser.get", [this](const JsonValue &) -> std::string {
+    const HWND h = hwnd_;
+    std::thread([h]() {
+      CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+      const AppConfig c = LoadConfig(DefaultConfigPath());
+      const NewestRun nr = FindNewestRun(c.workspaceRoot);
+      std::vector<std::string> domains;
+      std::string runId;
+      if (!nr.json.empty()) {
+        const AnalysisReport r = LoadReportBestEffort(nr.json);
+        domains = r.networkDomains;
+        runId = r.runId.empty() ? Narrow(nr.dir.filename().wstring().c_str())
+                                : r.runId;
+      }
+      const std::vector<BrowserRisk> risks =
+          AnalyzeBrowserImpact(domains, /*decryptBrowserSecrets=*/false);
+      std::string arr = "[";
+      for (size_t i = 0; i < risks.size(); ++i) {
+        if (i) {
+          arr += ",";
+        }
+        JsonObjectBuilder o;
+        o.AddString("site", risks[i].site);
+        o.AddString("domain", risks[i].domain);
+        o.AddBool("contactedBySample", risks[i].contactedBySample);
+        o.AddBool("savedCredentials", risks[i].savedCredentials);
+        o.AddBool("cookiesPresent", risks[i].cookiesPresent);
+        o.AddString("recommendation", risks[i].recommendation);
+        arr += o.Finish();
+      }
+      arr += "]";
+      WebViewHost::Emit(h, "browser.data",
+                        std::string("{\"risks\":") + arr +
+                            ",\"domains\":" + std::to_string(domains.size()) +
+                            ",\"runId\":" + JsonQuote(runId) + "}");
       CoUninitialize();
     }).detach();
     return std::string(R"({"loading":true})");

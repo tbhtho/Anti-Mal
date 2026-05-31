@@ -38,6 +38,7 @@
       if (m.evt === 'scan.progress' && m.data) onScanProgress(m.data);
       if (m.evt === 'reports.data' && m.data) onReportsData(m.data);
       if (m.evt === 'dashboard.data' && m.data) onDashboardData(m.data);
+      if (m.evt === 'browser.data' && m.data) onBrowserData(m.data);
       if (m.evt === 'run.status' && m.data) { /* P5 live status */ }
       if (m.evt === 'telemetry' && m.data) { /* P4 */ }
     });
@@ -137,10 +138,8 @@
         '<div class="panel"><h2>Requirements</h2>' + reqs.map(function (r) { return '<div class="gate"><span class="g">✓</span>' + esc(r) + '</div>'; }).join('') + '</div>';
     },
     browser: function () {
-      var rows = [['chrome-download.exe', 67, 'http://file-drop.cc/x'], ['invoice.pdf.exe', 95, 'mail attachment'], ['update.bin', 41, 'http://i-like-hokku.co.ua']]
-        .map(function (x) { return '<tr><td>' + esc(x[0]) + '</td><td>' + riskChip(x[1]) + '</td><td class="mono">C:/Users/…/Downloads/' + esc(x[0]) + '</td><td class="mono">' + esc(x[2]) + '</td><td><button class="iconbtn" title="Scan">⌕</button><button class="iconbtn" title="Report">▤</button></td></tr>'; }).join('');
-      return '<h1 class="page-title">Browser Risk</h1><p class="page-sub">Triage suspicious downloads and submitted files.</p>' +
-        '<div class="panel"><table class="grid"><thead><tr><th>File</th><th>Risk</th><th>Path</th><th>Source</th><th>Actions</th></tr></thead><tbody>' + rows + '</tbody></table></div>';
+      return '<h1 class="page-title">Browser Risk</h1><p class="page-sub">Saved browser sites and credentials potentially exposed by the latest run’s network activity. Decrypting stored secrets is a separate, gated action — never run automatically.</p>' +
+        '<div class="panel"><h2>Impact Assessment</h2><div id="browser-body"><p class="page-sub" style="margin:0">Loading…</p></div></div>';
     },
     config: function () {
       return '<h1 class="page-title">Config</h1><p class="page-sub">Live settings loaded from config/antimal.toml via the host bridge.</p>' +
@@ -342,6 +341,31 @@
       if (banner) banner.textContent = dyn ? 'WARNING: dynamic execution is ENABLED — detonations will run live samples.' : 'Dynamic execution is blocked by default.';
     });
   }
+  function loadBrowser() {
+    var box = $('#browser-body'); if (box) box.innerHTML = '<p class="page-sub" style="margin:0">Analyzing latest run…</p>';
+    send('browser.get').then(function (r) {
+      if ((!r || !r.ok) && box) { box.innerHTML = '<p class="page-sub" style="margin:0">Browser analysis failed.</p>'; appendLog('ERROR', 'Browser analysis failed: ' + String((r && r.error) || 'unknown')); }
+    });
+  }
+  function onBrowserData(d) {
+    var box = $('#browser-body'); if (!box) return;
+    var risks = (d && d.risks) || [];
+    var domains = (d && d.domains) | 0;
+    if (!risks.length) {
+      box.innerHTML = '<p class="page-sub" style="margin:0">No browser-credential exposure detected. The latest run contacted ' + domains + ' domain(s).</p>';
+      appendLog('INFO', 'Browser risk: clean (' + domains + ' domains contacted).');
+      return;
+    }
+    var rows = risks.map(function (x) {
+      var flags = [];
+      if (x.contactedBySample) flags.push('contacted');
+      if (x.savedCredentials) flags.push('saved creds');
+      if (x.cookiesPresent) flags.push('cookies');
+      return '<tr><td>' + esc(x.site || x.domain || '—') + '</td><td class="mono">' + esc(x.domain || '—') + '</td><td>' + tags(flags) + '</td><td>' + esc(x.recommendation || '') + '</td></tr>';
+    }).join('');
+    box.innerHTML = '<table class="grid"><thead><tr><th>Site</th><th>Domain</th><th>Signals</th><th>Recommendation</th></tr></thead><tbody>' + rows + '</tbody></table>';
+    appendLog('WARN', risks.length + ' site(s) flagged for browser-credential risk.');
+  }
   function fmtBytes(n) {
     n = Number(n) || 0;
     if (n <= 0) return '0 B';
@@ -363,7 +387,7 @@
       appendLog(exists ? 'INFO' : 'WARN', exists ? 'Base image ready (' + fmtBytes(c.baseSizeBytes) + ').' : 'Base image not built yet.');
     });
   }
-  var mounts = { dashboard: loadDashboard, vm: loadVm, base: loadBase, config: loadConfig, scan: renderScans, reports: loadReports, safety: loadSafety };
+  var mounts = { dashboard: loadDashboard, vm: loadVm, base: loadBase, config: loadConfig, scan: renderScans, reports: loadReports, browser: loadBrowser, safety: loadSafety };
 
   // ---------- router ----------
   function route(page) {
