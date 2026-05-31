@@ -3514,6 +3514,8 @@ public:
     return bytes_.size() >= 0x1000 && std::memcmp(bytes_.data(), "regf", 4) == 0;
   }
 
+  size_t ByteSize() const { return bytes_.size(); }
+
   std::optional<uint32_t> RootIndex() const {
     if (!IsValid() || bytes_.size() < 0x28) {
       return std::nullopt;
@@ -3563,6 +3565,18 @@ public:
       }
     }
     return std::nullopt;
+  }
+
+  // Diagnostic: names of a key's immediate children (for pinning offline-hive
+  // layout when a path nav fails).
+  std::vector<std::string> ChildKeyNames(uint32_t index) const {
+    std::vector<std::string> names;
+    for (const auto child : SubkeyIndexes(index)) {
+      if (const auto key = ReadKey(child)) {
+        names.push_back(key->name);
+      }
+    }
+    return names;
   }
 
   std::optional<BcdValueLocation> FindValue(uint32_t keyIndex,
@@ -6930,8 +6944,21 @@ bool PatchOverlayAutologon(hv::IBlockDevice &disk,
             cur = next;
             ++depth;
           }
-          samDiag = "SAM Administrator key not found (canonical nav depth=" +
-                    std::to_string(depth) + "/5)";
+          std::string kids;
+          auto root = hive.RootIndex();
+          const auto rk = root ? hive.ReadKey(*root) : std::nullopt;
+          if (root) {
+            for (const auto &n : hive.ChildKeyNames(*root)) {
+              kids += n + ";";
+            }
+          }
+          samDiag =
+              "SAM admin not found (depth=" + std::to_string(depth) +
+              "/5; bytes=" + std::to_string(hive.ByteSize()) + "; rootIdx=" +
+              (root ? std::to_string(*root) : std::string("none")) +
+              " skCount=" + (rk ? std::to_string(rk->subkeyCounts[0]) : "?") +
+              " skList=" + (rk ? std::to_string(rk->subkeyLists[0]) : "?") +
+              "; children=[" + kids + "])";
           return false;
         }
         const auto loc = hive.FindValue(*user, "F");
