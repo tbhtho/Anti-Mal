@@ -3600,6 +3600,13 @@ public:
 
   size_t ByteSize() const { return bytes_.size(); }
 
+  // regf header offset 0x28 = size of the hive's bin data (excludes the 4 KiB
+  // base block). Total valid hive = 0x1000 + this. Used to detect a truncated
+  // read (when the backing buffer is smaller than the hive claims).
+  uint32_t HiveBinDataSize() const {
+    return bytes_.size() >= 0x2C ? ReadLe32(bytes_.data() + 0x28) : 0;
+  }
+
   std::optional<uint32_t> RootIndex() const {
     if (!IsValid() || bytes_.size() < 0x28) {
       return std::nullopt;
@@ -7038,7 +7045,10 @@ bool PatchOverlayAutologon(hv::IBlockDevice &disk,
           }
           samDiag =
               "SAM admin not found (depth=" + std::to_string(depth) +
-              "/5; bytes=" + std::to_string(hive.ByteSize()) + "; rootIdx=" +
+              "/5; bytes=" + std::to_string(hive.ByteSize()) + "; binLen=" +
+              std::to_string(hive.HiveBinDataSize()) + " (hive claims " +
+              std::to_string(hive.HiveBinDataSize() + 0x1000u) +
+              "); rootIdx=" +
               (root ? std::to_string(*root) : std::string("none")) +
               " skCount=" + (rk ? std::to_string(rk->subkeyCounts[0]) : "?") +
               " skList=" + (rk ? std::to_string(rk->subkeyLists[0]) : "?") +
@@ -7079,6 +7089,25 @@ bool PatchOverlayAutologon(hv::IBlockDevice &disk,
         setStr("DefaultDomainName", L".");
         return true;
       });
+
+  // Probe for an existing answer file at a path the OOBE oobeSystem pass
+  // searches. The NTFS writer can't create files, but it can overwrite an
+  // existing one same-size -- so if one of these exists and is large enough we
+  // can drop an autounattend (account creation + AutoLogon) into it, the
+  // non-admin route to the desktop on a vanilla (empty-SAM) base.
+  if (result) {
+    for (const char *p :
+         {"Windows\\Panther\\unattend.xml",
+          "Windows\\Panther\\Unattend\\unattend.xml",
+          "Windows\\System32\\Sysprep\\unattend.xml",
+          "Windows\\System32\\Sysprep\\Autounattend.xml", "unattend.xml",
+          "autounattend.xml", "Windows\\System32\\oobe\\unattend.xml"}) {
+      if (const auto e = ntfs.FindPath(p)) {
+        result->notes.push_back(std::string("answerfile probe: ") + p +
+                                " EXISTS size=" + std::to_string(e->size));
+      }
+    }
+  }
 
   if (result) {
     result->notes.push_back(std::string("autologon overlay patch: SYSTEM=") +
