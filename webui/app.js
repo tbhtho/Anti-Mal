@@ -36,6 +36,7 @@
       if (m.evt === 'log' && m.data) appendLog(m.data.level || 'INFO', m.data.msg || '');
       if (m.evt === 'scan.result' && m.data) onScanResult(m.data);
       if (m.evt === 'scan.progress' && m.data) onScanProgress(m.data);
+      if (m.evt === 'reports.data' && m.data) onReportsData(m.data);
       if (m.evt === 'run.status' && m.data) { /* P4 */ }
       if (m.evt === 'telemetry' && m.data) { /* P4 */ }
     });
@@ -148,12 +149,8 @@
         gates.map(function (g) { return '<div class="gate"><span class="' + (g[1] ? 'g' : 'b') + '">' + (g[1] ? '✓' : '✕') + '</span>' + esc(g[0]) + '</div>'; }).join('') + '</div>';
     },
     reports: function () {
-      var rows = MOCK.reports.map(function (x) {
-        return '<tr><td class="mono">' + esc(x.id) + '</td><td>' + esc(x.file) + '</td><td>' + riskChip(x.score) + '</td><td>' + verdictBadge(x.verdict) +
-          '</td><td class="mono">' + esc(x.created) + '</td><td>' + esc(x.type) + '</td><td><button class="iconbtn" title="Open HTML">▤</button><button class="iconbtn" title="View JSON">{}</button><button class="iconbtn" title="Export">⭳</button><button class="iconbtn" title="Delete">🗑</button></td></tr>';
-      }).join('');
-      return '<h1 class="page-title">Reports</h1><p class="page-sub">Static and dynamic analysis reports archived on disk.</p>' +
-        '<div class="panel"><table class="grid"><thead><tr><th>Report</th><th>File</th><th>Risk</th><th>Verdict</th><th>Created</th><th>Type</th><th>Actions</th></tr></thead><tbody>' + rows + '</tbody></table></div>';
+      return '<h1 class="page-title">Reports</h1><p class="page-sub">Static and dynamic analysis reports archived under the workspace.</p>' +
+        '<div class="panel"><table class="grid"><thead><tr><th>Run</th><th>File</th><th>Risk</th><th>Verdict</th><th>Created</th><th>Type</th><th>Actions</th></tr></thead><tbody id="reports-rows"><tr><td colspan="7" class="page-sub" style="padding:14px">Loading&hellip;</td></tr></tbody></table></div>';
     },
     base: function () {
       var steps = ['Select Windows ISO', 'Choose workspace path', 'Create or import base VHDX', 'Validate boot files', 'Install GuestAgent', 'Confirm ready state'];
@@ -242,7 +239,43 @@
       appendLog(r && r.ok ? 'INFO' : 'ERROR', r && r.ok ? 'Config loaded from host.' : 'Config load failed.');
     });
   }
-  var mounts = { config: loadConfig, scan: renderScans };
+  function loadReports() {
+    var body = $('#reports-rows');
+    if (body) body.innerHTML = '<tr><td colspan="7" class="page-sub" style="padding:14px">Loading…</td></tr>';
+    send('reports.list').then(function (r) {
+      // The rows arrive asynchronously via a reports.data event; this reply
+      // only confirms the worker started (or surfaces a dispatch failure).
+      if ((!r || !r.ok) && body) {
+        body.innerHTML = '<tr><td colspan="7" class="page-sub" style="padding:14px">Reports failed to load.</td></tr>';
+        appendLog('ERROR', 'Reports load failed: ' + String((r && r.error) || 'unknown'));
+      }
+    });
+  }
+  function onReportsData(d) {
+    var body = $('#reports-rows'); if (!body) return;
+    var list = (d && d.reports) || [];
+    if (!list.length) {
+      body.innerHTML = '<tr><td colspan="7" class="page-sub" style="padding:14px">No reports yet. Scan or detonate a sample to generate one.</td></tr>';
+      appendLog('INFO', 'No reports found in workspace.');
+      return;
+    }
+    body.innerHTML = list.map(function (x) {
+      return '<tr><td class="mono">' + esc(String(x.id || '').slice(0, 8)) + '</td><td>' + esc(x.file || '—') + '</td><td>' + riskChip(x.score | 0) + '</td><td>' + verdictBadge(x.verdict || '?') +
+        '</td><td class="mono">' + esc(x.created || '—') + '</td><td>' + esc(x.type || '—') + '</td><td><button class="iconbtn" title="Open run folder" data-open="' + esc(x.runDir || '') + '">▤</button></td></tr>';
+    }).join('');
+    $all('#reports-rows [data-open]').forEach(function (b) {
+      b.onclick = function () {
+        var p = b.getAttribute('data-open'); if (!p) return;
+        send('run.open', { runDir: p }).then(function (rr) {
+          var ok = rr && rr.ok;
+          appendLog(ok ? 'INFO' : 'ERROR', ok ? 'Opened run folder.' : 'Open failed: ' + String((rr && rr.error) || 'unknown'));
+        });
+      };
+    });
+    var total = (d && d.total != null) ? d.total : list.length;
+    appendLog('INFO', 'Loaded ' + list.length + ' of ' + total + ' report(s).');
+  }
+  var mounts = { config: loadConfig, scan: renderScans, reports: loadReports };
 
   // ---------- router ----------
   function route(page) {

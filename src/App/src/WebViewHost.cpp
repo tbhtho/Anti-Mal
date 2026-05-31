@@ -1,17 +1,25 @@
 #include "WebViewHost.h"
 
 #include <dwmapi.h>
+#include <shellapi.h> // ShellExecuteW (open run folder in Explorer)
 #include <shobjidl.h> // IFileOpenDialog / IShellItem (native file/folder picker)
 
+#include <algorithm>
+#include <cstdio>
 #include <cstdlib>
+#include <filesystem>
+#include <stdexcept>
 #include <string>
+#include <system_error>
 #include <thread>
 #include <utility>
+#include <vector>
 
 #include "antimal/Config.h"
 #include "antimal/FileUtil.h"
 #include "antimal/Json.h"
 #include "antimal/JsonValue.h"
+#include "antimal/Report.h"
 #include "antimal/Scanner.h"
 
 // CLSID_FileOpenDialog lives in uuid.lib; CoCreateInstance/CoInitializeEx in
@@ -112,6 +120,23 @@ std::wstring PickPath(HWND owner, bool pickFolder) {
   std::wstring result(raw);
   CoTaskMemFree(raw);
   return result;
+}
+
+// Local-time "YYYY-MM-DD HH:MM" of a file's last-write time; empty on error.
+std::string FormatFileTime(const std::filesystem::path &p) {
+  WIN32_FILE_ATTRIBUTE_DATA fad{};
+  if (!GetFileAttributesExW(p.c_str(), GetFileExInfoStandard, &fad)) {
+    return std::string();
+  }
+  SYSTEMTIME utc{}, local{};
+  if (!FileTimeToSystemTime(&fad.ftLastWriteTime, &utc) ||
+      !SystemTimeToTzSpecificLocalTime(nullptr, &utc, &local)) {
+    return std::string();
+  }
+  char buf[32];
+  std::snprintf(buf, sizeof(buf), "%04d-%02d-%02d %02d:%02d", local.wYear,
+                local.wMonth, local.wDay, local.wHour, local.wMinute);
+  return std::string(buf);
 }
 
 } // namespace
@@ -346,6 +371,107 @@ void WebViewHost::RegisterHandlers() {
   // "Scan Computer" sweeps a chosen root recursively (same engine as folder).
   router_.Register("scan.computer",
                    [runScan](const JsonValue &) { return runScan(true); });
+
+  // P3: reports list. Enumerates run dirs under workspace_root that hold a
+  // report.json, sorts by mtime, and surfaces the most recent kMax (a workspace
+  // can hold hundreds of runs, and each parse is non-trivial). Runs on a worker
+  // and returns the rows via a reports.data event so the UI never blocks.
+  router_.Register("reports.list", [this](const JsonValue &) -> std::string {
+    const HWND h = hwnd_;
+    std::thread([h]() {
+      CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+      namespace fs = std::filesystem;
+      const AppConfig c = LoadConfig(DefaultConfigPath());
+      struct Entry {
+        fs::path dir;
+        fs::path json;
+        unsigned long long mtime;
+      };
+      std::vector<Entry> entries;
+      std::error_code ec;
+      if (fs::is_directory(c.workspaceRoot, ec)) {
+        for (const auto &e : fs::directory_iterator(c.workspaceRoot, ec)) {
+          if (!e.is_directory(ec)) {
+            continue;
+          }
+          const fs::path dir = e.path();
+          const std::wstring name = dir.filename().wstring();
+          if (name.empty() || name[0] == L'_') {
+            continue; // skip _base, _intel_cache, etc.
+          }
+          const fs::path json = dir / L"report.json";
+          WIN32_FILE_ATTRIBUTE_DATA fad{};
+          if (!GetFileAttributesExW(json.c_str(), GetFileExInfoStandard,
+                                    &fad)) {
+            continue;
+          }
+          ULARGE_INTEGER t{};
+          t.LowPart = fad.ftLastWriteTime.dwLowDateTime;
+          t.HighPart = fad.ftLastWriteTime.dwHighDateTime;
+          entries.push_back({dir, json, t.QuadPart});
+        }
+      }
+      std::sort(entries.begin(), entries.end(),
+                [](const Entry &a, const Entry &b) { return a.mtime > b.mtime; });
+      const size_t totalFound = entries.size();
+      const size_t kMax = 100;
+      if (entries.size() > kMax) {
+        entries.resize(kMax);
+      }
+      std::string arr = "[";
+      for (size_t i = 0; i < entries.size(); ++i) {
+        const AnalysisReport r = LoadReportBestEffort(entries[i].json);
+        const bool hasHtml = fs::exists(entries[i].dir / L"report.html", ec);
+        JsonObjectBuilder o;
+        o.AddString("id", r.runId.empty()
+                              ? Narrow(entries[i].dir.filename().wstring().c_str())
+                              : r.runId);
+        o.AddString("file", Narrow(r.samplePath.filename().wstring().c_str()));
+        o.AddNumber("score", r.scannerVerdict.score);
+        o.AddString("verdict", ToString(r.scannerVerdict.verdict));
+        o.AddString("created", FormatFileTime(entries[i].json));
+        o.AddString("type", hasHtml ? "HTML+JSON" : "JSON");
+        o.AddString("runDir", Narrow(entries[i].dir.wstring().c_str()));
+        if (i) {
+          arr += ",";
+        }
+        arr += o.Finish();
+      }
+      arr += "]";
+      WebViewHost::Emit(h, "reports.data",
+                        std::string("{\"reports\":") + arr +
+                            ",\"total\":" + std::to_string(totalFound) +
+                            ",\"shown\":" + std::to_string(entries.size()) +
+                            "}");
+      CoUninitialize();
+    }).detach();
+    return std::string(R"({"loading":true})");
+  });
+
+  // P3: open a run folder in Explorer. The path MUST resolve under
+  // workspace_root (defense against the page opening arbitrary locations --
+  // see the live-sandbox-console security model). Throws on rejection so the
+  // router reports ok:false to the caller.
+  router_.Register("run.open", [](const JsonValue &args) -> std::string {
+    namespace fs = std::filesystem;
+    const std::string wanted = args.At("runDir").AsString();
+    if (wanted.empty()) {
+      throw std::runtime_error("missing runDir");
+    }
+    const AppConfig c = LoadConfig(DefaultConfigPath());
+    std::error_code ec;
+    const fs::path root = fs::weakly_canonical(c.workspaceRoot, ec);
+    const fs::path target = fs::weakly_canonical(fs::path(Widen(wanted)), ec);
+    const fs::path rel = fs::relative(target, root, ec);
+    const bool inside =
+        !ec && !rel.empty() && rel.native().rfind(L"..", 0) != 0;
+    if (!inside || !fs::is_directory(target, ec)) {
+      throw std::runtime_error("path not under workspace");
+    }
+    ShellExecuteW(nullptr, L"open", target.c_str(), nullptr, nullptr,
+                  SW_SHOWNORMAL);
+    return std::string(R"({"opened":true})");
+  });
 }
 
 int WebViewHost::Run(HINSTANCE hInstance, int nCmdShow) {
