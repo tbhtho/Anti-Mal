@@ -1200,6 +1200,19 @@ VmRunSummary VirtualMachine::RunLoop(
   for (auto &ap : apVcpus_) {
     auto *cpu = ap.get();
     apThreads.emplace_back([&, cpu](std::stop_token stop) {
+      // While the AP is still startup-suspended (waiting for the BSP's SIPI),
+      // WHP can return spurious/empty exits. Bailing the thread on one of those
+      // kills the AP before its SIPI ever lands, so the BSP then spins forever
+      // waiting for an AP that never started -- the intermittent 2-vCPU
+      // bring-up hang. So while suspended, NO exit is fatal: pause briefly (to
+      // avoid a busy-spin) and re-enter until the SIPI clears the suspend.
+      auto suspendedBringup = [cpu]() -> bool {
+        if (cpu->IsStartupSuspended()) {
+          std::this_thread::sleep_for(1ms);
+          return true;
+        }
+        return false;
+      };
       while (!stop.stop_requested() && !stopAps.load(std::memory_order_relaxed)) {
         try {
           const auto reason = cpu->Run();
@@ -1227,6 +1240,8 @@ VmRunSummary VirtualMachine::RunLoop(
             apUnhandledExits.fetch_add(1, std::memory_order_relaxed);
             if (instrLen > 0) {
               cpu->AdvanceRip(instrLen);
+            } else if (suspendedBringup()) {
+              continue;
             } else {
               return;
             }
@@ -1235,16 +1250,24 @@ VmRunSummary VirtualMachine::RunLoop(
             apUnhandledExits.fetch_add(1, std::memory_order_relaxed);
             if (instrLen > 0) {
               cpu->AdvanceRip(instrLen);
+            } else if (suspendedBringup()) {
+              continue;
             } else {
               return;
             }
             break;
           default:
             apUnhandledExits.fetch_add(1, std::memory_order_relaxed);
+            if (suspendedBringup()) {
+              continue;
+            }
             return;
           }
         } catch (...) {
           apUnhandledExits.fetch_add(1, std::memory_order_relaxed);
+          if (suspendedBringup()) {
+            continue;
+          }
           return;
         }
       }

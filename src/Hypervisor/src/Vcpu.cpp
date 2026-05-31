@@ -93,6 +93,19 @@ bool Vcpu::TrySetStartupSuspended(bool suspended) noexcept {
       WHvSetVirtualProcessorRegisters(partition_, index_, &name, 1, &value));
 }
 
+bool Vcpu::IsStartupSuspended() const noexcept {
+  if (!partition_) {
+    return false;
+  }
+  WHV_REGISTER_NAME name = WHvRegisterInternalActivityState;
+  WHV_REGISTER_VALUE value{};
+  if (FAILED(WHvGetVirtualProcessorRegisters(partition_, index_, &name, 1,
+                                             &value))) {
+    return false;
+  }
+  return value.InternalActivity.StartupSuspend != 0ull;
+}
+
 uint64_t Vcpu::ReadRax() {
   WHV_REGISTER_NAME name = WHvX64RegisterRax;
   WHV_REGISTER_VALUE value{};

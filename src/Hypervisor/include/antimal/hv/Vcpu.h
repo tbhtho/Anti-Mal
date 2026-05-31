@@ -79,6 +79,13 @@ public:
   // clear.
   bool TrySetStartupSuspended(bool suspended) noexcept;
 
+  // True while this vCPU is still startup-suspended (an AP waiting for the BSP's
+  // SIPI). The AP run loop uses this to stay alive across the spurious/empty
+  // exits WHP can return before the SIPI lands: if the thread exited on one of
+  // those, the AP would never start and the BSP would spin forever waiting for
+  // it (the 2-vCPU bring-up hang). Returns false on error / when not suspended.
+  bool IsStartupSuspended() const noexcept;
+
   // Restores the local APIC to its power-on state for a guest warm-reset.
   // SetX86ResetState resets CPU registers but NOT the LAPIC, so a boot that
   // programmed the APIC timer/LVTs leaves them live across the reset -- the next
