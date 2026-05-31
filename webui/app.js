@@ -114,15 +114,13 @@
     },
     vm: function () {
       var steps = [['OVMF firmware', 'done'], ['bootmgfw.efi', 'done'], ['winload.efi', 'done'], ['ntoskrnl', 'done'], ['AHCI storage mount', 'done'], ['win32k / GUI stack', 'done'], ['Getting Ready (OOBE)', 'done'], ['GuestAgent heartbeat', 'cur'], ['Artifact return', 'todo']];
-      var gates = [['Network disabled or isolated', true], ['Disposable overlay active', true], ['Base image not mutated', true], ['GuestAgent heartbeat required', true], ['Sample execution blocked by default', true], ['Timeout configured', true], ['Artifact return enabled', true]];
       return '<h1 class="page-title">VM Analysis</h1><p class="page-sub">In-house WHP sandbox: state, controls, boot timeline, and safety gates.</p>' +
         '<div class="row"><div class="panel" style="flex:1;min-width:280px"><h2>VM State</h2>' +
-        kv([['State', 'Idle'], ['Run dir', 'C:/AntiMalRuns/<run-id>'], ['Base VHDX', 'C:/AntiMalRuns/_base/AntiMalBase.vhdx'], ['Overlay', 'disk/overlay.cow (disposable)'], ['Firmware', 'OVMF-debug.fd'], ['Timeout', '180 sec'], ['Network', 'Disabled']]) +
+        '<div id="vm-state"><p class="page-sub" style="margin:0">Loading…</p></div>' +
         '<div class="actions" style="margin-top:12px"><button class="btn">Stage Sample</button><button class="btn primary">Boot VM</button><button class="btn">Stop VM</button><button class="btn danger" disabled title="Disabled until safety gates pass">Detonate Selected</button></div></div>' +
         '<div class="panel" style="flex:1;min-width:260px"><h2>Boot Timeline</h2><ul class="timeline">' +
         steps.map(function (s) { return '<li class="' + s[1] + '"><span class="mark"></span>' + esc(s[0]) + '</li>'; }).join('') + '</ul></div></div>' +
-        '<div class="panel"><h2>Safety Gates</h2>' +
-        gates.map(function (g) { return '<div class="gate"><span class="' + (g[1] ? 'g' : 'b') + '">' + (g[1] ? '✓' : '✕') + '</span>' + esc(g[0]) + '</div>'; }).join('') + '</div>';
+        '<div class="panel"><h2>Safety Gates</h2><div id="vm-gates"><p class="page-sub" style="margin:0">Loading…</p></div></div>';
     },
     reports: function () {
       return '<h1 class="page-title">Reports</h1><p class="page-sub">Static and dynamic analysis reports archived under the workspace.</p>' +
@@ -148,13 +146,11 @@
         '<div id="cfg-body" class="row"><div class="panel"><h2>Loading&hellip;</h2></div></div>';
     },
     safety: function () {
-      var cards = [['Network', 'Disabled', 'g'], ['Execution', 'Blocked', 'g'], ['Overlay', 'Required', 'g'], ['GuestAgent', 'Required', 'g'], ['Artifact Return', 'Required', 'g'], ['Timeout', 'Enabled', 'g']]
-        .map(function (c) { return '<div class="metric"><div class="k">' + esc(c[0]) + '</div><div class="v" style="color:var(--green);font-size:15px">' + esc(c[1]) + '</div></div>'; }).join('');
       var dz = ['Enable dynamic execution', 'Enable live network', 'Disable overlay discard']
         .map(function (d) { return '<label class="toggle" style="display:flex;margin:6px 0;opacity:.5"><span class="track"></span>' + esc(d) + ' <span style="color:var(--muted)">— locked until all gates pass</span></label>'; }).join('');
       return '<h1 class="page-title">Safety</h1><p class="page-sub">AntiMal is safety-first. Dangerous actions are locked by default.</p>' +
-        '<div class="banner">Dynamic execution is blocked by default.</div>' +
-        '<div class="panel"><h2>Status</h2><div class="grid-cards">' + cards + '</div></div>' +
+        '<div class="banner" id="safety-banner">Dynamic execution is blocked by default.</div>' +
+        '<div class="panel"><h2>Status</h2><div class="grid-cards" id="safety-cards"><div class="page-sub">Loading…</div></div></div>' +
         '<div class="panel danger-zone"><h2>Danger Zone</h2>' + dz + '</div>';
     }
   };
@@ -302,7 +298,50 @@
       if (!r || !r.ok) appendLog('ERROR', 'Dashboard load failed: ' + String((r && r.error) || 'unknown'));
     });
   }
-  var mounts = { dashboard: loadDashboard, config: loadConfig, scan: renderScans, reports: loadReports };
+  function loadVm() {
+    send('config.get').then(function (r) {
+      var c = (r && r.ok && r.result) ? r.result : {};
+      var net = c.networkMode || 'disabled';
+      var dyn = !!c.dynamicExecutionEnabled;
+      var to = (c.defaultTimeoutSec != null ? c.defaultTimeoutSec : '—');
+      var st = $('#vm-state');
+      if (st) st.innerHTML = kv([['State', 'Idle'], ['Base VHDX', c.baseVhdxPath || '—'], ['Workspace', c.workspaceRoot || '—'], ['Provider', c.vmProvider || '—'], ['Overlay', 'disposable (per run)'], ['Firmware', 'OVMF (debug)'], ['Timeout', to + ' sec'], ['Network', net]]);
+      var gates = [
+        ['Network ' + net + (net === 'disabled' ? '' : ' (review)'), net === 'disabled'],
+        ['Disposable overlay active', true],
+        ['Base image not mutated', true],
+        ['GuestAgent heartbeat required', true],
+        ['Sample execution ' + (dyn ? 'ENABLED' : 'blocked by default'), !dyn],
+        ['Timeout configured (' + to + 's)', (c.defaultTimeoutSec | 0) > 0],
+        ['Artifact return enabled', true]
+      ];
+      var g = $('#vm-gates');
+      if (g) g.innerHTML = gates.map(function (gg) { return '<div class="gate"><span class="' + (gg[1] ? 'g' : 'b') + '">' + (gg[1] ? '✓' : '✕') + '</span>' + esc(gg[0]) + '</div>'; }).join('');
+    });
+  }
+  function loadSafety() {
+    send('config.get').then(function (r) {
+      var c = (r && r.ok && r.result) ? r.result : {};
+      var net = c.networkMode || 'disabled';
+      var dyn = !!c.dynamicExecutionEnabled;
+      var cards = [
+        ['Network', net, net === 'disabled' ? 'g' : 'b'],
+        ['Execution', dyn ? 'Enabled' : 'Blocked', dyn ? 'b' : 'g'],
+        ['Overlay', 'Required', 'g'],
+        ['GuestAgent', 'Required', 'g'],
+        ['Artifact Return', 'Required', 'g'],
+        ['Timeout', (c.defaultTimeoutSec != null ? c.defaultTimeoutSec : '—') + ' sec', 'g']
+      ];
+      var box = $('#safety-cards');
+      if (box) box.innerHTML = cards.map(function (cc) {
+        var color = cc[2] === 'g' ? 'var(--green)' : 'var(--red)';
+        return '<div class="metric"><div class="k">' + esc(cc[0]) + '</div><div class="v" style="color:' + color + ';font-size:15px">' + esc(cc[1]) + '</div></div>';
+      }).join('');
+      var banner = $('#safety-banner');
+      if (banner) banner.textContent = dyn ? 'WARNING: dynamic execution is ENABLED — detonations will run live samples.' : 'Dynamic execution is blocked by default.';
+    });
+  }
+  var mounts = { dashboard: loadDashboard, vm: loadVm, config: loadConfig, scan: renderScans, reports: loadReports, safety: loadSafety };
 
   // ---------- router ----------
   function route(page) {
