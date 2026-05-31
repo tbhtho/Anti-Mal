@@ -1838,6 +1838,7 @@ VmRunSummary VirtualMachine::RunLoop(
       // -> 0x1A MEMORY_MANAGEMENT (p1=0x404).
       pageTableAssistNext_ = pageTableAssistBase_;
       vcpu_.SetX86ResetState();
+      vcpu_.ResetApic();
       (void)vcpu_.TrySetStartupSuspended(false);
       continue;
     }

@@ -309,6 +309,40 @@ bool Vcpu::TryReadApicLvtTimer(uint32_t *value) noexcept {
   return true;
 }
 
+void Vcpu::ResetApic() noexcept {
+  if (!partition_) {
+    return;
+  }
+  alignas(16) uint8_t page[4096]{};
+  UINT32 written = 0;
+  if (FAILED(WHvGetVirtualProcessorInterruptControllerState(
+          partition_, index_, page, sizeof(page), &written)) ||
+      written < 0x400u) {
+    return;
+  }
+  // Preserve the read-only identity registers, then rebuild the rest as the
+  // xAPIC power-on state.
+  uint32_t apicId = 0, version = 0;
+  std::memcpy(&apicId, page + 0x020u, sizeof(apicId));
+  std::memcpy(&version, page + 0x030u, sizeof(version));
+  std::memset(page, 0, sizeof(page));
+  auto put = [&](size_t off, uint32_t v) {
+    std::memcpy(page + off, &v, sizeof(v));
+  };
+  put(0x020u, apicId);
+  put(0x030u, version != 0 ? version : 0x00050014u); // APIC ID / Version.
+  put(0x0E0u, 0xFFFFFFFFu);                           // DFR: flat (reset).
+  put(0x0F0u, 0x000000FFu);                           // SVR: vec 0xFF, soft-off.
+  // Mask every local vector table entry (bit 16) so no stale APIC source fires
+  // before the next boot reprograms it: CMCI, Timer, Thermal, PerfMon, LINT0/1,
+  // Error.
+  for (size_t lvt : {0x2F0u, 0x320u, 0x330u, 0x340u, 0x350u, 0x360u, 0x370u}) {
+    put(lvt, 0x00010000u);
+  }
+  (void)WHvSetVirtualProcessorInterruptControllerState(partition_, index_, page,
+                                                       sizeof(page));
+}
+
 WHV_RUN_VP_EXIT_REASON Vcpu::Run() {
   lastExit_ = {};
   const HRESULT hr = WHvRunVirtualProcessor(partition_, index_, &lastExit_,

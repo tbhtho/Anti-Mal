@@ -79,6 +79,16 @@ public:
   // clear.
   bool TrySetStartupSuspended(bool suspended) noexcept;
 
+  // Restores the local APIC to its power-on state for a guest warm-reset.
+  // SetX86ResetState resets CPU registers but NOT the LAPIC, so a boot that
+  // programmed the APIC timer/LVTs leaves them live across the reset -- the next
+  // boot's early code then takes an unexpected APIC interrupt before it
+  // reprograms the controller, surfacing as 0x7F UNEXPECTED_KERNEL_MODE_TRAP.
+  // This masks all LVT entries, clears the timer + ISR/IRR/TMR, sets SVR to the
+  // reset spurious vector (software-disabled), and DFR to flat, while preserving
+  // the APIC ID and version. Best-effort; ignored if WHP can't expose the state.
+  void ResetApic() noexcept;
+
   // Reads RAX from the vCPU.
   uint64_t ReadRax();
 
