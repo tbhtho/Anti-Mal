@@ -5,6 +5,9 @@
 #include <cstdlib>
 #include <string>
 
+#include "antimal/Config.h"
+#include "antimal/FileUtil.h"
+#include "antimal/Json.h"
 #include "antimal/JsonValue.h"
 
 using Microsoft::WRL::Callback;
@@ -201,6 +204,31 @@ void WebViewHost::RegisterHandlers() {
   // P1 bridge command.
   router_.Register("ping", [](const JsonValue &) {
     return std::string(R"({"version":"P1","ok":true})");
+  });
+
+  // P3: real config (read-only). The VirtualTotal API key is never exposed --
+  // only whether one is set.
+  router_.Register("config.get", [](const JsonValue &) -> std::string {
+    const AppConfig c = LoadConfig(DefaultConfigPath());
+    auto b = [](bool v) { return std::string(v ? "true" : "false"); };
+    std::string j = "{";
+    j += "\"baseVhdxPath\":" + JsonQuote(Narrow(c.baseVhdxPath.wstring().c_str())) + ",";
+    j += "\"workspaceRoot\":" + JsonQuote(Narrow(c.workspaceRoot.wstring().c_str())) + ",";
+    j += "\"vmProvider\":" + JsonQuote(c.vmProvider) + ",";
+    j += "\"networkMode\":" + JsonQuote(ToString(c.networkMode)) + ",";
+    j += "\"baseDiskFormat\":" + JsonQuote(c.baseDiskFormat) + ",";
+    j += "\"defaultTimeoutSec\":" + std::to_string(c.defaultTimeoutSec) + ",";
+    j += "\"screenshotIntervalMs\":" + std::to_string(c.screenshotIntervalMs) + ",";
+    j += "\"enrichYara\":" + b(c.enrichYara) + ",";
+    j += "\"enrichCapa\":" + b(c.enrichCapa) + ",";
+    j += "\"enrichDie\":" + b(c.enrichDie) + ",";
+    j += "\"enrichTagger\":" + b(c.enrichTagger) + ",";
+    j += "\"intelEnabled\":" + b(c.intelEnabled) + ",";
+    j += "\"intelMalwareBazaar\":" + b(c.intelMalwareBazaar) + ",";
+    j += "\"virusTotalKeySet\":" + b(!c.virusTotalApiKey.empty()) + ",";
+    j += "\"dynamicExecutionEnabled\":" + b(c.dynamicExecutionEnabled);
+    j += "}";
+    return j;
   });
 }
 

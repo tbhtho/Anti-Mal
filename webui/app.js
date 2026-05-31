@@ -167,15 +167,8 @@
         '<div class="panel"><table class="grid"><thead><tr><th>File</th><th>Risk</th><th>Path</th><th>Source</th><th>Actions</th></tr></thead><tbody>' + rows + '</tbody></table></div>';
     },
     config: function () {
-      function section(title, body) { return '<div class="panel" style="flex:1;min-width:300px"><h2>' + esc(title) + '</h2>' + body + '</div>'; }
-      return '<h1 class="page-title">Config</h1><p class="page-sub">General, scanner, sandbox, threat-intel, report and advanced settings.</p>' +
-        '<div class="row">' +
-        section('General', kv([['Theme', 'Dark (security)'], ['Accent', 'Console Blue'], ['Default page', 'Dashboard'], ['Run directory', 'C:/AntiMalRuns']])) +
-        section('Scanner', kv([['YARA path', 'tools/yara.exe'], ['capa path', 'tools/capa.exe'], ['DIE path', 'tools/diec.exe'], ['Entropy threshold', '7.2']])) +
-        '</div><div class="row">' +
-        section('VM / Sandbox', kv([['Workspace root', 'C:/AntiMalRuns'], ['Base VHDX', '_base/AntiMalBase.vhdx'], ['Firmware', 'OVMF-debug.fd'], ['VM timeout', '180 sec'], ['Network default', 'Disabled']])) +
-        section('Threat Intel', '<p class="page-sub" style="margin:0 0 8px">Lookups are <b>disabled by default</b> (no outbound HTTP).</p>' + kv([['VirusTotal', 'off · key ••••••'], ['MalwareBazaar', 'off']])) +
-        '</div>';
+      return '<h1 class="page-title">Config</h1><p class="page-sub">Live settings loaded from config/antimal.toml via the host bridge.</p>' +
+        '<div id="cfg-body" class="row"><div class="panel"><h2>Loading&hellip;</h2></div></div>';
     },
     safety: function () {
       var cards = [['Network', 'Disabled', 'g'], ['Execution', 'Blocked', 'g'], ['Overlay', 'Required', 'g'], ['GuestAgent', 'Required', 'g'], ['Artifact Return', 'Required', 'g'], ['Timeout', 'Enabled', 'g']]
@@ -189,12 +182,29 @@
     }
   };
 
+  // ---------- mounts (per-page live data over the bridge) ----------
+  function loadConfig() {
+    send('config.get').then(function (r) {
+      var c = (r && r.ok && r.result) ? r.result : {};
+      function section(t, b) { return '<div class="panel" style="flex:1;min-width:300px"><h2>' + esc(t) + '</h2>' + b + '</div>'; }
+      function yn(v) { return v ? 'on' : 'off'; }
+      var html = section('VM / Sandbox', kv([['Base VHDX', c.baseVhdxPath || '—'], ['Workspace', c.workspaceRoot || '—'], ['Provider', c.vmProvider || '—'], ['Network default', c.networkMode || '—'], ['VM timeout', (c.defaultTimeoutSec != null ? c.defaultTimeoutSec : '—') + ' sec'], ['Screenshot interval', (c.screenshotIntervalMs != null ? c.screenshotIntervalMs : '—') + ' ms']])) +
+        section('Scanner', kv([['YARA', yn(c.enrichYara)], ['capa', yn(c.enrichCapa)], ['Detect It Easy', yn(c.enrichDie)], ['Tagger', yn(c.enrichTagger)]])) +
+        section('Threat Intel', '<p class="page-sub" style="margin:0 0 8px">Network lookups <b>' + (c.intelEnabled ? 'enabled' : 'disabled by default') + '</b>.</p>' + kv([['MalwareBazaar', yn(c.intelMalwareBazaar)], ['VirusTotal key', c.virusTotalKeySet ? 'set ••••••' : 'not set']])) +
+        section('General', kv([['Theme', 'Dark (security)'], ['Base disk format', c.baseDiskFormat || '—'], ['Dynamic execution', c.dynamicExecutionEnabled ? 'ENABLED' : 'blocked']]));
+      var body = $('#cfg-body'); if (body) { body.innerHTML = html; }
+      appendLog(r && r.ok ? 'INFO' : 'ERROR', r && r.ok ? 'Config loaded from host.' : 'Config load failed.');
+    });
+  }
+  var mounts = { config: loadConfig };
+
   // ---------- router ----------
   function route(page) {
     if (!pages[page]) page = 'dashboard';
     $('#content').innerHTML = pages[page]();
     $all('#nav a').forEach(function (a) { a.classList.toggle('active', a.dataset.page === page); });
     wireContentActions();
+    if (mounts[page]) { mounts[page](); }
   }
   function wireContentActions() {
     $all('#content [data-cmd]').forEach(function (b) {
