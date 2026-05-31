@@ -1,0 +1,61 @@
+/* AntiMal.VX dark theme (P1 placeholder; P2 builds the full design system to
+   match the Loveable mock). */
+:root {
+  --bg: #0b0d10;
+  --panel: #14181d;
+  --border: #1f2730;
+  --text: #c9d3df;
+  --muted: #7e8a99;
+  --blue: #3b82f6;
+  --green: #22c55e;
+  --red: #ef4444;
+  --amber: #f59e0b;
+}
+* { box-sizing: border-box; }
+html, body {
+  margin: 0;
+  height: 100%;
+  background: var(--bg);
+  color: var(--text);
+  font-family: "Segoe UI", system-ui, sans-serif;
+  font-size: 14px;
+}
+#app { display: flex; flex-direction: column; height: 100vh; }
+.topbar {
+  display: flex; align-items: center; gap: 14px;
+  padding: 10px 16px;
+  border-bottom: 1px solid var(--border);
+  background: var(--panel);
+}
+.brand { font-weight: 600; font-size: 16px; letter-spacing: .3px; }
+.vx { color: var(--blue); }
+.tag { color: var(--muted); font-size: 12px; }
+main { padding: 18px; display: flex; flex-direction: column; gap: 16px; overflow: auto; }
+#status {
+  padding: 10px 14px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--panel);
+}
+#status.ok { border-color: var(--green); color: var(--green); }
+#status.err { border-color: var(--red); color: var(--red); }
+#status.pending { color: var(--muted); }
+.panel {
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: var(--panel);
+  padding: 12px 14px;
+}
+.panel h2 {
+  margin: 0 0 10px;
+  font-size: 13px; font-weight: 600;
+  color: var(--muted);
+  text-transform: uppercase; letter-spacing: .5px;
+}
+.log { font-family: Consolas, "Cascadia Mono", monospace; font-size: 12.5px; }
+.log-line { padding: 2px 0; }
+.log-level { display: inline-block; min-width: 46px; font-weight: 700; }
+.log-info .log-level { color: var(--blue); }
+.log-warn .log-level { color: var(--amber); }
+.log-error .log-level { color: var(--red); }
+.log-safe .log-level { color: var(--green); }

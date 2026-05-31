@@ -1,0 +1,28 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <!-- Strict CSP: local bundled resources only, no inline/eval, no network.
+       (Live sandbox console security model, Section 5.) -->
+  <meta http-equiv="Content-Security-Policy"
+        content="default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src 'none'; base-uri 'none'; form-action 'none';">
+  <title>AntiMal - Scanner and VM Analysis</title>
+  <link rel="stylesheet" href="app.css">
+</head>
+<body>
+  <div id="app">
+    <header class="topbar">
+      <span class="brand">AntiMal<span class="vx">.VX</span></span>
+      <span class="tag">Local defensive malware analysis and VM inspection</span>
+    </header>
+    <main>
+      <div id="status" class="pending">Connecting to host bridge&hellip;</div>
+      <section class="panel">
+        <h2>Status Log</h2>
+        <div id="log" class="log"></div>
+      </section>
+    </main>
+  </div>
+  <script src="app.js"></script>
+</body>
+</html>
