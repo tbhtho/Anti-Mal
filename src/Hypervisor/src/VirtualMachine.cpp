@@ -1127,22 +1127,19 @@ VmRunSummary VirtualMachine::RunLoop(
   // periodically so a Windows scheduler sees timer ticks.
   using namespace std::chrono_literals;
   constexpr auto kTimerInterval = 10ms;
-  constexpr auto kWatchdogCancelAfter = 750ms;
+  // Force the main loop to iterate at least this often by cancelling a Run()
+  // that has gone this long without exiting (e.g. a guest pure-CPU spin). The
+  // main loop then pumps the clock and checks the deadline. Kept short so a
+  // spinning guest still gets clock ticks -- which lets the guest scheduler
+  // preempt the spinner and run the worker it is waiting on (the OOBE spin-wait
+  // that otherwise looked like a 1-CPU deadlock was really clock starvation
+  // from the host wedging here).
+  constexpr auto kWatchdogCancelAfter = 15ms;
 
   std::atomic<bool> inRun{false};
   std::atomic<int> watchdogCancels{0};
   std::atomic<int> timerRequested{0};
   std::atomic<int> timerInjected{0};
-  // Cached BSP LVT-timer register (APIC offset 0x320), refreshed by
-  // injectLapicTimer at paused exit points. The watchdog injects the timer from
-  // this cache so it NEVER calls the blocking
-  // WHvGetVirtualProcessorInterruptControllerState on a *running* vCPU -- that
-  // read waits for the vCPU to reach a safe point, which never comes once the
-  // guest enters a pure-CPU spin (no VM exits), wedging the entire host loop
-  // (no cancel -> --timeout-sec never fires -> 100% CPU forever, no diagnostics).
-  // Default 0x10000 = masked, so no injection until the guest programs the LVT
-  // and a paused read populates the cache. See injectBspTimerCached.
-  std::atomic<uint32_t> bspLvtCache{0x10000u};
   std::atomic<bool> stopAps{false};
   std::atomic<uint64_t> apVcpuExits{0};
   std::atomic<uint64_t> apHltExits{0};
@@ -1151,42 +1148,21 @@ VmRunSummary VirtualMachine::RunLoop(
 
   std::vector<std::jthread> apThreads;
   apThreads.reserve(apVcpus_.size());
+  // Inject the guest's programmed LVT timer. MUST only be called when `cpu` is
+  // paused: an exit handler, an AP HLT, a suspended AP, or the main-loop clock
+  // pump. It reads interrupt-controller state + requests an interrupt; neither
+  // may run from the watchdog on a *running* vCPU -- the state read blocks
+  // forever once the guest stops taking exits, which wedged the watchdog (seen
+  // parked at 0 CPU in a Wait state) and with it the whole host loop.
   auto injectLapicTimer = [&](Vcpu &cpu) {
-    // MUST only be called when `cpu` is paused (a vCPU exit handler / AP HLT /
-    // suspended AP). It reads interrupt-controller state, which blocks forever
-    // on a *running* vCPU that has stopped taking exits. The watchdog uses
-    // injectBspTimerCached instead.
     uint32_t lvt = 0;
-    if (cpu.TryReadApicLvtTimer(&lvt)) {
-      // Cache the BSP's LVT-timer register at this safe (paused) read so the
-      // watchdog can inject without re-reading controller state on a running CPU.
-      if (&cpu == &vcpu_) {
-        bspLvtCache.store(lvt, std::memory_order_relaxed);
-      }
-      if ((lvt & (1u << 16)) == 0) {
-        const uint8_t vector = static_cast<uint8_t>(lvt & 0xFFu);
-        if (vector >= 0x10) {
-          timerRequested.fetch_add(1, std::memory_order_relaxed);
-          if (cpu.TryRequestFixedInterrupt(vector)) {
-            timerInjected.fetch_add(1, std::memory_order_relaxed);
-          }
+    if (cpu.TryReadApicLvtTimer(&lvt) && (lvt & (1u << 16)) == 0) {
+      const uint8_t vector = static_cast<uint8_t>(lvt & 0xFFu);
+      if (vector >= 0x10) {
+        timerRequested.fetch_add(1, std::memory_order_relaxed);
+        if (cpu.TryRequestFixedInterrupt(vector)) {
+          timerInjected.fetch_add(1, std::memory_order_relaxed);
         }
-      }
-    }
-  };
-  // Watchdog-safe BSP timer injection: uses the cached LVT register instead of
-  // reading interrupt-controller state. WHvRequestInterrupt IS safe to call on a
-  // running vCPU; the state *read* is not, so the watchdog must never do it.
-  auto injectBspTimerCached = [&]() {
-    const uint32_t lvt = bspLvtCache.load(std::memory_order_relaxed);
-    if ((lvt & (1u << 16)) != 0) {
-      return; // masked
-    }
-    const uint8_t vector = static_cast<uint8_t>(lvt & 0xFFu);
-    if (vector >= 0x10) {
-      timerRequested.fetch_add(1, std::memory_order_relaxed);
-      if (vcpu_.TryRequestFixedInterrupt(vector)) {
-        timerInjected.fetch_add(1, std::memory_order_relaxed);
       }
     }
   };
@@ -1204,6 +1180,25 @@ VmRunSummary VirtualMachine::RunLoop(
     if (!masked && vector >= 0x10) {
       (void)cpu.TryRequestFixedInterrupt(vector);
     }
+  };
+  // Steady clock pump, run on the MAIN thread at a paused point (the loop top,
+  // just after the previous exit was processed). This replaces the watchdog's
+  // timer injection: the watchdog now only calls the cheap, non-blocking
+  // CancelRun, which forces a loop iteration whenever a single Run() outlasts
+  // kWatchdogCancelAfter (e.g. a guest pure-CPU spin). So the BSP LVT timer +
+  // IOAPIC/PIT clock keep advancing -- during active boot via frequent natural
+  // exits, during idle via HLT exits, and during a spin via the cancel-forced
+  // iteration -- without ever calling a blocking WHP op on a running vCPU.
+  // Gated to the timer interval so frequent exits don't over-inject.
+  auto lastClockPump = std::chrono::steady_clock::now();
+  auto pumpClock = [&]() {
+    const auto now = std::chrono::steady_clock::now();
+    if (now - lastClockPump < kTimerInterval) {
+      return;
+    }
+    lastClockPump = now;
+    injectLapicTimer(vcpu_);
+    injectIoApicClock(vcpu_);
   };
   for (auto &ap : apVcpus_) {
     auto *cpu = ap.get();
@@ -1277,7 +1272,6 @@ VmRunSummary VirtualMachine::RunLoop(
   };
 
   std::jthread watchdog([&](std::stop_token stop) {
-    auto lastTimer = std::chrono::steady_clock::now();
     auto runEntered = std::chrono::steady_clock::now();
     bool wasInRun = false;
     while (!stop.stop_requested()) {
@@ -1289,28 +1283,18 @@ VmRunSummary VirtualMachine::RunLoop(
       }
       wasInRun = runningNow;
 
-      // Cancel FIRST so a guest that has stopped taking VM exits (a pure-CPU
-      // spin) is always reclaimed by the main loop. The injections below are
-      // non-blocking on the BSP now (cached); keep the ordering robust anyway.
+      // The watchdog's ONLY job: force the main loop to iterate (so it can pump
+      // the clock and check the deadline) whenever a single Run() outlasts
+      // kWatchdogCancelAfter -- e.g. a guest pure-CPU spin with no natural
+      // exits. It must call NOTHING but CancelRun: WHvRequestInterrupt or
+      // WHvGetVirtualProcessorInterruptControllerState here can block forever on
+      // a running vCPU and wedge this thread (and thus the whole host). All
+      // interrupt injection happens on the main thread (pumpClock + the exit
+      // handlers), at paused points.
       if (runningNow && now - runEntered >= kWatchdogCancelAfter) {
         vcpu_.CancelRun();
         watchdogCancels.fetch_add(1, std::memory_order_relaxed);
         runEntered = now;
-      }
-
-      if (now - lastTimer >= kTimerInterval) {
-        injectBspTimerCached();   // cached LVT vector -> never reads controller
-                                  // state on a running vCPU (would wedge the host)
-        injectIoApicClock(vcpu_); // RequestInterrupt only -- safe while running
-        for (auto &ap : apVcpus_) {
-          if (ap) {
-            // TODO(ap-sync): an AP in a pure-CPU spin can still block this read;
-            // give APs the same cached-injection treatment with the AP-bringup
-            // work. (1-vCPU runs have no APs, so this can't wedge them.)
-            injectLapicTimer(*ap);
-          }
-        }
-        lastTimer = now;
       }
     }
   });
@@ -1885,6 +1869,11 @@ VmRunSummary VirtualMachine::RunLoop(
       summary.halted = true;
       break;
     }
+    // Pump the steady clock here, at a paused point right before re-entering the
+    // guest. The watchdog's CancelRun guarantees we reach this point even when
+    // the guest stops taking natural exits (a pure-CPU spin), so the clock keeps
+    // ticking and the guest scheduler can preempt a spinner.
+    pumpClock();
     inRun.store(true, std::memory_order_relaxed);
     const auto reason = vcpu_.Run();
     inRun.store(false, std::memory_order_relaxed);
@@ -2189,9 +2178,12 @@ VmRunSummary VirtualMachine::RunLoop(
       } catch (const WhpError &) {
         ++sameCanceledRipStreak;
       }
-      if (sameCanceledRipStreak >= 32) {
+      if (sameCanceledRipStreak >= 256) {
         // The vCPU is wedged at the same RIP across many cancellations even
-        // though it isn't sitting on a HLT â€” give up.
+        // though it isn't sitting on a HLT -- give up. Threshold scaled to the
+        // shortened kWatchdogCancelAfter (15ms) so this still needs ~4s of an
+        // interrupts-disabled same-RIP spin before declaring a wedge -- long
+        // enough not to trip a legitimate brief IF=0 stretch.
         summary.idleLoop = true;
       }
       break;
