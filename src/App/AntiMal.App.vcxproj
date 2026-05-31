@@ -27,17 +27,18 @@
   </PropertyGroup>
   <ItemDefinitionGroup>
     <ClCompile>
-      <AdditionalIncludeDirectories>$(SolutionDir)src\Common\include;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <AdditionalIncludeDirectories>$(SolutionDir)src\Common\include;$(SolutionDir)external\webview2\include;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
       <LanguageStandard>stdcpp20</LanguageStandard>
       <AdditionalOptions>/utf-8 %(AdditionalOptions)</AdditionalOptions>
     </ClCompile>
     <Link>
       <SubSystem>Windows</SubSystem>
-      <AdditionalDependencies>dwmapi.lib;comctl32.lib;bcrypt.lib;wintrust.lib;crypt32.lib;advapi32.lib;shell32.lib;winsqlite3.lib;winhttp.lib;gdiplus.lib;WinHvPlatform.lib;WinHvEmulation.lib;VirtDisk.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <AdditionalDependencies>dwmapi.lib;comctl32.lib;bcrypt.lib;wintrust.lib;crypt32.lib;advapi32.lib;shell32.lib;winsqlite3.lib;winhttp.lib;gdiplus.lib;WinHvPlatform.lib;WinHvEmulation.lib;VirtDisk.lib;$(SolutionDir)external\webview2\x64\WebView2Loader.dll.lib;%(AdditionalDependencies)</AdditionalDependencies>
     </Link>
   </ItemDefinitionGroup>
   <ItemGroup>
     <ClCompile Include="src\main.cpp" />
+    <ClCompile Include="src\WebViewHost.cpp" />
   </ItemGroup>
   <ItemGroup>
     <None Include="..\..\tools\New-AntiMalBaseVhdx.ps1">
@@ -58,6 +59,21 @@
     </None>
     <None Include="..\..\rules\tags.json">
       <Link>rules\tags.json</Link>
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+    </None>
+    <None Include="..\..\webui\index.html">
+      <Link>webui\index.html</Link>
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+    </None>
+    <None Include="..\..\webui\app.js">
+      <Link>webui\app.js</Link>
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+    </None>
+    <None Include="..\..\webui\app.css">
+      <Link>webui\app.css</Link>
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+    </None>
+    <None Include="..\..\external\webview2\x64\WebView2Loader.dll">
       <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
     </None>
   </ItemGroup>
