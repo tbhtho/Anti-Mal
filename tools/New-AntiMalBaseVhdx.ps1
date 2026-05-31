@@ -15,7 +15,15 @@ param(
   [switch]$WriteConfig,
   [switch]$CreateBuilderVm,
   [switch]$StartBuilderVm,
-  [switch]$Force
+  [switch]$Force,
+
+  # Bake an autounattend.xml + AutoLogon into the base so first boot goes
+  # straight to the desktop. RECOMMENDED for the sandbox: the in-house VM
+  # otherwise stops at the interactive Win11 OOBE wizard, and 24H2 has no
+  # in-OOBE skip for the forced network/MSA screen with networking disabled.
+  # Creates a local admin 'antimal' / 'AntiMal!23' with auto-logon. Default
+  # off = vanilla interactive OOBE.
+  [switch]$Unattend
 )
 
 $ErrorActionPreference = "Stop"
@@ -208,6 +216,67 @@ function Apply-WindowsToMountedVhdx([string]$ImageFile, [int]$SelectedIndex, [st
   if ($LASTEXITCODE -ne 0) {
     throw "bcdboot failed with exit code $LASTEXITCODE"
   }
+
+  if ($Unattend) {
+    Write-UnattendXml $windowsRoot
+  }
+}
+
+# Writes a Windows 11 oobeSystem answer file into the applied image so first
+# boot auto-completes OOBE (skipping the region/keyboard/network/MSA/EULA
+# screens the in-house VM otherwise stalls on) and auto-logs-in a local admin
+# straight to the desktop. Benign disposable analysis VM => a known throwaway
+# password is fine. Windows Setup reads %WINDIR%\Panther\unattend.xml during the
+# specialize + oobeSystem passes of an applied (DISM /Apply-Image) install.
+function Write-UnattendXml([string]$WindowsRoot) {
+  $pantherDir = Join-Path $WindowsRoot "Windows\Panther"
+  New-Item -ItemType Directory -Force -Path $pantherDir | Out-Null
+  $unattendPath = Join-Path $pantherDir "unattend.xml"
+  $xml = @'
+<?xml version="1.0" encoding="utf-8"?>
+<unattend xmlns="urn:schemas-microsoft-com:unattend">
+  <settings pass="specialize">
+    <component name="Microsoft-Windows-Shell-Setup" processorArchitecture="amd64" publicKeyToken="31bf3856ad364e35" language="neutral" versionScope="nonSxS">
+      <ComputerName>ANTIMAL-VM</ComputerName>
+    </component>
+  </settings>
+  <settings pass="oobeSystem">
+    <component name="Microsoft-Windows-Shell-Setup" processorArchitecture="amd64" publicKeyToken="31bf3856ad364e35" language="neutral" versionScope="nonSxS" xmlns:wcm="http://schemas.microsoft.com/WMIConfig/2002/State">
+      <OOBE>
+        <HideEULAPage>true</HideEULAPage>
+        <HideOEMRegistrationScreen>true</HideOEMRegistrationScreen>
+        <HideOnlineAccountScreens>true</HideOnlineAccountScreens>
+        <HideWirelessSetupInOOBE>true</HideWirelessSetupInOOBE>
+        <ProtectYourPC>3</ProtectYourPC>
+      </OOBE>
+      <UserAccounts>
+        <LocalAccounts>
+          <LocalAccount wcm:action="add">
+            <Name>antimal</Name>
+            <DisplayName>AntiMal</DisplayName>
+            <Group>Administrators</Group>
+            <Password>
+              <Value>AntiMal!23</Value>
+              <PlainText>true</PlainText>
+            </Password>
+          </LocalAccount>
+        </LocalAccounts>
+      </UserAccounts>
+      <AutoLogon>
+        <Enabled>true</Enabled>
+        <Username>antimal</Username>
+        <LogonCount>999</LogonCount>
+        <Password>
+          <Value>AntiMal!23</Value>
+          <PlainText>true</PlainText>
+        </Password>
+      </AutoLogon>
+    </component>
+  </settings>
+</unattend>
+'@
+  Set-Content -LiteralPath $unattendPath -Value $xml -Encoding utf8
+  Write-Host "OK: wrote autounattend (auto-logon 'antimal') -> $unattendPath"
 }
 
 function Resolve-GuestAgentPath {

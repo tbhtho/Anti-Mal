@@ -11,7 +11,10 @@ param(
   [switch]$WriteConfig,
   [switch]$CreateBuilderVm,
   [switch]$StartBuilderVm,
-  [switch]$Force
+  [switch]$Force,
+  # Bake autounattend.xml + AutoLogon into the base so first boot goes straight
+  # to the desktop (see New-AntiMalBaseVhdx.ps1). Recommended for the sandbox.
+  [switch]$Unattend
 )
 
 $ErrorActionPreference = "Stop"
@@ -45,6 +48,7 @@ if ($requested -eq "local" -or $requested -eq "inhouse") {
     ConfigPath = $ConfigPath
     WriteConfig = $WriteConfig
     Force = $Force
+    Unattend = $Unattend
   }
   & $script @args
   return
