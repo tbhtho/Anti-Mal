@@ -1468,8 +1468,14 @@ VmRunSummary VirtualMachine::RunLoop(
                 summary.bugCheckDataValid
                     ? static_cast<uint32_t>(summary.bugCheckData[0] & 0xFFFFFFFFull)
                     : 0;
+            // The bugcheck param holding the faulting instruction RIP differs by
+            // code: 0x7E (SYSTEM_THREAD_EXCEPTION_NOT_HANDLED) -> p2; 0x50
+            // (PAGE_FAULT_IN_NONPAGED_AREA) -> p3. Map it to a loaded module to
+            // name the faulting driver/component.
             const uint64_t faultRip =
-                (bcCode == 0x7Eull) ? summary.bugCheckData[2] : 0;
+                (bcCode == 0x7Eull)   ? summary.bugCheckData[2]
+                : (bcCode == 0x50ull) ? summary.bugCheckData[3]
+                                      : 0;
             if (plmRva != 0 && ReadGuestMemory(head, &flink, sizeof(flink))) {
               std::string list;
               uint32_t count = 0;
