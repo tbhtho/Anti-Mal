@@ -2649,6 +2649,19 @@ VmRunSummary VirtualMachine::RunLoop(
     summary.ahciPortCmdWrites = ahci_->PortCmdWrites();
     summary.ahciCiWrites = ahci_->CiWrites();
     summary.ahciAbarBase = ahci_->AbarBase();
+    // The AHCI port is the boot disk, so its reads must feed the same
+    // boot-read analysis as IDE -- otherwise per-file sectorsRead/winloadReached
+    // read zero on every AHCI boot. Append into the shared disk-access list.
+    const auto &ahciRecent = ahci_->RecentAccesses();
+    summary.ideRecentAccesses.insert(summary.ideRecentAccesses.end(),
+                                     ahciRecent.begin(), ahciRecent.end());
+    constexpr size_t kMaxSummaryDiskAccesses = 4096;
+    if (summary.ideRecentAccesses.size() > kMaxSummaryDiskAccesses) {
+      summary.ideRecentAccesses.erase(
+          summary.ideRecentAccesses.begin(),
+          summary.ideRecentAccesses.begin() +
+              (summary.ideRecentAccesses.size() - kMaxSummaryDiskAccesses));
+    }
   }
   summary.ioApicRaises = ioApic_.RaiseCount();
   summary.ioApicDeliveries = ioApic_.Deliveries();

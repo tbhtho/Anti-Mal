@@ -303,6 +303,7 @@ void AhciController::RunCommandSlot(uint32_t slot) {
         disk_->ReadSectors(lba, static_cast<uint16_t>(std::min<uint32_t>(count, 0xFFFF)),
                            buf.data())) {
       sectorsRead_ += count;
+      RecordAccess(false, cmd, lba, count);
       prdbc = scatter(buf.data(), buf.size());
     } else {
       status = 0x51; // ERR | DRDY.
@@ -320,6 +321,7 @@ void AhciController::RunCommandSlot(uint32_t slot) {
         disk_->WriteSectors(lba, static_cast<uint16_t>(std::min<uint32_t>(count, 0xFFFF)),
                             buf.data())) {
       sectorsWritten_ += count;
+      RecordAccess(true, cmd, lba, count);
     } else {
       status = 0x51;
       err = 0x04;
@@ -392,6 +394,21 @@ void AhciController::RaiseInterrupt() {
       interruptPending_ = true;
     }
   }
+}
+
+void AhciController::RecordAccess(bool write, uint8_t cmd, uint64_t lba,
+                                 uint32_t count) {
+  if (recentAccesses_.size() >= kRecentAccessLimit) {
+    // Drop the oldest to stay bounded; a stuck boot's recent accesses are the
+    // boot reads the host analysis is looking for.
+    recentAccesses_.erase(recentAccesses_.begin());
+  }
+  IdeAccessRange access;
+  access.write = write;
+  access.command = cmd;
+  access.lba = lba;
+  access.count = static_cast<uint16_t>(count > 0xFFFFu ? 0xFFFFu : count);
+  recentAccesses_.push_back(access);
 }
 
 bool AhciController::OnRead(uint64_t gpa, uint8_t accessSize, uint64_t *outValue) {

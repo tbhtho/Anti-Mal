@@ -24,10 +24,12 @@
 
 #include "antimal/hv/BlockDevice.h"
 #include "antimal/hv/Device.h"
+#include "antimal/hv/StorageController.h" // IdeAccessRange (shared disk-access record)
 
 #include <array>
 #include <cstdint>
 #include <functional>
+#include <vector>
 
 namespace antimal::hv {
 
@@ -101,6 +103,15 @@ public:
   uint32_t PortCmdWrites() const noexcept { return portCmdWrites_; }
   uint32_t CiWrites() const noexcept { return ciWrites_; }
 
+  // Per-command read/write accesses (lba + count), for the host's boot-read
+  // analysis. The AHCI port is the actual boot device, so without this the
+  // diagnostics' per-file sectorsRead / winloadReached gates (which scan disk
+  // accesses) read zero on every AHCI boot and falsely look like a firmware
+  // failure. Mirrors IdeController::RecentAccesses().
+  const std::vector<IdeAccessRange> &RecentAccesses() const noexcept {
+    return recentAccesses_;
+  }
+
 private:
   // Generic Host Control register indices (byte offsets / 4 not used; we switch
   // on the byte offset directly).
@@ -111,6 +122,10 @@ private:
   void RaiseInterrupt();           // set HBA IS + latch INTx if enabled.
   static std::array<uint8_t, IBlockDevice::kSectorSize>
   BuildIdentify(const IBlockDevice *disk);
+  // Append a completed read/write to recentAccesses_, capped (keeps the most
+  // recent; a stuck boot's accesses are the boot reads we want to analyze).
+  void RecordAccess(bool write, uint8_t cmd, uint64_t lba, uint32_t count);
+  static constexpr size_t kRecentAccessLimit = 8192;
 
   IBlockDevice *disk_ = nullptr;
   DmaMemoryFn dmaMemory_;
@@ -146,6 +161,7 @@ private:
   uint8_t lastCommand_ = 0;
   uint32_t portCmdWrites_ = 0;
   uint32_t ciWrites_ = 0;
+  std::vector<IdeAccessRange> recentAccesses_;
 };
 
 } // namespace antimal::hv
