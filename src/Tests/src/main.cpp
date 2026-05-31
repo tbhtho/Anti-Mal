@@ -3806,6 +3806,86 @@ void TestHostChannelFuzz() {
   }
 }
 
+// End-to-end test of the live-sandbox-console telemetry channel data path (the
+// project's main goal), VM-free: GuestAgent-side encode (SerializeEventJsonLine
+// + AMCH frame) -> COM2 wire bytes -> host-side decode (HostSerialChannel) ->
+// events.jsonl (EventJournalWriter) -> the UI tail (EventJournalTailer, what
+// run.watch uses). Asserts frame routing, journaling, field fidelity across the
+// whole round-trip, and incremental-tail semantics. Only the GuestAgent running
+// *inside* the guest remains to close the loop (the VM-dependent frontier).
+void TestChannelTelemetryRoundTrip() {
+  using antimal::hv::HostChannelMessage;
+  using antimal::hv::HostSerialChannel;
+
+  // 1) GuestAgent side: a realistic COM2 byte stream (Hello + N Events +
+  //    ReportComplete), exactly as AntiMal.GuestAgent.exe emits.
+  std::vector<uint8_t> wire;
+  auto append = [&](const std::vector<uint8_t> &f) {
+    wire.insert(wire.end(), f.begin(), f.end());
+  };
+  append(HostSerialChannel::EncodeText(HostChannelMessage::Hello,
+                                       "AntiMal.GuestAgent hello; pid=4242"));
+  const int kEvents = 5;
+  for (int i = 0; i < kEvents; ++i) {
+    antimal::EventRecord ev;
+    ev.timestampUtc = "2026-05-31T06:00:0" + std::to_string(i) + "Z";
+    ev.source = "GuestAgent";
+    ev.category = "process";
+    ev.action = "proc.create";
+    ev.processId = static_cast<uint32_t>(1000 + i);
+    ev.imagePath = "C:\\Windows\\System32\\evil" + std::to_string(i) + ".exe";
+    ev.target = "child" + std::to_string(i);
+    ev.mitre = "T1059";
+    append(HostSerialChannel::EncodeText(HostChannelMessage::Event,
+                                         antimal::SerializeEventJsonLine(ev)));
+  }
+  append(HostSerialChannel::EncodeText(HostChannelMessage::ReportComplete,
+                                       "status=ok\n"));
+
+  // 2) Host side: decode the stream and journal Event frames (mirrors the
+  //    orchestrator's host-channel processing).
+  std::error_code ec;
+  const auto tmp = std::filesystem::temp_directory_path() / "antimal-chan-rt";
+  std::filesystem::create_directories(tmp, ec);
+  const auto journalPath = tmp / "events.jsonl";
+  std::filesystem::remove(journalPath, ec);
+  int helloSeen = 0, reportComplete = 0, journaled = 0;
+  {
+    HostSerialChannel channel;
+    channel.PushBytes(wire);
+    antimal::EventJournalWriter writer(journalPath);
+    while (const auto frame = channel.PopFrame()) {
+      const std::string payload(frame->payload.begin(), frame->payload.end());
+      if (frame->type == HostChannelMessage::Hello) {
+        ++helloSeen;
+      } else if (frame->type == HostChannelMessage::ReportComplete) {
+        ++reportComplete;
+      } else if (frame->type == HostChannelMessage::Event) {
+        writer.Append(antimal::ParseEventJsonLine(payload));
+        ++journaled;
+      }
+    }
+  } // writer flushes + closes here.
+  Expect(helloSeen == 1, "channel pipeline: Hello frame decoded");
+  Expect(reportComplete == 1, "channel pipeline: ReportComplete decoded");
+  Expect(journaled == kEvents, "channel pipeline: all Event frames journaled");
+
+  // 3) UI side (what run.watch tails): confirm fidelity + incremental semantics.
+  antimal::EventJournalTailer tailer(journalPath);
+  const auto pulled = tailer.PullNew();
+  Expect(static_cast<int>(pulled.size()) == kEvents,
+         "channel pipeline: tailer reads every journaled event");
+  const bool fieldsOk =
+      !pulled.empty() && pulled.front().action == "proc.create" &&
+      pulled.front().source == "GuestAgent" && pulled.back().mitre == "T1059" &&
+      pulled.back().processId == static_cast<uint32_t>(1000 + kEvents - 1);
+  Expect(fieldsOk,
+         "channel pipeline: fields survive encode->decode->journal->tail");
+  Expect(tailer.PullNew().empty(),
+         "channel pipeline: incremental tail returns nothing when idle");
+  std::filesystem::remove(journalPath, ec);
+}
+
 int main() {
   try {
     TestHashEntropyJson();
@@ -3838,6 +3918,7 @@ int main() {
     TestBridgeRouter();
     TestBridgeFuzz();
     TestHostChannelFuzz();
+    TestChannelTelemetryRoundTrip();
     TestIdeReadWriteSectors();
     TestIdeSecondaryNoDeviceStatus();
     TestIdeAssertsInterrupt();
