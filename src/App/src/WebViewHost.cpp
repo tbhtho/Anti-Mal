@@ -334,6 +334,17 @@ void WebViewHost::RegisterHandlers() {
     j += "\"intelEnabled\":" + b(c.intelEnabled) + ",";
     j += "\"intelMalwareBazaar\":" + b(c.intelMalwareBazaar) + ",";
     j += "\"virusTotalKeySet\":" + b(!c.virusTotalApiKey.empty()) + ",";
+    std::error_code ec;
+    const bool baseExists =
+        std::filesystem::exists(c.baseVhdxPath, ec) &&
+        std::filesystem::is_regular_file(c.baseVhdxPath, ec);
+    unsigned long long baseSize = 0;
+    if (baseExists) {
+      baseSize = static_cast<unsigned long long>(
+          std::filesystem::file_size(c.baseVhdxPath, ec));
+    }
+    j += "\"baseExists\":" + b(baseExists) + ",";
+    j += "\"baseSizeBytes\":" + std::to_string(baseSize) + ",";
     j += "\"dynamicExecutionEnabled\":" + b(c.dynamicExecutionEnabled);
     j += "}";
     return j;

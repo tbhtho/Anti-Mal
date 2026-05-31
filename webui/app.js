@@ -130,6 +130,7 @@
       var steps = ['Select Windows ISO', 'Choose workspace path', 'Create or import base VHDX', 'Validate boot files', 'Install GuestAgent', 'Confirm ready state'];
       var reqs = ['Windows x64', 'Visual Studio 2022 C++ toolchain', 'Windows SDK', 'MSBuild', 'Windows Hypervisor Platform'];
       return '<h1 class="page-title">Base Setup</h1><p class="page-sub">Build or import the clean Windows base image the sandbox boots.</p>' +
+        '<div class="panel"><h2>Base Image Status</h2><div id="base-status"><p class="page-sub" style="margin:0">Checking…</p></div></div>' +
         '<div class="panel"><h2>Setup Steps</h2><ul class="timeline">' +
         steps.map(function (s, i) { return '<li class="' + (i === 0 ? 'cur' : 'todo') + '"><span class="mark"></span>' + esc((i + 1) + '. ' + s) + '</li>'; }).join('') +
         '</ul><div class="actions" style="margin-top:12px"><button class="btn primary">Build Base</button><button class="btn">Import Base</button><button class="btn">Validate</button></div></div>' +
@@ -341,7 +342,28 @@
       if (banner) banner.textContent = dyn ? 'WARNING: dynamic execution is ENABLED — detonations will run live samples.' : 'Dynamic execution is blocked by default.';
     });
   }
-  var mounts = { dashboard: loadDashboard, vm: loadVm, config: loadConfig, scan: renderScans, reports: loadReports, safety: loadSafety };
+  function fmtBytes(n) {
+    n = Number(n) || 0;
+    if (n <= 0) return '0 B';
+    var u = ['B', 'KB', 'MB', 'GB', 'TB'];
+    var i = Math.min(Math.floor(Math.log(n) / Math.log(1024)), u.length - 1);
+    return (n / Math.pow(1024, i)).toFixed(i ? 1 : 0) + ' ' + u[i];
+  }
+  function loadBase() {
+    send('config.get').then(function (r) {
+      var c = (r && r.ok && r.result) ? r.result : {};
+      var box = $('#base-status'); if (!box) return;
+      var exists = !!c.baseExists;
+      var color = exists ? 'var(--green)' : 'var(--amber, #d9a441)';
+      box.innerHTML = '<div class="grid-cards">' +
+        '<div class="metric"><div class="k">Base Image</div><div class="v" style="color:' + color + ';font-size:15px">' + (exists ? 'Ready' : 'Not built') + '</div></div>' +
+        '<div class="metric"><div class="k">Size</div><div class="v">' + esc(exists ? fmtBytes(c.baseSizeBytes) : '—') + '</div></div>' +
+        '<div class="metric"><div class="k">Format</div><div class="v">' + esc(c.baseDiskFormat || '—') + '</div></div>' +
+        '</div>' + kv([['Path', c.baseVhdxPath || '—']]);
+      appendLog(exists ? 'INFO' : 'WARN', exists ? 'Base image ready (' + fmtBytes(c.baseSizeBytes) + ').' : 'Base image not built yet.');
+    });
+  }
+  var mounts = { dashboard: loadDashboard, vm: loadVm, base: loadBase, config: loadConfig, scan: renderScans, reports: loadReports, safety: loadSafety };
 
   // ---------- router ----------
   function route(page) {
