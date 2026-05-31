@@ -37,7 +37,8 @@
       if (m.evt === 'scan.result' && m.data) onScanResult(m.data);
       if (m.evt === 'scan.progress' && m.data) onScanProgress(m.data);
       if (m.evt === 'reports.data' && m.data) onReportsData(m.data);
-      if (m.evt === 'run.status' && m.data) { /* P4 */ }
+      if (m.evt === 'dashboard.data' && m.data) onDashboardData(m.data);
+      if (m.evt === 'run.status' && m.data) { /* P5 live status */ }
       if (m.evt === 'telemetry' && m.data) { /* P4 */ }
     });
   }
@@ -86,44 +87,19 @@
     }).join('') + '</div>';
   }
 
-  // ---------- mock data (P3 replaces with bridge data) ----------
-  var MOCK = {
-    latestRun: {
-      verdict: 'Booted to desktop', runId: 'bdf6c191-89d3-42a9-89a9-d65e597bd800',
-      frame: 'screenshots/guest-000625.png', when: '2026-05-31 05:51', network: 'Disabled', timeout: 180
-    },
-    metrics: { vmsec: 184, frames: 994, events: 1317, overlay: '412 MB', hb: 'NO HB', net: 'Disabled' },
-    results: [
-      { score: 72, verdict: 'Suspicious', tags: ['Packed', 'Suspicious API', 'Network IOC'], path: 'C:/Samples/sample.exe', sha: 'a3f9c2e85a4b11d9e8f09c92e51b4f3c7a6e2d1c9f8b7a4d6e0c2a1f5b9d8e77' },
-      { score: 18, verdict: 'Clean', tags: ['Signed'], path: 'C:/Samples/setup.exe', sha: '5dac656c21ad4a02ab49649917162e70aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa' },
-      { score: 95, verdict: 'Malicious', tags: ['Stealer', 'Loader', 'C2'], path: 'C:/Samples/invoice.bin.exe', sha: '0b0d247aa1f24c2f5867b3bf29f69450bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb' }
-    ],
-    reports: [
-      { id: 'RPT-0042', file: 'sample.exe', score: 72, verdict: 'Suspicious', created: '2026-05-31 16:02', type: 'HTML+JSON' },
-      { id: 'RPT-0041', file: 'invoice.bin.exe', score: 95, verdict: 'Malicious', created: '2026-05-31 14:39', type: 'HTML+JSON' },
-      { id: 'RPT-0040', file: 'setup.exe', score: 18, verdict: 'Clean', created: '2026-05-30 22:10', type: 'JSON' }
-    ]
-  };
+  // (Mock data fully retired in P4 — every page now renders live bridge data.)
 
   // ---------- pages ----------
   var pages = {
     dashboard: function () {
-      var r = MOCK.latestRun, m = MOCK.metrics;
-      var rows = MOCK.results.map(function (x) {
-        return '<tr><td>' + riskChip(x.score) + '</td><td>' + verdictBadge(x.verdict) + '</td><td>' + tags(x.tags) +
-          '</td><td class="mono">' + esc(x.path) + '</td><td class="mono">' + esc(x.sha.slice(0, 16)) + '…' +
-          '</td><td><button class="iconbtn" title="Copy hash">⧉</button><button class="iconbtn" title="Open report">▤</button></td></tr>';
-      }).join('');
-      var cards = [['VM Seconds', m.vmsec], ['Frames', m.frames], ['Events', m.events], ['Disk Overlay', m.overlay], ['GuestAgent', m.hb], ['Network', m.net]]
-        .map(function (c) { return '<div class="metric"><div class="k">' + esc(c[0]) + '</div><div class="v">' + esc(c[1]) + '</div></div>'; }).join('');
-      return '<h1 class="page-title">Dashboard</h1><p class="page-sub">Latest run, analysis results, and live VM telemetry.</p>' +
+      return '<h1 class="page-title">Dashboard</h1><p class="page-sub">Latest run, live telemetry, event feed, and analysis results.</p>' +
         '<div class="panel"><h2>Latest Run Preview</h2><div class="preview-wrap">' +
-        '<div class="screenframe">VM framebuffer preview — ' + esc(r.frame) + '</div>' +
-        '<div>' + kv([['Verdict', r.verdict], ['Run ID', r.runId], ['Frame', r.frame], ['When', r.when], ['Network', r.network], ['Timeout', r.timeout + ' sec']]) +
-        '<div class="actions" style="margin-top:12px"><button class="btn">Open Run Folder</button><button class="btn">Screenshots</button><button class="btn primary">Export Report</button></div></div>' +
+        '<div class="screenframe" id="dash-frame">No run yet — build a base image and detonate a sample to populate this.</div>' +
+        '<div id="dash-run"><p class="page-sub" style="margin:0">Loading latest run…</p></div>' +
         '</div></div>' +
-        '<div class="panel"><h2>Live Run Telemetry</h2><div class="grid-cards">' + cards + '</div></div>' +
-        '<div class="panel"><h2>Analysis Results</h2><table class="grid"><thead><tr><th>Score</th><th>Verdict</th><th>Tags</th><th>Path</th><th>SHA-256</th><th>Actions</th></tr></thead><tbody>' + rows + '</tbody></table></div>';
+        '<div class="panel"><h2>Live Run Telemetry</h2><div class="grid-cards" id="dash-metrics"><div class="page-sub">Loading…</div></div></div>' +
+        '<div class="panel"><h2>Event Feed</h2><div id="dash-events"><p class="page-sub" style="margin:0">Loading events…</p></div></div>' +
+        '<div class="panel"><h2>Analysis Results (this session)</h2><div id="dash-results"></div></div>';
     },
     scan: function () {
       var opts = ['Include strings', 'Extract IOCs', 'Parse PE metadata', 'Run YARA if available', 'Run capa if available', 'Generate HTML report', 'Generate JSON report'];
@@ -275,7 +251,58 @@
     var total = (d && d.total != null) ? d.total : list.length;
     appendLog('INFO', 'Loaded ' + list.length + ' of ' + total + ' report(s).');
   }
-  var mounts = { config: loadConfig, scan: renderScans, reports: loadReports };
+  function renderDashResults() {
+    var box = $('#dash-results'); if (!box) return;
+    if (!state.scans.length) { box.innerHTML = '<p class="page-sub" style="margin:0">No scans this session. Use Scan File to analyze a sample.</p>'; return; }
+    box.innerHTML = '<table class="grid"><thead><tr><th>Score</th><th>Verdict</th><th>Tags</th><th>Path</th><th>SHA-256</th></tr></thead><tbody>' + state.scans.map(scanRow).join('') + '</tbody></table>';
+  }
+  function renderEventFeed(events) {
+    var box = $('#dash-events'); if (!box) return;
+    if (!events || !events.length) { box.innerHTML = '<p class="page-sub" style="margin:0">No events recorded for this run.</p>'; return; }
+    var rows = events.slice().reverse().map(function (e) {
+      var when = String(e.time || '').replace('T', ' ').replace('Z', '');
+      var mit = e.mitre ? '<span class="tag">' + esc(e.mitre) + '</span>' : '';
+      return '<tr><td class="mono">' + esc(when) + '</td><td><span class="tag">' + esc(e.category || '?') + '</span></td><td>' + esc(e.action || '') +
+        '</td><td class="mono">' + esc(e.pid | 0) + '</td><td class="mono">' + esc(shortPath(e.image)) + '</td><td class="mono">' + esc(e.target || '') + '</td><td>' + mit + '</td></tr>';
+    }).join('');
+    box.innerHTML = '<table class="grid"><thead><tr><th>Time</th><th>Category</th><th>Action</th><th>PID</th><th>Image</th><th>Target</th><th>MITRE</th></tr></thead><tbody>' + rows + '</tbody></table>';
+  }
+  function onDashboardData(d) {
+    if (!d || !d.hasRun) {
+      var fr0 = $('#dash-frame'); if (fr0) fr0.textContent = 'No run yet — build a base image and detonate a sample to populate this.';
+      var run0 = $('#dash-run'); if (run0) run0.innerHTML = '<p class="page-sub" style="margin:0">No runs found in the workspace.</p>';
+      var mt0 = $('#dash-metrics'); if (mt0) mt0.innerHTML = '<div class="page-sub">No runs yet.</div>';
+      var ev0 = $('#dash-events'); if (ev0) ev0.innerHTML = '<p class="page-sub" style="margin:0">No events yet.</p>';
+      appendLog('INFO', 'Dashboard: no runs in workspace yet.');
+      return;
+    }
+    var lr = d.latestRun || {};
+    var fr = $('#dash-frame');
+    if (fr) {
+      if (lr.frame) { fr.innerHTML = ''; var img = document.createElement('img'); img.alt = 'VM framebuffer'; img.src = lr.frame; fr.appendChild(img); }
+      else { fr.textContent = 'Run has no screenshots.'; }
+    }
+    var run = $('#dash-run');
+    if (run) {
+      run.innerHTML = kv([['Verdict', lr.verdict || '—'], ['Scanner', (lr.scannerVerdict || '—') + ' (' + (lr.score | 0) + ')'], ['Run ID', lr.runId || '—'], ['When', lr.when || '—']]) +
+        '<div class="actions" style="margin-top:12px"><button class="btn" data-open-run="' + esc(lr.runDir || '') + '">Open Run Folder</button></div>';
+      var ob = run.querySelector('[data-open-run]');
+      if (ob) ob.onclick = function () { var p = ob.getAttribute('data-open-run'); if (!p) return; send('run.open', { runDir: p }).then(function (rr) { appendLog(rr && rr.ok ? 'INFO' : 'ERROR', rr && rr.ok ? 'Opened run folder.' : 'Open failed.'); }); };
+    }
+    var m = d.metrics || {};
+    var cards = [['Events', m.events | 0], ['Frames', m.frames | 0], ['Network Domains', m.domains | 0], ['Artifacts', m.artifacts | 0], ['MITRE', m.mitre | 0], ['Errors', m.errors | 0]];
+    var mt = $('#dash-metrics');
+    if (mt) mt.innerHTML = cards.map(function (c) { return '<div class="metric"><div class="k">' + esc(c[0]) + '</div><div class="v">' + esc(c[1]) + '</div></div>'; }).join('');
+    renderEventFeed(d.events || []);
+    appendLog('INFO', 'Dashboard loaded run ' + String(lr.runId || '').slice(0, 8) + ' (' + (m.events | 0) + ' events).');
+  }
+  function loadDashboard() {
+    renderDashResults();
+    send('dashboard.get').then(function (r) {
+      if (!r || !r.ok) appendLog('ERROR', 'Dashboard load failed: ' + String((r && r.error) || 'unknown'));
+    });
+  }
+  var mounts = { dashboard: loadDashboard, config: loadConfig, scan: renderScans, reports: loadReports };
 
   // ---------- router ----------
   function route(page) {

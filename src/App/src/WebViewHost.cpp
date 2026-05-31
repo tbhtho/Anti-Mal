@@ -230,6 +230,17 @@ HRESULT WebViewHost::OnControllerCreated(HRESULT result,
     wv3->SetVirtualHostNameToFolderMapping(
         L"antimal.local", webui.c_str(),
         COREWEBVIEW2_HOST_RESOURCE_ACCESS_KIND_DENY_CORS);
+    // Read-only map of the workspace so the UI can render run screenshots at
+    // https://runs.antimal.local/<run>/screenshots/<frame>.png. DENY_CORS +
+    // sub-resource only; NavigationStarting still locks top-level nav to
+    // antimal.local, and the page CSP whitelists this origin for img-src only.
+    const std::wstring runs =
+        LoadConfig(DefaultConfigPath()).workspaceRoot.wstring();
+    if (!runs.empty()) {
+      wv3->SetVirtualHostNameToFolderMapping(
+          L"runs.antimal.local", runs.c_str(),
+          COREWEBVIEW2_HOST_RESOURCE_ACCESS_KIND_DENY_CORS);
+    }
   }
 
   RegisterHandlers();
@@ -471,6 +482,141 @@ void WebViewHost::RegisterHandlers() {
     ShellExecuteW(nullptr, L"open", target.c_str(), nullptr, nullptr,
                   SW_SHOWNORMAL);
     return std::string(R"({"opened":true})");
+  });
+
+  // P4: dashboard summary. Finds the newest run dir with a report.json, reads
+  // it, lists its screenshot frames, and emits dashboard.data with the
+  // latest-run preview, telemetry metrics, the event feed, and frame URLs
+  // (served read-only via runs.antimal.local). Worker thread -> never blocks.
+  router_.Register("dashboard.get", [this](const JsonValue &) -> std::string {
+    const HWND h = hwnd_;
+    std::thread([h]() {
+      CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+      namespace fs = std::filesystem;
+      const AppConfig c = LoadConfig(DefaultConfigPath());
+      fs::path bestDir, bestJson;
+      unsigned long long bestMtime = 0;
+      std::error_code ec;
+      if (fs::is_directory(c.workspaceRoot, ec)) {
+        for (const auto &e : fs::directory_iterator(c.workspaceRoot, ec)) {
+          if (!e.is_directory(ec)) {
+            continue;
+          }
+          const fs::path dir = e.path();
+          const std::wstring name = dir.filename().wstring();
+          if (name.empty() || name[0] == L'_') {
+            continue;
+          }
+          const fs::path json = dir / L"report.json";
+          WIN32_FILE_ATTRIBUTE_DATA fad{};
+          if (!GetFileAttributesExW(json.c_str(), GetFileExInfoStandard,
+                                    &fad)) {
+            continue;
+          }
+          ULARGE_INTEGER t{};
+          t.LowPart = fad.ftLastWriteTime.dwLowDateTime;
+          t.HighPart = fad.ftLastWriteTime.dwHighDateTime;
+          if (t.QuadPart >= bestMtime) {
+            bestMtime = t.QuadPart;
+            bestDir = dir;
+            bestJson = json;
+          }
+        }
+      }
+      if (bestJson.empty()) {
+        WebViewHost::Emit(h, "dashboard.data", R"({"hasRun":false})");
+        CoUninitialize();
+        return;
+      }
+      const AnalysisReport r = LoadReportBestEffort(bestJson);
+      const std::string dirName = Narrow(bestDir.filename().wstring().c_str());
+
+      // Frames: prefer guest-*.png (real VM framebuffer) over diagnostics.
+      std::vector<std::wstring> guest, other;
+      const fs::path shots = bestDir / L"screenshots";
+      if (fs::is_directory(shots, ec)) {
+        for (const auto &f : fs::directory_iterator(shots, ec)) {
+          if (!f.is_regular_file(ec)) {
+            continue;
+          }
+          const std::wstring ext = f.path().extension().wstring();
+          if (ext != L".png" && ext != L".PNG") {
+            continue;
+          }
+          const std::wstring fn = f.path().filename().wstring();
+          if (fn.rfind(L"guest-", 0) == 0) {
+            guest.push_back(fn);
+          } else {
+            other.push_back(fn);
+          }
+        }
+      }
+      std::sort(guest.begin(), guest.end());
+      std::sort(other.begin(), other.end());
+      const std::vector<std::wstring> &frames = !guest.empty() ? guest : other;
+      auto frameUrl = [&](const std::wstring &fn) {
+        return std::string("https://runs.antimal.local/") + dirName +
+               "/screenshots/" + Narrow(fn.c_str());
+      };
+      std::string framesArr = "[";
+      const size_t fstart = frames.size() > 16 ? frames.size() - 16 : 0;
+      for (size_t i = fstart; i < frames.size(); ++i) {
+        if (i > fstart) {
+          framesArr += ",";
+        }
+        framesArr += JsonQuote(frameUrl(frames[i]));
+      }
+      framesArr += "]";
+      const std::string latestFrame =
+          frames.empty() ? std::string() : frameUrl(frames.back());
+
+      // Event feed: most recent 60 events.
+      std::string evArr = "[";
+      const size_t estart = r.events.size() > 60 ? r.events.size() - 60 : 0;
+      for (size_t i = estart; i < r.events.size(); ++i) {
+        const EventRecord &ev = r.events[i];
+        if (i > estart) {
+          evArr += ",";
+        }
+        JsonObjectBuilder eo;
+        eo.AddString("time", ev.timestampUtc);
+        eo.AddString("source", ev.source);
+        eo.AddString("category", ev.category);
+        eo.AddString("action", ev.action);
+        eo.AddNumber("pid", ev.processId);
+        eo.AddString("image", ev.imagePath);
+        eo.AddString("target", ev.target);
+        eo.AddString("mitre", ev.mitre);
+        evArr += eo.Finish();
+      }
+      evArr += "]";
+
+      JsonObjectBuilder lr;
+      lr.AddString("runId", r.runId.empty() ? dirName : r.runId);
+      lr.AddString("file", Narrow(r.samplePath.filename().wstring().c_str()));
+      lr.AddString("verdict", ToString(r.sandboxVerdict));
+      lr.AddNumber("score", r.scannerVerdict.score);
+      lr.AddString("scannerVerdict", ToString(r.scannerVerdict.verdict));
+      lr.AddString("when", FormatFileTime(bestJson));
+      lr.AddString("runDir", Narrow(bestDir.wstring().c_str()));
+      lr.AddString("frame", latestFrame);
+
+      JsonObjectBuilder met;
+      met.AddNumber("events", static_cast<int64_t>(r.events.size()));
+      met.AddNumber("frames", static_cast<int64_t>(frames.size()));
+      met.AddNumber("domains", static_cast<int64_t>(r.networkDomains.size()));
+      met.AddNumber("artifacts", static_cast<int64_t>(r.artifacts.size()));
+      met.AddNumber("mitre", static_cast<int64_t>(r.mitreTechniques.size()));
+      met.AddNumber("errors", static_cast<int64_t>(r.errors.size()));
+
+      const std::string payload =
+          "{\"hasRun\":true,\"latestRun\":" + lr.Finish() +
+          ",\"metrics\":" + met.Finish() + ",\"frames\":" + framesArr +
+          ",\"events\":" + evArr + "}";
+      WebViewHost::Emit(h, "dashboard.data", payload);
+      CoUninitialize();
+    }).detach();
+    return std::string(R"({"loading":true})");
   });
 }
 
