@@ -845,14 +845,22 @@ bool CowOverlayBlockDevice::ReadSectors(uint64_t lba, uint16_t count,
   if (!base_ || !out || !RangeValid(lba, count)) {
     return false;
   }
-  for (uint16_t i = 0; i < count; ++i) {
-    const auto overlay = overlaySectors_.find(lba + i);
-    uint8_t *dst = out + static_cast<size_t>(i) * kSectorSize;
-    if (overlay != overlaySectors_.end()) {
-      std::copy(overlay->second.begin(), overlay->second.end(), dst);
-    } else if (!base_->ReadSectors(lba + i, 1, dst)) {
-      return false;
-    }
+  // Fast path: pull the whole range from the base in ONE call, then overlay
+  // just the modified sectors that fall inside it. The old per-sector loop did
+  // `count` individual base reads (each a file seek) + `count` map lookups,
+  // which made multi-megabyte reads through a large overlay (e.g. the second
+  // boot after a reboot, once the overlay has accumulated the first boot's
+  // writes) crawl -- winload then spends its whole time in tiny reads. A bulk
+  // base read + a bounded overlay sweep is orders of magnitude faster and
+  // bit-for-bit identical (each sector ends up overlay-if-modified, else base).
+  if (!base_->ReadSectors(lba, count, out)) {
+    return false;
+  }
+  for (auto it = overlaySectors_.lower_bound(lba);
+       it != overlaySectors_.end() && it->first < lba + count; ++it) {
+    uint8_t *dst =
+        out + static_cast<size_t>(it->first - lba) * kSectorSize;
+    std::copy(it->second.begin(), it->second.end(), dst);
   }
   return true;
 }
