@@ -1133,6 +1133,16 @@ VmRunSummary VirtualMachine::RunLoop(
   std::atomic<int> watchdogCancels{0};
   std::atomic<int> timerRequested{0};
   std::atomic<int> timerInjected{0};
+  // Cached BSP LVT-timer register (APIC offset 0x320), refreshed by
+  // injectLapicTimer at paused exit points. The watchdog injects the timer from
+  // this cache so it NEVER calls the blocking
+  // WHvGetVirtualProcessorInterruptControllerState on a *running* vCPU -- that
+  // read waits for the vCPU to reach a safe point, which never comes once the
+  // guest enters a pure-CPU spin (no VM exits), wedging the entire host loop
+  // (no cancel -> --timeout-sec never fires -> 100% CPU forever, no diagnostics).
+  // Default 0x10000 = masked, so no injection until the guest programs the LVT
+  // and a paused read populates the cache. See injectBspTimerCached.
+  std::atomic<uint32_t> bspLvtCache{0x10000u};
   std::atomic<bool> stopAps{false};
   std::atomic<uint64_t> apVcpuExits{0};
   std::atomic<uint64_t> apHltExits{0};
@@ -1142,14 +1152,41 @@ VmRunSummary VirtualMachine::RunLoop(
   std::vector<std::jthread> apThreads;
   apThreads.reserve(apVcpus_.size());
   auto injectLapicTimer = [&](Vcpu &cpu) {
+    // MUST only be called when `cpu` is paused (a vCPU exit handler / AP HLT /
+    // suspended AP). It reads interrupt-controller state, which blocks forever
+    // on a *running* vCPU that has stopped taking exits. The watchdog uses
+    // injectBspTimerCached instead.
     uint32_t lvt = 0;
-    if (cpu.TryReadApicLvtTimer(&lvt) && (lvt & (1u << 16)) == 0) {
-      const uint8_t vector = static_cast<uint8_t>(lvt & 0xFFu);
-      if (vector >= 0x10) {
-        timerRequested.fetch_add(1, std::memory_order_relaxed);
-        if (cpu.TryRequestFixedInterrupt(vector)) {
-          timerInjected.fetch_add(1, std::memory_order_relaxed);
+    if (cpu.TryReadApicLvtTimer(&lvt)) {
+      // Cache the BSP's LVT-timer register at this safe (paused) read so the
+      // watchdog can inject without re-reading controller state on a running CPU.
+      if (&cpu == &vcpu_) {
+        bspLvtCache.store(lvt, std::memory_order_relaxed);
+      }
+      if ((lvt & (1u << 16)) == 0) {
+        const uint8_t vector = static_cast<uint8_t>(lvt & 0xFFu);
+        if (vector >= 0x10) {
+          timerRequested.fetch_add(1, std::memory_order_relaxed);
+          if (cpu.TryRequestFixedInterrupt(vector)) {
+            timerInjected.fetch_add(1, std::memory_order_relaxed);
+          }
         }
+      }
+    }
+  };
+  // Watchdog-safe BSP timer injection: uses the cached LVT register instead of
+  // reading interrupt-controller state. WHvRequestInterrupt IS safe to call on a
+  // running vCPU; the state *read* is not, so the watchdog must never do it.
+  auto injectBspTimerCached = [&]() {
+    const uint32_t lvt = bspLvtCache.load(std::memory_order_relaxed);
+    if ((lvt & (1u << 16)) != 0) {
+      return; // masked
+    }
+    const uint8_t vector = static_cast<uint8_t>(lvt & 0xFFu);
+    if (vector >= 0x10) {
+      timerRequested.fetch_add(1, std::memory_order_relaxed);
+      if (vcpu_.TryRequestFixedInterrupt(vector)) {
+        timerInjected.fetch_add(1, std::memory_order_relaxed);
       }
     }
   };
@@ -1252,21 +1289,28 @@ VmRunSummary VirtualMachine::RunLoop(
       }
       wasInRun = runningNow;
 
-      if (now - lastTimer >= kTimerInterval) {
-        injectLapicTimer(vcpu_);
-        injectIoApicClock(vcpu_);
-        for (auto &ap : apVcpus_) {
-          if (ap) {
-            injectLapicTimer(*ap);
-          }
-        }
-        lastTimer = now;
-      }
-
+      // Cancel FIRST so a guest that has stopped taking VM exits (a pure-CPU
+      // spin) is always reclaimed by the main loop. The injections below are
+      // non-blocking on the BSP now (cached); keep the ordering robust anyway.
       if (runningNow && now - runEntered >= kWatchdogCancelAfter) {
         vcpu_.CancelRun();
         watchdogCancels.fetch_add(1, std::memory_order_relaxed);
         runEntered = now;
+      }
+
+      if (now - lastTimer >= kTimerInterval) {
+        injectBspTimerCached();   // cached LVT vector -> never reads controller
+                                  // state on a running vCPU (would wedge the host)
+        injectIoApicClock(vcpu_); // RequestInterrupt only -- safe while running
+        for (auto &ap : apVcpus_) {
+          if (ap) {
+            // TODO(ap-sync): an AP in a pure-CPU spin can still block this read;
+            // give APs the same cached-injection treatment with the AP-bringup
+            // work. (1-vCPU runs have no APs, so this can't wedge them.)
+            injectLapicTimer(*ap);
+          }
+        }
+        lastTimer = now;
       }
     }
   });
