@@ -103,20 +103,42 @@ function Get-FreeDriveLetter {
 }
 
 function Get-PartitionRoot($Partition, [System.Collections.Generic.List[string]]$AssignedLetters) {
-  $volume = $null
-  try {
-    $volume = $Partition | Get-Volume -ErrorAction SilentlyContinue
-  } catch {
+  # Re-query so AccessPaths/DriveLetter reflect the current mount. Right after
+  # Mount-DiskImage, Get-Volume can briefly report no DriveLetter even though the
+  # partition already carries a persisted drive-letter access path from a prior
+  # mount (e.g. the W:\ the DISM apply step left on it). Trying to Add another
+  # letter then fails with "the requested access path is already in use", so use
+  # the existing access path when there is one.
+  $p = Get-Partition -DiskNumber $Partition.DiskNumber -PartitionNumber $Partition.PartitionNumber
+  # 1) Reuse an existing drive-letter access path that is actually reachable
+  #    (the apply step persists e.g. W:\ on the Windows partition across mounts).
+  foreach ($ap in @($p.AccessPaths)) {
+    if ($ap -match '^[A-Za-z]:\\$' -and (Test-Path -LiteralPath $ap)) {
+      return $ap.Substring(0, 3)
+    }
   }
-
-  if ($volume -and $volume.DriveLetter) {
+  $volume = $null
+  try { $volume = $p | Get-Volume -ErrorAction SilentlyContinue } catch {}
+  if ($volume -and $volume.DriveLetter -and (Test-Path -LiteralPath "$($volume.DriveLetter):\")) {
     return "$($volume.DriveLetter):\"
   }
-
-  $letter = Get-FreeDriveLetter
-  Add-PartitionAccessPath -DiskNumber $Partition.DiskNumber -PartitionNumber $Partition.PartitionNumber -AccessPath "$letter`:\"
-  $AssignedLetters.Add($letter) | Out-Null
-  return "$letter`:\"
+  # 2) Assign a fresh letter, retrying past any "already in use" caused by a
+  #    stale persisted access path left on the partition by a prior failed run.
+  foreach ($letter in @("S","T","U","V","X","Y","Z","R","Q","P","O","N","M","L","K","J","I","H","G","F","E","D")) {
+    if (Test-Path -LiteralPath "$letter`:\") { continue }
+    try {
+      Add-PartitionAccessPath -DiskNumber $p.DiskNumber -PartitionNumber $p.PartitionNumber -AccessPath "$letter`:\" -ErrorAction Stop
+      $AssignedLetters.Add($letter) | Out-Null
+      return "$letter`:\"
+    } catch {
+      continue
+    }
+  }
+  # 3) Last resort: the volume-GUID access path is always valid while mounted.
+  foreach ($ap in @($p.AccessPaths)) {
+    if ($ap -like '\\?\Volume{*') { return $ap }
+  }
+  throw "Could not obtain a usable access path for partition $($p.PartitionNumber)."
 }
 
 function Test-FilePresent([string]$Path, [string]$Label) {
