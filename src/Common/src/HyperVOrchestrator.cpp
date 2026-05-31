@@ -9670,6 +9670,45 @@ DetonationResult InHouseOrchestrator::PrepareAndRun(
           }
         }
       }
+      // Run the VM, recreating it from scratch on each guest-initiated reboot
+      // (0xCF9). A reboot becomes a real cold boot -- fresh WHP partition,
+      // devices, vCPU, LAPIC and RAM -- so the post-reboot boot has no stale
+      // state to trip over (the in-place warm-reset whack-a-mole was 0x1A -> 0x7F
+      // -> 0x50, each a different un-reset piece). The disk (cow) lives outside
+      // the VM and is reused, so Windows' on-disk first-boot setup progress
+      // (specialize -> reboot -> OOBE/login) carries forward. The shared
+      // screenshot callback in vmOptions keeps the filmstrip continuous. The one
+      // --timeout-sec budget is shared across all boots via a running deadline;
+      // a reboot cap is the backstop against a genuine reboot loop.
+      auto runWithReboots = [&](hv::IBlockDevice *disk) -> hv::VmRunSummary {
+        constexpr int kMaxReboots = 12;
+        const auto totalTimeout =
+            std::chrono::duration_cast<std::chrono::milliseconds>(request.timeout);
+        const auto runStart = std::chrono::steady_clock::now();
+        hv::VmRunSummary s;
+        for (int reboot = 0; reboot <= kMaxReboots; ++reboot) {
+          const auto elapsed =
+              std::chrono::duration_cast<std::chrono::milliseconds>(
+                  std::chrono::steady_clock::now() - runStart);
+          if (elapsed >= totalTimeout) {
+            s.timedOut = true;
+            s.guestReboots = reboot;
+            break;
+          }
+          hv::VmRunRequest reqLocal = request;
+          reqLocal.timeout = totalTimeout - elapsed;
+          hv::VirtualMachine vm(preflight.firmwarePath, disk, vmOptions);
+          if (reboot == 0) {
+            vm.QueueCom2Bytes(BuildHealthcheckJobFrame(result.runId));
+          }
+          s = vm.Run(reqLocal);
+          s.guestReboots = reboot;
+          if (!s.rebootRequested) {
+            break;
+          }
+        }
+        return s;
+      };
       if (preflight.rawBaseReady) {
         auto cow = hv::CowRawBlockDevice::Open(runConfig.baseDiskPath,
                                                result.overlayDiskPath);
@@ -9681,9 +9720,7 @@ DetonationResult InHouseOrchestrator::PrepareAndRun(
             MakeSandboxEvent("vm.boot-overlay.patched", result.overlayDiskPath,
                              BootOverlayPatchDetails(lastOverlayPatch)),
             &events);
-        hv::VirtualMachine vm(preflight.firmwarePath, &cow, vmOptions);
-        vm.QueueCom2Bytes(BuildHealthcheckJobFrame(result.runId));
-        vmSummary = vm.Run(request);
+        vmSummary = runWithReboots(&cow);
       } else if (preflight.baseVhdxReadable) {
         auto base = hv::VhdxBlockDevice::Open(runConfig.baseVhdxPath);
         auto cow = hv::CowOverlayBlockDevice::Open(&base, result.overlayDiskPath);
@@ -9695,9 +9732,7 @@ DetonationResult InHouseOrchestrator::PrepareAndRun(
             MakeSandboxEvent("vm.boot-overlay.patched", result.overlayDiskPath,
                              BootOverlayPatchDetails(lastOverlayPatch)),
             &events);
-        hv::VirtualMachine vm(preflight.firmwarePath, &cow, vmOptions);
-        vm.QueueCom2Bytes(BuildHealthcheckJobFrame(result.runId));
-        vmSummary = vm.Run(request);
+        vmSummary = runWithReboots(&cow);
       } else {
         throw std::runtime_error("no bootable base disk was available");
       }

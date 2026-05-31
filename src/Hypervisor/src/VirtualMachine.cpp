@@ -1806,11 +1806,6 @@ VmRunSummary VirtualMachine::RunLoop(
       summary.fatalCsSelector = vcpu_.LastExit().VpContext.Cs.Selector;
     }
   };
-  // VM warm-reset bookkeeping. Windows reboots during normal first-boot (after
-  // device specialize) to continue to OOBE/login; the cap is a backstop against
-  // a genuine reboot loop (a real crash that keeps re-bugchecking).
-  constexpr int kMaxGuestReboots = 10;
-  int guestReboots = 0;
   for (int step = 0; step < maxSteps && !summary.fatal && !summary.idleLoop &&
        !summary.halted && !summary.timedOut && !summary.guestShutdown &&
        !summary.hostStopRequested; ++step) {
@@ -1826,27 +1821,14 @@ VmRunSummary VirtualMachine::RunLoop(
     // and the COW disk overlay persist across the reset (warm reboot), so the
     // guest's on-disk setup progress carries forward.
     if (pcIo_.ConsumeResetRequest()) {
-      if (++guestReboots > kMaxGuestReboots) {
-        summary.guestReboots = guestReboots - 1;
-        summary.guestShutdown = true;
-        summary.halted = true;
-        break;
-      }
-      summary.guestReboots = guestReboots;
-      ioApic_.Reset();
-      if (ahci_) {
-        ahci_->Reset();
-      }
-      // Rewind the page-table-assist bump allocator: it advances as we hand out
-      // assist pages during early boot, and the next boot's firmware/loader page-
-      // table setup needs the full pool again. Not rewinding it leaves the second
-      // boot's assist depleted -> a bad/missing page-table page -> a corrupt PTE
-      // -> 0x1A MEMORY_MANAGEMENT (p1=0x404).
-      pageTableAssistNext_ = pageTableAssistBase_;
-      vcpu_.SetX86ResetState();
-      vcpu_.ResetApic();
-      (void)vcpu_.TrySetStartupSuspended(false);
-      continue;
+      // Guest requested a platform reset (0xCF9). Exit so the orchestrator can
+      // recreate the VM from scratch and continue the rebooting boot. That is a
+      // real cold boot -- fresh WHP partition, devices, vCPU, LAPIC and RAM --
+      // which avoids the stale-state whack-a-mole an in-place warm-reset hits
+      // (0x1A -> 0x7F -> 0x50, each a different un-reset piece). The disk overlay
+      // lives outside the VM, so Windows' on-disk setup progress carries forward.
+      summary.rebootRequested = true;
+      break;
     }
     if (pcIo_.ShutdownRequested()) {
       summary.guestShutdown = true;
