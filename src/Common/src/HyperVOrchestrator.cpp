@@ -4424,6 +4424,8 @@ struct BootOverlayPatchResult {
 
 bool PatchOverlaySystemBootStorage(hv::IBlockDevice &disk,
                                    BootOverlayPatchResult *result);
+bool PatchOverlayAutologon(hv::IBlockDevice &disk,
+                           BootOverlayPatchResult *result);
 
 bool AddBcdElementRaw(MutableHiveView &hive, uint32_t elementsKey,
                       const std::string &elementId, uint32_t valueType,
@@ -6148,6 +6150,11 @@ BootOverlayPatchResult ApplyEphemeralBootOverlay(hv::IBlockDevice &disk) {
   ApplySpacebootPatch(disk, partitions, &result);
   ApplyCiBypassPatch(disk, fat, partitions, &result);
   PatchOverlaySystemBootStorage(disk, &result);
+  // Opt-in: bake autologon into the overlay so the guest boots to a desktop
+  // instead of stopping at the interactive OOBE wizard. Overlay-only.
+  if (EnvFlagEnabled("ANTIMAL_PROBE_OOBE_AUTOLOGON")) {
+    PatchOverlayAutologon(disk, &result);
+  }
   return result;
 }
 
@@ -6827,6 +6834,114 @@ bool PatchSystemHivePiixCriticalDevices(std::vector<uint8_t> &bytes,
     result->notes.push_back("SYSTEM CriticalDeviceDatabase mutation failed");
   }
   return ok;
+}
+
+// Offline autologon patch (overlay-only, opt-in via ANTIMAL_PROBE_OOBE_AUTOLOGON).
+// Makes the per-run COW overlay boot straight to a desktop instead of stopping at
+// the interactive Win11 OOBE wizard: (1) SYSTEM\Setup marks setup/OOBE complete,
+// (2) SAM enables the built-in Administrator (RID 500) by clearing its
+// ACB_DISABLED bit, (3) SOFTWARE\...\Winlogon turns on AutoAdminLogon as that
+// account. Never touches the base VHDX (edits the disposable overlay only).
+bool PatchOverlayAutologon(hv::IBlockDevice &disk,
+                           BootOverlayPatchResult *result) {
+  const auto parts = ReadGptPartitionsLite(disk);
+  const auto windows =
+      std::find_if(parts.begin(), parts.end(), [](const GptPartitionLite &p) {
+        return IsWindowsBasicDataGuid(p.typeGuid);
+      });
+  if (windows == parts.end()) {
+    if (result) result->notes.push_back("autologon: Windows partition not found");
+    return false;
+  }
+  NtfsBootFileLocator ntfs(disk, windows->firstLba);
+  if (!ntfs.Init()) {
+    if (result) result->notes.push_back("autologon: Windows NTFS unreadable");
+    return false;
+  }
+  auto findPath = [](MutableHiveView &hive,
+                     std::initializer_list<std::string> components)
+      -> std::optional<uint32_t> {
+    auto cur = hive.RootIndex();
+    for (const auto &c : components) {
+      if (!cur) return std::nullopt;
+      cur = hive.FindSubkey(*cur, c);
+    }
+    return cur;
+  };
+  auto patchHive = [&](const char *path, auto &&fn) -> bool {
+    const auto entry = ntfs.FindPath(path);
+    if (!entry) {
+      if (result) result->notes.push_back(std::string("autologon: missing ") + path);
+      return false;
+    }
+    auto bytes = ntfs.ReadFile(*entry, 256u * 1024u * 1024u);
+    MutableHiveView hive(bytes);
+    if (!hive.IsValid() || !fn(hive)) {
+      if (result) result->notes.push_back(std::string("autologon: no change ") + path);
+      return false;
+    }
+    RefreshRegistryHiveHeader(bytes);
+    if (!ntfs.WriteFileSameSize(*entry, bytes)) {
+      if (result) result->notes.push_back(std::string("autologon: write failed ") + path);
+      return false;
+    }
+    return true;
+  };
+
+  const bool sys = patchHive(
+      "Windows\\System32\\config\\SYSTEM", [&](MutableHiveView &hive) {
+        const auto setup = findPath(hive, {"Setup"});
+        if (!setup) return false;
+        bool ok = false;
+        ok = UpsertHiveDword(hive, *setup, "SystemSetupInProgress", 0) || ok;
+        ok = UpsertHiveDword(hive, *setup, "OOBEInProgress", 0) || ok;
+        ok = UpsertHiveDword(hive, *setup, "SetupType", 0) || ok;
+        if (const auto loc = hive.FindValue(*setup, "CmdLine")) {
+          const std::vector<uint8_t> empty(loc->dataLength, 0);
+          ok = hive.UpsertBinaryValueSameSize(*setup, "CmdLine", loc->type,
+                                              empty) ||
+               ok;
+        }
+        return ok;
+      });
+
+  const bool sam = patchHive(
+      "Windows\\System32\\config\\SAM", [&](MutableHiveView &hive) {
+        const auto user = findPath(
+            hive, {"SAM", "Domains", "Account", "Users", "000001F4"});
+        if (!user) return false;
+        const auto loc = hive.FindValue(*user, "F");
+        if (!loc) return false;
+        auto f = hive.ValueBytes(*loc);
+        if (f.size() <= 0x38) return false;
+        if ((f[0x38] & 0x01u) == 0) return true; // already enabled
+        f[0x38] = static_cast<uint8_t>(f[0x38] & ~0x01u);
+        return hive.UpsertBinaryValueSameSize(*user, "F", loc->type, f);
+      });
+
+  const bool soft = patchHive(
+      "Windows\\System32\\config\\SOFTWARE", [&](MutableHiveView &hive) {
+        const auto winlogon = findPath(
+            hive, {"Microsoft", "Windows NT", "CurrentVersion", "Winlogon"});
+        if (!winlogon) return false;
+        auto setStr = [&](const char *name, const std::wstring &val) {
+          if (!hive.FindValue(*winlogon, name)) {
+            hive.SetAsciiStringValue(*winlogon, name, val);
+          }
+        };
+        setStr("AutoAdminLogon", L"1");
+        setStr("DefaultUserName", L"Administrator");
+        setStr("DefaultPassword", L"");
+        setStr("DefaultDomainName", L".");
+        return true;
+      });
+
+  if (result) {
+    result->notes.push_back(std::string("autologon overlay patch: SYSTEM=") +
+                            (sys ? "ok" : "no") + " SAM=" + (sam ? "ok" : "no") +
+                            " SOFTWARE=" + (soft ? "ok" : "no"));
+  }
+  return sys || sam || soft;
 }
 
 bool PatchOverlaySystemBootStorage(hv::IBlockDevice &disk,
