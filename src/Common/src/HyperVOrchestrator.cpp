@@ -1034,12 +1034,96 @@ private:
     if (!ReadFileRecord(entry.fileRecord, record)) {
       return;
     }
-    for (const auto &attr : Attributes(record)) {
+    const auto attrs = Attributes(record);
+
+    // Fast path: an unnamed $DATA in the base record. Covers non-fragmented
+    // files and the VCN=0 fragment of fragmented ones.
+    for (const auto &attr : attrs) {
       if (attr.type == 0x80) {
-        entry.size = attr.nonResident ? attr.realSize : attr.residentData.size();
+        entry.size =
+            attr.nonResident ? attr.realSize : attr.residentData.size();
         entry.dataRuns = attr.runs;
+        break;
+      }
+    }
+
+    // If the file uses an $ATTRIBUTE_LIST (type 0x20), its $DATA may be split
+    // across extension MFT records (the SAM hive does this). Gather every $DATA
+    // fragment's runs in StartingVCN order so the whole stream is readable;
+    // without this the read truncates to the base fragment (SAM came back as
+    // 8192 bytes, hiding the Administrator account). Purely additive: files with
+    // no $ATTRIBUTE_LIST, or a single $DATA fragment, keep the fast path above.
+    const Attribute *attrList = nullptr;
+    for (const auto &attr : attrs) {
+      if (attr.type == 0x20) {
+        attrList = &attr;
+        break;
+      }
+    }
+    if (!attrList) {
+      return;
+    }
+    std::vector<uint8_t> listBytes;
+    if (!attrList->nonResident) {
+      listBytes = attrList->residentData;
+    } else if (!attrList->runs.empty() && attrList->realSize > 0 &&
+               attrList->realSize < 4ull * 1024ull * 1024ull) {
+      listBytes.resize(static_cast<size_t>(attrList->realSize));
+      if (!ReadStreamBytes(attrList->runs, 0, listBytes.data(),
+                           listBytes.size())) {
         return;
       }
+    } else {
+      return;
+    }
+
+    // Collect (StartingVCN, MFT record) for every $DATA fragment.
+    std::vector<std::pair<uint64_t, uint64_t>> dataFrags;
+    size_t off = 0;
+    while (off + 0x1A <= listBytes.size()) {
+      const uint32_t type = ReadLe32(listBytes.data() + off);
+      const uint16_t len = ReadLe16(listBytes.data() + off + 4);
+      if (len < 0x18 || off + len > listBytes.size()) {
+        break;
+      }
+      if (type == 0x80) {
+        const uint64_t startVcn = ReadLe64(listBytes.data() + off + 8);
+        const uint64_t ref =
+            FileReferenceToRecord(ReadLe64(listBytes.data() + off + 0x10));
+        dataFrags.emplace_back(startVcn, ref);
+      }
+      off += len;
+    }
+    if (dataFrags.size() <= 1) {
+      return; // not fragmented across records; the fast path was complete
+    }
+    std::sort(dataFrags.begin(), dataFrags.end());
+    std::vector<NtfsRunLite> allRuns;
+    uint64_t totalSize = entry.size;
+    const uint64_t baseRec = FileReferenceToRecord(entry.fileRecord);
+    for (const auto &frag : dataFrags) {
+      const std::vector<uint8_t> *src = nullptr;
+      std::vector<uint8_t> erec;
+      if (frag.second == baseRec) {
+        src = &record;
+      } else if (ReadFileRecord(frag.second, erec)) {
+        src = &erec;
+      }
+      if (!src) {
+        continue;
+      }
+      for (const auto &a : Attributes(*src)) {
+        if (a.type == 0x80 && a.nonResident) {
+          allRuns.insert(allRuns.end(), a.runs.begin(), a.runs.end());
+          if (frag.first == 0 && a.realSize > 0) {
+            totalSize = a.realSize;
+          }
+        }
+      }
+    }
+    if (!allRuns.empty()) {
+      entry.dataRuns = std::move(allRuns);
+      entry.size = totalSize;
     }
   }
 
