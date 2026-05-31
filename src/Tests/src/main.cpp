@@ -3677,6 +3677,135 @@ void TestBridgeFuzz() {
   Expect(bad == 0, "fuzz: 20000 mutated envelopes all yield valid replies");
 }
 
+// Security hardening (live-sandbox-console P6): the AMCH frame decoder parses
+// the host<->guest control channel (COM2 today), i.e. *guest*-controlled bytes.
+// A malicious guest must never crash the host decoder, smuggle a malformed
+// frame past validation, or force unbounded buffering. Deterministic harness.
+void TestHostChannelFuzz() {
+  using antimal::hv::HostChannelFrame;
+  using antimal::hv::HostChannelMessage;
+  using antimal::hv::HostSerialChannel;
+  auto makeFrame = [](const std::string &s) {
+    return HostSerialChannel::EncodeText(HostChannelMessage::Event, s);
+  };
+  auto wellFormed = [](const HostChannelFrame &f) {
+    const uint16_t t = static_cast<uint16_t>(f.type);
+    return t >= 1 && t <= 10 &&
+           f.payload.size() <= HostSerialChannel::kMaxPayloadBytes;
+  };
+
+  // 1) Byte-at-a-time delivery still decodes exactly one intact frame.
+  {
+    HostSerialChannel ch;
+    const auto enc = makeFrame("hello-guest");
+    for (uint8_t b : enc) {
+      ch.PushBytes(&b, 1);
+    }
+    Expect(ch.PendingFrameCount() == 1, "channel fuzz: dribbled frame decodes");
+    const auto f = ch.PopFrame();
+    Expect(f && f->type == HostChannelMessage::Event &&
+               std::string(f->payload.begin(), f->payload.end()) == "hello-guest",
+           "channel fuzz: type + payload preserved across byte-at-a-time");
+  }
+
+  // 2) Garbage prefix then a valid frame -> magic resync recovers it.
+  {
+    HostSerialChannel ch;
+    const std::vector<uint8_t> junk = {0, 1, 2, 'A', 'M', 0xFF, 'A', 'M', 'C', 0};
+    ch.PushBytes(junk);
+    ch.PushBytes(makeFrame("after-junk"));
+    const auto f = ch.PopFrame();
+    Expect(f && std::string(f->payload.begin(), f->payload.end()) == "after-junk",
+           "channel fuzz: resync past leading garbage");
+  }
+
+  // 3) Corrupted payload (checksum mismatch) -> discarded, not delivered.
+  {
+    HostSerialChannel ch;
+    auto enc = makeFrame("tamper");
+    enc[enc.size() - 1] ^= 0xFF;
+    ch.PushBytes(enc);
+    Expect(ch.PendingFrameCount() == 0, "channel fuzz: bad checksum discarded");
+  }
+
+  // 4) Header claims max payload but stream is truncated -> waits, no crash,
+  //    no huge allocation (the bytes never arrive).
+  {
+    HostSerialChannel ch;
+    std::vector<uint8_t> hdr = {'A', 'M', 'C', 'H', 1, 0, 3, 0,
+                                0x00, 0x00, 0x00, 0x01, // length = 16 MiB (== cap)
+                                0,    0,    0,    0,    // checksum
+                                'x'};                   // 1 of 16 MiB payload bytes
+    ch.PushBytes(hdr);
+    Expect(ch.PendingFrameCount() == 0,
+           "channel fuzz: truncated max-length frame waits without crash");
+  }
+
+  // 5) Mutation fuzz over a valid frame fed in random chunk sizes: never crash;
+  //    nothing malformed is ever delivered.
+  {
+    const auto base = makeFrame("C:\\Windows\\System32\\evil.dll");
+    unsigned long lcg = 0xABCDEF01u;
+    auto next = [&lcg]() {
+      lcg = lcg * 1103515245u + 12345u;
+      return static_cast<unsigned>((lcg >> 16) & 0x7fff);
+    };
+    int malformed = 0;
+    for (int iter = 0; iter < 20000; ++iter) {
+      std::vector<uint8_t> m = base;
+      const int muts = 1 + static_cast<int>(next() % 5);
+      for (int k = 0; k < muts && !m.empty(); ++k) {
+        const int op = static_cast<int>(next() % 3);
+        const size_t pos = next() % m.size();
+        if (op == 0) {
+          m[pos] = static_cast<uint8_t>(next() & 0xff);
+        } else if (op == 1 && m.size() > 1) {
+          m.erase(m.begin() + static_cast<long>(pos));
+        } else {
+          m.insert(m.begin() + static_cast<long>(pos),
+                   static_cast<uint8_t>(next() & 0xff));
+        }
+      }
+      HostSerialChannel ch;
+      size_t off = 0;
+      while (off < m.size()) {
+        const size_t chunk = std::min<size_t>(1 + (next() % 7), m.size() - off);
+        ch.PushBytes(m.data() + off, chunk);
+        off += chunk;
+      }
+      while (const auto f = ch.PopFrame()) {
+        if (!wellFormed(*f)) {
+          ++malformed;
+        }
+      }
+    }
+    Expect(malformed == 0,
+           "channel fuzz: 20000 mutated frames -> no malformed frame delivered");
+  }
+
+  // 6) A long pure-random byte stream never crashes nor smuggles a frame.
+  {
+    HostSerialChannel ch;
+    unsigned long lcg = 0x13579BDFu;
+    auto next = [&lcg]() {
+      lcg = lcg * 1103515245u + 12345u;
+      return static_cast<uint8_t>((lcg >> 16) & 0xff);
+    };
+    int malformed = 0;
+    for (int i = 0; i < 120000; ++i) {
+      const uint8_t b = next();
+      ch.PushBytes(&b, 1);
+      while (const auto f = ch.PopFrame()) {
+        if (!wellFormed(*f)) {
+          ++malformed;
+        }
+      }
+    }
+    Expect(malformed == 0,
+           "channel fuzz: random byte stream delivers no malformed frame");
+  }
+}
+
 int main() {
   try {
     TestHashEntropyJson();
@@ -3708,6 +3837,7 @@ int main() {
     TestJsonValueParser();
     TestBridgeRouter();
     TestBridgeFuzz();
+    TestHostChannelFuzz();
     TestIdeReadWriteSectors();
     TestIdeSecondaryNoDeviceStatus();
     TestIdeAssertsInterrupt();
