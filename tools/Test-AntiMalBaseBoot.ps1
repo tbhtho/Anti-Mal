@@ -37,11 +37,11 @@ function Test-BcdStore([string]$BcdPath) {
   if ($output -notmatch "(?im)^\s*path\s+\\Windows\\system32\\winload\.efi\s*$") {
     throw "BCD validation failed: {default} does not point at \Windows\System32\winload.efi."
   }
-  if ($output -notmatch "(?im)^\s*device\s+partition=") {
-    throw "BCD validation failed: no partition-backed device entry was found."
+  if ($output -notmatch "(?im)^\s*device\s+(partition=|locate=)") {
+    throw "BCD validation failed: no device entry was found."
   }
-  if ($output -notmatch "(?im)^\s*osdevice\s+partition=") {
-    throw "BCD validation failed: no partition-backed osdevice entry was found."
+  if ($output -notmatch "(?im)^\s*osdevice\s+(partition=|locate=)") {
+    throw "BCD validation failed: no osdevice entry was found."
   }
 }
 
@@ -67,11 +67,15 @@ function Repair-BcdStore([string]$WindowsRoot, [string]$EspRoot) {
 
   $bcdPath = Join-Path $EspRoot "EFI\Microsoft\Boot\BCD"
   $espDevice = Format-BcdPartitionDevice $EspRoot
-  $windowsDevice = Format-BcdPartitionDevice $WindowsRoot
   Test-FilePresent $bcdPath "BCD store"
   Invoke-Checked "bcdedit.exe" @("/store", $bcdPath, "/set", "{bootmgr}", "device", $espDevice) "Pinning boot manager to ESP partition..."
-  Invoke-Checked "bcdedit.exe" @("/store", $bcdPath, "/set", "{default}", "device", $windowsDevice) "Pinning Windows loader device..."
-  Invoke-Checked "bcdedit.exe" @("/store", $bcdPath, "/set", "{default}", "osdevice", $windowsDevice) "Pinning Windows loader OS device..."
+  # {default} device/osdevice use locate= (bootmgr searches all partitions for
+  # the path) instead of partition=<letter>, which bakes in the build-time GPT
+  # partition GUID. That GUID does not resolve once the image boots through the
+  # in-house VM's COW overlay -> bootmgr cannot reach the OS volume -> winload
+  # fails with 0xc000000e. locate= is disk-identity independent and boots.
+  Invoke-Checked "bcdedit.exe" @("/store", $bcdPath, "/set", "{default}", "device", "locate=\Windows\System32\winload.efi") "Pinning Windows loader device (locate)..."
+  Invoke-Checked "bcdedit.exe" @("/store", $bcdPath, "/set", "{default}", "osdevice", "locate=\Windows") "Pinning Windows loader OS device (locate)..."
   Invoke-Checked "bcdedit.exe" @("/store", $bcdPath, "/set", "{default}", "path", "\Windows\System32\winload.efi") "Pinning Windows loader path..."
   Invoke-Checked "bcdedit.exe" @("/store", $bcdPath, "/set", "{default}", "systemroot", "\Windows") "Pinning Windows system root..."
   Invoke-Checked "bcdedit.exe" @("/store", $bcdPath, "/set", "{default}", "recoveryenabled", "No") "Disabling recovery auto-loop for sandbox base..."
