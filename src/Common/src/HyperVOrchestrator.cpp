@@ -6905,19 +6905,52 @@ bool PatchOverlayAutologon(hv::IBlockDevice &disk,
         return ok;
       });
 
+  std::string samDiag;
   const bool sam = patchHive(
       "Windows\\System32\\config\\SAM", [&](MutableHiveView &hive) {
-        const auto user = findPath(
+        // Offline SAM layout is either root -> "SAM" -> Domains -> ... or
+        // root(named SAM) -> Domains -> ...; try both. RID 500 (0x1F4) is the
+        // built-in Administrator.
+        auto user = findPath(
             hive, {"SAM", "Domains", "Account", "Users", "000001F4"});
-        if (!user) return false;
+        if (!user) {
+          user = findPath(hive, {"Domains", "Account", "Users", "000001F4"});
+        }
+        if (!user) {
+          // Report how deep the canonical path resolved so the exact layout is
+          // pinned for the next iteration.
+          const char *probe[] = {"SAM", "Domains", "Account", "Users",
+                                 "000001F4"};
+          auto cur = hive.RootIndex();
+          int depth = 0;
+          for (const char *c : probe) {
+            if (!cur) break;
+            auto next = hive.FindSubkey(*cur, c);
+            if (!next) break;
+            cur = next;
+            ++depth;
+          }
+          samDiag = "SAM Administrator key not found (canonical nav depth=" +
+                    std::to_string(depth) + "/5)";
+          return false;
+        }
         const auto loc = hive.FindValue(*user, "F");
-        if (!loc) return false;
+        if (!loc) {
+          samDiag = "SAM: RID-500 'F' value missing";
+          return false;
+        }
         auto f = hive.ValueBytes(*loc);
-        if (f.size() <= 0x38) return false;
+        if (f.size() <= 0x38) {
+          samDiag = "SAM: 'F' too short (" + std::to_string(f.size()) + ")";
+          return false;
+        }
         if ((f[0x38] & 0x01u) == 0) return true; // already enabled
         f[0x38] = static_cast<uint8_t>(f[0x38] & ~0x01u);
         return hive.UpsertBinaryValueSameSize(*user, "F", loc->type, f);
       });
+  if (result && !samDiag.empty()) {
+    result->notes.push_back("autologon: " + samDiag);
+  }
 
   const bool soft = patchHive(
       "Windows\\System32\\config\\SOFTWARE", [&](MutableHiveView &hive) {
