@@ -1584,6 +1584,79 @@ void TestAhciAdversarialDma() {
          "AHCI adv: DMA accessor rejected out-of-range guest addresses");
 }
 
+// Security hardening (escape surface): the legacy-IO + display + firmware-config
+// devices all take guest-controlled port writes; a missing bound (e.g. a
+// guest-controlled register index or an fw_cfg read offset past an item's end)
+// is a host OOB = a VM escape. This sweeps those devices with adversarial IO and
+// asserts none crash/over-read. Complements TestAhciAdversarialDma (DMA surface).
+void TestDeviceIoFuzz() {
+  using namespace antimal::hv;
+  unsigned long lcg = 0x2468ace0u;
+  auto next = [&lcg]() {
+    lcg = lcg * 1103515245u + 12345u;
+    return static_cast<unsigned>((lcg >> 16) & 0x7fff);
+  };
+  auto val32 = [&]() {
+    return static_cast<uint32_t>(next()) | (static_cast<uint32_t>(next()) << 15) |
+           (static_cast<uint32_t>(next() & 0x3u) << 30);
+  };
+  auto sz = [&]() {
+    static const uint8_t s[] = {1, 2, 4};
+    return s[next() % 3];
+  };
+
+  // 1) BochsVbe display: a guest-controlled register index feeds a fixed 16-entry
+  //    array -- it must never index out of bounds whatever index is written.
+  {
+    BochsVbeDevice vbe;
+    std::vector<uint8_t> fb(64u * 1024u, 0);
+    vbe.SetFramebufferHostBytes(fb.data(), fb.size());
+    const uint16_t ports[] = {BochsVbeDevice::kIndexPort, BochsVbeDevice::kDataPort,
+                              BochsVbeDevice::kDataPortAligned};
+    for (int i = 0; i < 60000; ++i) {
+      const uint16_t p = ports[next() % 3];
+      if (next() & 1) {
+        vbe.OnWrite(p, val32(), sz());
+      } else {
+        (void)vbe.OnRead(p, sz());
+      }
+    }
+    Expect(true, "device fuzz: BochsVbe survived 60k adversarial register IO ops");
+  }
+
+  // 2) Legacy PC IO incl. fw_cfg. Random IO across the real ports, then a focused
+  //    fw_cfg sweep: select an arbitrary item, then read 0x511 far past any
+  //    item's length -- a missing per-item offset bound would OOB-read host
+  //    memory (the classic QEMU-style firmware escape).
+  {
+    PcIoDevices pc;
+    const uint16_t ports[] = {0x0020, 0x0021, 0x00A0, 0x00A1, 0x0040, 0x0041,
+                              0x0042, 0x0043, 0x0070, 0x0071, 0x0092, 0x0402,
+                              0x0CF9, 0x0CF8, 0x0CFC, 0x0510, 0x0511, 0xB000,
+                              0xB002, 0xB004, 0xB008, 0xB00A, 0xAF00, 0xAF10,
+                              0xAF1F};
+    const int n = static_cast<int>(sizeof(ports) / sizeof(ports[0]));
+    for (int i = 0; i < 120000; ++i) {
+      const uint16_t p = ports[next() % n];
+      if (next() & 1) {
+        pc.OnWrite(p, val32(), sz());
+      } else {
+        (void)pc.OnRead(p, sz());
+      }
+    }
+    Expect(true,
+           "device fuzz: PcIoDevices survived 120k adversarial legacy-IO ops");
+    for (int s = 0; s < 4000; ++s) {
+      pc.OnWrite(0x510, val32() & 0xFFFFu, 2); // arbitrary fw_cfg selector
+      for (int r = 0; r < 600; ++r) {
+        (void)pc.OnRead(0x511, 1); // read far past any item end
+      }
+    }
+    Expect(true,
+           "device fuzz: fw_cfg arbitrary-selector over-read stayed bounded");
+  }
+}
+
 void TestIdeReadWriteSectors() {
   antimal::hv::MemoryBlockDevice disk(8);
   antimal::hv::IdeController ide(&disk);
@@ -3914,6 +3987,7 @@ int main() {
     TestAhciReadSectors();
     TestAhciReadDma28HighLba();
     TestAhciAdversarialDma();
+    TestDeviceIoFuzz();
     TestJsonValueParser();
     TestBridgeRouter();
     TestBridgeFuzz();
