@@ -9533,7 +9533,39 @@ DetonationResult InHouseOrchestrator::PrepareAndRun(
              std::filesystem::exists(runConfig.baseVhdxPath)) {
     result.overlayDiskPath = result.runDir / "disk" / "overlay.cow";
     std::string overlayError;
-    if (CreateRawCowOverlay(result.overlayDiskPath, &overlayError)) {
+    // ANTIMAL_SEED_OVERLAY=<path>: pre-seed this run's overlay from a saved
+    // post-OOBE desktop overlay (an AMCOW1 file) instead of empty, so the VM
+    // boots straight to that desktop state (writes append on top). This is the
+    // "snapshot" fast-boot path; the seed file is copied, never modified.
+    bool overlaySeeded = false;
+    {
+      char seedBuf[1024]{};
+      size_t seedNeeded = 0;
+      if (getenv_s(&seedNeeded, seedBuf, sizeof(seedBuf),
+                   "ANTIMAL_SEED_OVERLAY") == 0 &&
+          seedNeeded > 1 && seedBuf[0] != '\0') {
+        const std::filesystem::path seedPath(seedBuf);
+        std::error_code seedEc;
+        if (std::filesystem::exists(seedPath, seedEc)) {
+          std::filesystem::create_directories(
+              result.overlayDiskPath.parent_path(), seedEc);
+          std::filesystem::copy_file(
+              seedPath, result.overlayDiskPath,
+              std::filesystem::copy_options::overwrite_existing, seedEc);
+          overlaySeeded = !seedEc;
+          AppendJournalEvent(
+              result.journalPath,
+              MakeSandboxEvent(overlaySeeded ? "overlay.seeded"
+                                             : "overlay.seed-failed",
+                               result.overlayDiskPath,
+                               {{"seed", PathToUtf8(seedPath)},
+                                {"format", "vhdx-cow"}}),
+              &events);
+        }
+      }
+    }
+    if (overlaySeeded ||
+        CreateRawCowOverlay(result.overlayDiskPath, &overlayError)) {
       AppendJournalEvent(result.journalPath,
                          MakeSandboxEvent("overlay.created", result.overlayDiskPath,
                                           {{"parent", PathToUtf8(runConfig.baseVhdxPath)},
@@ -9772,23 +9804,22 @@ DetonationResult InHouseOrchestrator::PrepareAndRun(
             // live OOBE screen wins, and extra firings hit the desktop harmlessly
             // (Shift+F10 opens a console, the typed text/Enters are inert there).
             const std::vector<uint8_t> shiftF10{0x2A, 0x44, 0xC4, 0xAA};
-            std::vector<uint8_t> cmd;
-            appendKeys(cmd, "start ms-cxh:localonly");
-            cmd.push_back(0x1C);
-            cmd.push_back(0x9C);
-            std::vector<uint8_t> name;
-            appendKeys(name, "antimal");
-            name.push_back(0x1C);
-            name.push_back(0x9C);
+            // ms-cxh:localonly is BLOCKED in Win11 25H2 (build 26200): it returns
+            // "Access is denied / token does not exist". So instead run a
+            // pre-placed OOBE-completion script (c:\antimal-oobe.cmd, written into
+            // the base) from the Shift+F10 Administrator console: it creates a
+            // local admin, sets AutoAdminLogon, marks OOBE complete, and reboots
+            // straight to the desktop. The path uses only appendKeys-typable
+            // (lowercase) chars; the script is self-guarded against re-runs.
+            std::vector<uint8_t> runScript;
+            appendKeys(runScript, "c:\\antimal-oobe.cmd");
+            runScript.push_back(0x1C);
+            runScript.push_back(0x9C);
             for (int off : {0, 150, 300, 450, 600}) {
               const auto o = base + seconds{off};
-              bursts.push_back({o, enter});               // dismiss any focused button
-              bursts.push_back({o + seconds{4}, shiftF10}); // open a console
-              bursts.push_back({o + seconds{9}, cmd});      // ms-cxh:localonly
-              bursts.push_back({o + seconds{26}, name});    // local-account name
-              for (int i = 0; i < 6; ++i) {
-                bursts.push_back({o + seconds{34 + i * 6}, enter}); // finish flow
-              }
+              bursts.push_back({o, enter});                   // dismiss a focused dialog
+              bursts.push_back({o + seconds{4}, shiftF10});   // open a console
+              bursts.push_back({o + seconds{10}, runScript}); // run OOBE-complete script
             }
           }
         }
