@@ -9900,42 +9900,54 @@ DetonationResult InHouseOrchestrator::PrepareAndRun(
             const auto base = milliseconds{static_cast<int64_t>(startSec) * 1000};
             auto &bursts = request.keyboardBursts;
             const std::vector<uint8_t> enter{0x1C, 0x9C};
-            // Append Set-1 make/break scancodes for an ASCII string (US layout;
-            // shift-wrapped for ':').
-            auto appendKeys = [](std::vector<uint8_t> &v, const std::string &s) {
-              auto makeCode = [](char c, bool &shift) -> int {
-                shift = false;
-                if (c >= 'a' && c <= 'z') {
-                  static const uint8_t L[] = {
-                      0x1E, 0x30, 0x2E, 0x20, 0x12, 0x21, 0x22, 0x23, 0x17,
-                      0x24, 0x25, 0x26, 0x32, 0x31, 0x18, 0x19, 0x10, 0x13,
-                      0x1F, 0x14, 0x16, 0x2F, 0x11, 0x2D, 0x15, 0x2C};
-                  return L[c - 'a'];
-                }
-                if (c >= '0' && c <= '9') {
-                  static const uint8_t D[] = {0x0B, 0x02, 0x03, 0x04, 0x05,
-                                              0x06, 0x07, 0x08, 0x09, 0x0A};
-                  return D[c - '0'];
-                }
-                switch (c) {
-                case ' ': return 0x39;
-                case '-': return 0x0C;
-                case '.': return 0x34;
-                case '\\': return 0x2B;
-                case '/': return 0x35;
-                case ':': shift = true; return 0x27;
-                default: return -1;
-                }
-              };
+            // Set-1 scancode for an ASCII char (US layout; shift-wrapped ':').
+            auto makeCode = [](char c, bool &shift) -> int {
+              shift = false;
+              if (c >= 'a' && c <= 'z') {
+                static const uint8_t L[] = {
+                    0x1E, 0x30, 0x2E, 0x20, 0x12, 0x21, 0x22, 0x23, 0x17,
+                    0x24, 0x25, 0x26, 0x32, 0x31, 0x18, 0x19, 0x10, 0x13,
+                    0x1F, 0x14, 0x16, 0x2F, 0x11, 0x2D, 0x15, 0x2C};
+                return L[c - 'a'];
+              }
+              if (c >= '0' && c <= '9') {
+                static const uint8_t D[] = {0x0B, 0x02, 0x03, 0x04, 0x05,
+                                            0x06, 0x07, 0x08, 0x09, 0x0A};
+                return D[c - '0'];
+              }
+              switch (c) {
+              case ' ': return 0x39;
+              case '-': return 0x0C;
+              case '.': return 0x34;
+              case '\\': return 0x2B;
+              case '/': return 0x35;
+              case ':': shift = true; return 0x27;
+              default: return -1;
+              }
+            };
+            // Type a string into the guest PACED -- one keystroke per ~80ms burst
+            // from startMs. Dumping a whole string into the PS/2 queue at once
+            // makes the guest keyboard stack mangle consecutive keys (the same
+            // bug that made the login password wrong); per-keystroke spacing is
+            // what fixed the login, so the OOBE console path must be paced too --
+            // a mangled c:\antimal-oobe.cmd runs nothing and OOBE never completes.
+            // Returns the ms offset just past the last keystroke.
+            auto pacedType = [&](milliseconds startMs,
+                                 const std::string &s) -> int64_t {
+              int64_t ms = startMs.count();
               for (char c : s) {
                 bool shift = false;
                 const int code = makeCode(c, shift);
                 if (code < 0) continue;
-                if (shift) v.push_back(0x2A); // LShift make
-                v.push_back(static_cast<uint8_t>(code));
-                v.push_back(static_cast<uint8_t>(code | 0x80));
-                if (shift) v.push_back(0xAA); // LShift break
+                std::vector<uint8_t> k;
+                if (shift) k.push_back(0x2A); // LShift make
+                k.push_back(static_cast<uint8_t>(code));
+                k.push_back(static_cast<uint8_t>(code | 0x80));
+                if (shift) k.push_back(0xAA); // LShift break
+                bursts.push_back({milliseconds{ms}, k});
+                ms += 80;
               }
+              return ms;
             };
             // Timing-robust bypass. The un-accelerated VM's OOBE reaches the
             // network/account screens at a VARIABLE time (observed ~330s one run,
@@ -9954,15 +9966,13 @@ DetonationResult InHouseOrchestrator::PrepareAndRun(
             // local admin, sets AutoAdminLogon, marks OOBE complete, and reboots
             // straight to the desktop. The path uses only appendKeys-typable
             // (lowercase) chars; the script is self-guarded against re-runs.
-            std::vector<uint8_t> runScript;
-            appendKeys(runScript, "c:\\antimal-oobe.cmd");
-            runScript.push_back(0x1C);
-            runScript.push_back(0x9C);
             for (int off : {0, 150, 300, 450, 600}) {
-              const auto o = base + seconds{off};
-              bursts.push_back({o, enter});                   // dismiss a focused dialog
-              bursts.push_back({o + seconds{4}, shiftF10});   // open a console
-              bursts.push_back({o + seconds{10}, runScript}); // run OOBE-complete script
+              const milliseconds o = base + seconds{off};
+              bursts.push_back({o, enter});                  // dismiss a focused dialog
+              bursts.push_back({o + seconds{4}, shiftF10});  // open an admin console
+              // Paced type of the script path into the console, then Enter to run.
+              const int64_t end = pacedType(o + seconds{10}, "c:\\antimal-oobe.cmd");
+              bursts.push_back({milliseconds{end}, enter});
             }
           }
         }
