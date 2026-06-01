@@ -18,6 +18,7 @@
   var nextReqId = 1, pending = new Map();
   var state = { scans: [] };
   var currentPage = 'dashboard';
+  var livePollTimer = null;
   function send(cmd, args) {
     var reqId = nextReqId++;
     return new Promise(function (resolve) {
@@ -115,7 +116,10 @@
     },
     vm: function () {
       var steps = [['OVMF firmware', 'done'], ['bootmgfw.efi', 'done'], ['winload.efi', 'done'], ['ntoskrnl', 'done'], ['AHCI storage mount', 'done'], ['win32k / GUI stack', 'done'], ['Getting Ready (OOBE)', 'done'], ['GuestAgent heartbeat', 'cur'], ['Artifact return', 'todo']];
-      return '<h1 class="page-title">VM Analysis</h1><p class="page-sub">In-house WHP sandbox: state, controls, boot timeline, and safety gates.</p>' +
+      return '<h1 class="page-title">VM Analysis</h1><p class="page-sub">In-house WHP sandbox: live view, state, boot timeline, and safety gates.</p>' +
+        '<div class="panel"><h2>Live VM <span id="vm-live-status" class="page-sub" style="font-weight:400"></span></h2>' +
+        '<div class="actions"><button class="btn primary" id="vm-boot-btn">Boot VM (live)</button><button class="btn" id="vm-stop-btn">Stop</button></div>' +
+        '<div class="screenframe" id="live-frame" style="margin-top:12px">Click “Boot VM (live)” to start an isolated VM session and watch it here.</div></div>' +
         '<div class="row"><div class="panel" style="flex:1;min-width:280px"><h2>VM State</h2>' +
         '<div id="vm-state"><p class="page-sub" style="margin:0">Loading…</p></div>' +
         '<div class="actions" style="margin-top:12px"><button class="btn">Stage Sample</button><button class="btn primary">Boot VM</button><button class="btn">Stop VM</button><button class="btn danger" disabled title="Disabled until safety gates pass">Detonate Selected</button></div></div>' +
@@ -325,7 +329,35 @@
       if (!r || !r.ok) appendLog('ERROR', 'Dashboard load failed: ' + String((r && r.error) || 'unknown'));
     });
   }
+  function stopLivePoll() { if (livePollTimer) { clearInterval(livePollTimer); livePollTimer = null; } }
+  function startLivePoll() {
+    stopLivePoll();
+    livePollTimer = setInterval(function () {
+      var box = $('#live-frame');
+      if (!box) { stopLivePoll(); return; } // navigated away from VM page
+      send('vm.frame').then(function (r) {
+        var f = (r && r.result && r.result.frame) || '';
+        if (!f) return;
+        var img = document.getElementById('live-frame-img');
+        if (!img) { box.innerHTML = ''; img = document.createElement('img'); img.id = 'live-frame-img'; box.appendChild(img); }
+        img.src = f;
+      });
+    }, 1500);
+  }
   function loadVm() {
+    var bb = $('#vm-boot-btn');
+    if (bb) bb.onclick = function () {
+      appendLog('INFO', 'Booting live VM…');
+      var s = $('#vm-live-status'); if (s) s.textContent = '· starting…';
+      send('vm.boot').then(function (r) {
+        var ok = r && r.ok && r.result && r.result.started;
+        appendLog(ok ? 'INFO' : 'ERROR', ok ? ('Live VM booting' + (r.result.seeded ? ' from snapshot' : ' (full OOBE)') + '…') : 'VM boot failed: ' + String((r && r.result && r.result.error) || 'unknown'));
+        if (ok && s) s.textContent = r.result.seeded ? '· booting from snapshot' : '· booting (full OOBE)';
+        if (ok) startLivePoll();
+      });
+    };
+    var sb = $('#vm-stop-btn');
+    if (sb) sb.onclick = function () { send('vm.stop'); stopLivePoll(); appendLog('WARN', 'Live VM stopped.'); var box = $('#live-frame'); if (box) box.textContent = 'Stopped.'; var s = $('#vm-live-status'); if (s) s.textContent = '· stopped'; };
     send('config.get').then(function (r) {
       var c = (r && r.ok && r.result) ? r.result : {};
       var net = c.networkMode || 'disabled';

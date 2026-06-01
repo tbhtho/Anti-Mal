@@ -42,6 +42,7 @@ private:
   Microsoft::WRL::ComPtr<ICoreWebView2Controller> controller_;
   Microsoft::WRL::ComPtr<ICoreWebView2> webview_;
   BridgeRouter router_;
+  unsigned long vmPid_ = 0; // PID of the spawned live-VM HostCli process (P1).
 };
 
 } // namespace antimal

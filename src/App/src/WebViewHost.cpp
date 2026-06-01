@@ -763,6 +763,131 @@ void WebViewHost::RegisterHandlers() {
     }).detach();
     return std::string(R"({"watching":true})");
   });
+
+  // ---- P1: live VM (3c). The VM runs in a SEPARATE AntiMal.HostCli process
+  // (isolated from this UI process -- the escape-safety win); the UI polls
+  // vm.frame for the live framebuffer served read-only via runs.antimal.local.
+
+  // Newest run dir by mtime that has a screenshots/ dir = the active detonation
+  // (FindNewestRun needs report.json, which only exists after the run ends).
+  router_.Register("vm.frame", [](const JsonValue &) -> std::string {
+    namespace fs = std::filesystem;
+    const AppConfig c = LoadConfig(DefaultConfigPath());
+    std::error_code ec;
+    fs::path best;
+    unsigned long long bestT = 0;
+    if (fs::is_directory(c.workspaceRoot, ec)) {
+      for (const auto &e : fs::directory_iterator(c.workspaceRoot, ec)) {
+        if (!e.is_directory(ec)) {
+          continue;
+        }
+        const std::wstring name = e.path().filename().wstring();
+        if (name.empty() || name[0] == L'_') {
+          continue;
+        }
+        if (!fs::exists(e.path() / L"screenshots", ec)) {
+          continue;
+        }
+        WIN32_FILE_ATTRIBUTE_DATA fad{};
+        if (!GetFileAttributesExW(e.path().c_str(), GetFileExInfoStandard,
+                                  &fad)) {
+          continue;
+        }
+        ULARGE_INTEGER t{};
+        t.LowPart = fad.ftLastWriteTime.dwLowDateTime;
+        t.HighPart = fad.ftLastWriteTime.dwHighDateTime;
+        if (t.QuadPart >= bestT) {
+          bestT = t.QuadPart;
+          best = e.path();
+        }
+      }
+    }
+    if (best.empty()) {
+      return std::string(R"({"frame":""})");
+    }
+    const std::string dirName = Narrow(best.filename().wstring().c_str());
+    std::wstring newest;
+    for (const auto &f : fs::directory_iterator(best / L"screenshots", ec)) {
+      const std::wstring fn = f.path().filename().wstring();
+      if (fn.rfind(L"guest-", 0) == 0 && fn.size() > 4 &&
+          fn.compare(fn.size() - 4, 4, L".png") == 0 && fn > newest) {
+        newest = fn;
+      }
+    }
+    if (newest.empty()) {
+      return std::string(R"({"frame":""})");
+    }
+    const std::string url = std::string("https://runs.antimal.local/") + dirName +
+                            "/screenshots/" + Narrow(newest.c_str());
+    return std::string("{\"frame\":") + JsonQuote(url) +
+           ",\"run\":" + JsonQuote(dirName) + "}";
+  });
+
+  // Boot the VM live: spawn HostCli detonate with the fast-boot env (seed the
+  // desktop snapshot if present, else run full OOBE automation).
+  router_.Register("vm.boot", [this](const JsonValue &) -> std::string {
+    namespace fs = std::filesystem;
+    const AppConfig c = LoadConfig(DefaultConfigPath());
+    const std::wstring dir = ExeDir();
+    const fs::path hostCli = fs::path(dir) / L"AntiMal.HostCli.exe";
+    const fs::path sample = fs::path(dir) / L"AntiMal.Tests.exe";
+    const fs::path seed = c.workspaceRoot / L"_base" / L"AntiMalDesktop.cow";
+    std::error_code ec;
+    if (!fs::exists(hostCli, ec)) {
+      return std::string(R"({"started":false,"error":"HostCli missing"})");
+    }
+    SetEnvironmentVariableW(L"ANTIMAL_FIRMWARE_NAME", L"OVMF-debug.fd");
+    SetEnvironmentVariableW(L"ANTIMAL_VCPU_COUNT", L"1");
+    SetEnvironmentVariableW(L"ANTIMAL_PROBE_CI_POLICY_OFF", L"1");
+    SetEnvironmentVariableW(L"ANTIMAL_PROBE_CI_POLICY_OFF_AGGRESSIVE", L"1");
+    SetEnvironmentVariableW(L"ANTIMAL_PROBE_BCD_NOINTEGRITYCHECKS", L"1");
+    SetEnvironmentVariableW(L"ANTIMAL_PROBE_BCD_LEGACY_CONTEXT", L"1");
+    SetEnvironmentVariableW(L"ANTIMAL_PROBE_BCD_HYPERVISOR_LAUNCH_OFF", L"1");
+    SetEnvironmentVariableW(L"ANTIMAL_PROBE_SYSTEM_VBS_COMPAT", L"1");
+    const bool seeded = fs::exists(seed, ec);
+    if (seeded) {
+      SetEnvironmentVariableW(L"ANTIMAL_SEED_OVERLAY", seed.c_str());
+      SetEnvironmentVariableW(L"ANTIMAL_PROBE_OOBE_KEYS", nullptr);
+      SetEnvironmentVariableW(L"ANTIMAL_PROBE_PRESS_ENTER_SEC", L"40");
+    } else {
+      SetEnvironmentVariableW(L"ANTIMAL_SEED_OVERLAY", nullptr);
+      SetEnvironmentVariableW(L"ANTIMAL_PROBE_OOBE_KEYS", L"250");
+      SetEnvironmentVariableW(L"ANTIMAL_PROBE_PRESS_ENTER_SEC", nullptr);
+    }
+    std::wstring cmd = L"\"" + hostCli.wstring() + L"\" detonate \"" +
+                       sample.wstring() +
+                       L"\" --network disabled --timeout-sec 1200";
+    std::vector<wchar_t> cmdBuf(cmd.begin(), cmd.end());
+    cmdBuf.push_back(0);
+    STARTUPINFOW si{};
+    si.cb = sizeof(si);
+    PROCESS_INFORMATION pi{};
+    const BOOL ok =
+        CreateProcessW(nullptr, cmdBuf.data(), nullptr, nullptr, FALSE,
+                       CREATE_NO_WINDOW, nullptr, dir.c_str(), &si, &pi);
+    if (!ok) {
+      return std::string(R"({"started":false,"error":"spawn failed"})");
+    }
+    vmPid_ = pi.dwProcessId;
+    CloseHandle(pi.hThread);
+    CloseHandle(pi.hProcess);
+    return std::string("{\"started\":true,\"seeded\":") +
+           (seeded ? "true" : "false") + "}";
+  });
+
+  // Stop the live VM (terminate the spawned HostCli process).
+  router_.Register("vm.stop", [this](const JsonValue &) -> std::string {
+    if (vmPid_ == 0) {
+      return std::string(R"({"stopped":false})");
+    }
+    HANDLE hP = OpenProcess(PROCESS_TERMINATE, FALSE, vmPid_);
+    if (hP) {
+      TerminateProcess(hP, 1);
+      CloseHandle(hP);
+    }
+    vmPid_ = 0;
+    return std::string(R"({"stopped":true})");
+  });
 }
 
 int WebViewHost::Run(HINSTANCE hInstance, int nCmdShow) {
