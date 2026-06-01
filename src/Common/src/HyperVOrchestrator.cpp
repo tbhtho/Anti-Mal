@@ -10234,15 +10234,16 @@ DetonationResult InHouseOrchestrator::PrepareAndRun(
           }
         }
       }
-      // Post-reboot generations default to MORE vCPUs than the first boot. A
-      // 1-vCPU first boot gets cleanly through specialize+OOBE (side-stepping
-      // the 2-vCPU AP-bringup race), but the post-reboot first-logon "Getting
-      // ready" finalization is heavier SMP work that deadlocks on a
-      // 1-CPU-hostile kernel spinlock when there is only one vCPU (observed:
-      // guestReboots:1 then a frozen "Getting ready" spinner). So reboots get 2
-      // vCPUs by default; ANTIMAL_POST_REBOOT_VCPU_COUNT overrides (set equal to
-      // ANTIMAL_VCPU_COUNT to disable the bump).
-      uint32_t postRebootVcpuCount = 2;
+      // Per-generation vCPU control for the reboot loop. Motivation: a 1-vCPU
+      // post-reboot first-logon "Getting ready" deadlocks on a 1-CPU-hostile
+      // kernel spinlock (observed: frozen spinner). BUT bumping reboots to 2
+      // vCPUs trades that for the 2-vCPU AP-bringup race in firmware MP init
+      // (observed: stuck at the OVMF "starting Boot0002" screen). So neither
+      // count alone reaches the desktop yet -- the real fix is the AP-bringup
+      // race in the VMM. Default therefore = the first-boot count (behavior
+      // neutral); ANTIMAL_POST_REBOOT_VCPU_COUNT opts into a different count for
+      // experimentation once the AP race is fixed.
+      uint32_t postRebootVcpuCount = vmOptions.processorCount;
       {
         char buf[16]{};
         size_t needed = 0;
