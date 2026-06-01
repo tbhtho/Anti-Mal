@@ -4,6 +4,7 @@
 #include "antimal/GuestMonitor.h"
 #include "antimal/HostChannel.h"
 #include "antimal/Json.h"
+#include "antimal/ProcessTelemetry.h"
 #include "antimal/Report.h"
 #include "antimal/Screenshot.h"
 
@@ -199,6 +200,15 @@ int RunHostChannelLoop(std::string reason, bool serviceMode) {
 
   antimal::HostSerialChannel incoming;
   bool healthcheckComplete = false;
+  // Live process telemetry: snapshot the guest process table every few ticks
+  // and stream the deltas (process.start/stop) to the host over COM2. The very
+  // first snapshot emits a capped "process.running" baseline so the host's live
+  // process panel shows what is already running.
+  antimal::ProcessSnapshot knownProcs;
+  bool processBaselineSent = false;
+  constexpr uint32_t kProcessPollEveryTicks = 2; // ~2s between snapshots
+  constexpr size_t kProcessBaselineCap = 64;
+  constexpr size_t kProcessDeltaCap = 64;
   uint32_t tick = 0;
   const uint32_t maxTicks = serviceMode ? 24u * 60u * 60u : 120u;
   while (!g_stopRequested.load() && tick < maxTicks) {
@@ -233,6 +243,24 @@ int RunHostChannelLoop(std::string reason, bool serviceMode) {
       CloseHandle(com2);
       return 1;
     }
+
+    if (tick % kProcessPollEveryTicks == 0) {
+      auto current = antimal::CaptureProcessSnapshot();
+      if (!current.empty() || processBaselineSent) {
+        auto procEvents = antimal::DiffProcessSnapshots(
+            knownProcs, current, !processBaselineSent, kProcessBaselineCap,
+            kProcessDeltaCap);
+        processBaselineSent = true;
+        knownProcs = std::move(current);
+        for (const auto &ev : procEvents) {
+          if (!SendAgentEvent(com2, ev)) {
+            CloseHandle(com2);
+            return 1;
+          }
+        }
+      }
+    }
+
     ++tick;
     std::this_thread::sleep_for(std::chrono::seconds(1));
   }

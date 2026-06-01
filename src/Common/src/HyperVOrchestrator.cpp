@@ -7327,7 +7327,8 @@ HostChannelCapture ProcessHostChannelOutput(
     const std::string &hostChannelOutput,
     const std::filesystem::path &journalPath,
     const std::filesystem::path &artifactsDir,
-    std::vector<EventRecord> *events) {
+    std::vector<EventRecord> *events,
+    bool journalEvents = true) {
   HostChannelCapture capture;
   hv::HostSerialChannel channel;
   channel.PushBytes(reinterpret_cast<const uint8_t *>(hostChannelOutput.data()),
@@ -7346,7 +7347,12 @@ HostChannelCapture ProcessHostChannelOutput(
       break;
     case hv::HostChannelMessage::Event: {
       auto event = ParseEventJsonLine(payload);
-      AppendJournalEvent(journalPath, event, events);
+      // Interactive sessions journal events live (in the progress callback) so
+      // the UI can tail them in real time; re-journaling the same frames here
+      // post-run would duplicate them.
+      if (journalEvents) {
+        AppendJournalEvent(journalPath, event, events);
+      }
       ++capture.eventsReturned;
       break;
     }
@@ -9696,6 +9702,12 @@ DetonationResult InHouseOrchestrator::PrepareAndRun(
           request.liveInputPath = std::filesystem::path(liBuf);
         }
       }
+      // A live-input path means a human is driving the VM from the UI (the
+      // interactive "freely interact" view). Such a session must NOT be
+      // auto-stopped when the GuestAgent first checks in (that early stop is the
+      // non-interactive "is the agent alive?" probe), and its telemetry is
+      // journaled live below so the UI can tail it in real time.
+      const bool interactiveSession = !request.liveInputPath.empty();
       request.timeout = std::chrono::milliseconds(
           static_cast<int64_t>(std::max<uint32_t>(1, timeoutSec)) * 1000);
       // A Windows boot with CMOS/PM-timer polling spends millions of steps
@@ -9848,10 +9860,12 @@ DetonationResult InHouseOrchestrator::PrepareAndRun(
       const std::string runIdCopy = result.runId;
       const std::filesystem::path runDirCopy = result.runDir;
       const std::filesystem::path screenshotsDirCopy = result.screenshotsDir;
+      const std::filesystem::path journalPathCopy = result.journalPath;
       auto frameCounter = std::make_shared<std::atomic<uint32_t>>(0);
       auto realFrameCounter = std::make_shared<std::atomic<uint32_t>>(0);
       request.progressCallback = [progressCallback, runIdCopy, runDirCopy,
-                                  screenshotsDirCopy, frameCounter,
+                                  screenshotsDirCopy, journalPathCopy,
+                                  interactiveSession, frameCounter,
                                   realFrameCounter, liveHostChannel,
                                   liveHeartbeatCount,
                                   stopAfterGuestAgentProbe](
@@ -9890,13 +9904,30 @@ DetonationResult InHouseOrchestrator::PrepareAndRun(
                 const uint32_t count =
                     liveHeartbeatCount->fetch_add(1, std::memory_order_relaxed) +
                     1;
-                if (count >= 2) {
+                // The 2-heartbeat auto-stop is the non-interactive "agent is
+                // alive" probe. In an interactive session the human keeps the
+                // VM running, so never auto-stop on heartbeats there.
+                if (!interactiveSession && count >= 2) {
                   stopAfterGuestAgentProbe->store(true,
                                                   std::memory_order_relaxed);
                 }
+              } else if (frame->type == hv::HostChannelMessage::Event) {
+                // Live telemetry stream: journal each process/file/network
+                // event as it arrives so the UI's run.watch tail surfaces it in
+                // real time. Only interactive sessions journal live (the
+                // post-run ProcessHostChannelOutput handles non-interactive
+                // runs and would otherwise double-write these frames).
+                if (interactiveSession) {
+                  const std::string payload(frame->payload.begin(),
+                                            frame->payload.end());
+                  AppendJournalEvent(journalPathCopy,
+                                     ParseEventJsonLine(payload), nullptr);
+                }
               } else if (frame->type == hv::HostChannelMessage::ReportComplete) {
-                stopAfterGuestAgentProbe->store(true,
-                                                std::memory_order_relaxed);
+                if (!interactiveSession) {
+                  stopAfterGuestAgentProbe->store(true,
+                                                  std::memory_order_relaxed);
+                }
               }
             }
           }
@@ -10266,7 +10297,8 @@ DetonationResult InHouseOrchestrator::PrepareAndRun(
       AddResidualOwnerMilestones(&bootSignals, windowsResidualOwners);
       const auto hostCapture =
           ProcessHostChannelOutput(vmSummary.hostChannelOutput, result.journalPath,
-                                   result.artifactsDir, &events);
+                                   result.artifactsDir, &events,
+                                   /*journalEvents=*/!interactiveSession);
       result.dynamicSummary.bootMilestones = bootSignals.milestones;
       if (vmSummary.fwCfgSmbiosAnchorBytesRead != 0 ||
           vmSummary.fwCfgSmbiosTableBytesRead != 0) {

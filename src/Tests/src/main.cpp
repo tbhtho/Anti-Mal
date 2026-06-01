@@ -12,6 +12,7 @@
 #include "antimal/Json.h"
 #include "antimal/JsonValue.h"
 #include "antimal/PeParser.h"
+#include "antimal/ProcessTelemetry.h"
 #include "antimal/Report.h"
 #include "antimal/Scanner.h"
 #include "antimal/Screenshot.h"
@@ -282,6 +283,66 @@ void TestHostSerialChannelFrames() {
   channel.PushBytes(corrupt);
   Expect(channel.PendingFrameCount() == 0,
          "serial channel: checksum rejects corrupt frame");
+}
+
+void TestProcessTelemetryDiff() {
+  using antimal::ProcessInfo;
+  using antimal::ProcessSnapshot;
+
+  ProcessSnapshot t0;
+  t0[4] = ProcessInfo{0, "System"};
+  t0[100] = ProcessInfo{4, "smss.exe"};
+  t0[200] = ProcessInfo{100, "explorer.exe"};
+
+  // First snapshot: emit a baseline of everything currently running.
+  auto baseline = antimal::DiffProcessSnapshots({}, t0, true, 64, 64);
+  Expect(baseline.size() == 3, "proc telemetry: baseline emits all running");
+  Expect(baseline[0].category == "process" && baseline[0].source == "GuestAgent",
+         "proc telemetry: baseline event shape");
+  Expect(baseline[0].action == "process.running",
+         "proc telemetry: baseline action");
+
+  // Baseline cap is honored.
+  auto capped = antimal::DiffProcessSnapshots({}, t0, true, 2, 64);
+  Expect(capped.size() == 2, "proc telemetry: baseline cap honored");
+
+  // Delta: one new process appears, one exits.
+  ProcessSnapshot t1 = t0;
+  t1.erase(100);                          // smss.exe exited
+  t1[300] = ProcessInfo{200, "malware.exe"}; // new child of explorer
+  auto delta = antimal::DiffProcessSnapshots(t0, t1, false, 64, 64);
+  Expect(delta.size() == 2, "proc telemetry: delta emits start+stop only");
+  bool sawStart = false, sawStop = false;
+  for (const auto &ev : delta) {
+    if (ev.action == "process.start" && ev.processId == 300) {
+      sawStart = true;
+      Expect(ev.parentProcessId == 200, "proc telemetry: start ppid carried");
+      Expect(ev.imagePath == "malware.exe", "proc telemetry: start image carried");
+    }
+    if (ev.action == "process.stop" && ev.processId == 100) {
+      sawStop = true;
+    }
+  }
+  Expect(sawStart, "proc telemetry: new process -> process.start");
+  Expect(sawStop, "proc telemetry: exited process -> process.stop");
+
+  // No change between snapshots -> no events.
+  auto stable = antimal::DiffProcessSnapshots(t0, t0, false, 64, 64);
+  Expect(stable.empty(), "proc telemetry: unchanged table -> no events");
+
+  // Start cap limits process.start volume even with many new processes.
+  ProcessSnapshot many = t0;
+  for (uint32_t pid = 1000; pid < 1010; ++pid) {
+    many[pid] = ProcessInfo{200, "x.exe"};
+  }
+  auto deltaCapped = antimal::DiffProcessSnapshots(t0, many, false, 64, 3);
+  size_t starts = 0;
+  for (const auto &ev : deltaCapped) {
+    if (ev.action == "process.start") {
+      ++starts;
+    }
+  }
+  Expect(starts == 3, "proc telemetry: delta start cap honored");
 }
 
 void TestCom2UartFrames() {
@@ -3970,6 +4031,7 @@ int main() {
     TestCowRawBlockDeviceOverlay();
     TestJobMediaBlockDevice();
     TestHostSerialChannelFrames();
+    TestProcessTelemetryDiff();
     TestCom2UartFrames();
     TestPs2QueuedInput();
     TestTpm2CrbDevice();
