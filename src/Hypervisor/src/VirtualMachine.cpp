@@ -1214,6 +1214,14 @@ VmRunSummary VirtualMachine::RunLoop(
         }
         return false;
       };
+      // The AP only got its LVT timer injected on HLT exits, but a kernel
+      // SMP-sync rendezvous keeps the AP CPUID-spinning (apHltExits:0,
+      // apCpuidExits high) -- never halting -- so its LVT timer never fired and
+      // any timer-dependent AP wait spun forever while the BSP spun for it
+      // (the +0x2916EC two-vCPU hang). Pump the AP's LVT timer on CPUID exits
+      // too, gated to the timer interval. Safe because the AP is paused at the
+      // exit when this runs.
+      auto apLastPump = std::chrono::steady_clock::now();
       while (!stop.stop_requested() && !stopAps.load(std::memory_order_relaxed)) {
         try {
           const auto reason = cpu->Run();
@@ -1228,6 +1236,13 @@ VmRunSummary VirtualMachine::RunLoop(
           case WHvRunVpExitReasonX64Cpuid:
             apCpuidExits.fetch_add(1, std::memory_order_relaxed);
             cpu->EmulateCpuidExit();
+            {
+              const auto nowAp = std::chrono::steady_clock::now();
+              if (nowAp - apLastPump >= kTimerInterval) {
+                apLastPump = nowAp;
+                injectLapicTimer(*cpu);
+              }
+            }
             break;
           case WHvRunVpExitReasonX64Halt:
             apHltExits.fetch_add(1, std::memory_order_relaxed);
