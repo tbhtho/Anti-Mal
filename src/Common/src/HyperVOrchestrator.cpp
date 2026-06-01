@@ -9810,23 +9810,46 @@ DetonationResult InHouseOrchestrator::PrepareAndRun(
             default: return -1;
             }
           };
-          std::vector<uint8_t> typePwd;
+          // Build the attempt as a list of INDIVIDUAL keystrokes, each its own
+          // tiny burst. CRITICAL: the scancodes must be PACED — injecting a
+          // whole password into the PS/2 queue in one instant makes the guest
+          // keyboard stack mishandle consecutive keys (verified: two boots typed
+          // a wrong password into the focused field), whereas the live-input
+          // path injects ~one keystroke per 100ms and logs in fine. So each
+          // keystroke is scheduled ~80ms after the previous one, mimicking that.
+          // Sequence per attempt: Enter (dismiss lock / ack a prior "incorrect"
+          // / focus) -> Backspaces (clear residue) -> password chars -> Enter
+          // (submit). Make+break of a single key stay together (one tap).
+          std::vector<std::vector<uint8_t>> keys;
+          keys.push_back({0x1C, 0x9C}); // Enter: dismiss/ack/focus
+          for (int b = 0; b < 16; ++b) {
+            keys.push_back({0x0E, 0x8E}); // Backspace: clear the field
+          }
           for (size_t i = 0; i < pwdNeeded && pwd[i] != '\0'; ++i) {
             bool shift = false;
             const int code = makeCode(pwd[i], shift);
             if (code < 0) {
               continue;
             }
-            if (shift) typePwd.push_back(0x2A); // LShift make
-            typePwd.push_back(static_cast<uint8_t>(code));
-            typePwd.push_back(static_cast<uint8_t>(code | 0x80));
-            if (shift) typePwd.push_back(0xAA); // LShift break
+            std::vector<uint8_t> k;
+            if (shift) k.push_back(0x2A); // LShift make
+            k.push_back(static_cast<uint8_t>(code));
+            k.push_back(static_cast<uint8_t>(code | 0x80));
+            if (shift) k.push_back(0xAA); // LShift break
+            keys.push_back(std::move(k));
           }
-          typePwd.push_back(0x1C); // Enter make
-          typePwd.push_back(0x9C); // Enter break
-          for (int off : {55, 80, 110, 150, 200, 250}) {
-            request.keyboardBursts.push_back(
-                {milliseconds{static_cast<int64_t>(off) * 1000}, typePwd});
+          keys.push_back({0x1C, 0x9C}); // Enter: submit
+          // Fire several attempts across a wide, late window because the sign-in
+          // field appears late (~t+245s observed); only an attempt that lands on
+          // the focused field logs in. Extra attempts after login are inert.
+          const int64_t spacingMs = 80;
+          for (int off : {120, 180, 240, 300, 360}) {
+            for (size_t k = 0; k < keys.size(); ++k) {
+              request.keyboardBursts.push_back(
+                  {milliseconds{static_cast<int64_t>(off) * 1000 +
+                                static_cast<int64_t>(k) * spacingMs},
+                   keys[k]});
+            }
           }
         }
       }
