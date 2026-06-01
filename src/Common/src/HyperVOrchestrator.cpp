@@ -9686,6 +9686,16 @@ DetonationResult InHouseOrchestrator::PrepareAndRun(
     try {
       hv::VmRunRequest request;
       request.networkMode = ToHvNetworkMode(networkMode);
+      // ANTIMAL_LIVE_INPUT=<file>: the run loop polls this file for raw Set-1
+      // keyboard scancodes appended by the UI process -> live host->guest input.
+      {
+        char liBuf[1024]{};
+        size_t liNeeded = 0;
+        if (getenv_s(&liNeeded, liBuf, sizeof(liBuf), "ANTIMAL_LIVE_INPUT") == 0 &&
+            liNeeded > 1 && liBuf[0] != '\0') {
+          request.liveInputPath = std::filesystem::path(liBuf);
+        }
+      }
       request.timeout = std::chrono::milliseconds(
           static_cast<int64_t>(std::max<uint32_t>(1, timeoutSec)) * 1000);
       // A Windows boot with CMOS/PM-timer polling spends millions of steps

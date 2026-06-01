@@ -532,6 +532,10 @@ struct VmRunRequest {
     std::vector<uint8_t> scancodes;
   };
   std::vector<KeyboardBurst> keyboardBursts;
+  // Live interactive input (host->guest). When set, the run loop polls this file
+  // for newly-appended raw Set-1 keyboard scancodes and injects them into the
+  // PS/2 controller, giving the UI process real-time keyboard control of the VM.
+  std::filesystem::path liveInputPath;
 };
 
 class VirtualMachine {
@@ -598,6 +602,7 @@ private:
   SerialConsole com2_;
   PcIoDevices pcIo_;
   Ps2Controller ps2_;
+  std::filesystem::path liveInputPath_; // live host->guest keyboard input file
   IoApic ioApic_;
   int whpIoApicGpaProbeResult_ = 0;
   uint64_t whpMmioGapBitmap_ = 0;

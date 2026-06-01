@@ -9,6 +9,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <filesystem>
+#include <fstream>
 #include <stdexcept>
 #include <string>
 #include <system_error>
@@ -844,6 +845,11 @@ void WebViewHost::RegisterHandlers() {
     SetEnvironmentVariableW(L"ANTIMAL_PROBE_BCD_LEGACY_CONTEXT", L"1");
     SetEnvironmentVariableW(L"ANTIMAL_PROBE_BCD_HYPERVISOR_LAUNCH_OFF", L"1");
     SetEnvironmentVariableW(L"ANTIMAL_PROBE_SYSTEM_VBS_COMPAT", L"1");
+    // Live interactive keyboard channel: a fresh file the VM run loop polls and
+    // the UI's vm.input appends Set-1 scancodes to.
+    const fs::path liveInput = c.workspaceRoot / L"_live-input.bin";
+    { std::ofstream trunc(liveInput, std::ios::binary | std::ios::trunc); }
+    SetEnvironmentVariableW(L"ANTIMAL_LIVE_INPUT", liveInput.wstring().c_str());
     const bool seeded = fs::exists(seed, ec);
     if (seeded) {
       SetEnvironmentVariableW(L"ANTIMAL_SEED_OVERLAY", seed.c_str());
@@ -887,6 +893,37 @@ void WebViewHost::RegisterHandlers() {
     }
     vmPid_ = 0;
     return std::string(R"({"stopped":true})");
+  });
+
+  // Live interactive keyboard input: append raw Set-1 scancodes (from the UI) to
+  // the live-input file the running VM polls (host->guest real-time keyboard).
+  router_.Register("vm.input", [](const JsonValue &args) -> std::string {
+    const AppConfig c = LoadConfig(DefaultConfigPath());
+    const std::filesystem::path liveInput =
+        c.workspaceRoot / L"_live-input.bin";
+    const JsonValue &codes = args.At("scancodes");
+    if (!codes.IsArray() || codes.array.empty()) {
+      return std::string(R"({"ok":false,"error":"no scancodes"})");
+    }
+    std::vector<uint8_t> bytes;
+    bytes.reserve(codes.array.size());
+    for (const auto &v : codes.array) {
+      const int64_t b = v.AsInt64();
+      if (b >= 0 && b <= 255) {
+        bytes.push_back(static_cast<uint8_t>(b));
+      }
+    }
+    if (bytes.empty()) {
+      return std::string(R"({"ok":false})");
+    }
+    std::ofstream out(liveInput, std::ios::binary | std::ios::app);
+    if (!out) {
+      return std::string(R"({"ok":false})");
+    }
+    out.write(reinterpret_cast<const char *>(bytes.data()),
+              static_cast<std::streamsize>(bytes.size()));
+    return std::string("{\"ok\":true,\"n\":") + std::to_string(bytes.size()) +
+           "}";
   });
 }
 

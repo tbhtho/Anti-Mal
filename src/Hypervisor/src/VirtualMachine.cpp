@@ -1082,6 +1082,7 @@ VmRunSummary VirtualMachine::Run(const VmRunRequest &request) {
   const auto timeout = request.timeout.count() > 0
                            ? request.timeout
                            : std::chrono::milliseconds{1};
+  liveInputPath_ = request.liveInputPath;
   auto summary = RunLoop(request.maxSteps,
                          std::chrono::steady_clock::now() + timeout,
                          request.progressCallback, request.progressInterval,
@@ -1340,6 +1341,15 @@ VmRunSummary VirtualMachine::RunLoop(
   const auto runStarted = std::chrono::steady_clock::now();
   auto lastProgressFire = runStarted;
   bool keyboardInjected = keyboardScancodes.empty();
+  std::uintmax_t liveInputCursor = 0;     // bytes consumed from liveInputPath_
+  if (!liveInputPath_.empty()) {          // skip input that predates this run
+    std::error_code lec0;
+    const auto s0 = std::filesystem::file_size(liveInputPath_, lec0);
+    if (!lec0) {
+      liveInputCursor = s0;
+    }
+  }
+  auto lastLiveInputPoll = runStarted;    // throttle the live-input file poll
   KdSerialDebugger kdDebugger;
   size_t kdCom1Cursor = 0;
   auto queueKdHostReset = [&](const char *reason) {
@@ -2407,6 +2417,30 @@ VmRunSummary VirtualMachine::RunLoop(
             static_cast<int>(burst.scancodes.size());
         burst.scancodes.clear();
         madeProgress = true;
+      }
+    }
+    // Live interactive input: poll the input file (~every 100ms) for bytes the
+    // UI process appended and inject them as Set-1 keyboard scancodes.
+    if (!liveInputPath_.empty() &&
+        now - lastLiveInputPoll >= std::chrono::milliseconds{100}) {
+      lastLiveInputPoll = now;
+      std::error_code lec;
+      const auto sz = std::filesystem::file_size(liveInputPath_, lec);
+      if (!lec && sz > liveInputCursor) {
+        std::ifstream lin(liveInputPath_, std::ios::binary);
+        if (lin) {
+          lin.seekg(static_cast<std::streamoff>(liveInputCursor));
+          std::vector<uint8_t> lbuf(static_cast<size_t>(sz - liveInputCursor));
+          lin.read(reinterpret_cast<char *>(lbuf.data()),
+                   static_cast<std::streamsize>(lbuf.size()));
+          const auto got = static_cast<size_t>(lin.gcount());
+          if (got > 0) {
+            ps2_.InjectKeyboardScancodes(lbuf.data(), got);
+            summary.keyboardScancodesInjected += static_cast<int>(got);
+            liveInputCursor += got;
+            madeProgress = true;
+          }
+        }
       }
     }
     if (progressCallback && now - lastProgressFire >= progressInterval) {
