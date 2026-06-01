@@ -199,6 +199,19 @@ CpuidExitResult Vcpu::EmulateCpuidExit() {
       rdx &= ~(1u << 28);
     }
     break;
+  case 0x00000007u:
+    if (subleaf == 0) {
+      // Hide CET (Control-flow Enforcement Technology). Our WHP guest does not
+      // back the shadow-stack MSRs (IA32_PL3_SSP=0x6A7, IA32_S_CET, ...) or the
+      // WRUSS/WRSS instructions, so when Windows sees CET in CPUID it enables
+      // shadow stacks and then deterministically wedges in ntoskrnl CET setup
+      // (observed: post-OOBE boot frozen at WRUSS right after RDMSR 0x6A7,
+      // ntkrnlmp+0x3E58A4). Same rationale as masking x2APIC/TSC-deadline above:
+      // never advertise a feature this hypervisor cannot faithfully emulate.
+      rcx &= ~(1u << 7);  // CET_SS  (shadow stack)
+      rdx &= ~(1u << 20); // CET_IBT (indirect branch tracking)
+    }
+    break;
   case 0x00000004u:
     // Deterministic cache parameters report cores-per-package in EAX[31:26].
     // Keep the host cache geometry but make the topology match our ACPI MADT.
