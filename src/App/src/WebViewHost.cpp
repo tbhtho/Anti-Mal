@@ -701,12 +701,26 @@ void WebViewHost::RegisterHandlers() {
   router_.Register("run.watch", [this](const JsonValue &args) -> std::string {
     const HWND h = hwnd_;
     const std::string argDir = args.At("runDir").AsString();
-    std::thread([h, argDir]() {
+    // Live mode (the interactive VM view) tails until the VM process exits,
+    // surviving the long, quiet boot phase; replay mode (reports page) stops
+    // after a short stretch of no journal growth.
+    const bool live = args.At("live").AsBool();
+    const unsigned long vmPid = live ? vmPid_ : 0;
+    std::thread([h, argDir, live, vmPid]() {
       CoInitializeEx(nullptr, COINIT_MULTITHREADED);
       namespace fs = std::filesystem;
       const AppConfig c = LoadConfig(DefaultConfigPath());
-      fs::path runDir = argDir.empty() ? FindNewestRun(c.workspaceRoot).dir
-                                       : fs::path(Widen(argDir));
+      // A bare run name (no path separators) is resolved against workspace_root
+      // so the page can pass just the run id returned by vm.frame. During a live
+      // run FindNewestRun() would pick the previous *completed* run (it needs
+      // report.json), so live callers must pass the run explicitly.
+      fs::path runDir;
+      if (argDir.empty()) {
+        runDir = FindNewestRun(c.workspaceRoot).dir;
+      } else {
+        fs::path given(Widen(argDir));
+        runDir = given.is_absolute() ? given : (c.workspaceRoot / given);
+      }
       // Same workspace-confinement guard as run.open: never tail a journal
       // outside workspace_root, even if the page asks for an arbitrary path.
       std::error_code ec;
@@ -729,17 +743,44 @@ void WebViewHost::RegisterHandlers() {
           h, "run.status",
           std::string("{\"state\":\"watching\",\"journal\":") +
               JsonQuote(Narrow(journal.wstring().c_str())) + "}");
-      int empties = 0, streamed = 0;
+      auto vmAlive = [](unsigned long pid) -> bool {
+        if (pid == 0) {
+          return false;
+        }
+        HANDLE hp =
+            OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+        if (!hp) {
+          return false;
+        }
+        DWORD code = 0;
+        const bool alive =
+            GetExitCodeProcess(hp, &code) && code == STILL_ACTIVE;
+        CloseHandle(hp);
+        return alive;
+      };
+      int empties = 0, streamed = 0, postExitDrain = 0;
       const int kMaxEmpties = 8;   // ~2s of no growth on a completed run -> stop
-      const int kMaxEvents = 5000; // safety cap
-      while (empties < kMaxEmpties && streamed < kMaxEvents) {
+      const int kMaxEvents = live ? 200000 : 5000; // safety cap
+      for (;;) {
+        if (streamed >= kMaxEvents) {
+          break;
+        }
         const std::vector<EventRecord> evs = tailer.PullNew();
         if (evs.empty()) {
-          ++empties;
+          if (live) {
+            // Keep tailing while the VM process runs (the boot phase is quiet
+            // for minutes); once it exits, drain briefly then stop.
+            if (!vmAlive(vmPid) && ++postExitDrain >= 4) {
+              break;
+            }
+          } else if (++empties >= kMaxEmpties) {
+            break;
+          }
           std::this_thread::sleep_for(std::chrono::milliseconds(250));
           continue;
         }
         empties = 0;
+        postExitDrain = 0;
         for (const EventRecord &ev : evs) {
           JsonObjectBuilder eo;
           eo.AddString("time", ev.timestampUtc);
