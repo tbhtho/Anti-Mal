@@ -10234,6 +10234,27 @@ DetonationResult InHouseOrchestrator::PrepareAndRun(
           }
         }
       }
+      // Post-reboot generations default to MORE vCPUs than the first boot. A
+      // 1-vCPU first boot gets cleanly through specialize+OOBE (side-stepping
+      // the 2-vCPU AP-bringup race), but the post-reboot first-logon "Getting
+      // ready" finalization is heavier SMP work that deadlocks on a
+      // 1-CPU-hostile kernel spinlock when there is only one vCPU (observed:
+      // guestReboots:1 then a frozen "Getting ready" spinner). So reboots get 2
+      // vCPUs by default; ANTIMAL_POST_REBOOT_VCPU_COUNT overrides (set equal to
+      // ANTIMAL_VCPU_COUNT to disable the bump).
+      uint32_t postRebootVcpuCount = 2;
+      {
+        char buf[16]{};
+        size_t needed = 0;
+        if (getenv_s(&needed, buf, sizeof(buf),
+                     "ANTIMAL_POST_REBOOT_VCPU_COUNT") == 0 &&
+            needed > 1 && buf[0] != '\0') {
+          const int requested = std::atoi(buf);
+          if (requested >= 1 && requested <= 64) {
+            postRebootVcpuCount = static_cast<uint32_t>(requested);
+          }
+        }
+      }
       // ANTIMAL_HIGH_RAM_MB overrides the above-4G RAM allocation in MiB
       // for quick experimentation without a rebuild. Set 0 to disable.
       {
@@ -10275,7 +10296,17 @@ DetonationResult InHouseOrchestrator::PrepareAndRun(
           }
           hv::VmRunRequest reqLocal = request;
           reqLocal.timeout = totalTimeout - elapsed;
-          hv::VirtualMachine vm(preflight.firmwarePath, disk, vmOptions);
+          // First boot: configured vCPU count (1-vCPU is deterministic through
+          // specialize+OOBE). Post-reboot: postRebootVcpuCount (default 2) so the
+          // first-logon "Getting ready" SMP finalization isn't wedged on a
+          // 1-CPU-hostile spinlock. The reboot re-creates a fresh partition, so
+          // a different vCPU count across generations is safe (Windows re-reads
+          // the ACPI MADT each boot).
+          hv::VirtualMachineOptions optsLocal = vmOptions;
+          if (reboot >= 1) {
+            optsLocal.processorCount = postRebootVcpuCount;
+          }
+          hv::VirtualMachine vm(preflight.firmwarePath, disk, optsLocal);
           if (reboot == 0) {
             vm.QueueCom2Bytes(BuildHealthcheckJobFrame(result.runId));
           }
