@@ -2435,10 +2435,51 @@ VmRunSummary VirtualMachine::RunLoop(
                    static_cast<std::streamsize>(lbuf.size()));
           const auto got = static_cast<size_t>(lin.gcount());
           if (got > 0) {
-            ps2_.InjectKeyboardScancodes(lbuf.data(), got);
-            summary.keyboardScancodesInjected += static_cast<int>(got);
             liveInputCursor += got;
-            madeProgress = true;
+            // Framed live-input protocol (so keyboard + mouse can interleave):
+            //   'K' <count> <count scancodes>  -> inject keyboard scancodes
+            //   'M' <buttons> <dx> <dy>        -> inject one PS/2 mouse packet
+            // A record split across polls stays buffered until it completes.
+            liveInputRemainder_.insert(liveInputRemainder_.end(), lbuf.begin(),
+                                       lbuf.begin() + got);
+            auto &buf = liveInputRemainder_;
+            size_t off = 0;
+            for (;;) {
+              if (off >= buf.size()) {
+                break;
+              }
+              const uint8_t tag = buf[off];
+              if (tag == 'K') {
+                if (off + 2 > buf.size()) {
+                  break; // need tag + count
+                }
+                const uint8_t n = buf[off + 1];
+                if (off + 2 + static_cast<size_t>(n) > buf.size()) {
+                  break; // need all scancodes
+                }
+                if (n > 0) {
+                  ps2_.InjectKeyboardScancodes(&buf[off + 2], n);
+                  summary.keyboardScancodesInjected += static_cast<int>(n);
+                  madeProgress = true;
+                }
+                off += 2 + static_cast<size_t>(n);
+              } else if (tag == 'M') {
+                if (off + 4 > buf.size()) {
+                  break; // need tag + buttons + dx + dy
+                }
+                const uint8_t buttons = buf[off + 1];
+                const int8_t dx = static_cast<int8_t>(buf[off + 2]);
+                const int8_t dy = static_cast<int8_t>(buf[off + 3]);
+                ps2_.InjectMousePacket(buttons, dx, dy);
+                madeProgress = true;
+                off += 4;
+              } else {
+                off += 1; // unknown tag: resync by skipping one byte
+              }
+            }
+            if (off > 0) {
+              buf.erase(buf.begin(), buf.begin() + off);
+            }
           }
         }
       }

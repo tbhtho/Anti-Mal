@@ -20,6 +20,8 @@
   var currentPage = 'dashboard';
   var livePollTimer = null;
   var liveWatchRun = null; // run id whose live telemetry tail is already started
+  var liveMouse = { btn: 0, dx: 0, dy: 0 }; // accumulated relative mouse state
+  var liveMouseTimer = null;                // flushes accumulated movement
   function send(cmd, args) {
     var reqId = nextReqId++;
     return new Promise(function (resolve) {
@@ -358,10 +360,25 @@
     if (shift) out.push(0xAA);
     return out;
   }
-  function stopLivePoll() { if (livePollTimer) { clearInterval(livePollTimer); livePollTimer = null; } }
+  function stopLivePoll() {
+    if (livePollTimer) { clearInterval(livePollTimer); livePollTimer = null; }
+    if (liveMouseTimer) { clearInterval(liveMouseTimer); liveMouseTimer = null; }
+    liveMouse = { btn: 0, dx: 0, dy: 0 };
+  }
+  // Flush accumulated relative mouse movement to the guest (~20/s). PS/2 mouse
+  // Y is positive-up, screen Y is positive-down -> negate dy.
+  function flushLiveMouse() {
+    if (!livePollTimer) return;
+    if (Math.abs(liveMouse.dx) >= 1 || Math.abs(liveMouse.dy) >= 1) {
+      var dx = Math.round(liveMouse.dx), dy = Math.round(liveMouse.dy);
+      liveMouse.dx = 0; liveMouse.dy = 0;
+      send('vm.input', { mouse: { buttons: liveMouse.btn, dx: dx, dy: -dy } });
+    }
+  }
   function startLivePoll() {
     stopLivePoll();
     liveWatchRun = null; // each boot re-tails the new run's journal
+    liveMouseTimer = setInterval(flushLiveMouse, 50);
     livePollTimer = setInterval(function () {
       var box = $('#live-frame');
       if (!box) { stopLivePoll(); return; } // navigated away from VM page
@@ -398,6 +415,39 @@
     };
     var sb = $('#vm-stop-btn');
     if (sb) sb.onclick = function () { send('vm.stop'); stopLivePoll(); liveWatchRun = null; appendLog('WARN', 'Live VM stopped.'); var box = $('#live-frame'); if (box) box.textContent = 'Stopped.'; var s = $('#vm-live-status'); if (s) s.textContent = '· stopped'; var ts = $('#vm-telemetry-status'); if (ts) ts.textContent = '· stopped'; };
+    // Live mouse: route movement/clicks over the frame into the guest (relative
+    // PS/2 mouse). Movement deltas are scaled from displayed px to guest px and
+    // accumulated; flushLiveMouse sends them ~20/s. Buttons go immediately.
+    var lf = $('#live-frame');
+    if (lf) {
+      function frameScale() {
+        var img = document.getElementById('live-frame-img');
+        if (img && img.clientWidth > 0 && img.naturalWidth > 0) {
+          return { x: img.naturalWidth / img.clientWidth, y: img.naturalHeight / Math.max(1, img.clientHeight) };
+        }
+        return { x: 1, y: 1 };
+      }
+      function btnBit(b) { return b === 2 ? 0x02 : (b === 1 ? 0x04 : 0x01); }
+      lf.addEventListener('mousemove', function (e) {
+        if (!livePollTimer) return;
+        var s = frameScale();
+        liveMouse.dx += (e.movementX || 0) * s.x;
+        liveMouse.dy += (e.movementY || 0) * s.y;
+      });
+      lf.addEventListener('mousedown', function (e) {
+        if (!livePollTimer) return;
+        e.preventDefault();
+        liveMouse.btn |= btnBit(e.button);
+        send('vm.input', { mouse: { buttons: liveMouse.btn, dx: 0, dy: 0 } });
+      });
+      lf.addEventListener('mouseup', function (e) {
+        if (!livePollTimer) return;
+        e.preventDefault();
+        liveMouse.btn &= ~btnBit(e.button);
+        send('vm.input', { mouse: { buttons: liveMouse.btn, dx: 0, dy: 0 } });
+      });
+      lf.addEventListener('contextmenu', function (e) { e.preventDefault(); });
+    }
     send('config.get').then(function (r) {
       var c = (r && r.ok && r.result) ? r.result : {};
       var net = c.networkMode || 'disabled';

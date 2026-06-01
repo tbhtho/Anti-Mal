@@ -602,7 +602,8 @@ private:
   SerialConsole com2_;
   PcIoDevices pcIo_;
   Ps2Controller ps2_;
-  std::filesystem::path liveInputPath_; // live host->guest keyboard input file
+  std::filesystem::path liveInputPath_; // live host->guest input file (framed)
+  std::vector<uint8_t> liveInputRemainder_; // partial framed live-input record
   IoApic ioApic_;
   int whpIoApicGpaProbeResult_ = 0;
   uint64_t whpMmioGapBitmap_ = 0;

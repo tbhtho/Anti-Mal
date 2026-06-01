@@ -941,34 +941,55 @@ void WebViewHost::RegisterHandlers() {
     return std::string(R"({"stopped":true})");
   });
 
-  // Live interactive keyboard input: append raw Set-1 scancodes (from the UI) to
-  // the live-input file the running VM polls (host->guest real-time keyboard).
+  // Live interactive input: append a framed record (from the UI) to the
+  // live-input file the running VM polls (host->guest real-time input).
+  //   keyboard: 'K' <count> <Set-1 scancodes...>
+  //   mouse:    'M' <buttons> <dx int8> <dy int8>   (relative PS/2 packet)
   router_.Register("vm.input", [](const JsonValue &args) -> std::string {
     const AppConfig c = LoadConfig(DefaultConfigPath());
     const std::filesystem::path liveInput =
         c.workspaceRoot / L"_live-input.bin";
+    std::vector<uint8_t> rec;
     const JsonValue &codes = args.At("scancodes");
-    if (!codes.IsArray() || codes.array.empty()) {
-      return std::string(R"({"ok":false,"error":"no scancodes"})");
-    }
-    std::vector<uint8_t> bytes;
-    bytes.reserve(codes.array.size());
-    for (const auto &v : codes.array) {
-      const int64_t b = v.AsInt64();
-      if (b >= 0 && b <= 255) {
-        bytes.push_back(static_cast<uint8_t>(b));
+    const JsonValue &mouse = args.At("mouse");
+    if (codes.IsArray() && !codes.array.empty()) {
+      std::vector<uint8_t> sc;
+      sc.reserve(codes.array.size());
+      for (const auto &v : codes.array) {
+        const int64_t b = v.AsInt64();
+        if (b >= 0 && b <= 255) {
+          sc.push_back(static_cast<uint8_t>(b));
+        }
       }
+      for (size_t i = 0; i < sc.size(); i += 255) {
+        const size_t n = (sc.size() - i) < 255 ? (sc.size() - i) : 255;
+        rec.push_back('K');
+        rec.push_back(static_cast<uint8_t>(n));
+        rec.insert(rec.end(), sc.begin() + i, sc.begin() + i + n);
+      }
+    } else if (mouse.IsObject()) {
+      auto clamp8 = [](int64_t v) -> uint8_t {
+        if (v > 127) v = 127;
+        if (v < -127) v = -127;
+        return static_cast<uint8_t>(static_cast<int8_t>(v));
+      };
+      rec.push_back('M');
+      rec.push_back(static_cast<uint8_t>(mouse.At("buttons").AsInt64() & 0x07));
+      rec.push_back(clamp8(mouse.At("dx").AsInt64()));
+      rec.push_back(clamp8(mouse.At("dy").AsInt64()));
+    } else {
+      return std::string(R"({"ok":false,"error":"no input"})");
     }
-    if (bytes.empty()) {
+    if (rec.empty()) {
       return std::string(R"({"ok":false})");
     }
     std::ofstream out(liveInput, std::ios::binary | std::ios::app);
     if (!out) {
       return std::string(R"({"ok":false})");
     }
-    out.write(reinterpret_cast<const char *>(bytes.data()),
-              static_cast<std::streamsize>(bytes.size()));
-    return std::string("{\"ok\":true,\"n\":") + std::to_string(bytes.size()) +
+    out.write(reinterpret_cast<const char *>(rec.data()),
+              static_cast<std::streamsize>(rec.size()));
+    return std::string("{\"ok\":true,\"n\":") + std::to_string(rec.size()) +
            "}";
   });
 }
