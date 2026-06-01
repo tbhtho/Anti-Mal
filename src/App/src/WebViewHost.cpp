@@ -896,10 +896,15 @@ void WebViewHost::RegisterHandlers() {
       SetEnvironmentVariableW(L"ANTIMAL_SEED_OVERLAY", seed.c_str());
       SetEnvironmentVariableW(L"ANTIMAL_PROBE_OOBE_KEYS", nullptr);
       SetEnvironmentVariableW(L"ANTIMAL_PROBE_PRESS_ENTER_SEC", L"40");
+      // Snapshot lands on the lock/login screen; plaintext autologon fails on
+      // 25H2, so type the account password to reach the desktop hands-free.
+      SetEnvironmentVariableW(L"ANTIMAL_PROBE_LOGIN_PASSWORD", L"AntiMal!23");
     } else {
       SetEnvironmentVariableW(L"ANTIMAL_SEED_OVERLAY", nullptr);
       SetEnvironmentVariableW(L"ANTIMAL_PROBE_OOBE_KEYS", L"250");
       SetEnvironmentVariableW(L"ANTIMAL_PROBE_PRESS_ENTER_SEC", nullptr);
+      // Full OOBE sets AutoAdminLogon via the in-guest script; no login typing.
+      SetEnvironmentVariableW(L"ANTIMAL_PROBE_LOGIN_PASSWORD", nullptr);
     }
     std::wstring cmd = L"\"" + hostCli.wstring() + L"\" detonate \"" +
                        sample.wstring() +

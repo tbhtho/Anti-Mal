@@ -9739,6 +9739,97 @@ DetonationResult InHouseOrchestrator::PrepareAndRun(
           }
         }
       }
+      // ANTIMAL_PROBE_LOGIN_PASSWORD=<password>: after the lock screen is
+      // dismissed (PRESS_ENTER above), type this password + Enter at several
+      // offsets so it lands once the Win11 login password field is focused.
+      // Win11 25H2 ignores plaintext autologon (the lock screen intercepts; the
+      // LSA secret is required), so injected-input login is the proven path to
+      // the desktop on a seeded fast-boot. Extra firings on an already
+      // logged-in desktop are inert. Does NOT authorize sample execution.
+      {
+        char pwd[128]{};
+        size_t pwdNeeded = 0;
+        if (getenv_s(&pwdNeeded, pwd, sizeof(pwd),
+                     "ANTIMAL_PROBE_LOGIN_PASSWORD") == 0 &&
+            pwdNeeded > 1 && pwd[0] != '\0') {
+          using namespace std::chrono;
+          // Map an ASCII char to a Set-1 make scancode (US layout), reporting
+          // whether Left-Shift must wrap it (uppercase + shifted symbols).
+          auto makeCode = [](char c, bool &shift) -> int {
+            shift = false;
+            if (c >= 'A' && c <= 'Z') {
+              shift = true;
+              c = static_cast<char>(c - 'A' + 'a');
+            }
+            if (c >= 'a' && c <= 'z') {
+              static const uint8_t L[] = {
+                  0x1E, 0x30, 0x2E, 0x20, 0x12, 0x21, 0x22, 0x23, 0x17,
+                  0x24, 0x25, 0x26, 0x32, 0x31, 0x18, 0x19, 0x10, 0x13,
+                  0x1F, 0x14, 0x16, 0x2F, 0x11, 0x2D, 0x15, 0x2C};
+              return L[c - 'a'];
+            }
+            if (c >= '0' && c <= '9') {
+              static const uint8_t D[] = {0x0B, 0x02, 0x03, 0x04, 0x05,
+                                          0x06, 0x07, 0x08, 0x09, 0x0A};
+              return D[c - '0'];
+            }
+            switch (c) {
+            case ' ': return 0x39;
+            case '-': return 0x0C;
+            case '=': return 0x0D;
+            case '[': return 0x1A;
+            case ']': return 0x1B;
+            case ';': return 0x27;
+            case '\'': return 0x28;
+            case '`': return 0x29;
+            case '\\': return 0x2B;
+            case ',': return 0x33;
+            case '.': return 0x34;
+            case '/': return 0x35;
+            case '!': shift = true; return 0x02;
+            case '@': shift = true; return 0x03;
+            case '#': shift = true; return 0x04;
+            case '$': shift = true; return 0x05;
+            case '%': shift = true; return 0x06;
+            case '^': shift = true; return 0x07;
+            case '&': shift = true; return 0x08;
+            case '*': shift = true; return 0x09;
+            case '(': shift = true; return 0x0A;
+            case ')': shift = true; return 0x0B;
+            case '_': shift = true; return 0x0C;
+            case '+': shift = true; return 0x0D;
+            case '{': shift = true; return 0x1A;
+            case '}': shift = true; return 0x1B;
+            case ':': shift = true; return 0x27;
+            case '"': shift = true; return 0x28;
+            case '~': shift = true; return 0x29;
+            case '|': shift = true; return 0x2B;
+            case '<': shift = true; return 0x33;
+            case '>': shift = true; return 0x34;
+            case '?': shift = true; return 0x35;
+            default: return -1;
+            }
+          };
+          std::vector<uint8_t> typePwd;
+          for (size_t i = 0; i < pwdNeeded && pwd[i] != '\0'; ++i) {
+            bool shift = false;
+            const int code = makeCode(pwd[i], shift);
+            if (code < 0) {
+              continue;
+            }
+            if (shift) typePwd.push_back(0x2A); // LShift make
+            typePwd.push_back(static_cast<uint8_t>(code));
+            typePwd.push_back(static_cast<uint8_t>(code | 0x80));
+            if (shift) typePwd.push_back(0xAA); // LShift break
+          }
+          typePwd.push_back(0x1C); // Enter make
+          typePwd.push_back(0x9C); // Enter break
+          for (int off : {55, 80, 110, 150, 200, 250}) {
+            request.keyboardBursts.push_back(
+                {milliseconds{static_cast<int64_t>(off) * 1000}, typePwd});
+          }
+        }
+      }
       // ANTIMAL_PROBE_BYPASS_DRIVER_SIG: at this delay (seconds), the host
       // injects F8 (recovery -> Startup Settings), then 7 (disable driver
       // signature enforcement) one second later. This walks the bootmgr
