@@ -1428,6 +1428,67 @@ VmRunSummary VirtualMachine::RunLoop(
           ReadGuestMemory(summary.fatalRipWindowBase, summary.fatalRipWindow,
                           sizeof(summary.fatalRipWindow));
       (void)IdentifyGuestImage(summary.fatalRip, &summary.fatalRipImage);
+      // Current guest process (EPROCESS.ImageFileName) at the fatal point — turns
+      // a bare user-mode hang RIP into a named culprit. For a user-mode RIP the
+      // kernel KPCR is in KERNEL_GS_BASE; for kernel-mode it is in GS_BASE. Walk
+      // KPCR(+0x180=Prcb)+0x8=CurrentThread(KTHREAD) -> ApcState.Process(EPROCESS)
+      // -> ImageFileName. Offsets are build-specific, so try the known Win11 x64
+      // candidates and accept the first that yields a printable image name.
+      {
+        const bool userMode = (summary.fatalCsSelector & 3u) == 3u;
+        const WHV_REGISTER_NAME gsNames[] = {WHvX64RegisterGs,
+                                             WHvX64RegisterKernelGsBase};
+        WHV_REGISTER_VALUE gsVals[2]{};
+        auto canonical = [](uint64_t p) {
+          return p >= 0xFFFF800000000000ull && p != UINT64_MAX;
+        };
+        auto rd64 = [&](uint64_t va, uint64_t &outVal) {
+          return ReadGuestMemory(va, reinterpret_cast<uint8_t *>(&outVal),
+                                 sizeof(outVal));
+        };
+        if (SUCCEEDED(WHvGetVirtualProcessorRegisters(vcpu_.Partition(),
+                                                      vcpu_.Index(), gsNames, 2,
+                                                      gsVals))) {
+          const uint64_t kpcr =
+              userMode ? gsVals[1].Reg64 : gsVals[0].Segment.Base;
+          uint64_t curThread = 0;
+          if (canonical(kpcr) && rd64(kpcr + 0x180 + 0x8, curThread) &&
+              canonical(curThread)) {
+            const uint64_t procOffs[] = {0xB8, 0xD8, 0x98, 0x220, 0x98 + 0x20};
+            const uint64_t nameOffs[] = {0x5a8, 0x550, 0x450, 0x2e0, 0x468};
+            for (uint64_t po : procOffs) {
+              uint64_t eproc = 0;
+              if (!rd64(curThread + po, eproc) || !canonical(eproc)) {
+                continue;
+              }
+              for (uint64_t no : nameOffs) {
+                char nameBuf[16]{};
+                if (!ReadGuestMemory(eproc + no,
+                                     reinterpret_cast<uint8_t *>(nameBuf), 15)) {
+                  continue;
+                }
+                bool printable = nameBuf[0] > 32 && nameBuf[0] < 127;
+                int len = 0;
+                for (; printable && len < 15 && nameBuf[len]; ++len) {
+                  if (nameBuf[len] < 32 || nameBuf[len] > 126) {
+                    printable = false;
+                  }
+                }
+                if (printable && len >= 3) {
+                  std::memcpy(summary.fatalProcessName, nameBuf, 15);
+                  summary.fatalProcessName[15] = '\0';
+                  summary.fatalCurrentProcess = eproc;
+                  summary.fatalProcessNameValid = true;
+                  break;
+                }
+              }
+              if (summary.fatalProcessNameValid) {
+                break;
+              }
+            }
+          }
+        }
+      }
       const WHV_REGISTER_NAME names[] = {
           WHvX64RegisterRax, WHvX64RegisterRbx, WHvX64RegisterRcx,
           WHvX64RegisterRdx, WHvX64RegisterRsi, WHvX64RegisterRdi,

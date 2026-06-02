@@ -241,6 +241,9 @@ struct VmRunSummary {
   uint64_t lastExceptionParameter = 0;
   uint64_t fatalRip = 0;
   uint16_t fatalCsSelector = 0;
+  bool fatalProcessNameValid = false;
+  char fatalProcessName[16]{}; // guest EPROCESS.ImageFileName of the running thread
+  uint64_t fatalCurrentProcess = 0; // EPROCESS pointer (0 if not resolved)
   bool fatalRipBytesValid = false;
   uint8_t fatalRipBytes[16]{};
   bool fatalRipWindowValid = false;
