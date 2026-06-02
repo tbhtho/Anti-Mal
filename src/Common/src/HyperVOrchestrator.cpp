@@ -8612,10 +8612,20 @@ std::string FormatVmDiagnostics(const hv::VmRunSummary &vm) {
     }
     out << "fatalCsSelector: 0x" << std::hex << std::uppercase
         << vm.fatalCsSelector << std::dec << "\n";
+    if (vm.fatalKpcr != 0) {
+      out << "fatalKpcr: 0x" << std::hex << std::uppercase << vm.fatalKpcr
+          << "\nfatalCurrentThread: 0x" << vm.fatalCurrentThread
+          << "\nfatalCurrentProcess: 0x" << vm.fatalCurrentProcess << std::dec
+          << "\n";
+    }
     if (vm.fatalProcessNameValid) {
       out << "fatalProcessName: " << vm.fatalProcessName << "\n";
-      out << "fatalCurrentProcess: 0x" << std::hex << std::uppercase
-          << vm.fatalCurrentProcess << std::dec << "\n";
+    }
+    if (vm.fatalEprocBytesValid) {
+      out << "fatalEprocDumpBase: 0x" << std::hex << std::uppercase
+          << vm.fatalEprocDumpBase << std::dec << "\n";
+      writeBytes(out, "fatalEprocBytes", vm.fatalEprocBytes,
+                 sizeof(vm.fatalEprocBytes));
     }
     if (vm.fatalRipBytesValid) {
       writeBytes(out, "fatalRipBytes", vm.fatalRipBytes,

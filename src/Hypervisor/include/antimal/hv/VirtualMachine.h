@@ -244,6 +244,12 @@ struct VmRunSummary {
   bool fatalProcessNameValid = false;
   char fatalProcessName[16]{}; // guest EPROCESS.ImageFileName of the running thread
   uint64_t fatalCurrentProcess = 0; // EPROCESS pointer (0 if not resolved)
+  // Self-debug for the EPROCESS walk (so one boot reveals the right offsets):
+  uint64_t fatalKpcr = 0;           // chosen KPCR (KERNEL_GS_BASE / GS_BASE)
+  uint64_t fatalCurrentThread = 0;  // KPCR.Prcb.CurrentThread
+  bool fatalEprocBytesValid = false;
+  uint64_t fatalEprocDumpBase = 0;  // GVA the dump starts at (eproc + 0x540)
+  uint8_t fatalEprocBytes[160]{};   // raw EPROCESS bytes to locate ImageFileName
   bool fatalRipBytesValid = false;
   uint8_t fatalRipBytes[16]{};
   bool fatalRipWindowValid = false;

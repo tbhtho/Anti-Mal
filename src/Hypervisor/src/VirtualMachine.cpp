@@ -1451,15 +1451,26 @@ VmRunSummary VirtualMachine::RunLoop(
                                                       gsVals))) {
           const uint64_t kpcr =
               userMode ? gsVals[1].Reg64 : gsVals[0].Segment.Base;
+          summary.fatalKpcr = kpcr;
           uint64_t curThread = 0;
           if (canonical(kpcr) && rd64(kpcr + 0x180 + 0x8, curThread) &&
               canonical(curThread)) {
+            summary.fatalCurrentThread = curThread;
             const uint64_t procOffs[] = {0xB8, 0xD8, 0x98, 0x220, 0x98 + 0x20};
             const uint64_t nameOffs[] = {0x5a8, 0x550, 0x450, 0x2e0, 0x468};
             for (uint64_t po : procOffs) {
               uint64_t eproc = 0;
               if (!rd64(curThread + po, eproc) || !canonical(eproc)) {
                 continue;
+              }
+              if (!summary.fatalEprocBytesValid) {
+                // Dump the first plausible EPROCESS so the correct ImageFileName
+                // offset for this build can be confirmed from one boot.
+                summary.fatalCurrentProcess = eproc;
+                summary.fatalEprocDumpBase = eproc + 0x540;
+                summary.fatalEprocBytesValid = ReadGuestMemory(
+                    summary.fatalEprocDumpBase, summary.fatalEprocBytes,
+                    sizeof(summary.fatalEprocBytes));
               }
               for (uint64_t no : nameOffs) {
                 char nameBuf[16]{};
