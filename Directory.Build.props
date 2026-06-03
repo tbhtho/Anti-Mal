@@ -15,6 +15,14 @@
     <ClCompile>
       <PreprocessorDefinitions>WIN32_LEAN_AND_MEAN;NOMINMAX;UNICODE;_UNICODE;%(PreprocessorDefinitions)</PreprocessorDefinitions>
       <AdditionalOptions>/utf-8 %(AdditionalOptions)</AdditionalOptions>
+      <!-- Static CRT (/MT) so binaries are self-contained. The in-guest GuestAgent
+           must run on a CLEAN Windows image that has the UCRT but NO VC++ redist;
+           with the default /MD it imports MSVCP140/VCRUNTIME140 and the LocalSystem
+           service silently fails to LOAD before running. /MT bakes the CRT into the
+           exe. Applied solution-wide because the shared Common static lib must have
+           a single CRT matching all its consumers. -->
+      <RuntimeLibrary Condition="'$(Configuration)'=='Debug'">MultiThreadedDebug</RuntimeLibrary>
+      <RuntimeLibrary Condition="'$(Configuration)'!='Debug'">MultiThreaded</RuntimeLibrary>
     </ClCompile>
   </ItemDefinitionGroup>
 </Project>
