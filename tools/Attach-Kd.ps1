@@ -10,7 +10,8 @@ param(
   [int]$TimeoutSec = 300,
   [switch]$Dump,
   [string]$KdLog = "C:\AntiMalRuns\_kdA.log",
-  [string]$KdCommand = "q"
+  [string]$KdCommand = "q",
+  [int]$BreakinAt = 0
 )
 
 # Cache symbols locally so repeated runs don't re-download from the MS server.
@@ -29,6 +30,8 @@ $env:ANTIMAL_PROBE_WINLOAD_DEBUG="1"; $env:ANTIMAL_PROBE_BCD_KERNEL_DEBUG="1"
 $env:ANTIMAL_KD_PIPE="1"
 if ($Dump) { $env:ANTIMAL_KD_DUMP="1" } else { $env:ANTIMAL_KD_DUMP=$null }
 $env:ANTIMAL_SEED_OVERLAY=$null; $env:ANTIMAL_PROBE_OOBE_KEYS="250"
+$env:ANTIMAL_PROBE_OOBE_AUTOLOGON="1"; $env:ANTIMAL_PROBE_LOGIN_PASSWORD="AntiMal!23"
+if ($BreakinAt -gt 0) { $env:ANTIMAL_KD_BREAKIN_AT="$BreakinAt" } else { $env:ANTIMAL_KD_BREAKIN_AT=$null }
 
 $vm = Start-Process "$bin\AntiMal.HostCli.exe" -ArgumentList @("detonate","$bin\AntiMal.Tests.exe","--network","disabled","--timeout-sec","$TimeoutSec") -PassThru -WindowStyle Hidden
 

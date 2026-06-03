@@ -1371,6 +1371,22 @@ VmRunSummary VirtualMachine::RunLoop(
       }
     }
   }
+  // ANTIMAL_KD_BREAKIN_AT=<seconds>: with the real-kd bridge active, inject the
+  // KD break-in byte (0x62 'b') into the guest COM1 RX at this elapsed time. This
+  // is the autonomous equivalent of pressing Ctrl+Break in WinDbg (which merely
+  // transmits 0x62): the kernel's KdPollBreakIn sees it, breaks in, and kd stops
+  // at its first break -- exactly when kd runs its -c command. Lets us break a
+  // running-but-hung target headlessly, since GenerateConsoleCtrlEvent doesn't
+  // reach kd in a non-interactive/background context.
+  int kdBreakinAtSec = 0;
+  bool kdBreakinDone = false;
+  {
+    char b[16]{};
+    size_t n = 0;
+    if (getenv_s(&n, b, sizeof(b), "ANTIMAL_KD_BREAKIN_AT") == 0 && n > 1) {
+      kdBreakinAtSec = std::atoi(b);
+    }
+  }
   auto queueKdHostReset = [&](const char *reason) {
     kdDebugger.QueueHostReset(reason);
     const auto replies = kdDebugger.PullReplies();
@@ -2364,6 +2380,20 @@ VmRunSummary VirtualMachine::RunLoop(
       if (!fromDbg.empty()) {
         com1_.QueueRxBytes(fromDbg);
         madeProgress = true;
+      }
+      // Timed KD break-in: inject 0x62 once at the configured elapsed time so the
+      // running guest breaks into kd (which then runs its -c dump commands).
+      if (kdBreakinAtSec > 0 && !kdBreakinDone) {
+        const auto elapsedSec =
+            std::chrono::duration_cast<std::chrono::seconds>(
+                std::chrono::steady_clock::now() - runStarted)
+                .count();
+        if (elapsedSec >= kdBreakinAtSec) {
+          const uint8_t breakByte = 0x62; // 'b' = KD break-in request
+          com1_.QueueRxBytes(&breakByte, 1);
+          kdBreakinDone = true;
+          madeProgress = true;
+        }
       }
     } else {
       if (!kdBytes.empty()) {

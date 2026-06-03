@@ -46,6 +46,12 @@ class KdDrive {
   [DllImport("kernel32.dll", SetLastError=true)]
   static extern bool GenerateConsoleCtrlEvent(uint evt, uint group);
   [DllImport("kernel32.dll", SetLastError=true)]
+  static extern bool AllocConsole();
+  [DllImport("kernel32.dll", SetLastError=true)]
+  static extern bool FreeConsole();
+  [DllImport("kernel32.dll", SetLastError=true)]
+  static extern bool SetConsoleCtrlHandler(IntPtr handler, bool add);
+  [DllImport("kernel32.dll", SetLastError=true)]
   static extern uint WaitForSingleObject(IntPtr h, uint ms);
 
   const uint CREATE_NEW_PROCESS_GROUP = 0x00000200;
@@ -55,6 +61,7 @@ class KdDrive {
 
   static StreamWriter log;
   static IntPtr kdStdinWr;
+  static volatile bool connected = false;
   static void W(string s){ Console.WriteLine(s); if(log!=null){ log.WriteLine(s); log.Flush(); } }
   static void Send(string cmd){
     byte[] b = Encoding.ASCII.GetBytes(cmd + "\r\n");
@@ -67,6 +74,14 @@ class KdDrive {
     string conn=a[0], logPath=a[1], delaysCsv=a[2], dump=a[3];
     log = new StreamWriter(logPath, false);
     string kd = @"C:\Program Files (x86)\Windows Kits\10\Debuggers\x64\kd.exe";
+
+    // The background-task PowerShell context may have a non-interactive console
+    // that swallows GenerateConsoleCtrlEvent. Detach from it and allocate a fresh
+    // real console so the Ctrl+Break we send actually reaches kd. Ignore the
+    // event in THIS process so our own break doesn't kill us.
+    FreeConsole();
+    AllocConsole();
+    SetConsoleCtrlHandler(IntPtr.Zero, true); // this process ignores Ctrl+C
 
     var sa = new SECURITY_ATTRIBUTES();
     sa.nLength = Marshal.SizeOf(typeof(SECURITY_ATTRIBUTES)); sa.bInheritHandle = 1;
@@ -88,26 +103,40 @@ class KdDrive {
     CloseHandle(outWr); CloseHandle(inRd);
     W("[KdDrive] kd pid=" + pi.dwProcessId + " group started");
 
-    // Reader thread: drain kd stdout -> log+console.
+    // Reader thread: drain kd stdout -> log+console, and detect when the KD
+    // session is actually established (kd auto-continues the target, so -c never
+    // runs and we must break in ourselves — but only AFTER it's connected).
     var reader = new Thread(() => {
-      byte[] buf = new byte[4096];
+      byte[] buf = new byte[4096]; var tail = new StringBuilder();
       while(true){ int n; if(!ReadFile(outRd, buf, buf.Length, out n, IntPtr.Zero) || n==0) break;
-        string s = Encoding.ASCII.GetString(buf,0,n); Console.Write(s); if(log!=null){ log.Write(s); log.Flush(); } }
+        string s = Encoding.ASCII.GetString(buf,0,n); Console.Write(s); if(log!=null){ log.Write(s); log.Flush(); }
+        tail.Append(s); if(tail.Length>2000) tail.Remove(0, tail.Length-2000);
+        if(!connected && (tail.ToString().Contains("connection established") || tail.ToString().Contains("Connected to Windows"))) connected = true;
+      }
     }); reader.IsBackground = true; reader.Start();
 
+    // Wait for the KD session to establish before trying to break in.
+    int waited = 0;
+    while(!connected && waited < 240){ Thread.Sleep(1000); waited++; }
+    if(!connected){ W("[KdDrive] target never connected within 240s"); }
+    else { W("[KdDrive] connected after ~" + waited + "s; target is running (kd auto-continued). Breaking in on schedule."); }
+
+    // Delays are measured FROM CONNECTION (let the boot progress, then break in
+    // and dump). Symbols are pre-cached so the dump commands are fast.
     string[] delays = delaysCsv.Split(',');
     int prev = 0;
-    for(int i=0;i<delays.Length;i++){
+    for(int i=0;i<delays.Length && connected;i++){
       int t = int.Parse(delays[i].Trim());
       int waitMs = (t - prev) * 1000; prev = t;
       if(waitMs > 0) Thread.Sleep(waitMs);
-      W("\n[KdDrive] === break #" + (i+1) + " at t+" + t + "s ===");
+      W("\n[KdDrive] === break #" + (i+1) + " at conn+" + t + "s ===");
       if(!GenerateConsoleCtrlEvent(CTRL_BREAK_EVENT, (uint)pi.dwProcessId))
         W("[KdDrive] GenerateConsoleCtrlEvent failed: " + Marshal.GetLastWin32Error());
-      Thread.Sleep(2500); // let kd break in
-      foreach(string c in dump.Split(';')) Send(c.Trim());
+      Thread.Sleep(6000); // let kd break in
+      foreach(string c in dump.Split(';')) { Send(c.Trim()); Thread.Sleep(1500); }
+      Thread.Sleep(6000); // let symbol-dependent commands finish
       Send(i == delays.Length-1 ? "q" : "g");
-      Thread.Sleep(2500);
+      Thread.Sleep(3000);
     }
     WaitForSingleObject(pi.hProcess, 30000);
     W("[KdDrive] done");
