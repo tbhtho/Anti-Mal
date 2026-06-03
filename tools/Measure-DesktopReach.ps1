@@ -17,7 +17,14 @@
 param(
   [int]$Boots = 5,
   [int]$TimeoutSec = 1400,
-  [int]$OobeStartSec = 250
+  [int]$OobeStartSec = 250,
+  # When set to an AntiMalDesktop.cow snapshot path, each boot SEEDS from it (fast-boot
+  # straight to the desktop) instead of a cold OOBE. The snapshot was made from a desktop
+  # with AutoAdminLogon, so a paced Enter dismisses any lock screen; no OOBE automation.
+  [string]$SeedOverlay = "",
+  # Optional login password for a seed whose account is password-protected (not needed for
+  # an AutoAdminLogon snapshot).
+  [string]$LoginPassword = ""
 )
 $ws  = "C:\AntiMalRuns"
 $bin = "bin\x64\Release"
@@ -29,12 +36,28 @@ $env:ANTIMAL_FIRMWARE_NAME="OVMF-debug.fd"; $env:ANTIMAL_VCPU_COUNT="1"
 $env:ANTIMAL_PROBE_CI_POLICY_OFF="1"; $env:ANTIMAL_PROBE_CI_POLICY_OFF_AGGRESSIVE="1"
 $env:ANTIMAL_PROBE_BCD_NOINTEGRITYCHECKS="1"; $env:ANTIMAL_PROBE_BCD_LEGACY_CONTEXT="1"
 $env:ANTIMAL_PROBE_BCD_HYPERVISOR_LAUNCH_OFF="1"; $env:ANTIMAL_PROBE_SYSTEM_VBS_COMPAT="1"
-$env:ANTIMAL_PROBE_OOBE_KEYS="$OobeStartSec"
-# Explicitly OFF: no kd, no seed, no login-password (cold OOBE creates the account itself).
+# Explicitly OFF: no kd perturbation.
 $env:ANTIMAL_PROBE_WINLOAD_DEBUG=$null; $env:ANTIMAL_PROBE_BCD_KERNEL_DEBUG=$null
 $env:ANTIMAL_KD_PIPE=$null; $env:ANTIMAL_KD_DUMP=$null; $env:ANTIMAL_KD_BREAKIN_AT=$null
-$env:ANTIMAL_SEED_OVERLAY=$null; $env:ANTIMAL_PROBE_LOGIN_PASSWORD=$null
 $env:ANTIMAL_PROBE_OOBE_AUTOLOGON=$null
+$mode = "cold"
+if ($SeedOverlay -ne "" -and (Test-Path $SeedOverlay)) {
+  # SEED mode: fast-boot from the desktop snapshot. No cold OOBE; dismiss a possible lock
+  # screen with paced Enter starting at 30s (the snapshot has AutoAdminLogon).
+  $mode = "seed"
+  $env:ANTIMAL_SEED_OVERLAY = $SeedOverlay
+  $env:ANTIMAL_PROBE_OOBE_KEYS = $null
+  $env:ANTIMAL_PROBE_PRESS_ENTER_SEC = "30"
+  if ($LoginPassword -ne "") { $env:ANTIMAL_PROBE_LOGIN_PASSWORD = $LoginPassword }
+  else { $env:ANTIMAL_PROBE_LOGIN_PASSWORD = $null }
+} else {
+  # COLD mode: paced OOBE automation creates the account + AutoAdminLogon + reboot.
+  $env:ANTIMAL_SEED_OVERLAY = $null
+  $env:ANTIMAL_PROBE_OOBE_KEYS = "$OobeStartSec"
+  $env:ANTIMAL_PROBE_PRESS_ENTER_SEC = $null
+  $env:ANTIMAL_PROBE_LOGIN_PASSWORD = $null
+}
+Write-Host ("mode: {0}  (seed={1})" -f $mode, $(if ($SeedOverlay -ne "") { $SeedOverlay } else { "<none>" }))
 
 function Field([string[]]$c, [string]$k) {
   $m = $c | Select-String -Pattern ("^" + [regex]::Escape($k) + ":") | Select-Object -Last 1
