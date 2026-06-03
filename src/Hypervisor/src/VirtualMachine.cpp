@@ -31,6 +31,13 @@ constexpr uint64_t kAssistReserveBytes = 2ull * 1024ull * 1024ull;
 constexpr uint64_t kHighScratchBase = 0x100000000ull;
 constexpr uint64_t kFirmwareApertureBase = 0xFC000000ull;
 constexpr uint64_t kFirmwareApertureSize = 64ull * 1024ull * 1024ull;
+// Lowest canonical kernel-mode virtual address (Windows x64 system space begins
+// at 0xFFFF800000000000). OVMF firmware + winload execute at low/identity
+// addresses far below this; ntoskrnl runs above it. Observing a RIP at/above this
+// means the OS kernel is executing, which is when the firmware page-fault assist
+// MUST stop (it writes into the current cr3's page tables -- harmless for OVMF,
+// catastrophic once that cr3 is Windows's).
+constexpr uint64_t kOsKernelRipFloor = 0xFFFF800000000000ull;
 // WHP's Local APIC emulation (WHvX64LocalApicEmulationModeXApic) silently
 // maps dummy RAM across the ENTIRE conventional MMIO gap [0xFEC00000,
 // 0xFEF00000). WHvUnmapGpaRange "succeeds" but the internal handling
@@ -1418,6 +1425,14 @@ VmRunSummary VirtualMachine::RunLoop(
   std::array<uint64_t, kRipRingSize> ripRing{};
   size_t ripRingHead = 0;
   size_t ripRingCount = 0;
+
+  // The firmware page-fault assist (TryAssistFirmwarePageFault) is only valid
+  // while OVMF firmware owns the page tables. It is disabled permanently the
+  // instant the guest executes OS-kernel code (see kOsKernelRipFloor) so it can
+  // never write identity PTEs into Windows's live page tables. Starts true
+  // (firmware runs first); resets per VM generation (this object is recreated on
+  // each guest reboot).
+  bool firmwareAssistActive = true;
   std::map<uint64_t, uint64_t> ripHotspots;
   auto captureLowRamImages = [&](std::vector<VmGuestImageInfo> *images,
                                  size_t limit) {
@@ -2059,6 +2074,15 @@ VmRunSummary VirtualMachine::RunLoop(
       ++ripHotspots[exitRip & ~uint64_t{0xF}];
     }
 
+    // OS-kernel entry: once the guest runs code at a kernel-canonical RIP, OVMF
+    // is done forever (this generation), so permanently disable the firmware
+    // page-fault assist. Leaving it on lets a Windows user/kernel write-fault in
+    // the high-scratch aperture corrupt Windows's page tables (root cause of the
+    // intermittent 0x4E/0x1A MM bugchecks + the "Preparing Windows" hang).
+    if (firmwareAssistActive && exitRip >= kOsKernelRipFloor) {
+      firmwareAssistActive = false;
+    }
+
     // Track I/O progress so we can detect a true wedge (no IO + no IDE work).
     bool madeProgress = false;
 
@@ -2141,7 +2165,8 @@ VmRunSummary VirtualMachine::RunLoop(
       summary.lastExceptionErrorCode = ex.ErrorCode;
       summary.lastExceptionParameter = ex.ExceptionParameter;
       uint64_t assistedGpa = 0;
-      if (ex.ExceptionType == WHvX64ExceptionTypePageFault &&
+      if (firmwareAssistActive &&
+          ex.ExceptionType == WHvX64ExceptionTypePageFault &&
           TryAssistFirmwarePageFault(ex.ExceptionParameter, ex.ErrorCode,
                                      &assistedGpa)) {
         ++summary.pageFaultAssists;
@@ -2149,6 +2174,15 @@ VmRunSummary VirtualMachine::RunLoop(
         summary.lastPageFaultAssistGpa = assistedGpa;
         madeProgress = true;
         break;
+      }
+      // OS is running: a #PF in the firmware high-scratch aperture is NOT ours to
+      // assist anymore (assisting would write into Windows's page tables). Count
+      // it and fall through to re-inject it to the guest's own #PF handler.
+      if (!firmwareAssistActive &&
+          ex.ExceptionType == WHvX64ExceptionTypePageFault &&
+          ex.ExceptionParameter >= kHighScratchBase &&
+          ex.ExceptionParameter < kHighScratchBase + kFirmwareApertureSize) {
+        ++summary.pageFaultAssistsSuppressed;
       }
       // Not a host-assisted firmware fault: this is the guest's own page fault
       // (kernel demand paging, copy-on-write, a guard page, or an SEH-protected

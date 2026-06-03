@@ -8726,6 +8726,7 @@ std::string FormatVmDiagnostics(const hv::VmRunSummary &vm) {
   out << "timerInterruptsRequested: " << vm.timerInterruptsRequested << "\n";
   out << "timerInterruptsInjected: " << vm.timerInterruptsInjected << "\n";
   out << "pageFaultAssists: " << vm.pageFaultAssists << "\n";
+  out << "pageFaultAssistsSuppressed: " << vm.pageFaultAssistsSuppressed << "\n";
   out << "pageFaultsReinjected: " << vm.pageFaultsReinjected << "\n";
   out << "lastReinjectedFaultGva: 0x" << std::hex << std::uppercase
       << vm.lastReinjectedFaultGva << std::dec << "\n";
@@ -8922,6 +8923,7 @@ std::string FormatVmDiagnostics(const hv::VmRunSummary &vm) {
   out << "fwCfgSmbiosAnchorBytesRead: " << vm.fwCfgSmbiosAnchorBytesRead
       << "\n";
   out << "pageFaultAssists: " << vm.pageFaultAssists << "\n";
+  out << "pageFaultAssistsSuppressed: " << vm.pageFaultAssistsSuppressed << "\n";
   out << "hostChannelBytes: " << vm.hostChannelOutput.size() << "\n";
   out << "com1TouchStatus: " << ClassifyCom1TouchStatus(vm) << "\n";
   out << "com1RegisterReads: " << vm.com1RegisterReads << "\n";

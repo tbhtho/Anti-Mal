@@ -168,6 +168,12 @@ struct VmRunSummary {
   uint64_t pageFaultAssists = 0;
   uint64_t lastPageFaultAssistGva = 0;
   uint64_t lastPageFaultAssistGpa = 0;
+  // #PFs inside the firmware high-scratch aperture that were NOT assisted because
+  // the guest had already entered the OS kernel (firmware assist disabled). They
+  // are re-injected to the guest instead. >0 proves Windows faulted in the
+  // aperture and the host correctly stayed out of its page tables -- the fix for
+  // the intermittent 0x4E/0x1A MM bugchecks + "Preparing Windows" hang (2026-06-03).
+  uint64_t pageFaultAssistsSuppressed = 0;
   // Guest #PFs that the host did not need to assist and instead re-injected
   // into the guest so its own IDT #PF handler services them (kernel demand
   // paging, copy-on-write, SEH-protected probes such as ProbeForRead touching
