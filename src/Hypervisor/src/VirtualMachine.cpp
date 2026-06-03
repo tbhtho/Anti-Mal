@@ -1375,14 +1375,15 @@ VmRunSummary VirtualMachine::RunLoop(
   // (0x62 'b') into the guest COM1 RX this many seconds after kd attaches. This is
   // the autonomous equivalent of pressing Ctrl+Break in WinDbg (which merely
   // transmits 0x62): the kernel's KdPollBreakIn sees it and breaks into
-  // KdReceivePacket. CRITICAL: kd reads the KdDebuggerDataBlock at connection
-  // time, and that memory read only succeeds while the kernel is broken in (in
-  // KdReceivePacket polling COM1) -- but kd auto-continues the kernel, so the
-  // connection-time read hits a *running* kernel and fails ("Unable to read
-  // debugger data block header"). Breaking in shortly AFTER connect puts the
-  // kernel back in KdReceivePacket so kd's reads (and !process/!thread) work.
-  // GenerateConsoleCtrlEvent doesn't reach kd in a background/non-interactive
-  // context, so we inject the byte directly via the bridge.
+  // KdReceivePacket. GenerateConsoleCtrlEvent doesn't reach kd in a background/
+  // non-interactive context, so we inject the byte directly via the bridge.
+  // NOTE (2026-06-03): the old "kd's connection-time KdDebuggerDataBlock read
+  // fails because kd auto-continued the kernel" theory was DISPROVEN by byte-
+  // level dumps -- the kernel was provably broken-in (spinning in kdcom polling
+  // COM1) yet reads still failed. Root cause was relay TIMING: the old CV-woken
+  // reader/writer threads delivered kd's ACKs past the kernel's KdReceivePacket
+  // retry window, so the kernel re-sent its STATE_CHANGE forever and never
+  // processed a manipulate request. Fixed by KdPipeBridge::Pump() (in-loop I/O).
   int kdBreakinAtSec = 0;
   bool kdBreakinDone = false;
   auto kdConnectObservedAt = std::chrono::steady_clock::time_point{};
@@ -2382,6 +2383,10 @@ VmRunSummary VirtualMachine::RunLoop(
         kdPipe->SendToDebugger(
             reinterpret_cast<const uint8_t *>(kdBytes.data()), kdBytes.size());
       }
+      // Drive pipe I/O inline so the debugger's replies/ACKs reach the guest
+      // the SAME iteration the kernel polls COM1 (no cross-thread relay lag --
+      // that lag was why the KD session never converged; see KdPipeBridge.h).
+      kdPipe->Pump();
       const auto fromDbg = kdPipe->ReceiveFromDebugger();
       if (!fromDbg.empty()) {
         com1_.QueueRxBytes(fromDbg);

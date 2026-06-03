@@ -46,22 +46,24 @@ KdPipeBridge::KdPipeBridge(const std::wstring &pipeName) {
                     FILE_SHARE_READ, nullptr, CREATE_ALWAYS,
                     FILE_ATTRIBUTE_NORMAL, nullptr);
   }
-  reader_ = std::thread([this] { ReaderProc(); });
-  writer_ = std::thread([this] { WriterProc(); });
+  // Only the blocking ConnectNamedPipe (+ re-listen) lives on a thread; all data
+  // I/O is driven inline by Pump() from the run loop.
+  accept_ = std::thread([this] { AcceptProc(); });
 }
 
 KdPipeBridge::~KdPipeBridge() {
   stop_.store(true, std::memory_order_relaxed);
-  txCv_.notify_all();
+  {
+    std::lock_guard<std::mutex> lk(acceptMu_);
+    needReaccept_ = true;
+  }
+  acceptCv_.notify_all();
   if (pipe_ != INVALID_HANDLE_VALUE) {
-    // Unblock any in-flight ConnectNamedPipe / ReadFile / WriteFile.
+    // Unblock any in-flight ConnectNamedPipe in AcceptProc.
     CancelIoEx(pipe_, nullptr);
   }
-  if (reader_.joinable()) {
-    reader_.join();
-  }
-  if (writer_.joinable()) {
-    writer_.join();
+  if (accept_.joinable()) {
+    accept_.join();
   }
   if (pipe_ != INVALID_HANDLE_VALUE) {
     DisconnectNamedPipe(pipe_);
@@ -83,18 +85,16 @@ void KdPipeBridge::SendToDebugger(const uint8_t *data, size_t size) {
     return;
   }
   AppendBytes(dumpTo_, data, size);
-  {
-    std::lock_guard<std::mutex> lock(txMu_);
-    tx_.insert(tx_.end(), data, data + size);
-    // While no client is attached, bound the backlog (drop oldest).
-    if (!connected_.load(std::memory_order_relaxed) &&
-        tx_.size() > kMaxTxQueue) {
-      tx_.erase(tx_.begin(),
-                tx_.begin() +
-                    static_cast<std::ptrdiff_t>(tx_.size() - kMaxTxQueue));
-    }
+  std::lock_guard<std::mutex> lock(txMu_);
+  tx_.insert(tx_.end(), data, data + size);
+  // While no client is attached, bound the backlog (drop oldest). We do NOT
+  // clear tx_ on disconnect: kd resyncs via reconnect churn and the not-yet-
+  // sent bytes are the kernel's in-flight packet it still needs delivered.
+  if (!connected_.load(std::memory_order_relaxed) && tx_.size() > kMaxTxQueue) {
+    tx_.erase(tx_.begin(),
+              tx_.begin() +
+                  static_cast<std::ptrdiff_t>(tx_.size() - kMaxTxQueue));
   }
-  txCv_.notify_one();
 }
 
 std::vector<uint8_t> KdPipeBridge::ReceiveFromDebugger() {
@@ -107,11 +107,83 @@ std::vector<uint8_t> KdPipeBridge::ReceiveFromDebugger() {
   return out;
 }
 
-void KdPipeBridge::ReaderProc() {
-  // Re-listen loop: serve one debugger, and when it disconnects, reset the pipe
-  // and wait for the next one. This lets us attach/detach kd repeatedly to the
-  // same running VM (e.g. attach once the guest is sitting at the hang).
-  std::vector<uint8_t> buffer(8192);
+void KdPipeBridge::SignalReaccept() {
+  connected_.store(false, std::memory_order_relaxed);
+  {
+    std::lock_guard<std::mutex> lk(acceptMu_);
+    needReaccept_ = true;
+  }
+  acceptCv_.notify_all();
+}
+
+void KdPipeBridge::Pump() {
+  if (pipe_ == INVALID_HANDLE_VALUE ||
+      !connected_.load(std::memory_order_relaxed)) {
+    return;
+  }
+
+  // debugger -> guest: pull everything kd has queued, non-blocking. PeekNamedPipe
+  // tells us how many bytes are available so the following ReadFile never blocks.
+  for (;;) {
+    DWORD avail = 0;
+    if (!PeekNamedPipe(pipe_, nullptr, 0, nullptr, &avail, nullptr)) {
+      SignalReaccept();
+      return;
+    }
+    if (avail == 0) {
+      break;
+    }
+    uint8_t buf[8192];
+    const DWORD toRead =
+        avail < sizeof(buf) ? avail : static_cast<DWORD>(sizeof(buf));
+    DWORD got = 0;
+    if (!ReadFile(pipe_, buf, toRead, &got, nullptr) || got == 0) {
+      SignalReaccept();
+      return;
+    }
+    AppendBytes(dumpFrom_, buf, got);
+    {
+      std::lock_guard<std::mutex> lock(rxMu_);
+      rx_.insert(rx_.end(), buf, buf + got);
+    }
+    bytesFromDbg_.fetch_add(got, std::memory_order_relaxed);
+    if (got < toRead) {
+      break;
+    }
+  }
+
+  // guest -> debugger: flush queued bytes. If a write fails (client gone), requeue
+  // the un-written tail to the FRONT so a mid-packet disconnect never truncates
+  // the kernel's stream for the reconnecting debugger.
+  std::vector<uint8_t> pending;
+  {
+    std::lock_guard<std::mutex> lock(txMu_);
+    if (!tx_.empty()) {
+      pending.assign(tx_.begin(), tx_.end());
+      tx_.clear();
+    }
+  }
+  size_t off = 0;
+  while (off < pending.size()) {
+    DWORD wrote = 0;
+    if (!WriteFile(pipe_, pending.data() + off,
+                   static_cast<DWORD>(pending.size() - off), &wrote, nullptr) ||
+        wrote == 0) {
+      std::lock_guard<std::mutex> lock(txMu_);
+      tx_.insert(tx_.begin(), pending.begin() + static_cast<std::ptrdiff_t>(off),
+                 pending.end());
+      SignalReaccept();
+      return;
+    }
+    off += wrote;
+    bytesToDbg_.fetch_add(wrote, std::memory_order_relaxed);
+  }
+}
+
+void KdPipeBridge::AcceptProc() {
+  // Re-listen loop: serve one debugger; when Pump detects it disconnected,
+  // reset the pipe and wait for the next one. This lets us attach/detach kd
+  // repeatedly to the same running VM.
   while (!stop_.load(std::memory_order_relaxed)) {
     const BOOL ok = ConnectNamedPipe(pipe_, nullptr);
     if (stop_.load(std::memory_order_relaxed)) {
@@ -122,69 +194,24 @@ void KdPipeBridge::ReaderProc() {
       DisconnectNamedPipe(pipe_);
       continue;
     }
-    connected_.store(true, std::memory_order_relaxed);
     clientConnects_.fetch_add(1, std::memory_order_relaxed);
-    txCv_.notify_all(); // let the writer start flushing
+    connected_.store(true, std::memory_order_relaxed);
 
-    for (;;) {
-      DWORD read = 0;
-      if (!ReadFile(pipe_, buffer.data(),
-                    static_cast<DWORD>(buffer.size()), &read, nullptr)) {
-        break; // client disconnected / canceled
-      }
-      if (stop_.load(std::memory_order_relaxed)) {
-        break;
-      }
-      if (read == 0) {
-        continue;
-      }
-      AppendBytes(dumpFrom_, buffer.data(), read);
-      {
-        std::lock_guard<std::mutex> lock(rxMu_);
-        rx_.insert(rx_.end(), buffer.begin(),
-                   buffer.begin() + static_cast<std::ptrdiff_t>(read));
-      }
-      bytesFromDbg_.fetch_add(read, std::memory_order_relaxed);
+    // Block here (no busy-wait, no data I/O) until Pump signals a disconnect or
+    // we're shutting down. All byte relay happens in Pump() on the run-loop
+    // thread while connected_ is true.
+    {
+      std::unique_lock<std::mutex> lk(acceptMu_);
+      acceptCv_.wait(lk, [this] {
+        return stop_.load(std::memory_order_relaxed) || needReaccept_;
+      });
+      needReaccept_ = false;
     }
-    // Client gone: reset the pipe and wait for the next debugger.
-    // NOTE: we deliberately do NOT clear tx_ here. kd uses reconnect churn
-    // (disconnect/reconnect) during its RESET resync; if the guest had just
-    // queued its RESET echo + resent state-change, clearing tx_ would drop
-    // exactly the bytes the reconnecting kd needs to complete the handshake.
-    // The kMaxTxQueue cap in SendToDebugger still bounds the backlog, and kd
-    // re-scans for packet leaders so stale bytes are harmless.
+    if (stop_.load(std::memory_order_relaxed)) {
+      break;
+    }
     connected_.store(false, std::memory_order_relaxed);
     DisconnectNamedPipe(pipe_);
-  }
-}
-
-void KdPipeBridge::WriterProc() {
-  std::vector<uint8_t> pending;
-  while (!stop_.load(std::memory_order_relaxed)) {
-    {
-      std::unique_lock<std::mutex> lock(txMu_);
-      txCv_.wait(lock, [this] {
-        return stop_.load(std::memory_order_relaxed) ||
-               (connected_.load(std::memory_order_relaxed) && !tx_.empty());
-      });
-      if (stop_.load(std::memory_order_relaxed)) {
-        return;
-      }
-      pending.assign(tx_.begin(), tx_.end());
-      tx_.clear();
-    }
-    size_t offset = 0;
-    while (offset < pending.size() && !stop_.load(std::memory_order_relaxed)) {
-      DWORD written = 0;
-      if (!WriteFile(pipe_, pending.data() + offset,
-                     static_cast<DWORD>(pending.size() - offset), &written,
-                     nullptr) ||
-          written == 0) {
-        break; // client disconnected mid-write; wait for the next one (re-listen)
-      }
-      offset += written;
-      bytesToDbg_.fetch_add(written, std::memory_order_relaxed);
-    }
   }
 }
 

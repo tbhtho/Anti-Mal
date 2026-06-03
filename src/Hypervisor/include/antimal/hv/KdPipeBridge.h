@@ -9,9 +9,18 @@
 // handshake); this bridge instead hands the raw KD byte stream to WinDbg/kd,
 // which does the real protocol (break-in, !process, ~*k, symbols).
 //
-// A worker owns the blocking pipe I/O so the VM run loop never blocks: the loop
-// only enqueues guest->debugger bytes and drains debugger->guest bytes. Two
-// threads share the full-duplex pipe handle (one read, one write).
+// I/O model: the VM run loop calls Pump() once per iteration to do ALL pipe
+// data I/O inline (non-blocking PeekNamedPipe + ReadFile for debugger->guest, a
+// direct WriteFile for guest->debugger). This is deliberate. An earlier design
+// used CV-woken reader/writer worker threads, but the cross-thread hand-off
+// delayed delivery of the debugger's ACKs past the kernel's KdReceivePacket
+// retry window, so the kernel re-sent its STATE_CHANGE break-notification
+// forever and the session never converged (kd stuck at "no_debuggee" /
+// "Unable to read head of debugger data list, 0n56"). Pumping in the run loop
+// delivers the debugger's bytes to COM1 the same iteration the kernel polls for
+// them, with no scheduling lag. A single tiny accept thread owns only the
+// blocking ConnectNamedPipe (so the run loop never blocks waiting for kd to
+// attach) and re-listens on disconnect for attach/detach.
 
 #include <atomic>
 #include <condition_variable>
@@ -40,10 +49,16 @@ public:
     return connected_.load(std::memory_order_relaxed);
   }
 
-  // Guest wrote these bytes to COM1 (guest -> debugger). Queued for the writer.
+  // Guest wrote these bytes to COM1 (guest -> debugger). Queued; flushed by Pump.
   void SendToDebugger(const uint8_t *data, size_t size);
-  // Bytes the debugger sent (debugger -> guest); feed these to COM1 RX.
+  // Bytes the debugger sent (debugger -> guest); feed these to COM1 RX. Filled
+  // by Pump(); drain right after calling Pump().
   std::vector<uint8_t> ReceiveFromDebugger();
+
+  // Drive all pipe data I/O inline from the VM run loop: pull any available
+  // debugger->guest bytes (non-blocking, PeekNamedPipe-gated) and flush queued
+  // guest->debugger bytes. Never blocks. Call once per run-loop iteration.
+  void Pump();
 
   uint64_t BytesToDebugger() const noexcept {
     return bytesToDbg_.load(std::memory_order_relaxed);
@@ -56,20 +71,17 @@ public:
   }
 
 private:
-  void ReaderProc();
-  void WriterProc();
+  void AcceptProc();
+  void SignalReaccept();
 
   // Diagnostics: when ANTIMAL_KD_DUMP is set, append the raw bidirectional KD
-  // byte stream to <value>_to_dbg.bin (guest->debugger) and <value>_from_dbg.bin
-  // (debugger->guest) so the framing/checksum can be decoded offline. The two
-  // files are written by different threads (VM loop vs reader), so each gets its
-  // own handle and no lock is shared between directions.
+  // byte stream to _to_dbg.bin (guest->debugger) and _from_dbg.bin
+  // (debugger->guest) so the framing/checksum can be decoded offline.
   HANDLE dumpTo_ = INVALID_HANDLE_VALUE;   // guest -> debugger
   HANDLE dumpFrom_ = INVALID_HANDLE_VALUE; // debugger -> guest
 
   // Drop oldest queued guest->debugger bytes past this cap while no client is
-  // attached (the guest resends KD state; WinDbg resyncs on connect, so stale
-  // retries are safe to discard rather than buffering unboundedly).
+  // attached (kd resyncs on connect, so stale retries are safe to discard).
   static constexpr size_t kMaxTxQueue = 256u * 1024u;
 
   HANDLE pipe_ = INVALID_HANDLE_VALUE;
@@ -80,14 +92,17 @@ private:
   std::atomic<uint64_t> clientConnects_{0};
 
   std::mutex txMu_;
-  std::condition_variable txCv_;
-  std::deque<uint8_t> tx_; // guest -> debugger
+  std::deque<uint8_t> tx_; // guest -> debugger (flushed by Pump)
 
   std::mutex rxMu_;
-  std::deque<uint8_t> rx_; // debugger -> guest
+  std::deque<uint8_t> rx_; // debugger -> guest (filled by Pump)
 
-  std::thread reader_;
-  std::thread writer_;
+  // The accept thread owns ONLY the blocking ConnectNamedPipe + re-listen, so
+  // the run loop never blocks waiting for kd. All data I/O is in Pump().
+  std::thread accept_;
+  std::mutex acceptMu_;
+  std::condition_variable acceptCv_;
+  bool needReaccept_ = false;
 };
 
 } // namespace antimal::hv

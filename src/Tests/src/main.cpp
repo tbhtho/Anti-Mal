@@ -28,6 +28,7 @@
 #include "antimal/hv/HostSerialChannel.h"
 #include "antimal/hv/IoApic.h"
 #include "antimal/hv/IoBus.h"
+#include "antimal/hv/KdPipeBridge.h"
 #include "antimal/hv/KdSerialDebugger.h"
 #include "antimal/hv/MmioBus.h"
 #include "antimal/hv/MmioEmulator.h"
@@ -4020,6 +4021,76 @@ void TestChannelTelemetryRoundTrip() {
   std::filesystem::remove(journalPath, ec);
 }
 
+// Regression guard for the in-loop KD pipe relay (KdPipeBridge::Pump). The live
+// timing bug it fixed only reproduces under a real kernel KD handshake, but this
+// verifies the bridge relays bytes BOTH directions inline from the caller (no
+// CV-woken worker threads) and registers/clears the client via the accept thread.
+void TestKdPipeBridgeRelay() {
+  const std::wstring pipeName = L"\\\\.\\pipe\\antimal-kd-test-relay";
+  antimal::hv::KdPipeBridge bridge(pipeName);
+  Expect(bridge.Valid(), "KdPipeBridge: pipe created");
+  if (!bridge.Valid()) {
+    return;
+  }
+  // Connect a client; the accept thread accepts on open.
+  HANDLE client = INVALID_HANDLE_VALUE;
+  for (int i = 0; i < 200 && client == INVALID_HANDLE_VALUE; ++i) {
+    client = CreateFileW(pipeName.c_str(), GENERIC_READ | GENERIC_WRITE, 0,
+                         nullptr, OPEN_EXISTING, 0, nullptr);
+    if (client == INVALID_HANDLE_VALUE) {
+      Sleep(5);
+    }
+  }
+  Expect(client != INVALID_HANDLE_VALUE, "KdPipeBridge: test client opened pipe");
+  if (client == INVALID_HANDLE_VALUE) {
+    return;
+  }
+  for (int i = 0; i < 400 && !bridge.ClientConnected(); ++i) {
+    Sleep(5);
+  }
+  Expect(bridge.ClientConnected(),
+         "KdPipeBridge: accept thread registered client");
+
+  // debugger -> guest: client writes; Pump pulls; ReceiveFromDebugger returns.
+  const uint8_t inbytes[] = {0x69, 0x69, 0x69, 0x69, 'A', 'C', 'K'};
+  DWORD wrote = 0;
+  WriteFile(client, inbytes, sizeof(inbytes), &wrote, nullptr);
+  std::vector<uint8_t> got;
+  for (int i = 0; i < 400 && got.empty(); ++i) {
+    bridge.Pump();
+    got = bridge.ReceiveFromDebugger();
+    if (got.empty()) {
+      Sleep(2);
+    }
+  }
+  Expect(got.size() == sizeof(inbytes) && !got.empty() && got.front() == 0x69 &&
+             got.back() == 'K',
+         "KdPipeBridge: relayed debugger->guest bytes inline");
+
+  // guest -> debugger: SendToDebugger + Pump; client reads back.
+  const uint8_t outbytes[] = {0x30, 0x30, 0x30, 0x30, 1, 2, 3, 4};
+  bridge.SendToDebugger(outbytes, sizeof(outbytes));
+  bridge.Pump();
+  DWORD cavail = 0;
+  for (int i = 0; i < 400 && cavail < sizeof(outbytes); ++i) {
+    if (!PeekNamedPipe(client, nullptr, 0, nullptr, &cavail, nullptr)) {
+      break;
+    }
+    if (cavail < sizeof(outbytes)) {
+      Sleep(2);
+    }
+  }
+  uint8_t rbuf[64] = {0};
+  DWORD rd = 0;
+  if (cavail > 0) {
+    ReadFile(client, rbuf, sizeof(rbuf), &rd, nullptr);
+  }
+  Expect(rd == sizeof(outbytes) && rbuf[0] == 0x30 && rbuf[7] == 4,
+         "KdPipeBridge: relayed guest->debugger bytes inline");
+
+  CloseHandle(client);
+}
+
 int main() {
   try {
     TestHashEntropyJson();
@@ -4055,6 +4126,7 @@ int main() {
     TestBridgeFuzz();
     TestHostChannelFuzz();
     TestChannelTelemetryRoundTrip();
+    TestKdPipeBridgeRelay();
     TestIdeReadWriteSectors();
     TestIdeSecondaryNoDeviceStatus();
     TestIdeAssertsInterrupt();
