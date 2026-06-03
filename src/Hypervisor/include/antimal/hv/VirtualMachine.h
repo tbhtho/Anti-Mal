@@ -399,6 +399,13 @@ struct VmRunSummary {
   bool com1RxInterruptEnabled = false;
   bool com1RxDataReady = false;
   uint64_t kdCom1RxQueuedBytes = 0;
+  // KD named-pipe bridge (ANTIMAL_KD_PIPE) diagnostics: did a real debugger
+  // attach, and did bytes flow each way? Distinguishes "guest never emitted KD"
+  // from "bridge relayed but the debugger never synced".
+  bool kdPipeActive = false;
+  uint64_t kdPipeClientConnects = 0;
+  uint64_t kdPipeBytesToDebugger = 0;
+  uint64_t kdPipeBytesFromDebugger = 0;
   KdSerialSummary kdSummary;
   std::vector<KdSerialEvent> kdEvents;
   std::string kdTranscript;

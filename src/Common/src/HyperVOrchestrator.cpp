@@ -8956,6 +8956,12 @@ std::string FormatVmDiagnostics(const hv::VmRunSummary &vm) {
       << (vm.com1RxInterruptEnabled ? "true" : "false") << "\n";
   out << "com1RxDataReady: " << (vm.com1RxDataReady ? "true" : "false")
       << "\n";
+  if (vm.kdPipeActive) {
+    out << "kdPipeActive: true\n";
+    out << "kdPipeClientConnects: " << vm.kdPipeClientConnects << "\n";
+    out << "kdPipeBytesToDebugger: " << vm.kdPipeBytesToDebugger << "\n";
+    out << "kdPipeBytesFromDebugger: " << vm.kdPipeBytesFromDebugger << "\n";
+  }
   out << "kdCom1BytesObserved: " << vm.kdSummary.bytesObserved << "\n";
   out << "kdCom1NoiseBytes: " << vm.kdSummary.noiseBytes << "\n";
   out << "kdPacketsReceived: " << vm.kdSummary.packetsReceived << "\n";

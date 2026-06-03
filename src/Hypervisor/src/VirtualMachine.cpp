@@ -2760,6 +2760,12 @@ VmRunSummary VirtualMachine::RunLoop(
   summary.com1RxInterruptEnabled = com1Stats.rxInterruptEnabled;
   summary.com1RxDataReady = com1Stats.rxDataReady;
   summary.kdCom1RxQueuedBytes = com1_.RxQueuedBytes();
+  if (kdPipe) {
+    summary.kdPipeActive = true;
+    summary.kdPipeClientConnects = kdPipe->ClientConnects();
+    summary.kdPipeBytesToDebugger = kdPipe->BytesToDebugger();
+    summary.kdPipeBytesFromDebugger = kdPipe->BytesFromDebugger();
+  }
   summary.kdSummary = kdDebugger.Summary();
   summary.kdEvents = kdDebugger.Events();
   summary.kdTranscript = kdDebugger.Transcript();
