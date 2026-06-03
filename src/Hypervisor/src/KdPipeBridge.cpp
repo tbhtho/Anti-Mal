@@ -146,13 +146,15 @@ void KdPipeBridge::ReaderProc() {
       }
       bytesFromDbg_.fetch_add(read, std::memory_order_relaxed);
     }
-    // Client gone: reset the pipe + drop stale outbound bytes for the next one.
+    // Client gone: reset the pipe and wait for the next debugger.
+    // NOTE: we deliberately do NOT clear tx_ here. kd uses reconnect churn
+    // (disconnect/reconnect) during its RESET resync; if the guest had just
+    // queued its RESET echo + resent state-change, clearing tx_ would drop
+    // exactly the bytes the reconnecting kd needs to complete the handshake.
+    // The kMaxTxQueue cap in SendToDebugger still bounds the backlog, and kd
+    // re-scans for packet leaders so stale bytes are harmless.
     connected_.store(false, std::memory_order_relaxed);
     DisconnectNamedPipe(pipe_);
-    {
-      std::lock_guard<std::mutex> lock(txMu_);
-      tx_.clear();
-    }
   }
 }
 

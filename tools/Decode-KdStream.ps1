@@ -19,7 +19,11 @@ $types = @{
 }
 
 if (-not (Test-Path $Path)) { Write-Host "MISSING: $Path"; exit 1 }
-$b = [System.IO.File]::ReadAllBytes($Path)
+# Shared read so we can decode while the bridge still has the file open for write.
+$fs = New-Object System.IO.FileStream($Path, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]::ReadWrite)
+$b = New-Object byte[] $fs.Length
+[void]$fs.Read($b, 0, $b.Length)
+$fs.Close()
 Write-Host ("File: {0}  ({1} bytes)" -f $Path, $b.Length)
 
 $i = 0; $n = $b.Length; $shown = 0; $stray = 0
