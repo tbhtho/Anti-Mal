@@ -1371,15 +1371,21 @@ VmRunSummary VirtualMachine::RunLoop(
       }
     }
   }
-  // ANTIMAL_KD_BREAKIN_AT=<seconds>: with the real-kd bridge active, inject the
-  // KD break-in byte (0x62 'b') into the guest COM1 RX at this elapsed time. This
-  // is the autonomous equivalent of pressing Ctrl+Break in WinDbg (which merely
-  // transmits 0x62): the kernel's KdPollBreakIn sees it, breaks in, and kd stops
-  // at its first break -- exactly when kd runs its -c command. Lets us break a
-  // running-but-hung target headlessly, since GenerateConsoleCtrlEvent doesn't
-  // reach kd in a non-interactive/background context.
+  // ANTIMAL_KD_BREAKIN_AT=<seconds-AFTER-kd-connects>: inject the KD break-in byte
+  // (0x62 'b') into the guest COM1 RX this many seconds after kd attaches. This is
+  // the autonomous equivalent of pressing Ctrl+Break in WinDbg (which merely
+  // transmits 0x62): the kernel's KdPollBreakIn sees it and breaks into
+  // KdReceivePacket. CRITICAL: kd reads the KdDebuggerDataBlock at connection
+  // time, and that memory read only succeeds while the kernel is broken in (in
+  // KdReceivePacket polling COM1) -- but kd auto-continues the kernel, so the
+  // connection-time read hits a *running* kernel and fails ("Unable to read
+  // debugger data block header"). Breaking in shortly AFTER connect puts the
+  // kernel back in KdReceivePacket so kd's reads (and !process/!thread) work.
+  // GenerateConsoleCtrlEvent doesn't reach kd in a background/non-interactive
+  // context, so we inject the byte directly via the bridge.
   int kdBreakinAtSec = 0;
   bool kdBreakinDone = false;
+  auto kdConnectObservedAt = std::chrono::steady_clock::time_point{};
   {
     char b[16]{};
     size_t n = 0;
@@ -2381,14 +2387,20 @@ VmRunSummary VirtualMachine::RunLoop(
         com1_.QueueRxBytes(fromDbg);
         madeProgress = true;
       }
-      // Timed KD break-in: inject 0x62 once at the configured elapsed time so the
-      // running guest breaks into kd (which then runs its -c dump commands).
+      // Timed KD break-in: once kd has attached, wait kdBreakinAtSec seconds
+      // (giving the connection time to settle) then inject 0x62 so the running
+      // guest breaks into KdReceivePacket -- where kd's memory reads + -c dump
+      // commands work. Fire ONCE, measured from when the client connected.
       if (kdBreakinAtSec > 0 && !kdBreakinDone) {
-        const auto elapsedSec =
+        const auto nowBrk = std::chrono::steady_clock::now();
+        if (kdPipe->ClientConnected() &&
+            kdConnectObservedAt == std::chrono::steady_clock::time_point{}) {
+          kdConnectObservedAt = nowBrk;
+        }
+        if (kdConnectObservedAt != std::chrono::steady_clock::time_point{} &&
             std::chrono::duration_cast<std::chrono::seconds>(
-                std::chrono::steady_clock::now() - runStarted)
-                .count();
-        if (elapsedSec >= kdBreakinAtSec) {
+                nowBrk - kdConnectObservedAt)
+                    .count() >= kdBreakinAtSec) {
           const uint8_t breakByte = 0x62; // 'b' = KD break-in request
           com1_.QueueRxBytes(&breakByte, 1);
           kdBreakinDone = true;
