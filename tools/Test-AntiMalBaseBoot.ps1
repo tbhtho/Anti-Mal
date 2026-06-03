@@ -223,6 +223,27 @@ function Install-GuestAgent([string]$WindowsRoot, [string]$AgentPath) {
   $dest = Join-Path $agentDir "AntiMal.GuestAgent.exe"
   Copy-Item -LiteralPath $AgentPath -Destination $dest -Force
 
+  # The agent links the VC++ runtime dynamically (/MD): MSVCP140 / VCRUNTIME140 /
+  # VCRUNTIME140_1. A clean Windows ISO image ships the UCRT (api-ms-win-crt-*) but
+  # NOT these, so the LocalSystem service's exe fails to LOAD before running a single
+  # instruction (silent: zero COM2 bytes, no log). Bundle them next to the exe (the
+  # exe's own directory is first in the DLL search order) so the agent is
+  # self-sufficient in a clean guest. (Permanent alternative: build the agent /MT.)
+  $vcDlls = @("msvcp140.dll", "vcruntime140.dll", "vcruntime140_1.dll")
+  $vcSrc = $null
+  $vcRedist = Get-ChildItem "C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Redist\MSVC\*\x64\Microsoft.VC143.CRT" -Directory -ErrorAction SilentlyContinue | Sort-Object FullName -Descending | Select-Object -First 1
+  if ($vcRedist -and (@($vcDlls | Where-Object { Test-Path (Join-Path $vcRedist.FullName $_) }).Count -eq $vcDlls.Count)) {
+    $vcSrc = $vcRedist.FullName
+  } elseif (@($vcDlls | Where-Object { Test-Path (Join-Path "C:\Windows\System32" $_) }).Count -eq $vcDlls.Count) {
+    $vcSrc = "C:\Windows\System32"
+  }
+  if ($vcSrc) {
+    foreach ($d in $vcDlls) { Copy-Item -LiteralPath (Join-Path $vcSrc $d) -Destination (Join-Path $agentDir $d) -Force }
+    Write-Host "OK: bundled VC++ runtime ($($vcDlls -join ', ')) from $vcSrc"
+  } else {
+    Write-Warning "VC++ runtime DLLs not found - in-guest agent may fail to start on a clean image. Install the VC143 redist or build the agent /MT."
+  }
+
   $softwareHiveName = "AntiMalBaseSoftware"
   $softwareHivePath = Join-Path $WindowsRoot "Windows\System32\Config\SOFTWARE"
   $systemHiveName = "AntiMalBaseSystem"
