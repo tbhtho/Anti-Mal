@@ -9973,14 +9973,21 @@ DetonationResult InHouseOrchestrator::PrepareAndRun(
               return ms;
             };
             // Timing-robust bypass. The un-accelerated VM's OOBE reaches the
-            // network/account screens at a VARIABLE time (observed ~330s one run,
-            // ~690s another) because the specialize-reboot count + render speed
-            // vary, so a single timed shot misses. `Shift+F10` -> `start
-            // ms-cxh:localonly` jumps to local-account creation from ANY
-            // interactive OOBE screen, so fire the whole bypass + account-create
-            // block at SEVERAL offsets spanning the window; whichever lands on a
-            // live OOBE screen wins, and extra firings hit the desktop harmlessly
-            // (Shift+F10 opens a console, the typed text/Enters are inert there).
+            // "Hi there"/network/account screens at a HIGHLY VARIABLE time --
+            // observed ~330s, ~690s, and (2026-06-03) as late as ~1260s -- because
+            // the specialize-reboot count + provisioning IO + render speed vary a
+            // lot per boot. The previous window (offsets {0,150,300,450,600} from
+            // startSec, i.e. only ~250-850s) MISSED a boot whose OOBE rendered at
+            // ~1260s: all firings were spent on earlier boot screens and OOBE then
+            // sat at "Hi there" forever with no input left -> no desktop. So fire
+            // the whole Enter -> Shift+F10 -> run-script -> Enter block REPEATEDLY
+            // across the entire boot window (every ~120s out to ~1320s past
+            // startSec); whichever firing lands on a live OOBE screen wins, and
+            // extra firings hit the desktop harmlessly (Shift+F10 + typing a path
+            // that matches no shell action + Enter are inert; the script is
+            // self-guarded against re-runs). This directly fixes the desktop-reach
+            // intermittency: it no longer depends on OOBE rendering inside a narrow
+            // early window.
             const std::vector<uint8_t> shiftF10{0x2A, 0x44, 0xC4, 0xAA};
             // ms-cxh:localonly is BLOCKED in Win11 25H2 (build 26200): it returns
             // "Access is denied / token does not exist". So instead run a
@@ -9989,7 +9996,8 @@ DetonationResult InHouseOrchestrator::PrepareAndRun(
             // local admin, sets AutoAdminLogon, marks OOBE complete, and reboots
             // straight to the desktop. The path uses only appendKeys-typable
             // (lowercase) chars; the script is self-guarded against re-runs.
-            for (int off : {0, 150, 300, 450, 600}) {
+            for (int off : {0,   120, 240, 360, 480,  600,  720,
+                            840, 960, 1080, 1200, 1320}) {
               const milliseconds o = base + seconds{off};
               bursts.push_back({o, enter});                  // dismiss a focused dialog
               bursts.push_back({o + seconds{4}, shiftF10});  // open an admin console
