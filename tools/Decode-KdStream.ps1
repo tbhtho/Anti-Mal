@@ -60,6 +60,14 @@ while ($i -lt $n) {
   if ($isData) {
     # data + trailer; verify checksum = sum of data bytes
     if ($i + 16 + $bc + 1 -le $n) {
+      # For STATE_MANIPULATE (type 2), the first dword of data is the ApiNumber:
+      # 0x3130=ReadVirtualMemory, 0x3131=WriteVirtualMemory, 0x3132=GetContext,
+      # 0x313C=Continue, 0x3146=GetVersion. Lets us see reads vs responses.
+      if ($type -eq 2 -and $bc -ge 4) {
+        $api = [BitConverter]::ToUInt32($b, $i+16)
+        $apiName = switch ($api) { 0x3130 {'ReadVirtMem'} 0x3131 {'WriteVirtMem'} 0x3132 {'GetContext'} 0x3137 {'ReadCtlSpace'} 0x313C {'Continue'} 0x3146 {'GetVersion'} 0x3140 {'ReadPhysMem'} default {('api0x{0:X}' -f $api)} }
+        $tname = "MANIP:$apiName"
+      }
       $sum = 0
       for ($j = 0; $j -lt $bc; $j++) { $sum = ($sum + $b[$i+16+$j]) -band 0xFFFFFFFF }
       $trail = $b[$i+16+$bc]
