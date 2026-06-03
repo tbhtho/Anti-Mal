@@ -52,11 +52,10 @@ Real malware execution remains intentionally blocked. The project stages samples
 
 All of the dynamic-sandbox *software* is built (live console, telemetry pipeline, live input, agent deployed). The **one remaining gate is runtime reliability: the VM reaching a stable logged-in desktop on every automated run.** The desktop has been reached, but intermittently — so the agent doesn't yet auto-stream telemetry end-to-end (`hostChannelBytes` is still `0` because no automated run has held a stable desktop long enough for the agent service to connect).
 
-The failure modes (full detail + the ordered fix plan in private development documentation (private documentation)):
+Boots are **bounded** (the watchdog reliably fires `--timeout-sec`; every run shows `timedOut:true`). The blocker is the *hang itself*, not runaway boots. The failure modes (full detail + ordered plan in private development documentation (private documentation)):
 
-1. **Watchdog wedge (fix first — code-only):** when the guest enters a pure-CPU spin, the watchdog blocks in a WHP call instead of driving `CancelRun`, so `--timeout-sec` never fires and the boot runs for hours. Fix: the watchdog does *only* `CancelRun`; move all interrupt injection into the main loop's exit handlers. This makes boots bounded + repeatable, which unblocks fast iteration.
-2. **1-vCPU first-logon stall:** boots reach OOBE/login/"Preparing Windows" but the first-logon finalization often hangs (a user-mode wait). A new diagnostic captures the current guest process at the hang to name the culprit (needs offset calibration for build 26200).
-3. **2-vCPU AP-bringup race:** deterministically spins at a kernel SMP rendezvous (`ntkrnlmp+0x2916EC`) — an AP-bringup synchronization bug (confirmed *not* CET-related). 2-vCPU is the better long-term path because first-logon is heavy SMP work.
+1. **1-vCPU first-logon stall:** boots reach OOBE/login/"Preparing Windows" but the first-logon finalization hangs (a user-mode wait, RIP `0x7FF8…`). The hard part is *naming* what's hung — best unlocked by getting a real kernel debugger attached (KD-over-serial, partially set up) rather than guessing struct offsets. The VM has **no NIC**, which can stall network-dependent first-logon work (a virtual NIC, Milestone C.1, is a strong candidate fix and is needed anyway).
+2. **2-vCPU AP-bringup race:** deterministically spins at a kernel SMP rendezvous (`ntkrnlmp+0x2916EC`) — an AP-bringup synchronization bug (confirmed *not* CET-related). 2-vCPU is the better long-term path because first-logon is heavy SMP work.
 
 Once a stable desktop is reached, the baked agent service auto-starts → streams `process.*` over COM2 → `events.jsonl` → the UI panel, on a desktop you can see and drive — closing both 3b (live telemetry) and 3c (live interaction). Then re-snapshot `AntiMalDesktop.cow` from the agent-equipped desktop for fast seed-boots.
 
@@ -204,7 +203,7 @@ rules/             tagger rules
 - **80%: complete. Boots to the GUI stack** (ntoskrnl Phase 0/1 → AHCI mount → win32k/dxgkrnl/display → "Getting ready").
 - **85%: complete. VM warm-reset + login/desktop.** Guest-initiated reset (`0xCF9`/ACPI) is serviced (VM recreated, overlay persists), so Windows' first-boot reboots succeed → OOBE → account creation → **login → "Preparing Windows" → desktop** (reached, intermittently). Injected-input garbling fixed by **pacing**; a **CET kernel hang** (CPUID leaf 7) fixed so the boot reaches user mode.
 - **88%: complete. Live console + telemetry + input software.** WebView2 UI + bridge; in-guest process collector + COM2/AMCH channel + host journaling + UI panel; live keyboard+mouse injection; GuestAgent installed in the base.
-- **90%: in progress. Desktop-reach RELIABILITY** — the one remaining runtime gate. Boots reach the desktop intermittently; closing this needs the watchdog fix (bounded boots) + the 1-vCPU first-logon-stall / 2-vCPU AP-rendezvous work. See `private development documentation`.
+- **90%: in progress. Desktop-reach RELIABILITY** — the one remaining runtime gate. Boots are bounded (they time out cleanly) but reach the desktop only intermittently; closing it means diagnosing + fixing the first-logon "Preparing Windows" hang (best via a real kernel debugger) and/or the 2-vCPU AP rendezvous, plus likely a virtual NIC. See `private development documentation`.
 - 93%: agent auto-streams `process.*` telemetry from a reliably-reached desktop → UI (3b live); live mouse/keyboard interaction proven on that desktop (3c live); re-snapshot the agent-equipped desktop.
 - 96%: benign job round-trip, disposable-overlay discard, artifact return, timeout handling hardened; network modes + fake-internet.
 - 100%: interactive malware sandbox MVP.
