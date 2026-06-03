@@ -404,6 +404,11 @@ struct VmRunSummary {
   bool com1Dlab = false;
   bool com1RxInterruptEnabled = false;
   bool com1RxDataReady = false;
+  // COM2 (the host<->guest AMCH channel, 0x2F8) full register stats. Lets us tell
+  // "Windows serial.sys never enumerated COM2" (all zero) from "it probed/initialized
+  // the port but the agent never wrote data" (registerReads/lcrWrites/dllWrites > 0,
+  // dataWrites == 0) -- the decisive split for the agent-telemetry diagnosis.
+  SerialConsoleStats com2Stats{};
   uint64_t kdCom1RxQueuedBytes = 0;
   // KD named-pipe bridge (ANTIMAL_KD_PIPE) diagnostics: did a real debugger
   // attach, and did bytes flow each way? Distinguishes "guest never emitted KD"

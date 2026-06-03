@@ -8925,6 +8925,21 @@ std::string FormatVmDiagnostics(const hv::VmRunSummary &vm) {
   out << "pageFaultAssists: " << vm.pageFaultAssists << "\n";
   out << "pageFaultAssistsSuppressed: " << vm.pageFaultAssistsSuppressed << "\n";
   out << "hostChannelBytes: " << vm.hostChannelOutput.size() << "\n";
+  // COM2 (the host<->guest AMCH channel @0x2F8) register activity. The decisive
+  // agent-telemetry split: com2RegisterReads==0 => Windows serial.sys never
+  // enumerated/probed COM2 (ACPI/PnP problem); registerReads>0 but dataWrites==0 =>
+  // the port was probed/initialized but the agent never wrote (agent/open problem);
+  // dataWrites>0 => the agent streamed (== hostChannelBytes).
+  out << "com2RegisterReads: " << vm.com2Stats.registerReads << "\n";
+  out << "com2RegisterWrites: " << vm.com2Stats.registerWrites << "\n";
+  out << "com2DataWrites: " << vm.com2Stats.dataWrites << "\n";
+  out << "com2DataReads: " << vm.com2Stats.dataReads << "\n";
+  out << "com2LcrWrites: " << vm.com2Stats.lcrWrites << "\n";
+  out << "com2DllWrites: " << vm.com2Stats.dllWrites << "\n";
+  out << "com2IerWrites: " << vm.com2Stats.ierWrites << "\n";
+  out << "com2McrWrites: " << vm.com2Stats.mcrWrites << "\n";
+  out << "com2LsrReads: " << vm.com2Stats.lsrReads << "\n";
+  out << "com2RxBytesQueued: " << vm.com2Stats.rxBytesQueued << "\n";
   out << "com1TouchStatus: " << ClassifyCom1TouchStatus(vm) << "\n";
   out << "com1RegisterReads: " << vm.com1RegisterReads << "\n";
   out << "com1RegisterWrites: " << vm.com1RegisterWrites << "\n";

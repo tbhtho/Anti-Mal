@@ -2840,6 +2840,7 @@ VmRunSummary VirtualMachine::RunLoop(
   summary.com1Dlab = com1Stats.dlab;
   summary.com1RxInterruptEnabled = com1Stats.rxInterruptEnabled;
   summary.com1RxDataReady = com1Stats.rxDataReady;
+  summary.com2Stats = com2_.Stats();
   summary.kdCom1RxQueuedBytes = com1_.RxQueuedBytes();
   if (kdPipe) {
     summary.kdPipeActive = true;
