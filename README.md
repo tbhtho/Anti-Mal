@@ -2,29 +2,22 @@
 
 AntiMal is a defensive malware-analysis scaffold for Windows. The long-term goal is a local, open-source interactive sandbox for safely detonating suspicious Windows binaries without relying on Windows Sandbox, VirtualBox, VMware, or commercial services.
 
-Overall progress: [██████████████░░░] 80%
+Overall progress: [████████████████░] 90%
+
+> **For the authoritative, dated "where we are" status, read private development documentation (private documentation) first.** This section is the narrative; that file is the single source of truth.
 
 ## Current Status
 
 AntiMal has two major layers:
 
-1. Static enrichment, which works today.
-2. Dynamic detonation inside an AntiMal-owned Windows VM, which is actively being built on Windows Hypervisor Platform (WHP).
+1. **Static enrichment — ships today.** Hash, entropy, PE metadata, strings + IOC mining, rule/tag tracker, optional YARA/capa/DIE, optional MalwareBazaar/VirusTotal lookups (off by default), JSON + HTML reports.
+2. **Dynamic "live sandbox" — software complete, runtime-gated.** The in-house WHP VM now boots Windows 11 25H2 **all the way to login and the desktop** (the desktop *has* been reached — that's how the desktop snapshot was made), a **WebView2 live console** UI is built, the **host↔guest telemetry pipeline** and **live keyboard+mouse input** are wired, and the GuestAgent is **installed in the base image**.
 
-The scanner can already hash files, calculate entropy, parse PE metadata, mine strings and IOCs, apply rules/tags, and optionally call external tools such as YARA, capa, and Detect It Easy when those binaries are present. Threat-intel lookup support exists for MalwareBazaar and VirusTotal, but outbound intel is off by default.
+**The full boot chain works:** OVMF → `bootmgfw` → `winload.efi` → code-integrity → **ntoskrnl** → kernel Phase 0/1 → **AHCI storage mount** → win32k/dxgkrnl/display → OOBE → **VM warm-reset (guest reboot is serviced)** → interactive OOBE / account creation → **login → "Preparing Windows" → desktop**. Walls cleared to get here include: the `0xc0000225` code-integrity abort (source-built TPM2 OVMF), the `0xc0430001` winload wall (our own ACPI checksum bug), the **`0x7B INACCESSIBLE_BOOT_DEVICE`** storage wall (built a from-scratch PCI-native **AHCI** controller — `storahci.sys` binds it), VM warm-reset, the **injected-input garbling** (fixed by pacing keystrokes), and a **CET kernel hang** (Windows wedged enabling CET shadow stacks; fixed by masking CET in CPUID leaf 7 — the boot now reaches user mode and reboots normally).
 
-The in-house VM has reached its biggest milestone yet: **it now boots Windows 11 24H2 all the way through the kernel and the full graphics/GUI stack to the "Getting ready" setup screen — the months-long `INACCESSIBLE_BOOT_DEVICE` (0x7B) storage wall is broken.** The WHP frontend creates a partition, runs vCPUs, maps RAM and OVMF firmware, emulates the PC hardware that OVMF and Windows need, exposes the boot disk through a **from-scratch in-house AHCI/SATA controller**, streams OVMF debug output, creates per-run copy-on-write overlays, and captures a real guest framebuffer PNG roughly every second.
+**The one thing not yet closed is reliability:** reaching a stable logged-in desktop *every automated run* is intermittent — one run reaches the desktop / "Preparing Windows", the next stalls or reboot-loops. The remaining work is VMM systems engineering (1-vCPU first-logon stalls, a 2-vCPU AP-bringup SMP race, and a watchdog wedge that makes failed boots run for hours instead of timing out). See `private development documentation` for the exact failure modes and the ordered plan (fix the watchdog first).
 
-A clean boot now runs the entire chain end to end — OVMF → `bootmgfw` → `winload.efi` → code-integrity → **ntoskrnl** → kernel Phase 0/1 → storage mount → service/session init → `win32k`/`dxgkrnl`/display → the **"Getting ready" screen** at 1280×800. Along the way it reads **~3.4 GB off the AHCI disk** (68K read commands) with **every one of 187,170 storage interrupts delivered**. Four major walls were cleared to get here:
-
-1. `0xc0000225` code-integrity abort — cleared with a source-built TPM2-enabled OVMF (real `Tcg2Protocol` + in-house TPM 2.0 CRB stub) plus an overlay-only CI/VBS policy-off probe.
-2. `0xc0430001` winload `SpacebootInitialize` wall — root-caused to a bug in *our own* ACPI checksum handling (all 8 ACPI tables now install; ntoskrnl/hal/ci/bootvid + all boot drivers load).
-3. `0x7B INACCESSIBLE_BOOT_DEVICE` — root-caused to **two of our own bugs**: an ACPI `_HID` EISAID byte-order bug (so the OS never recognized the PCI root and never enumerated storage), then the realization that a compat-mode PCI IDE channel's *ISA-scope* resources (legacy ports + IRQ14) simply cannot be arbitrated for a device living in PCI scope. **The fix was to build a PCI-native AHCI controller** — its MMIO/PCI-interrupt resources arbitrate cleanly where the device lives, and `storahci.sys` binds and mounts the boot volume. (Diagnosed entirely via host-side guest-memory introspection — PnP devnode tree, `CM_RESOURCE_LIST`, resource-requirements walks — with no kernel debugger.)
-4. Several hand-emulation gates: an OVMF runtime tick-wait spin, ACPI PM1 timer/status, IOAPIC interrupt routing, and page-fault re-injection.
-
-**The one remaining boot gate is VM warm-reset.** After "Getting ready" (device specialize), Windows performs a normal first-boot **reboot** to continue to OOBE/login. The VM does not yet handle a guest-initiated reset, so the UEFI `ResetSystem` call no-ops and Windows falls into an `int 3` (surfacing as a `0x7E` bugcheck). The boot itself succeeded — the next step is to implement guest-reset → VM reboot so Windows completes setup into the login/desktop experience.
-
-Real malware execution remains intentionally blocked. The project stages samples and creates reports, but `dynamic_execution_enabled = false` is the default and `sampleExecuted` stays false until the benign GuestAgent channel, overlay discard, artifact return, and report pipeline are proven end to end.
+Real malware execution remains intentionally blocked. The project stages samples and creates reports, but `dynamic_execution_enabled = false` is the default and `sampleExecuted` stays false until the benign GuestAgent channel, overlay discard, artifact return, and report pipeline are proven end to end on a stable desktop.
 
 ## What Works Today
 
@@ -40,31 +33,32 @@ Real malware execution remains intentionally blocked. The project stages samples
   - optional YARA/capa/DIE wrappers
   - optional MalwareBazaar/VirusTotal hash lookups
 - JSON and self-contained HTML report generation
-- In-house WHP VM that boots Windows 11 24H2 through the kernel + GUI stack to the "Getting ready" setup screen:
+- **WebView2 live console** (`AntiMal.exe`): the Win32 app is now a thin shell hosting a hardened WebView2 UI (`webui/`, vanilla HTML/CSS/JS), 8 sections all wired to a real C++ bridge — scan, config, reports, dashboard, browser-impact, and the live VM view (**Boot VM (live)** streams frames + accepts mouse/keyboard).
+- **Host↔guest telemetry pipeline (3b):** in-guest process collector (`ProcessTelemetry`, unit-tested) → COM2/AMCH channel → host live-journaling to `events.jsonl` → UI Live Process Telemetry panel (`run.watch`). The `AntiMalGuestAgent` service is installed in the base image. *(Streams the moment a stable desktop is reached.)*
+- **Live interaction (3c):** the running VM's framebuffer is streamed into the UI, and keyboard + mouse are injected back into the VM in real time via a framed `_live-input.bin` protocol. The live VM runs in a separate process from the UI (escape-isolation).
+- In-house WHP VM that boots Windows 11 25H2 through the kernel + GUI stack + OOBE + **login to the desktop** (intermittently — see Current Status):
   - WHP host and vCPU wrappers; guest RAM and firmware mapping
   - source-built OVMF (release/debug, TPM2-enabled); serial debugcon capture
   - CMOS/RTC, PIT, PIC, LAPIC timer injection, IOAPIC (with `\_PIC` ACPI routing), HPET, fw_cfg, TPM 2.0 CRB stub, ACPI table generation
   - **from-scratch in-house AHCI/SATA controller** (PCI-native ABAR/MMIO + PCI-interrupt + command-list/FIS/PRDT DMA engine) against VHDX or raw/COW overlays — OVMF's AhciBusDxe and Windows' `storahci.sys` both drive it; a legacy PIIX4/IDE path (PIO + bus-master PRD DMA) also exists
-  - the full Windows boot chain: OVMF → bootmgfw → winload → code-integrity → ntoskrnl → Phase 0/1 → **storage mount via AHCI** → service/session init → win32k/dxgkrnl/display → "Getting ready" (≈3.4 GB read off AHCI, 100% of storage interrupts delivered)
+  - the full Windows boot chain: OVMF → bootmgfw → winload → code-integrity → ntoskrnl → Phase 0/1 → **storage mount via AHCI** → service/session init → win32k/dxgkrnl/display → OOBE → **VM warm-reset** → account creation / **login** → "Preparing Windows" → **desktop** (reached intermittently)
+  - **VM warm-reset**: guest-initiated reset (`0xCF9`/ACPI) recreates the VM (cold boot, overlay persists) so Windows' multi-phase first-boot reboots succeed
+  - **paced host→guest keyboard + mouse injection** (the OOBE script types correctly, the login password is accepted) and a framed live-input channel for real-time UI interaction
   - QEMU/Bochs VGA BAR sizing, Bochs VBE, OVMF GOP, and real guest framebuffer capture (boot spinner, "Getting ready", and BSOD screens visible in `guest-*.png`)
   - deep boot diagnostics from guest memory: `PsLoadedModuleList` walk, PnP devnode tree + `CM_RESOURCE_LIST`/resource-requirements parse, faulting-module identification, deep-stack + `KiBugCheckData` capture at the bugcheck
   - PS/2 scaffolding; COM2 host-channel codec and safe GuestAgent heartbeat mode
 
 ## What Is In Progress
 
-The current milestone is "agent boot": carry the booted kernel past its last gate into the login/desktop experience so `AntiMal.GuestAgent.exe` can auto-start and send a COM2 heartbeat — proving the VM can run Windows code without executing the submitted sample.
+All of the dynamic-sandbox *software* is built (live console, telemetry pipeline, live input, agent deployed). The **one remaining gate is runtime reliability: the VM reaching a stable logged-in desktop on every automated run.** The desktop has been reached, but intermittently — so the agent doesn't yet auto-stream telemetry end-to-end (`hostChannelBytes` is still `0` because no automated run has held a stable desktop long enough for the agent service to connect).
 
-The single active blocker is now **VM warm-reset**. After the kernel boots and Windows reaches the "Getting ready" device-specialize stage, it performs a *normal* first-boot **reboot** to continue to OOBE/login. The VM does not yet service a guest-initiated reset, so:
+The failure modes (full detail + the ordered fix plan in private development documentation (private documentation)):
 
-- Windows calls the UEFI `ResetSystem` runtime service to reboot.
-- The VM has no reset handler, so the call returns instead of resetting (on real firmware it never returns).
-- Control falls into ntoskrnl's `HalpPowerWriteResetCommand` `int 3` ("reset must never return"), which surfaces as a `0x7E SYSTEM_THREAD_EXCEPTION_NOT_HANDLED` bugcheck.
+1. **Watchdog wedge (fix first — code-only):** when the guest enters a pure-CPU spin, the watchdog blocks in a WHP call instead of driving `CancelRun`, so `--timeout-sec` never fires and the boot runs for hours. Fix: the watchdog does *only* `CancelRun`; move all interrupt injection into the main loop's exit handlers. This makes boots bounded + repeatable, which unblocks fast iteration.
+2. **1-vCPU first-logon stall:** boots reach OOBE/login/"Preparing Windows" but the first-logon finalization often hangs (a user-mode wait). A new diagnostic captures the current guest process at the hang to name the culprit (needs offset calibration for build 26200).
+3. **2-vCPU AP-bringup race:** deterministically spins at a kernel SMP rendezvous (`ntkrnlmp+0x2916EC`) — an AP-bringup synchronization bug (confirmed *not* CET-related). 2-vCPU is the better long-term path because first-logon is heavy SMP work.
 
-This was pinpointed by mapping the `0x7E` faulting RIP to `ntoskrnl.exe!HalpPowerWriteResetCommand` via the kernel's own symbols — confirming the boot **succeeded** and the failure is purely the missing reboot path. Next step: implement guest-reset detection (reset port / ACPI reset) → VM warm-reset (vCPU reset-state + device re-init + re-run OVMF), so Windows completes its multi-phase setup into OOBE and the login/desktop.
-
-The previous `0x7B` storage wall is **resolved** — see Current Status. It was cracked by switching the boot disk from the compat-mode PIIX4/IDE (whose ISA-scope legacy resources could not be arbitrated for a PCI-bus device) to a from-scratch PCI-native **AHCI** controller, after two of our own bugs (an ACPI EISAID byte-order bug and the IDETIM channel-decode gating) were found and fixed via guest-memory introspection.
-
-After the boot reaches user mode, the remaining pipeline is: GuestAgent auto-start + COM2 heartbeat, a benign `healthcheck` job round-trip, and journal/screenshot/artifact return.
+Once a stable desktop is reached, the baked agent service auto-starts → streams `process.*` over COM2 → `events.jsonl` → the UI panel, on a desktop you can see and drive — closing both 3b (live telemetry) and 3c (live interaction). Then re-snapshot `AntiMalDesktop.cow` from the agent-equipped desktop for fast seed-boots.
 
 ## Safety Model
 
@@ -207,12 +201,12 @@ rules/             tagger rules
 - **58%: complete. winload wall SHATTERED.** Root-caused the BootEnvironment abort to our own ACPI table builder pre-storing non-zero SDT checksums (OVMF's in-place recompute inverted them → only 1 table installed → no MADT). Leaving the checksum bytes zero installs all 8 ACPI tables, and **ntoskrnl + hal + ci + bootvid + every boot driver now load and execute.**
 - **64%: complete. Live kernel.** ntoskrnl runs Phase 0/1 and renders the bootvid boot spinner. Cleared the OVMF runtime tick-wait spin (PM timer), ACPI PM1 timer/status emulation, IOAPIC-routed IDE IRQ delivery (`\_PIC` method), and page-fault re-injection.
 - **68%: complete. 0x7B storage wall BROKEN.** Root-caused `INACCESSIBLE_BOOT_DEVICE` to two of our own bugs — an ACPI `_HID` EISAID byte-order bug (PCI root never recognized → no storage enumeration) and PIIX4 IDETIM channel-decode gating — then found a compat-mode PCI IDE channel's ISA-scope resources can't be arbitrated for a PCI-bus device. Built a **from-scratch PCI-native AHCI controller**; `storahci.sys` binds it and mounts the boot volume. Diagnosed via guest-memory introspection (PnP devnode tree + `CM_RESOURCE_LIST` + resource-requirements walks), no KD.
-- **80%: in progress. Boots to the GUI stack.** Windows boots through ntoskrnl Phase 0/1 → AHCI storage mount → service/session init → win32k/dxgkrnl/display to the **"Getting ready"** screen (~3.4 GB read off AHCI, 100% of 187K storage interrupts delivered). Remaining gate: implement **VM warm-reset** so the normal first-boot reboot succeeds into OOBE/login (currently the missing reset path surfaces as a `0x7E`).
-- 85%: VM warm-reset handled → Windows completes setup and reaches login/desktop in-house.
-- 88%: GuestAgent auto-starts in user mode and sends a COM2 heartbeat.
-- 91%: host sends a benign job to GuestAgent and receives journal/report artifacts.
-- 94%: real screenshots/framebuffer and interactive input are usable end to end.
-- 97%: disposable overlays, timeout handling, artifact return are hardened; network modes + live UI.
+- **80%: complete. Boots to the GUI stack** (ntoskrnl Phase 0/1 → AHCI mount → win32k/dxgkrnl/display → "Getting ready").
+- **85%: complete. VM warm-reset + login/desktop.** Guest-initiated reset (`0xCF9`/ACPI) is serviced (VM recreated, overlay persists), so Windows' first-boot reboots succeed → OOBE → account creation → **login → "Preparing Windows" → desktop** (reached, intermittently). Injected-input garbling fixed by **pacing**; a **CET kernel hang** (CPUID leaf 7) fixed so the boot reaches user mode.
+- **88%: complete. Live console + telemetry + input software.** WebView2 UI + bridge; in-guest process collector + COM2/AMCH channel + host journaling + UI panel; live keyboard+mouse injection; GuestAgent installed in the base.
+- **90%: in progress. Desktop-reach RELIABILITY** — the one remaining runtime gate. Boots reach the desktop intermittently; closing this needs the watchdog fix (bounded boots) + the 1-vCPU first-logon-stall / 2-vCPU AP-rendezvous work. See `private development documentation`.
+- 93%: agent auto-streams `process.*` telemetry from a reliably-reached desktop → UI (3b live); live mouse/keyboard interaction proven on that desktop (3c live); re-snapshot the agent-equipped desktop.
+- 96%: benign job round-trip, disposable-overlay discard, artifact return, timeout handling hardened; network modes + fake-internet.
 - 100%: interactive malware sandbox MVP.
 
 ## Important Notes
