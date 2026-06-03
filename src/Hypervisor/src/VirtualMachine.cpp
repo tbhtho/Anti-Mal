@@ -1,5 +1,7 @@
 ﻿#include "antimal/hv/VirtualMachine.h"
 
+#include "antimal/hv/KdPipeBridge.h"
+
 #include <Windows.h>
 
 #include <algorithm>
@@ -1352,6 +1354,23 @@ VmRunSummary VirtualMachine::RunLoop(
   auto lastLiveInputPoll = runStarted;    // throttle the live-input file poll
   KdSerialDebugger kdDebugger;
   size_t kdCom1Cursor = 0;
+  // ANTIMAL_KD_PIPE: hand the raw COM1 KD byte stream to a real kernel debugger
+  // over a named pipe (kd.exe/windbg -k com:pipe,port=\\.\pipe\antimal-kd,...)
+  // instead of the in-house auto-ACK stub. When active, the in-house
+  // KdSerialDebugger is bypassed and WinDbg drives the protocol (break-in,
+  // !process, ~*k with symbols) -- the way to actually name a hung process.
+  std::unique_ptr<KdPipeBridge> kdPipe;
+  {
+    char buf[16]{};
+    size_t needed = 0;
+    if (getenv_s(&needed, buf, sizeof(buf), "ANTIMAL_KD_PIPE") == 0 &&
+        needed > 1 && buf[0] != '\0') {
+      auto bridge = std::make_unique<KdPipeBridge>(L"\\\\.\\pipe\\antimal-kd");
+      if (bridge->Valid()) {
+        kdPipe = std::move(bridge);
+      }
+    }
+  }
   auto queueKdHostReset = [&](const char *reason) {
     kdDebugger.QueueHostReset(reason);
     const auto replies = kdDebugger.PullReplies();
@@ -1359,7 +1378,9 @@ VmRunSummary VirtualMachine::RunLoop(
       com1_.QueueRxBytes(replies);
     }
   };
-  queueKdHostReset("initial host KD reset/resync probe");
+  if (!kdPipe) {
+    queueKdHostReset("initial host KD reset/resync probe");
+  }
   auto lastKdHostReset = runStarted;
   uint32_t kdHostResetBursts = 1;
   constexpr uint32_t kKdHostResetBurstLimit = 60;
@@ -2331,26 +2352,41 @@ VmRunSummary VirtualMachine::RunLoop(
 
     const auto kdBytes = com1_.PullSince(kdCom1Cursor);
     kdCom1Cursor = com1_.CapturedBytes();
-    if (!kdBytes.empty()) {
-      const auto beforePackets = kdDebugger.Summary().packetsReceived;
-      kdDebugger.PushBytes(kdBytes);
-      const auto replies = kdDebugger.PullReplies();
-      if (!replies.empty()) {
-        com1_.QueueRxBytes(replies);
+    if (kdPipe) {
+      // Real-debugger bridge: forward the guest's KD stream to WinDbg/kd over
+      // the named pipe and feed its replies back into COM1 RX. The in-house
+      // stub + periodic host-reset are bypassed (WinDbg owns the protocol).
+      if (!kdBytes.empty()) {
+        kdPipe->SendToDebugger(
+            reinterpret_cast<const uint8_t *>(kdBytes.data()), kdBytes.size());
+      }
+      const auto fromDbg = kdPipe->ReceiveFromDebugger();
+      if (!fromDbg.empty()) {
+        com1_.QueueRxBytes(fromDbg);
         madeProgress = true;
       }
-      if (kdDebugger.Summary().packetsReceived != beforePackets) {
-        madeProgress = true;
+    } else {
+      if (!kdBytes.empty()) {
+        const auto beforePackets = kdDebugger.Summary().packetsReceived;
+        kdDebugger.PushBytes(kdBytes);
+        const auto replies = kdDebugger.PullReplies();
+        if (!replies.empty()) {
+          com1_.QueueRxBytes(replies);
+          madeProgress = true;
+        }
+        if (kdDebugger.Summary().packetsReceived != beforePackets) {
+          madeProgress = true;
+        }
       }
-    }
-    const auto nowForKd = std::chrono::steady_clock::now();
-    if (kdDebugger.Summary().bytesObserved == 0 &&
-        kdHostResetBursts < kKdHostResetBurstLimit &&
-        nowForKd - lastKdHostReset >= kKdHostResetInterval &&
-        !com1_.RxDataReady()) {
-      queueKdHostReset("periodic host KD reset/resync probe");
-      lastKdHostReset = nowForKd;
-      ++kdHostResetBursts;
+      const auto nowForKd = std::chrono::steady_clock::now();
+      if (kdDebugger.Summary().bytesObserved == 0 &&
+          kdHostResetBursts < kKdHostResetBurstLimit &&
+          nowForKd - lastKdHostReset >= kKdHostResetInterval &&
+          !com1_.RxDataReady()) {
+        queueKdHostReset("periodic host KD reset/resync probe");
+        lastKdHostReset = nowForKd;
+        ++kdHostResetBursts;
+      }
     }
 
     // After each guest exit, look at the IDE channels for a pending IRQ and

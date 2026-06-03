@@ -45,6 +45,7 @@
     <ClInclude Include="include\antimal\hv\HostSerialChannel.h" />
     <ClInclude Include="include\antimal\hv\IoApic.h" />
     <ClInclude Include="include\antimal\hv\IoBus.h" />
+    <ClInclude Include="include\antimal\hv\KdPipeBridge.h" />
     <ClInclude Include="include\antimal\hv\KdSerialDebugger.h" />
     <ClInclude Include="include\antimal\hv\MmioBus.h" />
     <ClInclude Include="include\antimal\hv\MmioEmulator.h" />
@@ -69,6 +70,7 @@
     <ClCompile Include="src\HostSerialChannel.cpp" />
     <ClCompile Include="src\IoApic.cpp" />
     <ClCompile Include="src\IoBus.cpp" />
+    <ClCompile Include="src\KdPipeBridge.cpp" />
     <ClCompile Include="src\KdSerialDebugger.cpp" />
     <ClCompile Include="src\MmioBus.cpp" />
     <ClCompile Include="src\MmioEmulator.cpp" />
