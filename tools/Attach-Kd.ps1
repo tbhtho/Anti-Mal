@@ -9,8 +9,12 @@ param(
   [string]$ConnString = "com:pipe,port=\\.\pipe\antimal-kd,resets=0,reconnect",
   [int]$TimeoutSec = 300,
   [switch]$Dump,
-  [string]$KdLog = "C:\AntiMalRuns\_kdA.log"
+  [string]$KdLog = "C:\AntiMalRuns\_kdA.log",
+  [string]$KdCommand = "q"
 )
+
+# Cache symbols locally so repeated runs don't re-download from the MS server.
+$env:_NT_SYMBOL_PATH = "srv*C:\symbols*https://msdl.microsoft.com/download/symbols"
 
 $ws  = "C:\AntiMalRuns"
 $bin = "bin\x64\Release"
@@ -35,7 +39,7 @@ for ($t = 0; $t -lt 60; $t++) {
     $bat = Join-Path $ws "_kdA.bat"
     Set-Content -Path $bat -Encoding ascii -Value @(
       '@echo off',
-      ('"C:\Program Files (x86)\Windows Kits\10\Debuggers\x64\kd.exe" -k ' + $ConnString + ' -c "q" -logo ' + $KdLog))
+      ('"C:\Program Files (x86)\Windows Kits\10\Debuggers\x64\kd.exe" -k ' + $ConnString + ' -c "' + $KdCommand + '" -logo ' + $KdLog))
     $kd = Start-Process -FilePath "cmd.exe" -ArgumentList @('/c',$bat) -PassThru -NoNewWindow
     Write-Host ("kd attached at ~{0}s after VM start (pipe appeared)" -f $t)
     break
