@@ -7,6 +7,8 @@
 #include "antimal/Scanner.h"
 #include "antimal/hv/BlockDevice.h"
 
+#include <windows.h>
+
 #include <algorithm>
 #include <array>
 #include <cctype>
@@ -27,6 +29,90 @@ namespace {
 
 using antimal::Utf8ToWide;
 using antimal::WideToUtf8;
+
+// Defense-in-depth hardening for the detonation worker process (opt-in via
+// ANTIMAL_VMM_LOWPRIV=1). If a malicious guest ever escaped the WHP boundary into
+// THIS host process, these reduce what it can do from inside it. Safe to apply
+// because the detonation path spawns NO child process (HyperVOrchestrator has no
+// CreateProcess/system call) and the VM has no NIC. Default OFF so it never
+// perturbs the desktop-reach boots; the live detonation VM already runs in its own
+// HostCli process, isolated from the UI. Best-effort: each step logs + continues.
+void ApplyDetonationWorkerHardening() {
+  wchar_t buf[8]{};
+  const DWORD n = GetEnvironmentVariableW(L"ANTIMAL_VMM_LOWPRIV", buf, 8);
+  if (n != 1 || buf[0] != L'1') {
+    return;
+  }
+  int applied = 0, unavailable = 0;
+
+  // 1) No child processes: an escaped guest cannot spawn cmd.exe / powershell /
+  //    rundll32 / etc. from this process.
+  PROCESS_MITIGATION_CHILD_PROCESS_POLICY cp{};
+  cp.NoChildProcessCreation = 1;
+  if (SetProcessMitigationPolicy(ProcessChildProcessPolicy, &cp, sizeof(cp)))
+    ++applied;
+  else
+    ++unavailable;
+
+  // 2) Block legacy extension-point DLL injection (AppInit_DLLs, SetWindowsHookEx,
+  //    IME, Winsock LSPs) -- classic in-process code-injection vectors.
+  PROCESS_MITIGATION_EXTENSION_POINT_DISABLE_POLICY ep{};
+  ep.DisableExtensionPoints = 1;
+  if (SetProcessMitigationPolicy(ProcessExtensionPointDisablePolicy, &ep,
+                                 sizeof(ep)))
+    ++applied;
+  else
+    ++unavailable;
+
+  // 3) Refuse to load images over the network or with a low mandatory label --
+  //    deny a remote/dropped-DLL load primitive. Safe: the VMM's DLLs (WinHvPlatform,
+  //    gdiplus, ...) load from System32, locally.
+  PROCESS_MITIGATION_IMAGE_LOAD_POLICY il{};
+  il.NoRemoteImages = 1;
+  il.NoLowMandatoryLabelImages = 1;
+  if (SetProcessMitigationPolicy(ProcessImageLoadPolicy, &il, sizeof(il)))
+    ++applied;
+  else
+    ++unavailable;
+
+  // 4) Permanently REMOVE dangerous token privileges (so they can't be re-enabled).
+  //    Matters when detonate is run elevated; a normal user holds few of these.
+  //    SeChangeNotifyPrivilege (normal file traversal) is deliberately kept.
+  HANDLE token = nullptr;
+  if (OpenProcessToken(GetCurrentProcess(),
+                       TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY, &token)) {
+    static const wchar_t *kDangerous[] = {
+        SE_DEBUG_NAME,         SE_TCB_NAME,
+        SE_LOAD_DRIVER_NAME,   SE_BACKUP_NAME,
+        SE_RESTORE_NAME,       SE_TAKE_OWNERSHIP_NAME,
+        SE_IMPERSONATE_NAME,   SE_ASSIGNPRIMARYTOKEN_NAME,
+        SE_CREATE_TOKEN_NAME,  SE_SECURITY_NAME,
+        SE_SYSTEMTIME_NAME,    SE_SHUTDOWN_NAME,
+        SE_MANAGE_VOLUME_NAME, SE_CREATE_PAGEFILE_NAME,
+        SE_SYSTEM_ENVIRONMENT_NAME};
+    for (const wchar_t *priv : kDangerous) {
+      LUID luid{};
+      if (!LookupPrivilegeValueW(nullptr, priv, &luid)) {
+        continue;
+      }
+      TOKEN_PRIVILEGES tp{};
+      tp.PrivilegeCount = 1;
+      tp.Privileges[0].Luid = luid;
+      tp.Privileges[0].Attributes = SE_PRIVILEGE_REMOVED;
+      if (AdjustTokenPrivileges(token, FALSE, &tp, sizeof(tp), nullptr,
+                                nullptr) &&
+          GetLastError() == ERROR_SUCCESS) {
+        ++applied;
+      }
+    }
+    CloseHandle(token);
+  } else {
+    ++unavailable;
+  }
+
+  std::cout << "[hardening] low-priv detonation worker: " << applied
+            << " mitigations applied, " << unavailable << " unavailable\n";
+}
 
 std::string Arg(int argc, wchar_t **argv, int index) {
   if (index < 0 || index >= argc) {
@@ -176,6 +262,9 @@ int CommandDetonate(int argc, wchar_t **argv) {
       std::cout << "[" << snap.phase << "] " << snap.message << std::endl;
     }
   };
+  // Drop privileges + lock down this worker process before the guest runs
+  // (opt-in via ANTIMAL_VMM_LOWPRIV=1; no-op otherwise).
+  ApplyDetonationWorkerHardening();
   const auto result = orchestrator.PrepareAndRun(
       std::filesystem::path(argv[2]), timeout, network, true, progress);
 
