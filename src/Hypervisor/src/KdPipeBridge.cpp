@@ -1,6 +1,26 @@
 #include "antimal/hv/KdPipeBridge.h"
 
+#include <cstdlib>
+
 namespace antimal::hv {
+
+namespace {
+void AppendBytes(HANDLE h, const uint8_t *data, size_t size) {
+  if (h == INVALID_HANDLE_VALUE || !data || size == 0) {
+    return;
+  }
+  size_t off = 0;
+  while (off < size) {
+    DWORD wrote = 0;
+    if (!WriteFile(h, data + off, static_cast<DWORD>(size - off), &wrote,
+                   nullptr) ||
+        wrote == 0) {
+      break;
+    }
+    off += wrote;
+  }
+}
+} // namespace
 
 KdPipeBridge::KdPipeBridge(const std::wstring &pipeName) {
   pipe_ = CreateNamedPipeW(
@@ -12,6 +32,19 @@ KdPipeBridge::KdPipeBridge(const std::wstring &pipeName) {
       0, nullptr);
   if (pipe_ == INVALID_HANDLE_VALUE) {
     return;
+  }
+  // Optional raw-stream capture for offline KD-packet decoding.
+  size_t dumpLen = 0;
+  char dumpVal[8] = {0};
+  if (getenv_s(&dumpLen, dumpVal, sizeof(dumpVal), "ANTIMAL_KD_DUMP") == 0 &&
+      dumpLen > 0) {
+    dumpTo_ = CreateFileW(L"C:\\AntiMalRuns\\_kddump_to_dbg.bin", GENERIC_WRITE,
+                          FILE_SHARE_READ, nullptr, CREATE_ALWAYS,
+                          FILE_ATTRIBUTE_NORMAL, nullptr);
+    dumpFrom_ =
+        CreateFileW(L"C:\\AntiMalRuns\\_kddump_from_dbg.bin", GENERIC_WRITE,
+                    FILE_SHARE_READ, nullptr, CREATE_ALWAYS,
+                    FILE_ATTRIBUTE_NORMAL, nullptr);
   }
   reader_ = std::thread([this] { ReaderProc(); });
   writer_ = std::thread([this] { WriterProc(); });
@@ -35,12 +68,21 @@ KdPipeBridge::~KdPipeBridge() {
     CloseHandle(pipe_);
     pipe_ = INVALID_HANDLE_VALUE;
   }
+  if (dumpTo_ != INVALID_HANDLE_VALUE) {
+    CloseHandle(dumpTo_);
+    dumpTo_ = INVALID_HANDLE_VALUE;
+  }
+  if (dumpFrom_ != INVALID_HANDLE_VALUE) {
+    CloseHandle(dumpFrom_);
+    dumpFrom_ = INVALID_HANDLE_VALUE;
+  }
 }
 
 void KdPipeBridge::SendToDebugger(const uint8_t *data, size_t size) {
   if (!data || size == 0 || pipe_ == INVALID_HANDLE_VALUE) {
     return;
   }
+  AppendBytes(dumpTo_, data, size);
   {
     std::lock_guard<std::mutex> lock(txMu_);
     tx_.insert(tx_.end(), data, data + size);
@@ -96,6 +138,7 @@ void KdPipeBridge::ReaderProc() {
       if (read == 0) {
         continue;
       }
+      AppendBytes(dumpFrom_, buffer.data(), read);
       {
         std::lock_guard<std::mutex> lock(rxMu_);
         rx_.insert(rx_.end(), buffer.begin(),

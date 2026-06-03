@@ -59,6 +59,14 @@ private:
   void ReaderProc();
   void WriterProc();
 
+  // Diagnostics: when ANTIMAL_KD_DUMP is set, append the raw bidirectional KD
+  // byte stream to <value>_to_dbg.bin (guest->debugger) and <value>_from_dbg.bin
+  // (debugger->guest) so the framing/checksum can be decoded offline. The two
+  // files are written by different threads (VM loop vs reader), so each gets its
+  // own handle and no lock is shared between directions.
+  HANDLE dumpTo_ = INVALID_HANDLE_VALUE;   // guest -> debugger
+  HANDLE dumpFrom_ = INVALID_HANDLE_VALUE; // debugger -> guest
+
   // Drop oldest queued guest->debugger bytes past this cap while no client is
   // attached (the guest resends KD state; WinDbg resyncs on connect, so stale
   // retries are safe to discard rather than buffering unboundedly).
