@@ -51,6 +51,9 @@ public:
   uint64_t BytesFromDebugger() const noexcept {
     return bytesFromDbg_.load(std::memory_order_relaxed);
   }
+  uint64_t ClientConnects() const noexcept {
+    return clientConnects_.load(std::memory_order_relaxed);
+  }
 
 private:
   void ReaderProc();
@@ -66,6 +69,7 @@ private:
   std::atomic_bool connected_{false};
   std::atomic<uint64_t> bytesToDbg_{0};
   std::atomic<uint64_t> bytesFromDbg_{0};
+  std::atomic<uint64_t> clientConnects_{0};
 
   std::mutex txMu_;
   std::condition_variable txCv_;

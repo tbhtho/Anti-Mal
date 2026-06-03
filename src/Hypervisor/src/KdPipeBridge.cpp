@@ -66,32 +66,50 @@ std::vector<uint8_t> KdPipeBridge::ReceiveFromDebugger() {
 }
 
 void KdPipeBridge::ReaderProc() {
-  // Wait for the debugger to connect. ConnectNamedPipe returns nonzero on a new
-  // connection, or sets ERROR_PIPE_CONNECTED if a client connected between the
-  // CreateNamedPipe and this call.
-  const BOOL ok = ConnectNamedPipe(pipe_, nullptr);
-  if (!ok && GetLastError() != ERROR_PIPE_CONNECTED) {
-    return; // canceled (shutdown) or failed
-  }
-  connected_.store(true, std::memory_order_relaxed);
-  txCv_.notify_all(); // let the writer start flushing the backlog
-
+  // Re-listen loop: serve one debugger, and when it disconnects, reset the pipe
+  // and wait for the next one. This lets us attach/detach kd repeatedly to the
+  // same running VM (e.g. attach once the guest is sitting at the hang).
   std::vector<uint8_t> buffer(8192);
   while (!stop_.load(std::memory_order_relaxed)) {
-    DWORD read = 0;
-    if (!ReadFile(pipe_, buffer.data(),
-                  static_cast<DWORD>(buffer.size()), &read, nullptr)) {
-      break; // broken pipe / canceled
+    const BOOL ok = ConnectNamedPipe(pipe_, nullptr);
+    if (stop_.load(std::memory_order_relaxed)) {
+      break;
     }
-    if (read == 0) {
+    if (!ok && GetLastError() != ERROR_PIPE_CONNECTED) {
+      // Connect failed/canceled; reset and retry.
+      DisconnectNamedPipe(pipe_);
       continue;
     }
-    {
-      std::lock_guard<std::mutex> lock(rxMu_);
-      rx_.insert(rx_.end(), buffer.begin(),
-                 buffer.begin() + static_cast<std::ptrdiff_t>(read));
+    connected_.store(true, std::memory_order_relaxed);
+    clientConnects_.fetch_add(1, std::memory_order_relaxed);
+    txCv_.notify_all(); // let the writer start flushing
+
+    for (;;) {
+      DWORD read = 0;
+      if (!ReadFile(pipe_, buffer.data(),
+                    static_cast<DWORD>(buffer.size()), &read, nullptr)) {
+        break; // client disconnected / canceled
+      }
+      if (stop_.load(std::memory_order_relaxed)) {
+        break;
+      }
+      if (read == 0) {
+        continue;
+      }
+      {
+        std::lock_guard<std::mutex> lock(rxMu_);
+        rx_.insert(rx_.end(), buffer.begin(),
+                   buffer.begin() + static_cast<std::ptrdiff_t>(read));
+      }
+      bytesFromDbg_.fetch_add(read, std::memory_order_relaxed);
     }
-    bytesFromDbg_.fetch_add(read, std::memory_order_relaxed);
+    // Client gone: reset the pipe + drop stale outbound bytes for the next one.
+    connected_.store(false, std::memory_order_relaxed);
+    DisconnectNamedPipe(pipe_);
+    {
+      std::lock_guard<std::mutex> lock(txMu_);
+      tx_.clear();
+    }
   }
 }
 
@@ -117,7 +135,7 @@ void KdPipeBridge::WriterProc() {
                      static_cast<DWORD>(pending.size() - offset), &written,
                      nullptr) ||
           written == 0) {
-        return; // broken pipe / canceled
+        break; // client disconnected mid-write; wait for the next one (re-listen)
       }
       offset += written;
       bytesToDbg_.fetch_add(written, std::memory_order_relaxed);
