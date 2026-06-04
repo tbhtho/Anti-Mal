@@ -25,6 +25,21 @@ function Invoke-Checked([string]$Tool, [string[]]$Arguments, [string]$Label) {
   return $output
 }
 
+function Unload-OfflineHive([string]$HiveKey) {
+  # PowerShell's registry provider (Test-Path HKLM:\..., Get-ChildItem on a loaded hive)
+  # opens handles that linger until GC. A plain `reg unload` then fails with "being used
+  # by another process", leaves the hive loaded, and breaks the NEXT reg load of the same
+  # hive file (e.g. Repair-BootStorageDrivers' SYSTEM unload racing Install-GuestAgent's
+  # SYSTEM load). Release the handles + retry until it actually unloads.
+  for ($try = 1; $try -le 12; $try++) {
+    [gc]::Collect(); [gc]::WaitForPendingFinalizers()
+    & reg.exe unload $HiveKey 2>$null | Out-Null
+    if ($LASTEXITCODE -eq 0) { return }
+    Start-Sleep -Seconds 1
+  }
+  Write-Warning "reg unload $HiveKey did not succeed after retries; hive may still be loaded"
+}
+
 function Test-BcdStore([string]$BcdPath) {
   Test-FilePresent $BcdPath "BCD store"
   $output = Invoke-Checked "bcdedit.exe" @("/store", $BcdPath, "/enum", "all") "Inspecting BCD store..."
@@ -202,7 +217,7 @@ function Repair-BootStorageDrivers([string]$WindowsRoot) {
     }
   } finally {
     if ($systemLoaded) {
-      & reg.exe unload "HKLM\$systemHiveName" | Out-Null
+      Unload-OfflineHive "HKLM\$systemHiveName"
     }
   }
 
@@ -269,10 +284,10 @@ function Install-GuestAgent([string]$WindowsRoot, [string]$AgentPath) {
     Invoke-Checked "reg.exe" @("add", $serviceKey, "/v", "Description", "/t", "REG_SZ", "/d", "AntiMal benign VM heartbeat and artifact channel", "/f") "Configuring GuestAgent service description..."
   } finally {
     if ($systemLoaded) {
-      & reg.exe unload "HKLM\$systemHiveName" | Out-Null
+      Unload-OfflineHive "HKLM\$systemHiveName"
     }
     if ($softwareLoaded) {
-      & reg.exe unload "HKLM\$softwareHiveName" | Out-Null
+      Unload-OfflineHive "HKLM\$softwareHiveName"
     }
   }
 
