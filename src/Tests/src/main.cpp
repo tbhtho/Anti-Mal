@@ -3796,6 +3796,18 @@ void TestE1000Device() {
     Expect(sum == 0xBABA,
            "e1000: EEPROM words sum to 0xBABA (driver accepts the checksum)");
   }
+
+  // MDIC PHY access: a read of PHY status register (1) completes (Ready) and
+  // reports link up, so the driver's PHY probe succeeds.
+  {
+    antimal::hv::E1000Device nic4;
+    nic4.SetMmioBase(kMmio);
+    nic4.OnWrite(kMmio + 0x0020, 4, (2u << 26) | (1u << 21) | (1u << 16));
+    uint64_t mdic = 0;
+    nic4.OnRead(kMmio + 0x0020, 4, &mdic);
+    Expect((mdic & (1u << 28)) != 0, "e1000: MDIC read completes (Ready set)");
+    Expect((mdic & 0x04) != 0, "e1000: PHY status register reports link up");
+  }
 }
 
 void TestNicPciConfig() {

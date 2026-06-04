@@ -9,6 +9,7 @@ namespace {
 constexpr uint32_t kRegCTRL = 0x0000;
 constexpr uint32_t kRegSTATUS = 0x0008;
 constexpr uint32_t kRegEERD = 0x0014;
+constexpr uint32_t kRegMDIC = 0x0020;
 constexpr uint32_t kRegICR = 0x00C0;
 constexpr uint32_t kRegIMS = 0x00D0;
 constexpr uint32_t kRegIMC = 0x00D8;
@@ -49,6 +50,20 @@ uint64_t RdU64(const uint8_t *p) {
   return v;
 }
 
+// Minimal internal copper-PHY register read for the e1000 driver's link/PHY-ID
+// probe via MDIC. Reports a present PHY with the link up and autoneg complete so
+// the driver brings the interface up.
+uint16_t PhyRead(uint32_t reg) {
+  switch (reg) {
+    case 0:  return 0x1140;  // control: autoneg enabled, 1000 Mbps full
+    case 1:  return 0x796D;  // status: link up + autoneg complete + capabilities
+    case 2:  return 0x0141;  // PHY ID high (OUI)
+    case 3:  return 0x0CB1;  // PHY ID low (internal copper PHY)
+    case 17: return 0x4400;  // M88-specific status: link up, resolved
+    default: return 0;
+  }
+}
+
 }  // namespace
 
 E1000Device::E1000Device() {
@@ -78,6 +93,7 @@ E1000Device::E1000Device() {
 void E1000Device::Reset() noexcept {
   ctrl_ = 0;
   eerd_ = 0;
+  mdic_ = 0;
   icr_ = 0;
   ims_ = 0;
   tctl_ = 0;
@@ -104,6 +120,8 @@ uint32_t E1000Device::ReadReg(uint32_t off) {
       }
       return eerd_;
     }
+    case kRegMDIC:
+      return mdic_;
     case kRegICR: {
       const uint32_t v = icr_;
       icr_ = 0;  // read clears
@@ -152,6 +170,19 @@ void E1000Device::WriteReg(uint32_t off, uint32_t value) {
     case kRegEERD:
       eerd_ = value;
       break;
+    case kRegMDIC: {
+      // MDIC: bits16-20 = PHY reg, bits26-27 = opcode (01 write, 10 read).
+      // Complete the transaction immediately with the Ready bit (28) set; for a
+      // read, splice in the PHY register value so the driver's poll succeeds.
+      const uint32_t op = (value >> 26) & 0x3u;
+      const uint32_t reg = (value >> 16) & 0x1Fu;
+      if (op == 2u) {  // read
+        mdic_ = (value & 0x07FF0000u) | PhyRead(reg) | (1u << 28);
+      } else {  // write (or other): accept it, set Ready
+        mdic_ = value | (1u << 28);
+      }
+      break;
+    }
     case kRegICR:
       icr_ &= ~value;  // write 1 to clear
       break;

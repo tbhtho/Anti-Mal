@@ -86,6 +86,7 @@ class E1000Device final : public IMmioDevice {
   std::array<uint16_t, 64> eeprom_{};  // word 0..2 = MAC
   uint32_t ctrl_ = 0;
   uint32_t eerd_ = 0;
+  uint32_t mdic_ = 0;  // MDI control (PHY register access)
   uint32_t icr_ = 0;
   uint32_t ims_ = 0;
   uint32_t tctl_ = 0;
