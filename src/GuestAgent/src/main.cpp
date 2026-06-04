@@ -4,6 +4,7 @@
 #include "antimal/FileUtil.h"
 #include "antimal/GuestMonitor.h"
 #include "antimal/HostChannel.h"
+#include "antimal/NetworkTelemetry.h"
 #include "antimal/Json.h"
 #include "antimal/ProcessTelemetry.h"
 #include "antimal/Report.h"
@@ -297,6 +298,8 @@ int RunHostChannelLoop(std::string reason, bool serviceMode) {
   // process panel shows what is already running.
   antimal::ProcessSnapshot knownProcs;
   bool processBaselineSent = false;
+  antimal::TcpSnapshot knownConns;
+  bool netBaselineSent = false;
   // Authorized-detonation state: an execute JobStart opens a transfer, the
   // SampleChunk frames fill the reassembler, then the sample launches and we
   // track it to exit/timeout. All gated on GuestExecutionAuthorized().
@@ -429,6 +432,27 @@ int RunHostChannelLoop(std::string reason, bool serviceMode) {
         processBaselineSent = true;
         knownProcs = std::move(current);
         for (const auto &ev : procEvents) {
+          if (!SendAgentEvent(com2, ev)) {
+            CloseHandle(com2);
+            return 1;
+          }
+        }
+      }
+    }
+
+    // Network-connection telemetry: snapshot the guest TCP table and stream
+    // network.connect / network.close deltas (what the sample is reaching out
+    // to). Fully meaningful once the VM has a NIC (SP3); until then it captures
+    // local/loopback connections.
+    if (tick % kProcessPollEveryTicks == 0) {
+      auto conns = antimal::CaptureTcpConnections();
+      if (!conns.empty() || netBaselineSent) {
+        auto netEvents = antimal::DiffTcpConnections(
+            knownConns, conns, !netBaselineSent, kProcessBaselineCap,
+            kProcessDeltaCap);
+        netBaselineSent = true;
+        knownConns = std::move(conns);
+        for (const auto &ev : netEvents) {
           if (!SendAgentEvent(com2, ev)) {
             CloseHandle(com2);
             return 1;

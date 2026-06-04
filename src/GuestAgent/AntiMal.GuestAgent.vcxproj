@@ -31,7 +31,7 @@
       <AdditionalOptions>/utf-8 %(AdditionalOptions)</AdditionalOptions>
     </ClCompile>
     <Link>
-      <AdditionalDependencies>bcrypt.lib;wintrust.lib;crypt32.lib;advapi32.lib;shell32.lib;winsqlite3.lib;winhttp.lib;gdiplus.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <AdditionalDependencies>bcrypt.lib;wintrust.lib;crypt32.lib;advapi32.lib;shell32.lib;winsqlite3.lib;winhttp.lib;gdiplus.lib;iphlpapi.lib;%(AdditionalDependencies)</AdditionalDependencies>
     </Link>
   </ItemDefinitionGroup>
   <ItemGroup>

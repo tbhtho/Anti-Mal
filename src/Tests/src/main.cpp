@@ -12,6 +12,7 @@
 #include "antimal/IntelLookup.h"
 #include "antimal/Json.h"
 #include "antimal/JsonValue.h"
+#include "antimal/NetworkTelemetry.h"
 #include "antimal/PeParser.h"
 #include "antimal/ProcessTelemetry.h"
 #include "antimal/Report.h"
@@ -3496,6 +3497,55 @@ void TestDetonationProtocol() {
          "detonation: truncated SampleChunk payload rejected");
 }
 
+void TestNetworkTelemetry() {
+  antimal::TcpConnection conn;
+  conn.pid = 1000;
+  conn.localAddress = "10.0.2.15";
+  conn.localPort = 49200;
+  conn.remoteAddress = "93.184.216.34";
+  conn.remotePort = 443;
+  conn.state = "ESTABLISHED";
+  antimal::TcpSnapshot withConn;
+  withConn[antimal::TcpConnectionKey(conn)] = conn;
+
+  // Baseline: existing connections become network.connection events.
+  auto baseline = antimal::DiffTcpConnections({}, withConn, true, 64, 64);
+  Expect(baseline.size() == 1 && baseline[0].action == "network.connection" &&
+             baseline[0].category == "network" &&
+             baseline[0].target == "93.184.216.34:443" &&
+             baseline[0].processId == 1000,
+         "network: baseline emits network.connection with remote target");
+
+  // A new connection appears -> network.connect (what the sample reaches out to).
+  antimal::TcpConnection dns;
+  dns.pid = 1000;
+  dns.localAddress = "10.0.2.15";
+  dns.localPort = 50000;
+  dns.remoteAddress = "1.1.1.1";
+  dns.remotePort = 53;
+  dns.state = "SYN_SENT";
+  antimal::TcpSnapshot both = withConn;
+  both[antimal::TcpConnectionKey(dns)] = dns;
+  auto connectEvents = antimal::DiffTcpConnections(withConn, both, false, 64, 64);
+  Expect(connectEvents.size() == 1 &&
+             connectEvents[0].action == "network.connect" &&
+             connectEvents[0].target == "1.1.1.1:53",
+         "network: new connection emits network.connect");
+
+  // A connection disappears -> network.close (uncapped).
+  auto closeEvents = antimal::DiffTcpConnections(both, withConn, false, 64, 64);
+  Expect(closeEvents.size() == 1 && closeEvents[0].action == "network.close" &&
+             closeEvents[0].target == "1.1.1.1:53",
+         "network: dropped connection emits network.close");
+
+  // The identity key ignores state, so a SYN_SENT->ESTABLISHED transition is not
+  // mistaken for a close + reopen.
+  antimal::TcpConnection synced = conn;
+  synced.state = "SYN_SENT";
+  Expect(antimal::TcpConnectionKey(conn) == antimal::TcpConnectionKey(synced),
+         "network: connection identity key is state-independent");
+}
+
 void TestIntelLookupOffline() {
   // With enabled=false the lookup returns immediately, no transport.
   antimal::IntelLookupConfig cfg;
@@ -4290,6 +4340,7 @@ int main() {
     TestPolicyProbeScriptGuards();
     TestIntelLookupOffline();
     TestDetonationProtocol();
+    TestNetworkTelemetry();
     TestHttpUrlEncode();
     TestFramebufferVisiblePixels();
     TestScreenshotCaptureBestEffort();
