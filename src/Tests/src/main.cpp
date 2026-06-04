@@ -27,6 +27,7 @@
 #include "antimal/hv/AcpiTables.h"
 #include "antimal/hv/BlockDevice.h"
 #include "antimal/hv/BochsVbe.h"
+#include "antimal/hv/E1000Device.h"
 #include "antimal/hv/Firmware.h"
 #include "antimal/hv/GuestMemory.h"
 #include "antimal/hv/Hpet.h"
@@ -3701,6 +3702,67 @@ void TestPacketInspector() {
          "packet: non-IPv4 (ARP) ignored");
 }
 
+void TestE1000Device() {
+  antimal::hv::E1000Device nic;
+  const uint64_t kMmio = 0xF0000000ull;
+  nic.SetMmioBase(kMmio);
+
+  // A 4 KiB "guest RAM" window the device DMAs against.
+  const uint64_t baseGpa = 0x10000ull;
+  std::vector<uint8_t> mem(4096, 0);
+  nic.SetDmaMemory([&](uint64_t gpa, std::size_t len) -> uint8_t * {
+    if (gpa < baseGpa || gpa + len > baseGpa + mem.size()) return nullptr;
+    return mem.data() + static_cast<size_t>(gpa - baseGpa);
+  });
+  std::vector<uint8_t> captured;
+  nic.SetTxHandler([&](const uint8_t *f, std::size_t len) {
+    captured.assign(f, f + len);
+  });
+
+  // The frame to transmit, at baseGpa+0x200.
+  std::vector<uint8_t> frame;
+  for (int i = 0; i < 64; ++i) frame.push_back(static_cast<uint8_t>(i + 1));
+  const uint64_t bufGpa = baseGpa + 0x200;
+  for (size_t i = 0; i < frame.size(); ++i) mem[0x200 + i] = frame[i];
+
+  // Legacy TX descriptor 0 at baseGpa+0: buffer addr(8) | length(2) | _ | CMD.
+  for (int i = 0; i < 8; ++i)
+    mem[i] = static_cast<uint8_t>((bufGpa >> (i * 8)) & 0xFF);
+  mem[8] = static_cast<uint8_t>(frame.size() & 0xFF);
+  mem[9] = static_cast<uint8_t>((frame.size() >> 8) & 0xFF);
+  mem[11] = 0x09;  // CMD = EOP | RS
+
+  auto w = [&](uint32_t reg, uint32_t val) {
+    nic.OnWrite(kMmio + reg, 4, val);
+  };
+  w(0x3800, static_cast<uint32_t>(baseGpa & 0xFFFFFFFF));  // TDBAL
+  w(0x3804, static_cast<uint32_t>(baseGpa >> 32));         // TDBAH
+  w(0x3808, 16 * 8);  // TDLEN = 8 descriptors
+  w(0x3810, 0);       // TDH
+  w(0x00D0, 0x01);    // IMS: enable TXDW
+  w(0x3818, 1);       // TDT = 1 -> transmit descriptor 0
+
+  Expect(captured == frame, "e1000: TX descriptor frame DMA'd to the handler");
+  Expect(nic.FramesTransmitted() == 1 &&
+             nic.BytesTransmitted() == frame.size(),
+         "e1000: transmit counters advance");
+  Expect(nic.InterruptPending(),
+         "e1000: TXDW interrupt latched (IMS enabled)");
+  Expect((mem[12] & 0x01) != 0, "e1000: descriptor DD status written back");
+
+  // EEPROM MAC read (EERD): START + addr 0 -> DONE + data word.
+  w(0x0014, 0x00000001);
+  uint64_t eerd = 0;
+  nic.OnRead(kMmio + 0x0014, 4, &eerd);
+  Expect((eerd & 0x10) != 0, "e1000: EERD returns DONE");
+  Expect((eerd >> 16) != 0, "e1000: EERD returns a nonzero MAC word");
+
+  // STATUS reports link up so the driver proceeds past init.
+  uint64_t status = 0;
+  nic.OnRead(kMmio + 0x0008, 4, &status);
+  Expect((status & 0x2) != 0, "e1000: STATUS link-up bit set");
+}
+
 void TestIntelLookupOffline() {
   // With enabled=false the lookup returns immediately, no transport.
   antimal::IntelLookupConfig cfg;
@@ -4499,6 +4561,7 @@ int main() {
     TestRegistryTelemetry();
     TestFileSystemTelemetry();
     TestPacketInspector();
+    TestE1000Device();
     TestHttpUrlEncode();
     TestFramebufferVisiblePixels();
     TestScreenshotCaptureBestEffort();

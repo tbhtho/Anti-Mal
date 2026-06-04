@@ -39,6 +39,7 @@
     <ClInclude Include="include\antimal\hv\BochsVbe.h" />
     <ClInclude Include="include\antimal\hv\AhciController.h" />
     <ClInclude Include="include\antimal\hv\Device.h" />
+    <ClInclude Include="include\antimal\hv\E1000Device.h" />
     <ClInclude Include="include\antimal\hv\Firmware.h" />
     <ClInclude Include="include\antimal\hv\GuestMemory.h" />
     <ClInclude Include="include\antimal\hv\Hpet.h" />
@@ -64,6 +65,7 @@
     <ClCompile Include="src\AhciController.cpp" />
     <ClCompile Include="src\BlockDevice.cpp" />
     <ClCompile Include="src\BochsVbe.cpp" />
+    <ClCompile Include="src\E1000Device.cpp" />
     <ClCompile Include="src\Firmware.cpp" />
     <ClCompile Include="src\GuestMemory.cpp" />
     <ClCompile Include="src\Hpet.cpp" />
