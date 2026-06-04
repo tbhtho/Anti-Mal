@@ -2,9 +2,11 @@
 #include "antimal/DetonationProtocol.h"
 #include "antimal/EventJournal.h"
 #include "antimal/FileUtil.h"
+#include "antimal/FileSystemTelemetry.h"
 #include "antimal/GuestMonitor.h"
 #include "antimal/HostChannel.h"
 #include "antimal/NetworkTelemetry.h"
+#include "antimal/RegistryTelemetry.h"
 #include "antimal/Json.h"
 #include "antimal/ProcessTelemetry.h"
 #include "antimal/Report.h"
@@ -300,6 +302,12 @@ int RunHostChannelLoop(std::string reason, bool serviceMode) {
   bool processBaselineSent = false;
   antimal::TcpSnapshot knownConns;
   bool netBaselineSent = false;
+  antimal::RegistrySnapshot knownReg;
+  bool regBaselineSent = false;
+  antimal::FileSnapshot knownFiles;
+  bool fileBaselineSent = false;
+  const std::vector<std::filesystem::path> watchedDirs =
+      antimal::DefaultWatchedDirs();
   // Authorized-detonation state: an execute JobStart opens a transfer, the
   // SampleChunk frames fill the reassembler, then the sample launches and we
   // track it to exit/timeout. All gated on GuestExecutionAuthorized().
@@ -311,6 +319,7 @@ int RunHostChannelLoop(std::string reason, bool serviceMode) {
   bool sampleLaunched = false;
   bool sampleReported = false;
   constexpr uint32_t kProcessPollEveryTicks = 2; // ~2s between snapshots
+  constexpr uint32_t kFilePollEveryTicks = 5;    // file walk is heavier
   constexpr size_t kProcessBaselineCap = 64;
   constexpr size_t kProcessDeltaCap = 64;
   uint32_t tick = 0;
@@ -453,6 +462,45 @@ int RunHostChannelLoop(std::string reason, bool serviceMode) {
         netBaselineSent = true;
         knownConns = std::move(conns);
         for (const auto &ev : netEvents) {
+          if (!SendAgentEvent(com2, ev)) {
+            CloseHandle(com2);
+            return 1;
+          }
+        }
+      }
+    }
+
+    // Registry-persistence telemetry: snapshot the autostart keys and stream
+    // registry.set / registry.delete deltas (did the sample install persistence?).
+    if (tick % kProcessPollEveryTicks == 0) {
+      auto reg = antimal::CaptureRegistrySnapshot();
+      if (!reg.empty() || regBaselineSent) {
+        auto regEvents = antimal::DiffRegistrySnapshots(
+            knownReg, reg, !regBaselineSent, kProcessBaselineCap,
+            kProcessDeltaCap);
+        regBaselineSent = true;
+        knownReg = std::move(reg);
+        for (const auto &ev : regEvents) {
+          if (!SendAgentEvent(com2, ev)) {
+            CloseHandle(com2);
+            return 1;
+          }
+        }
+      }
+    }
+
+    // Filesystem telemetry: snapshot the drop directories and stream
+    // file.create / file.modify / file.delete deltas. Polled less often than the
+    // others because the directory walk is heavier.
+    if (tick % kFilePollEveryTicks == 0) {
+      auto files = antimal::CaptureFileSnapshot(watchedDirs);
+      if (!files.empty() || fileBaselineSent) {
+        auto fileEvents = antimal::DiffFileSnapshots(
+            knownFiles, files, !fileBaselineSent, kProcessBaselineCap,
+            kProcessDeltaCap);
+        fileBaselineSent = true;
+        knownFiles = std::move(files);
+        for (const auto &ev : fileEvents) {
           if (!SendAgentEvent(com2, ev)) {
             CloseHandle(com2);
             return 1;

@@ -6,6 +6,7 @@
 #include "antimal/DetonationProtocol.h"
 #include "antimal/EventJournal.h"
 #include "antimal/ExternalTools.h"
+#include "antimal/FileSystemTelemetry.h"
 #include "antimal/FileUtil.h"
 #include "antimal/Http.h"
 #include "antimal/HyperVOrchestrator.h"
@@ -14,6 +15,7 @@
 #include "antimal/JsonValue.h"
 #include "antimal/NetworkTelemetry.h"
 #include "antimal/PeParser.h"
+#include "antimal/RegistryTelemetry.h"
 #include "antimal/ProcessTelemetry.h"
 #include "antimal/Report.h"
 #include "antimal/Scanner.h"
@@ -3546,6 +3548,80 @@ void TestNetworkTelemetry() {
          "network: connection identity key is state-independent");
 }
 
+void TestRegistryTelemetry() {
+  antimal::RegistrySnapshot prev, cur;
+  prev["HKLM\\...\\Run\\legit"] = "C:\\Windows\\legit.exe";
+  cur["HKLM\\...\\Run\\legit"] = "C:\\Windows\\legit.exe";
+  cur["HKCU\\...\\Run\\evil"] = "C:\\Users\\x\\AppData\\evil.exe";
+
+  // Baseline: existing autostart values become registry.value events.
+  auto base = antimal::DiffRegistrySnapshots({}, cur, true, 64, 64);
+  Expect(base.size() == 2 && base[0].action == "registry.value" &&
+             base[0].category == "registry",
+         "registry: baseline emits registry.value");
+
+  // A new persistence value -> registry.set with its data.
+  auto delta = antimal::DiffRegistrySnapshots(prev, cur, false, 64, 64);
+  Expect(delta.size() == 1 && delta[0].action == "registry.set" &&
+             delta[0].target == "HKCU\\...\\Run\\evil" &&
+             delta[0].details["data"] == "C:\\Users\\x\\AppData\\evil.exe",
+         "registry: new persistence value -> registry.set");
+
+  // A changed value (hijack) -> registry.set with the new data.
+  antimal::RegistrySnapshot changed = prev;
+  changed["HKLM\\...\\Run\\legit"] = "C:\\hijacked.exe";
+  auto chg = antimal::DiffRegistrySnapshots(prev, changed, false, 64, 64);
+  Expect(chg.size() == 1 && chg[0].action == "registry.set" &&
+             chg[0].details["data"] == "C:\\hijacked.exe",
+         "registry: changed value -> registry.set");
+
+  // A removed value -> registry.delete.
+  auto del = antimal::DiffRegistrySnapshots(cur, prev, false, 64, 64);
+  Expect(del.size() == 1 && del[0].action == "registry.delete" &&
+             del[0].target == "HKCU\\...\\Run\\evil",
+         "registry: removed value -> registry.delete");
+}
+
+void TestFileSystemTelemetry() {
+  antimal::FileSnapshot prev, cur;
+  prev["C:\\Temp\\a.txt"] = antimal::FileMeta{10, 100};
+  cur["C:\\Temp\\a.txt"] = antimal::FileMeta{10, 100};
+  cur["C:\\Temp\\dropped.exe"] = antimal::FileMeta{2048, 200};
+
+  // A new file -> file.create with its size.
+  auto delta = antimal::DiffFileSnapshots(prev, cur, false, 64, 64);
+  Expect(delta.size() == 1 && delta[0].action == "file.create" &&
+             delta[0].category == "file" &&
+             delta[0].target == "C:\\Temp\\dropped.exe" &&
+             delta[0].details["size"] == "2048",
+         "file: new file -> file.create");
+
+  // A size change -> file.modify.
+  antimal::FileSnapshot resized = prev;
+  resized["C:\\Temp\\a.txt"] = antimal::FileMeta{99, 100};
+  auto mod = antimal::DiffFileSnapshots(prev, resized, false, 64, 64);
+  Expect(mod.size() == 1 && mod[0].action == "file.modify",
+         "file: size change -> file.modify");
+
+  // An mtime change -> file.modify.
+  antimal::FileSnapshot touched = prev;
+  touched["C:\\Temp\\a.txt"] = antimal::FileMeta{10, 999};
+  auto tch = antimal::DiffFileSnapshots(prev, touched, false, 64, 64);
+  Expect(tch.size() == 1 && tch[0].action == "file.modify",
+         "file: mtime change -> file.modify");
+
+  // A removed file -> file.delete.
+  auto del = antimal::DiffFileSnapshots(cur, prev, false, 64, 64);
+  Expect(del.size() == 1 && del[0].action == "file.delete" &&
+             del[0].target == "C:\\Temp\\dropped.exe",
+         "file: removed file -> file.delete");
+
+  // Baseline is capped (a huge %TEMP% can't flood the channel).
+  auto baseline = antimal::DiffFileSnapshots({}, cur, true, 1, 64);
+  Expect(baseline.size() == 1 && baseline[0].action == "file.observed",
+         "file: baseline is capped");
+}
+
 void TestIntelLookupOffline() {
   // With enabled=false the lookup returns immediately, no transport.
   antimal::IntelLookupConfig cfg;
@@ -4341,6 +4417,8 @@ int main() {
     TestIntelLookupOffline();
     TestDetonationProtocol();
     TestNetworkTelemetry();
+    TestRegistryTelemetry();
+    TestFileSystemTelemetry();
     TestHttpUrlEncode();
     TestFramebufferVisiblePixels();
     TestScreenshotCaptureBestEffort();

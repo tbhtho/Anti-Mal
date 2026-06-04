@@ -48,7 +48,9 @@
     <ClInclude Include="include\antimal\IntelLookup.h" />
     <ClInclude Include="include\antimal\Json.h" />
     <ClInclude Include="include\antimal\JsonValue.h" />
+    <ClInclude Include="include\antimal\FileSystemTelemetry.h" />
     <ClInclude Include="include\antimal\NetworkTelemetry.h" />
+    <ClInclude Include="include\antimal\RegistryTelemetry.h" />
     <ClInclude Include="include\antimal\PeParser.h" />
     <ClInclude Include="include\antimal\ProcessTelemetry.h" />
     <ClInclude Include="include\antimal\Report.h" />
@@ -73,8 +75,10 @@
     <ClCompile Include="src\IntelLookup.cpp" />
     <ClCompile Include="src\Json.cpp" />
     <ClCompile Include="src\JsonValue.cpp" />
+    <ClCompile Include="src\FileSystemTelemetry.cpp" />
     <ClCompile Include="src\NetworkCapture.cpp" />
     <ClCompile Include="src\NetworkTelemetry.cpp" />
+    <ClCompile Include="src\RegistryTelemetry.cpp" />
     <ClCompile Include="src\PeParser.cpp" />
     <ClCompile Include="src\ProcessTelemetry.cpp" />
     <ClCompile Include="src\Report.cpp" />
