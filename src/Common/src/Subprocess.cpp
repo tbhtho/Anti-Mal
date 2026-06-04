@@ -133,9 +133,19 @@ SubprocessResult RunSubprocess(const std::filesystem::path &executable,
   const wchar_t *workingDirPtr = workingDir.empty() ? nullptr : workingDir.c_str();
 
   PROCESS_INFORMATION pi{};
+  // lpEnvironment: nullptr inherits the parent block (the default). When the
+  // caller opts out, hand CreateProcessW an empty Unicode block (a bare
+  // double-null) so the child launches with NO inherited variables — passing
+  // nullptr in both branches (the prior bug) made inheritEnvironment a no-op.
+  static const wchar_t kEmptyEnvBlock[2] = {L'\0', L'\0'};
+  DWORD creationFlags = CREATE_NO_WINDOW;
+  LPVOID environmentBlock = nullptr;
+  if (!options.inheritEnvironment) {
+    environmentBlock = const_cast<wchar_t *>(kEmptyEnvBlock);
+    creationFlags |= CREATE_UNICODE_ENVIRONMENT;
+  }
   const BOOL ok = CreateProcessW(nullptr, cmdMutable.data(), nullptr, nullptr,
-                                 TRUE, CREATE_NO_WINDOW,
-                                 options.inheritEnvironment ? nullptr : nullptr,
+                                 TRUE, creationFlags, environmentBlock,
                                  workingDirPtr, &si, &pi);
 
   // Close the child-side handles in the parent regardless of CreateProcess
