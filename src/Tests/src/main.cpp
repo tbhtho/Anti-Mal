@@ -3,6 +3,7 @@
 #include "antimal/BrowserImpact.h"
 #include "antimal/Config.h"
 #include "antimal/Crypto.h"
+#include "antimal/DetonationProtocol.h"
 #include "antimal/EventJournal.h"
 #include "antimal/ExternalTools.h"
 #include "antimal/FileUtil.h"
@@ -3422,6 +3423,79 @@ void TestPolicyProbeScriptGuards() {
          "policy probe script: runner toggle documented");
 }
 
+void TestDetonationProtocol() {
+  // Execute-job JSON build -> parse round-trip (all fields).
+  antimal::ExecuteJobRequest req;
+  req.allowSampleExecution = true;
+  req.sampleName = "evil sample.exe";
+  req.sampleBytes = 4242;
+  req.timeoutMs = 90000;
+  req.networkMode = "disabled";
+  req.runId = "run-123";
+  const auto json = antimal::BuildExecuteJobJson(req);
+  const auto parsed = antimal::ParseExecuteJobJson(json);
+  Expect(parsed.isExecute, "detonation: kind=execute parsed");
+  Expect(parsed.allowSampleExecution, "detonation: allowSampleExecution parsed");
+  Expect(parsed.sampleName == "evil sample.exe",
+         "detonation: sampleName round-trips");
+  Expect(parsed.sampleBytes == 4242, "detonation: sampleBytes round-trips");
+  Expect(parsed.timeoutMs == 90000, "detonation: timeoutMs round-trips");
+  Expect(parsed.runId == "run-123", "detonation: runId round-trips");
+
+  // A healthcheck payload must NOT read as an execute job (the protocol gate).
+  const auto health = antimal::ParseExecuteJobJson(
+      R"({"kind":"healthcheck","runId":"r","allowSampleExecution":false})");
+  Expect(!health.isExecute, "detonation: healthcheck is not execute");
+  Expect(!health.allowSampleExecution, "detonation: healthcheck not authorized");
+
+  // SampleChunk encodes + decodes through the AMCH channel and the payload
+  // parses back to (offset, bytes).
+  const std::vector<uint8_t> payload = {0xDE, 0xAD, 0xBE, 0xEF, 0x10, 0x20};
+  auto frameBytes =
+      antimal::EncodeSampleChunkFrame(7, payload.data(), payload.size());
+  antimal::HostSerialChannel dec;
+  dec.PushBytes(frameBytes);
+  auto frame = dec.PopFrame();
+  Expect(frame.has_value() &&
+             frame->type == antimal::HostChannelMessage::SampleChunk,
+         "detonation: SampleChunk frame decodes through AMCH");
+  auto chunk = frame ? antimal::ParseSampleChunkPayload(frame->payload)
+                     : std::nullopt;
+  Expect(chunk.has_value() && chunk->offset == 7 && chunk->bytes == payload,
+         "detonation: SampleChunk payload round-trips offset+bytes");
+
+  // Reassembler: in-order chunks complete and reconstruct the buffer exactly.
+  std::vector<uint8_t> sample;
+  for (int i = 0; i < 100; ++i) sample.push_back(static_cast<uint8_t>(i * 7));
+  antimal::SampleReassembler r(sample.size());
+  antimal::SampleChunk c1{
+      0, std::vector<uint8_t>(sample.begin(), sample.begin() + 40)};
+  antimal::SampleChunk c2{
+      40, std::vector<uint8_t>(sample.begin() + 40, sample.end())};
+  Expect(r.Add(c1), "detonation: reassembler accepts first chunk");
+  Expect(!r.Complete(), "detonation: not complete after partial transfer");
+  Expect(r.Add(c2), "detonation: reassembler accepts second chunk");
+  Expect(r.Complete() && r.Bytes() == sample,
+         "detonation: reassembled bytes match the source");
+
+  // Out-of-order, overflow, and oversized transfers are rejected (no silent
+  // corruption) — these are the guards that protect the guest from a malformed
+  // or hostile delivery.
+  antimal::SampleReassembler r2(sample.size());
+  antimal::SampleChunk outOfOrder{40, {1, 2, 3}};
+  Expect(!r2.Add(outOfOrder), "detonation: out-of-order chunk rejected");
+  antimal::SampleReassembler r3(4);
+  antimal::SampleChunk tooBig{0, {1, 2, 3, 4, 5}};
+  Expect(!r3.Add(tooBig), "detonation: overflowing chunk rejected");
+  antimal::SampleReassembler r4(8ull * 1024 * 1024 + 1, 8ull * 1024 * 1024);
+  antimal::SampleChunk anyChunk{0, {1}};
+  Expect(!r4.Add(anyChunk), "detonation: oversized job rejected by cap");
+
+  // A SampleChunk payload shorter than the 4-byte offset header is rejected.
+  Expect(!antimal::ParseSampleChunkPayload({0x01, 0x02}).has_value(),
+         "detonation: truncated SampleChunk payload rejected");
+}
+
 void TestIntelLookupOffline() {
   // With enabled=false the lookup returns immediately, no transport.
   antimal::IntelLookupConfig cfg;
@@ -4215,6 +4289,7 @@ int main() {
     TestReportRoundtripAndFramePaths();
     TestPolicyProbeScriptGuards();
     TestIntelLookupOffline();
+    TestDetonationProtocol();
     TestHttpUrlEncode();
     TestFramebufferVisiblePixels();
     TestScreenshotCaptureBestEffort();

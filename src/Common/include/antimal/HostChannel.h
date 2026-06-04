@@ -26,6 +26,11 @@ enum class HostChannelMessage : uint16_t {
   InputKey = 8,
   Heartbeat = 9,
   Shutdown = 10,
+  // Host->guest sample delivery for authorized detonation. Payload is
+  // <u32 offset LE><bytes>; see DetonationProtocol.h. Added after the v1 types,
+  // so an older decoder rejects it as an unknown type and never executes
+  // (fail-safe). The wire version is unchanged.
+  SampleChunk = 11,
 };
 
 struct HostChannelFrame {
@@ -128,7 +133,7 @@ private:
 
   static bool ValidType(uint16_t type) {
     return type >= static_cast<uint16_t>(HostChannelMessage::Hello) &&
-           type <= static_cast<uint16_t>(HostChannelMessage::Shutdown);
+           type <= static_cast<uint16_t>(HostChannelMessage::SampleChunk);
   }
 
   void TryDecode() {
