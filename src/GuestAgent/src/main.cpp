@@ -1,4 +1,5 @@
 #include "antimal/Config.h"
+#include "antimal/DetonationProtocol.h"
 #include "antimal/EventJournal.h"
 #include "antimal/FileUtil.h"
 #include "antimal/GuestMonitor.h"
@@ -162,6 +163,91 @@ bool SendHealthcheck(HANDLE com2, const std::string &jobPayload) {
                    "status=ok\nevents=3\nartifacts=1\nsampleExecuted=false\n");
 }
 
+bool WriteFileBytes(const std::filesystem::path &path,
+                    const std::vector<uint8_t> &bytes) {
+  HANDLE h = CreateFileW(path.wstring().c_str(), GENERIC_WRITE, 0, nullptr,
+                         CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+  if (h == INVALID_HANDLE_VALUE) {
+    return false;
+  }
+  const bool ok = WriteAll(h, bytes);
+  CloseHandle(h);
+  return ok;
+}
+
+// Launches the delivered sample. CreateProcessW runs it in the agent's session
+// (session 0 for the installed service); the process telemetry collector below
+// captures its subtree regardless of session. Visible-desktop launch
+// (CreateProcessAsUser into the active session) is a later refinement (SP5).
+bool LaunchSampleProcess(const std::filesystem::path &path, DWORD *pid,
+                         HANDLE *proc) {
+  STARTUPINFOW si{};
+  si.cb = sizeof(si);
+  PROCESS_INFORMATION pi{};
+  std::wstring cmd = L"\"" + path.wstring() + L"\"";
+  cmd.push_back(L'\0');  // CreateProcessW may write into the buffer.
+  const std::wstring workdir = path.parent_path().wstring();
+  if (!CreateProcessW(nullptr, cmd.data(), nullptr, nullptr, FALSE, 0, nullptr,
+                      workdir.empty() ? nullptr : workdir.c_str(), &si, &pi)) {
+    return false;
+  }
+  CloseHandle(pi.hThread);
+  *pid = pi.dwProcessId;
+  *proc = pi.hProcess;
+  return true;
+}
+
+// Writes the reassembled sample to a per-run guest directory and launches it.
+// Emits agent.sample.received + process.create over COM2. Returns true and fills
+// proc/pid/deadline on success; false (with a failure event) otherwise.
+bool LaunchExecuteJob(HANDLE com2, const antimal::ExecuteJobRequest &req,
+                      const std::vector<uint8_t> &bytes, HANDLE *proc,
+                      DWORD *pid, std::chrono::steady_clock::time_point *deadline) {
+  auto received = MakeAgentEvent("agent.sample.received", req.sampleName);
+  received.details["bytes"] = std::to_string(bytes.size());
+  (void)SendAgentEvent(com2, received);
+
+  const std::filesystem::path runDir =
+      std::filesystem::path(L"C:\\AntiMal\\run") /
+      std::filesystem::path(req.runId.empty() ? "exec" : req.runId);
+  const std::filesystem::path sampleDir = runDir / "sample";
+  antimal::EnsureDirectory(sampleDir);
+  std::wstring safeName =
+      std::filesystem::path(req.sampleName).filename().wstring();
+  if (safeName.empty()) {
+    safeName = L"sample.bin";
+  }
+  const std::filesystem::path samplePath = sampleDir / safeName;
+  if (!WriteFileBytes(samplePath, bytes)) {
+    auto fail = MakeAgentEvent("agent.sample.write-failed", req.sampleName);
+    fail.details["error"] = std::to_string(GetLastError());
+    (void)SendAgentEvent(com2, fail);
+    return false;
+  }
+
+  DWORD launchedPid = 0;
+  HANDLE launchedProc = nullptr;
+  if (!LaunchSampleProcess(samplePath, &launchedPid, &launchedProc)) {
+    auto fail = MakeAgentEvent("process.create-failed",
+                               antimal::PathToUtf8(samplePath));
+    fail.category = "process";
+    fail.details["error"] = std::to_string(GetLastError());
+    (void)SendAgentEvent(com2, fail);
+    return false;
+  }
+  *proc = launchedProc;
+  *pid = launchedPid;
+  *deadline = std::chrono::steady_clock::now() +
+              std::chrono::milliseconds(req.timeoutMs);
+  auto created =
+      MakeAgentEvent("process.create", antimal::PathToUtf8(samplePath));
+  created.category = "process";
+  created.processId = launchedPid;
+  created.details["sampleExecuted"] = "true";
+  (void)SendAgentEvent(com2, created);
+  return true;
+}
+
 bool ReadCom2Frames(HANDLE com2, antimal::HostSerialChannel *channel) {
   if (!channel) {
     return false;
@@ -182,6 +268,11 @@ bool ReadCom2Frames(HANDLE com2, antimal::HostSerialChannel *channel) {
     }
   }
 }
+
+// Defined below (wmain path also uses it); the service loop's execute branch
+// needs it here, so forward-declare. True only when the guest's own gate
+// (ANTIMAL_GUEST_ALLOW_EXECUTION=1) is set.
+bool GuestExecutionAuthorized();
 
 int RunHostChannelLoop(std::string reason, bool serviceMode) {
   HANDLE com2 = OpenCom2WithRetry();
@@ -206,6 +297,16 @@ int RunHostChannelLoop(std::string reason, bool serviceMode) {
   // process panel shows what is already running.
   antimal::ProcessSnapshot knownProcs;
   bool processBaselineSent = false;
+  // Authorized-detonation state: an execute JobStart opens a transfer, the
+  // SampleChunk frames fill the reassembler, then the sample launches and we
+  // track it to exit/timeout. All gated on GuestExecutionAuthorized().
+  std::optional<antimal::ExecuteJobRequest> executeReq;
+  std::optional<antimal::SampleReassembler> reassembler;
+  HANDLE sampleProcess = nullptr;
+  DWORD samplePid = 0;
+  std::chrono::steady_clock::time_point sampleDeadline{};
+  bool sampleLaunched = false;
+  bool sampleReported = false;
   constexpr uint32_t kProcessPollEveryTicks = 2; // ~2s between snapshots
   constexpr size_t kProcessBaselineCap = 64;
   constexpr size_t kProcessDeltaCap = 64;
@@ -217,22 +318,97 @@ int RunHostChannelLoop(std::string reason, bool serviceMode) {
       return 1;
     }
     while (const auto frame = incoming.PopFrame()) {
+      if (frame->type == antimal::HostChannelMessage::SampleChunk) {
+        // Sample bytes for an authorized execute job, arriving after the
+        // JobStart. Collect until complete, then write + launch.
+        if (!executeReq || !reassembler || sampleLaunched) {
+          continue;  // no pending transfer
+        }
+        const auto chunk = antimal::ParseSampleChunkPayload(frame->payload);
+        if (!chunk || !reassembler->Add(*chunk)) {
+          auto rejected = MakeAgentEvent("agent.job.rejected", "execute");
+          rejected.details["reason"] = "sample-transfer-error";
+          (void)SendAgentEvent(com2, rejected);
+          executeReq.reset();
+          reassembler.reset();
+          continue;
+        }
+        if (reassembler->Complete()) {
+          sampleLaunched =
+              LaunchExecuteJob(com2, *executeReq, reassembler->Bytes(),
+                               &sampleProcess, &samplePid, &sampleDeadline);
+          if (!sampleLaunched) {
+            executeReq.reset();
+            reassembler.reset();
+          }
+        }
+        continue;
+      }
       if (frame->type != antimal::HostChannelMessage::JobStart) {
         continue;
       }
       const auto payload = PayloadString(*frame);
+      const auto req = antimal::ParseExecuteJobJson(payload);
+      if (req.isExecute && req.allowSampleExecution) {
+        // Authorized execute job. The guest re-checks its own gate before
+        // accepting the transfer; a host that armed execution without the guest
+        // being authorized is rejected here.
+        if (!GuestExecutionAuthorized()) {
+          auto rejected = MakeAgentEvent("agent.job.rejected", "execute");
+          rejected.details["reason"] = "sample-execution-not-authorized";
+          (void)SendAgentEvent(com2, rejected);
+        } else if (req.sampleBytes == 0 || executeReq || sampleLaunched) {
+          auto rejected = MakeAgentEvent("agent.job.rejected", "execute");
+          rejected.details["reason"] =
+              req.sampleBytes == 0 ? "empty-sample" : "execute-already-active";
+          (void)SendAgentEvent(com2, rejected);
+        } else {
+          executeReq = req;
+          reassembler.emplace(req.sampleBytes);
+          auto started = MakeAgentEvent("agent.job.start", "execute");
+          started.details["kind"] = "execute";
+          started.details["sampleName"] = req.sampleName;
+          started.details["sampleBytes"] = std::to_string(req.sampleBytes);
+          (void)SendAgentEvent(com2, started);
+        }
+        continue;
+      }
       const bool isHealthcheck = ContainsText(payload, "\"kind\":\"healthcheck\"") ||
                                  ContainsText(payload, "\"kind\": \"healthcheck\"");
-      const bool allowsSample = ContainsText(payload, "\"allowSampleExecution\":true") ||
-                                ContainsText(payload, "\"allowSampleExecution\": true");
-      if (isHealthcheck && !allowsSample && !healthcheckComplete) {
+      if (isHealthcheck && !req.allowSampleExecution && !healthcheckComplete) {
         healthcheckComplete = SendHealthcheck(com2, payload);
       } else {
         auto rejected = MakeAgentEvent("agent.job.rejected", "host-channel");
-        rejected.details["reason"] =
-            allowsSample ? "sample-execution-not-authorized"
-                         : "unsupported-job";
+        rejected.details["reason"] = "unsupported-job";
         (void)SendAgentEvent(com2, rejected);
+      }
+    }
+
+    // Track a launched sample to exit/timeout, then send ReportComplete. The
+    // process-telemetry poll below keeps streaming its subtree meanwhile.
+    if (sampleLaunched && !sampleReported) {
+      const bool exited =
+          WaitForSingleObject(sampleProcess, 0) == WAIT_OBJECT_0;
+      const bool timedOut = std::chrono::steady_clock::now() >= sampleDeadline;
+      if (exited || timedOut) {
+        DWORD exitCode = 0;
+        if (exited) {
+          GetExitCodeProcess(sampleProcess, &exitCode);
+        } else {
+          TerminateProcess(sampleProcess, 0xDEADu);
+        }
+        auto done = MakeAgentEvent(exited ? "process.exit" : "process.timeout",
+                                   executeReq ? executeReq->sampleName : "");
+        done.category = "process";
+        done.processId = samplePid;
+        done.details["exitCode"] = std::to_string(exitCode);
+        (void)SendAgentEvent(com2, done);
+        (void)SendFrame(com2, antimal::HostChannelMessage::ReportComplete,
+                        std::string("status=ok\nsampleExecuted=true\nexitCode=") +
+                            std::to_string(exitCode) + "\n");
+        CloseHandle(sampleProcess);
+        sampleProcess = nullptr;
+        sampleReported = true;
       }
     }
 

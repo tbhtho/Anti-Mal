@@ -149,6 +149,8 @@ void PrintUsage() {
       << "                    [--intel] [--vt-key <KEY>] [--json <out.json>]\n"
       << "  antimal detonate <sample> --timeout-sec 180 --network disabled|hostonly|nat\n"
       << "                    [--vcpus 1]   (1 = reliable default; >1 exercises SMP boot)\n"
+      << "                    [--allow-execution]  (arms in-guest detonation; needs\n"
+      << "                                          dynamic_execution_enabled=true too)\n"
       << "  antimal base convert --vhdx <base.vhdx> --raw <AntiMalBase.raw> [--force]\n"
       << "  antimal base inspect --vhdx <base.vhdx> [--overlay <overlay.cow>]\n"
       << "                       [--dump-bcd <out.bcd>] [--dump-system <out.hive>]\n"
@@ -265,6 +267,14 @@ int CommandDetonate(int argc, wchar_t **argv) {
       SetEnvironmentVariableW(L"ANTIMAL_VCPU_COUNT",
                               antimal::Utf8ToWide(*value).c_str());
     }
+  }
+
+  // --allow-execution is the per-run half of the two-key execution gate
+  // (dynamic_execution_enabled in config is the other). It sets
+  // ANTIMAL_AUTHORIZE_EXECUTION, which the orchestrator reads before arming an
+  // in-guest detonation. Without BOTH keys the sample is staged but never run.
+  if (HasFlag(argc, argv, "--allow-execution")) {
+    SetEnvironmentVariableW(L"ANTIMAL_AUTHORIZE_EXECUTION", L"1");
   }
 
   antimal::HyperVOrchestrator orchestrator(config);

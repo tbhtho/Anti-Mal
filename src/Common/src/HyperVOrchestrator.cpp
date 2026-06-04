@@ -1,5 +1,6 @@
 #include "antimal/HyperVOrchestrator.h"
 
+#include "antimal/DetonationProtocol.h"
 #include "antimal/EventJournal.h"
 #include "antimal/FileUtil.h"
 #include "antimal/HostChannel.h"
@@ -7398,6 +7399,83 @@ std::vector<uint8_t> BuildHealthcheckJobFrame(const std::string &runId) {
                                            job.Finish());
 }
 
+// Second key of the two-key execution gate (config.dynamicExecutionEnabled is
+// the first). Set by HostCli `--allow-execution`. Default closed: with this
+// unset, an authorized detonation is impossible regardless of config.
+bool PerRunExecutionAuthorized() {
+  char buf[8]{};
+  size_t needed = 0;
+  if (getenv_s(&needed, buf, sizeof(buf), "ANTIMAL_AUTHORIZE_EXECUTION") == 0 &&
+      needed >= 1 && buf[0] == '1') {
+    return true;
+  }
+  return false;
+}
+
+// Builds the first-boot COM2 payload. When execution is authorized, this is an
+// "execute" JobStart frame followed by the staged sample delivered as
+// SampleChunk frames (AMCH, built with the Common encoder — byte-identical to
+// the host's hv encoder, so the in-guest agent decodes it). Otherwise it is the
+// existing healthcheck frame (unchanged default). Oversized/unreadable samples
+// fall back to healthcheck with a note rather than arming a partial run.
+std::vector<uint8_t> BuildFirstBootCom2Bytes(bool executionAuthorized,
+                                             const std::string &runId,
+                                             const std::filesystem::path &stagedSample,
+                                             uint32_t timeoutMs,
+                                             NetworkMode networkMode,
+                                             std::string *note) {
+  if (!executionAuthorized) {
+    return BuildHealthcheckJobFrame(runId);
+  }
+  // COM2 is the only delivery channel today (~11 KB/s emulated). Cap the
+  // sample size so a large binary can't balloon the guest RX queue; a
+  // disk-backed delivery is the documented perf follow-up.
+  constexpr uint64_t kMaxCom2Sample = 8ull * 1024 * 1024;
+  std::error_code ec;
+  const auto size = std::filesystem::file_size(stagedSample, ec);
+  if (ec || size == 0 || size > kMaxCom2Sample) {
+    if (note) {
+      *note = ec ? "execution authorized but staged sample is unreadable; "
+                   "falling back to healthcheck"
+                 : "execution authorized but sample is " + std::to_string(size) +
+                       " bytes (> " + std::to_string(kMaxCom2Sample) +
+                       " COM2 cap); falling back to healthcheck";
+    }
+    return BuildHealthcheckJobFrame(runId);
+  }
+  std::vector<uint8_t> sample;
+  try {
+    sample = ReadAllBytes(stagedSample);
+  } catch (...) {
+    if (note) *note = "execution authorized but sample read failed; healthcheck";
+    return BuildHealthcheckJobFrame(runId);
+  }
+
+  ExecuteJobRequest req;
+  req.allowSampleExecution = true;
+  req.sampleName = PathToUtf8(stagedSample.filename());
+  req.sampleBytes = sample.size();
+  req.timeoutMs = timeoutMs;
+  req.networkMode = ToString(networkMode);
+  req.runId = runId;
+
+  std::vector<uint8_t> out = HostSerialChannel::EncodeText(
+      HostChannelMessage::JobStart, BuildExecuteJobJson(req));
+  constexpr size_t kChunkBytes = 32u * 1024u;
+  for (size_t off = 0; off < sample.size(); off += kChunkBytes) {
+    const size_t len = std::min(kChunkBytes, sample.size() - off);
+    auto frame = EncodeSampleChunkFrame(static_cast<uint32_t>(off),
+                                        sample.data() + off, len);
+    out.insert(out.end(), frame.begin(), frame.end());
+  }
+  if (note) {
+    *note = "execution AUTHORIZED: delivering sample '" + req.sampleName +
+            "' (" + std::to_string(sample.size()) +
+            " bytes) over COM2 for in-guest detonation";
+  }
+  return out;
+}
+
 std::filesystem::path CurrentExecutableDir() {
   std::wstring buffer(MAX_PATH, L'\0');
   DWORD size = GetModuleFileNameW(nullptr, buffer.data(), static_cast<DWORD>(buffer.size()));
@@ -10325,6 +10403,25 @@ DetonationResult InHouseOrchestrator::PrepareAndRun(
           }
         }
       }
+      // Two-key execution gate: config (dynamic_execution_enabled) AND a per-run
+      // authorization (HostCli --allow-execution -> ANTIMAL_AUTHORIZE_EXECUTION).
+      // Only when BOTH hold does the first-boot COM2 payload carry the sample for
+      // in-guest detonation; otherwise it stays the benign healthcheck. The
+      // decision is journaled so every run records whether it armed execution.
+      const bool executionAuthorized =
+          config_.dynamicExecutionEnabled && PerRunExecutionAuthorized();
+      AppendJournalEvent(
+          result.journalPath,
+          MakeSandboxEvent(executionAuthorized ? "run.execution.authorized"
+                                               : "run.execution.gated",
+                           samplePath,
+                           {{"runId", result.runId},
+                            {"dynamicExecutionEnabled",
+                             config_.dynamicExecutionEnabled ? "true" : "false"},
+                            {"perRunAuthorized",
+                             PerRunExecutionAuthorized() ? "true" : "false"}}),
+          &events);
+
       // Run the VM, recreating it from scratch on each guest-initiated reboot
       // (0xCF9). A reboot becomes a real cold boot -- fresh WHP partition,
       // devices, vCPU, LAPIC and RAM -- so the post-reboot boot has no stale
@@ -10364,7 +10461,14 @@ DetonationResult InHouseOrchestrator::PrepareAndRun(
           }
           hv::VirtualMachine vm(preflight.firmwarePath, disk, optsLocal);
           if (reboot == 0) {
-            vm.QueueCom2Bytes(BuildHealthcheckJobFrame(result.runId));
+            std::string jobNote;
+            vm.QueueCom2Bytes(BuildFirstBootCom2Bytes(
+                executionAuthorized, result.runId, stagedSample,
+                static_cast<uint32_t>(totalTimeout.count()), networkMode,
+                &jobNote));
+            if (!jobNote.empty()) {
+              fireProgress("booting", jobNote);
+            }
           }
           s = vm.Run(reqLocal);
           s.guestReboots = reboot;
