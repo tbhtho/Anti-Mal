@@ -8,6 +8,7 @@
 #include "antimal/hv/BochsVbe.h"
 #include "antimal/hv/Firmware.h"
 #include "antimal/hv/AhciController.h"
+#include "antimal/hv/E1000Device.h"
 #include "antimal/hv/GuestMemory.h"
 #include "antimal/hv/Hpet.h"
 #include "antimal/hv/IoApic.h"
@@ -449,6 +450,11 @@ struct VmRunSummary {
   uint32_t ahciPortCmdWrites = 0;
   uint32_t ahciCiWrites = 0;
   uint64_t ahciAbarBase = 0;
+  // Outbound Ethernet frames the guest transmitted through the e1000 NIC (only
+  // populated when ANTIMAL_ENABLE_NIC). Raw bytes — the orchestrator runs the
+  // PacketInspector over them (the Hypervisor layer can't depend on Common).
+  std::vector<std::vector<uint8_t>> capturedNetworkFrames;
+  uint64_t nicFramesTransmitted = 0;
   uint64_t pitIrqsDelivered = 0;
   uint64_t rtcIrqsDelivered = 0;
   uint32_t framesCaptured = 0;
@@ -608,6 +614,7 @@ private:
   void AttachDefaultDevices();
   void AttachIdeDisk(IBlockDevice *disk);
   void AttachAhciDisk(IBlockDevice *disk);
+  void MaybeAttachNic();  // gated on ANTIMAL_ENABLE_NIC; default no-op.
   uint8_t *HostPointerForGpa(uint64_t gpa, size_t length) noexcept;
   bool ReadGuestMemory(uint64_t gva, void *buffer, size_t length);
   bool ReadGuestMemoryFor(Vcpu &vcpu, uint64_t gva, void *buffer,
@@ -659,6 +666,9 @@ private:
   std::unique_ptr<IdeController> ide_;
   std::unique_ptr<IdeController> secondaryIde_;
   std::unique_ptr<AhciController> ahci_;
+  std::unique_ptr<E1000Device> nic_;
+  std::vector<std::vector<uint8_t>> capturedNetworkFrames_;
+  static constexpr size_t kMaxCapturedFrames = 8192;
   uint64_t pageTableAssistBase_ = 0;
   uint64_t pageTableAssistNext_ = 0;
   uint64_t pageTableAssistLimit_ = 0;

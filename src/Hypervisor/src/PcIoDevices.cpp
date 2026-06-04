@@ -1120,6 +1120,23 @@ void PcIoDevices::WritePciConfigData(uint16_t port, uint32_t value,
       ahciAbar_ = v;
     }
   }
+
+  // NIC BAR0: the same sizing/assignment dance as the AHCI ABAR (128 KiB).
+  if (nicPresent_ && bus == 0 && device == 4 && function == 0 && reg == 0x10) {
+    const uint32_t v = (nicBar0_ & ~mask) | ((value << shift) & mask);
+    if ((v & 0xFFFE0000u) == 0xFFFE0000u) {
+      nicBar0Sizing_ = true;
+      return;
+    }
+    nicBar0Sizing_ = false;
+    const uint32_t newBase = v & 0xFFFE0000u;
+    if (newBase != 0 && newBase != (nicBar0_ & 0xFFFE0000u)) {
+      nicBar0_ = newBase;
+      nicBar0Dirty_ = true;
+    } else {
+      nicBar0_ = v;
+    }
+  }
 }
 
 uint32_t PcIoDevices::ReadPciConfigDword() const {
@@ -1297,6 +1314,31 @@ uint32_t PcIoDevices::ReadPciConfigDword() const {
       return 0x000001FFu;
     default:
       return 0; // BAR0-4, subsystem, cap pointer: unimplemented/zero.
+    }
+  }
+
+  if (nicPresent_ && device == 4 && function == 0) {
+    // Intel 82540EM (8086:100E) NIC. Class 0x02 (network); a single MMIO BAR
+    // (BAR0) + a PCI INTx. The guest's e1000 driver binds 8086:100E, and its
+    // outbound frames are captured on the TX descriptor ring (E1000Device).
+    switch (reg) {
+    case 0x00:
+      return 0x100E8086u; // Vendor 0x8086, Device 0x100E.
+    case 0x04:
+      return 0x00000006u; // Memory Space Enable + Bus Master Enable.
+    case 0x08:
+      return 0x02000000u; // Class 0x02, subclass 0x00 (ethernet), prog-if/rev 0.
+    case 0x0C:
+      return 0x00000000u; // Type-0 header, single function.
+    case 0x10:
+      // BAR0: 32-bit non-prefetchable memory, 128 KiB. Sizing -> size mask.
+      return nicBar0Sizing_ ? 0xFFFE0000u : (nicBar0_ & 0xFFFE0000u);
+    case 0x2C:
+      return 0x100E8086u; // Subsystem vendor/device.
+    case 0x3C:
+      return 0x000001FFu; // Interrupt Pin INTA; line 0xFF (routed via ACPI _PRT).
+    default:
+      return 0;
     }
   }
 

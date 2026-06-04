@@ -2,6 +2,7 @@
 
 #include "antimal/DetonationProtocol.h"
 #include "antimal/EventJournal.h"
+#include "antimal/PacketInspector.h"
 #include "antimal/FileUtil.h"
 #include "antimal/HostChannel.h"
 #include "antimal/Json.h"
@@ -10535,6 +10536,30 @@ DetonationResult InHouseOrchestrator::PrepareAndRun(
       }
       vmSummary.framesCaptured =
           realFrameCounter->load(std::memory_order_relaxed);
+
+      // Network requests: parse the Ethernet frames the guest transmitted via the
+      // e1000 NIC (present only with ANTIMAL_ENABLE_NIC) into dns/http/connect
+      // events. The VMM captured raw frames; the PacketInspector lives here in
+      // Common (the Hypervisor layer can't depend on it).
+      if (!vmSummary.capturedNetworkFrames.empty()) {
+        size_t netEventCount = 0;
+        for (const auto &frame : vmSummary.capturedNetworkFrames) {
+          for (const auto &ev : InspectEthernetFrame(frame.data(), frame.size())) {
+            AppendJournalEvent(result.journalPath, ev, &events);
+            ++netEventCount;
+          }
+        }
+        AppendJournalEvent(
+            result.journalPath,
+            MakeSandboxEvent(
+                "vm.network.captured", samplePath,
+                {{"frames",
+                  std::to_string(vmSummary.capturedNetworkFrames.size())},
+                 {"requestEvents", std::to_string(netEventCount)},
+                 {"nicFramesTransmitted",
+                  std::to_string(vmSummary.nicFramesTransmitted)}}),
+            &events);
+      }
       const auto bootReadObservations =
           AnalyzeBootReadTargets(vmSummary, bootReadTargets);
       const auto readAttribution =

@@ -39,6 +39,10 @@ public:
   void SetAhciControllerPresent(bool present) noexcept {
     ahciControllerPresent_ = present;
   }
+  // Advertise the e1000 NIC (PCI dev 4). Off by default; only set when the
+  // network-observation path is explicitly enabled, so default boots enumerate
+  // exactly as before.
+  void SetNicPresent(bool present) noexcept { nicPresent_ = present; }
   void SetVgaControllerPresent(bool present) noexcept {
     vgaControllerPresent_ = present;
   }
@@ -170,6 +174,17 @@ public:
   bool ConsumeAhciAbarDirty() noexcept {
     const bool dirty = ahciAbarDirty_;
     ahciAbarDirty_ = false;
+    return dirty;
+  }
+
+  // e1000 NIC memory window (PCI BAR0), assigned by the guest's PCI enumeration.
+  // Same dirty-latch dance as the AHCI ABAR.
+  uint64_t NicBar0Base() const noexcept {
+    return static_cast<uint64_t>(nicBar0_ & 0xFFFE0000u);
+  }
+  bool ConsumeNicBar0Dirty() noexcept {
+    const bool dirty = nicBar0Dirty_;
+    nicBar0Dirty_ = false;
     return dirty;
   }
 
@@ -324,6 +339,14 @@ private:
   uint32_t ahciAbar_ = 0xFEBB0000u;
   bool ahciAbarSizing_ = false;
   bool ahciAbarDirty_ = false;
+  // e1000 NIC (PCI dev 4). Present only when explicitly enabled
+  // (ANTIMAL_ENABLE_NIC); default boots have no NIC, so PCI config returns
+  // all-ones for dev 4 and enumeration is byte-identical to today. BAR0 is a
+  // 32-bit non-prefetchable 128 KiB memory BAR.
+  bool nicPresent_ = false;
+  uint32_t nicBar0_ = 0xFE900000u;
+  bool nicBar0Sizing_ = false;
+  bool nicBar0Dirty_ = false;
   bool resetRequested_ = false; // guest wrote 0xCF9 reset bit -> warm-reset the VM.
   bool vgaControllerPresent_ = false;
   bool acpiTablesEnabled_ = true;

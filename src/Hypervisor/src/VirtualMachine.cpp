@@ -392,6 +392,7 @@ VirtualMachine::VirtualMachine(const std::filesystem::path &firmwarePath,
     // OVMF's AhciBusDxe and Windows' storahci.sys both drive the disk via AHCI.
     AttachAhciDisk(ideDisk);
   }
+  MaybeAttachNic();
 }
 
 bool VirtualMachine::DeliverIoApicVector(void *context, uint32_t destination,
@@ -483,6 +484,31 @@ void VirtualMachine::AttachAhciDisk(IBlockDevice *disk) {
   ahci_->SetAbarBase(pcIo_.AhciAbarBase());
   mmioBus_.Attach(ahci_.get());
   pcIo_.ConsumeAhciAbarDirty();
+}
+
+void VirtualMachine::MaybeAttachNic() {
+  // Default OFF: no NIC at all, so PCI enumeration + the boot path are
+  // byte-identical to today. Enabled explicitly for the network-observation
+  // path (ANTIMAL_ENABLE_NIC=1): an e1000 whose TX ring we DMA-capture.
+  const char *enabled = std::getenv("ANTIMAL_ENABLE_NIC");
+  if (!enabled || enabled[0] != '1') {
+    return;
+  }
+  pcIo_.SetNicPresent(true);
+  nic_ = std::make_unique<E1000Device>();
+  nic_->SetDmaMemory([this](uint64_t gpa, std::size_t len) -> uint8_t * {
+    return HostPointerForGpa(gpa, len);
+  });
+  nic_->SetTxHandler([this](const uint8_t *frame, std::size_t len) {
+    // Capture the raw outbound frame. The orchestrator (Common) runs the
+    // PacketInspector over it — the Hypervisor layer must not depend on Common.
+    if (len > 0 && capturedNetworkFrames_.size() < kMaxCapturedFrames) {
+      capturedNetworkFrames_.emplace_back(frame, frame + len);
+    }
+  });
+  nic_->SetMmioBase(pcIo_.NicBar0Base());
+  mmioBus_.Attach(nic_.get());
+  pcIo_.ConsumeNicBar0Dirty();
 }
 
 uint8_t *VirtualMachine::HostPointerForGpa(uint64_t gpa,
@@ -2164,6 +2190,9 @@ VmRunSummary VirtualMachine::RunLoop(
       if (pcIo_.ConsumeAhciAbarDirty() && ahci_) {
         ahci_->SetAbarBase(pcIo_.AhciAbarBase());
       }
+      if (nic_ && pcIo_.ConsumeNicBar0Dirty()) {
+        nic_->SetMmioBase(pcIo_.NicBar0Base());
+      }
       vcpu_.AdvanceRip(instrLen != 0 ? instrLen : io.InstructionByteCount);
       break;
     }
@@ -2922,6 +2951,10 @@ VmRunSummary VirtualMachine::RunLoop(
   };
   collectIde(ide_);
   collectIde(secondaryIde_);
+  if (nic_) {
+    summary.nicFramesTransmitted = nic_->FramesTransmitted();
+    summary.capturedNetworkFrames = capturedNetworkFrames_;
+  }
   if (ahci_) {
     summary.ahciCommandsIssued = ahci_->CommandsIssued();
     summary.ahciIdentifyCommands = ahci_->IdentifyCommands();

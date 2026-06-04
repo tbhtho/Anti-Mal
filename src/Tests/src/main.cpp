@@ -3763,6 +3763,42 @@ void TestE1000Device() {
   Expect((status & 0x2) != 0, "e1000: STATUS link-up bit set");
 }
 
+void TestNicPciConfig() {
+  antimal::hv::PcIoDevices pc;
+  pc.SetNicPresent(true);
+  auto cfg = [&](uint8_t dev, uint8_t func, uint8_t reg) -> uint32_t {
+    const uint32_t addr = 0x80000000u | (static_cast<uint32_t>(dev) << 11) |
+                          (static_cast<uint32_t>(func) << 8) | (reg & 0xFC);
+    pc.OnWrite(0xCF8, addr, 4);
+    return pc.OnRead(0xCFC, 4);
+  };
+  Expect(cfg(4, 0, 0x00) == 0x100E8086u,
+         "nic pci: device 4 is Intel 8086:100E");
+  Expect((cfg(4, 0, 0x08) >> 8) == 0x020000u,
+         "nic pci: class 0x02 subclass 0x00 (ethernet)");
+
+  // BAR0 sizing: write all-ones -> read back the 128 KiB size mask.
+  const uint32_t bar = 0x80000000u | (4u << 11) | 0x10u;
+  pc.OnWrite(0xCF8, bar, 4);
+  pc.OnWrite(0xCFC, 0xFFFFFFFFu, 4);
+  pc.OnWrite(0xCF8, bar, 4);
+  Expect(pc.OnRead(0xCFC, 4) == 0xFFFE0000u,
+         "nic pci: BAR0 sizes to 128 KiB (mask 0xFFFE0000)");
+
+  // Assign a base -> latched + flagged dirty for the device to follow.
+  pc.OnWrite(0xCF8, bar, 4);
+  pc.OnWrite(0xCFC, 0xF0000000u, 4);
+  Expect(pc.NicBar0Base() == 0xF0000000ull, "nic pci: BAR0 base latched");
+  Expect(pc.ConsumeNicBar0Dirty(), "nic pci: BAR0 assignment flagged dirty");
+
+  // Default (no SetNicPresent) -> device 4 reads all-ones, i.e. absent, so the
+  // default boot enumerates exactly as before.
+  antimal::hv::PcIoDevices absent;
+  absent.OnWrite(0xCF8, 0x80000000u | (4u << 11), 4);
+  Expect(absent.OnRead(0xCFC, 4) == 0xFFFFFFFFu,
+         "nic pci: absent by default (no NIC enumerated)");
+}
+
 void TestIntelLookupOffline() {
   // With enabled=false the lookup returns immediately, no transport.
   antimal::IntelLookupConfig cfg;
@@ -4562,6 +4598,7 @@ int main() {
     TestFileSystemTelemetry();
     TestPacketInspector();
     TestE1000Device();
+    TestNicPciConfig();
     TestHttpUrlEncode();
     TestFramebufferVisiblePixels();
     TestScreenshotCaptureBestEffort();

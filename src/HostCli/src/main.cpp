@@ -153,6 +153,7 @@ void PrintUsage() {
       << "                                          dynamic_execution_enabled=true too)\n"
       << "                    [--seed <snapshot.cow>] [--cold]  (default: auto-seed\n"
       << "                                          AntiMalDesktop.cow next to the base)\n"
+      << "                    [--nic]  (attach NIC; capture network requests)\n"
       << "  antimal base convert --vhdx <base.vhdx> --raw <AntiMalBase.raw> [--force]\n"
       << "  antimal base inspect --vhdx <base.vhdx> [--overlay <overlay.cow>]\n"
       << "                       [--dump-bcd <out.bcd>] [--dump-system <out.hive>]\n"
@@ -277,6 +278,12 @@ int CommandDetonate(int argc, wchar_t **argv) {
   // in-guest detonation. Without BOTH keys the sample is staged but never run.
   if (HasFlag(argc, argv, "--allow-execution")) {
     SetEnvironmentVariableW(L"ANTIMAL_AUTHORIZE_EXECUTION", L"1");
+  }
+
+  // --nic attaches an e1000 NIC so the guest's outbound frames are captured and
+  // parsed into network.dns/http/connect events (off by default — no NIC).
+  if (HasFlag(argc, argv, "--nic")) {
+    SetEnvironmentVariableW(L"ANTIMAL_ENABLE_NIC", L"1");
   }
 
   // Seed/cold boot selection. By default detonation auto-seeds from a desktop
