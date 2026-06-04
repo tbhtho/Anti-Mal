@@ -2081,6 +2081,20 @@ VmRunSummary VirtualMachine::RunLoop(
     // intermittent 0x4E/0x1A MM bugchecks + the "Preparing Windows" hang).
     if (firmwareAssistActive && exitRip >= kOsKernelRipFloor) {
       firmwareAssistActive = false;
+      // The firmware page-fault assist is the ONLY reason we intercept #PF. With it
+      // off forever (this generation), stop intercepting #PF entirely: clear the WHP
+      // exception-exit bitmap so Windows handles its own page faults NATIVELY, as on
+      // real hardware. This removes the per-fault re-inject overhead AND eliminates
+      // the recurring-fault-fatal (a re-injected fault that won't "take" loops to
+      // kMaxReinjectedFaultStreak and kills the boot) -- the desktop-reach
+      // intermittency. Best-effort: if WHP rejects the runtime change, the re-inject
+      // path below still services faults, so this is a safe speedup + reliability fix.
+      const uint64_t noExceptionExits = 0;
+      const HRESULT pfHr = WHvSetPartitionProperty(
+          host_.Handle(), WHvPartitionPropertyCodeExceptionExitBitmap,
+          &noExceptionExits, sizeof(noExceptionExits));
+      summary.pageFaultExitsDisabled = SUCCEEDED(pfHr);
+      summary.pageFaultExitsDisableHr = static_cast<uint32_t>(pfHr);
     }
 
     // Track I/O progress so we can detect a true wedge (no IO + no IDE work).

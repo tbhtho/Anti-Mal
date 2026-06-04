@@ -181,6 +181,15 @@ struct VmRunSummary {
   uint64_t pageFaultsReinjected = 0;
   uint64_t lastReinjectedFaultGva = 0;
   uint32_t lastReinjectedFaultErrorCode = 0;
+  // Once the OS kernel runs, the firmware page-fault assist is off forever, so the
+  // ONLY reason we intercept #PF (re-injecting every Windows fault) is gone. We then
+  // clear the WHP exception-exit bitmap so the guest handles its own faults NATIVELY
+  // -- removing the re-inject overhead AND the recurring-fault-fatal (a re-inject
+  // that won't "take" loops to kMaxReinjectedFaultStreak and kills the boot). If WHP
+  // rejects the runtime change, the re-inject path still services faults (safe).
+  // disableHr is the HRESULT (0 = S_OK = #PF exits successfully disabled).
+  bool pageFaultExitsDisabled = false;
+  uint32_t pageFaultExitsDisableHr = 0;
   // Guest-RAM patches applied to OVMF's runtime "wait for tick to change" spin
   // (the Windows kernel calls a UEFI runtime service whose tick-wait deadlocks
   // because OVMF's timer ISR stops once the OS owns the interrupt controllers).

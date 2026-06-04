@@ -8727,6 +8727,8 @@ std::string FormatVmDiagnostics(const hv::VmRunSummary &vm) {
   out << "timerInterruptsInjected: " << vm.timerInterruptsInjected << "\n";
   out << "pageFaultAssists: " << vm.pageFaultAssists << "\n";
   out << "pageFaultAssistsSuppressed: " << vm.pageFaultAssistsSuppressed << "\n";
+  out << "pageFaultExitsDisabled: " << (vm.pageFaultExitsDisabled ? "true" : "false") << "\n";
+  out << "pageFaultExitsDisableHr: 0x" << std::hex << std::uppercase << vm.pageFaultExitsDisableHr << std::nouppercase << std::dec << "\n";
   out << "pageFaultsReinjected: " << vm.pageFaultsReinjected << "\n";
   out << "lastReinjectedFaultGva: 0x" << std::hex << std::uppercase
       << vm.lastReinjectedFaultGva << std::dec << "\n";
@@ -8924,6 +8926,8 @@ std::string FormatVmDiagnostics(const hv::VmRunSummary &vm) {
       << "\n";
   out << "pageFaultAssists: " << vm.pageFaultAssists << "\n";
   out << "pageFaultAssistsSuppressed: " << vm.pageFaultAssistsSuppressed << "\n";
+  out << "pageFaultExitsDisabled: " << (vm.pageFaultExitsDisabled ? "true" : "false") << "\n";
+  out << "pageFaultExitsDisableHr: 0x" << std::hex << std::uppercase << vm.pageFaultExitsDisableHr << std::nouppercase << std::dec << "\n";
   out << "hostChannelBytes: " << vm.hostChannelOutput.size() << "\n";
   // COM2 (the host<->guest AMCH channel @0x2F8) register activity. The decisive
   // agent-telemetry split: com2RegisterReads==0 => Windows serial.sys never
