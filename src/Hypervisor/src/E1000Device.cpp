@@ -63,6 +63,16 @@ E1000Device::E1000Device() {
          (static_cast<uint32_t>(mac[3]) << 24);
   rah_ = static_cast<uint32_t>(mac[4]) | (static_cast<uint32_t>(mac[5]) << 8) |
          (1u << 31);  // Address Valid
+
+  // EEPROM checksum: the Windows e1000 driver validates that the sum of all 64
+  // words equals 0xBABA before it will initialize. Without a valid checksum it
+  // rejects the EEPROM and never binds (nicRegisterWrites stays 0). Put a
+  // plausible device-id word at 0x0D (82540EM) and compute word 0x3F so the
+  // sum checks out.
+  eeprom_[0x0D] = 0x100E;  // device id hint some drivers read
+  uint16_t sum = 0;
+  for (size_t i = 0; i < 0x3F; ++i) sum = static_cast<uint16_t>(sum + eeprom_[i]);
+  eeprom_[0x3F] = static_cast<uint16_t>(0xBABA - sum);
 }
 
 void E1000Device::Reset() noexcept {

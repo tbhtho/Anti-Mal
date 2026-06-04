@@ -3780,6 +3780,22 @@ void TestE1000Device() {
   uint64_t icr = 0;
   nic2.OnRead(kMmio + 0x00C0, 4, &icr);
   Expect((icr & 0x04) != 0, "e1000: ICR reports Link-Status-Change cause");
+
+  // EEPROM checksum: all 64 words must sum to 0xBABA or the Windows driver
+  // rejects the EEPROM and never binds.
+  {
+    antimal::hv::E1000Device nic3;
+    nic3.SetMmioBase(kMmio);
+    uint16_t sum = 0;
+    for (uint32_t addr = 0; addr < 64; ++addr) {
+      nic3.OnWrite(kMmio + 0x0014, 4, (addr << 8) | 0x1);  // EERD START + addr
+      uint64_t v = 0;
+      nic3.OnRead(kMmio + 0x0014, 4, &v);
+      sum = static_cast<uint16_t>(sum + ((v >> 16) & 0xFFFF));
+    }
+    Expect(sum == 0xBABA,
+           "e1000: EEPROM words sum to 0xBABA (driver accepts the checksum)");
+  }
 }
 
 void TestNicPciConfig() {
