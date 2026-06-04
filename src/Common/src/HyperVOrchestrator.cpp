@@ -10263,7 +10263,12 @@ DetonationResult InHouseOrchestrator::PrepareAndRun(
       IdeReadAttributionCatalog readAttributionCatalog;
       BootOverlayPatchResult lastOverlayPatch;
       hv::VirtualMachineOptions vmOptions;
-      vmOptions.processorCount = 2;
+      // Default to a single vCPU: per the private development documentation the 2-vCPU config
+      // deterministically hangs at a kernel SMP/AP-bringup rendezvous, while
+      // 1-vCPU is the known-working boot path. Until the AP-bringup race is
+      // fixed, 1 is the reliable default; ANTIMAL_VCPU_COUNT (or the HostCli
+      // `--vcpus` flag, which sets it) overrides this to exercise SMP boots.
+      vmOptions.processorCount = 1;
       // Windows 11 minimum RAM is 4 GiB. 2 GiB low + 2 GiB high meets that.
       // bootstat.dat showed winload aborting with STATUS_MEMORY_NOT_ALLOCATED /
       // STATUS_FREE_VM_NOT_AT_BASE on a 2 GiB-only configuration — winload

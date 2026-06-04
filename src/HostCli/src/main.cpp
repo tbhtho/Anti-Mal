@@ -148,6 +148,7 @@ void PrintUsage() {
       << "                    [--no-yara] [--no-capa] [--no-die] [--no-tagger]\n"
       << "                    [--intel] [--vt-key <KEY>] [--json <out.json>]\n"
       << "  antimal detonate <sample> --timeout-sec 180 --network disabled|hostonly|nat\n"
+      << "                    [--vcpus 1]   (1 = reliable default; >1 exercises SMP boot)\n"
       << "  antimal base convert --vhdx <base.vhdx> --raw <AntiMalBase.raw> [--force]\n"
       << "  antimal base inspect --vhdx <base.vhdx> [--overlay <overlay.cow>]\n"
       << "                       [--dump-bcd <out.bcd>] [--dump-system <out.hive>]\n"
@@ -255,6 +256,16 @@ int CommandDetonate(int argc, wchar_t **argv) {
   }
   const auto networkText = OptionValue(argc, argv, "--network").value_or(antimal::ToString(config.networkMode));
   const auto network = antimal::ParseNetworkMode(networkText).value_or(antimal::NetworkMode::Disabled);
+
+  // --vcpus overrides the guest processor count. The orchestrator reads
+  // ANTIMAL_VCPU_COUNT, so the flag simply sets it (unless the env var is
+  // already present, which takes precedence — explicit env wins over flag).
+  if (const auto value = OptionValue(argc, argv, "--vcpus")) {
+    if (GetEnvironmentVariableW(L"ANTIMAL_VCPU_COUNT", nullptr, 0) == 0) {
+      SetEnvironmentVariableW(L"ANTIMAL_VCPU_COUNT",
+                              antimal::Utf8ToWide(*value).c_str());
+    }
+  }
 
   antimal::HyperVOrchestrator orchestrator(config);
   auto progress = [](const antimal::DetonationProgress &snap) {
