@@ -64,7 +64,10 @@ driver_bridge_mode = "off"
 vm_provider = "inhouse"
 dynamic_execution_enabled = false
 "@
-  Set-Content -LiteralPath $ConfigPath -Value $text -Encoding UTF8
+  # BOM-less UTF-8: Set-Content -Encoding UTF8 on Windows PowerShell 5.1 prepends a
+  # UTF-8 BOM. The C++ config loader now strips a leading BOM, but write it clean so
+  # the file is correct for any reader.
+  [System.IO.File]::WriteAllText($ConfigPath, $text, (New-Object System.Text.UTF8Encoding $false))
   Write-Host "Wrote config: $ConfigPath"
 }
 

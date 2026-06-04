@@ -82,7 +82,18 @@ AppConfig LoadConfig(const std::filesystem::path &path) {
     return config;
   }
 
-  std::istringstream input(ReadTextFile(path));
+  std::string content = ReadTextFile(path);
+  // Strip a leading UTF-8 BOM (EF BB BF) if present. Windows PowerShell 5.1's
+  // `Set-Content -Encoding UTF8` (used by the project's own Write-AntiMalConfig)
+  // prepends one; without stripping it the first key (base_vhdx_path) carries the
+  // BOM, never matches, and the base path is silently left empty -> the in-house
+  // orchestrator then reports "no readable base VHDX is available".
+  if (content.size() >= 3 && static_cast<unsigned char>(content[0]) == 0xEF &&
+      static_cast<unsigned char>(content[1]) == 0xBB &&
+      static_cast<unsigned char>(content[2]) == 0xBF) {
+    content.erase(0, 3);
+  }
+  std::istringstream input(content);
   std::string line;
   while (std::getline(input, line)) {
     const auto comment = line.find('#');

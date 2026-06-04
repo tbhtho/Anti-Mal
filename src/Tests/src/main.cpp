@@ -109,6 +109,18 @@ void TestConfig() {
   Expect(loaded.workspaceRoot == config.workspaceRoot, "config workspace");
   Expect(loaded.networkMode == antimal::NetworkMode::HostOnly, "config network");
   Expect(loaded.dynamicExecutionEnabled, "config dynamic execution gate");
+
+  // A config written with a UTF-8 BOM (PowerShell 5.1 `Set-Content -Encoding UTF8`,
+  // and the project's own Write-AntiMalConfig, prepend one) must still parse: the
+  // loader strips a leading BOM, else the first key (base_vhdx_path) silently fails
+  // to match and the base path comes back empty -> "no readable base VHDX".
+  const auto bomPath = root / "antimal-bom.toml";
+  antimal::WriteTextFile(bomPath, "\xEF\xBB\xBF" + antimal::SerializeConfig(config));
+  const auto loadedBom = antimal::LoadConfig(bomPath);
+  Expect(loadedBom.baseVhdxPath == config.baseVhdxPath,
+         "config base vhdx parses despite a leading UTF-8 BOM");
+  Expect(loadedBom.workspaceRoot == config.workspaceRoot,
+         "config workspace parses despite a leading UTF-8 BOM");
 }
 
 void TestLocalBaseVhdxInfo() {
