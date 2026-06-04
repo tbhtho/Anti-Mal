@@ -151,6 +151,8 @@ void PrintUsage() {
       << "                    [--vcpus 1]   (1 = reliable default; >1 exercises SMP boot)\n"
       << "                    [--allow-execution]  (arms in-guest detonation; needs\n"
       << "                                          dynamic_execution_enabled=true too)\n"
+      << "                    [--seed <snapshot.cow>] [--cold]  (default: auto-seed\n"
+      << "                                          AntiMalDesktop.cow next to the base)\n"
       << "  antimal base convert --vhdx <base.vhdx> --raw <AntiMalBase.raw> [--force]\n"
       << "  antimal base inspect --vhdx <base.vhdx> [--overlay <overlay.cow>]\n"
       << "                       [--dump-bcd <out.bcd>] [--dump-system <out.hive>]\n"
@@ -275,6 +277,17 @@ int CommandDetonate(int argc, wchar_t **argv) {
   // in-guest detonation. Without BOTH keys the sample is staged but never run.
   if (HasFlag(argc, argv, "--allow-execution")) {
     SetEnvironmentVariableW(L"ANTIMAL_AUTHORIZE_EXECUTION", L"1");
+  }
+
+  // Seed/cold boot selection. By default detonation auto-seeds from a desktop
+  // snapshot next to the base (reliable). --seed overrides the snapshot path;
+  // --cold forces a full cold OOBE boot (intermittent — diagnostics only).
+  if (HasFlag(argc, argv, "--cold")) {
+    SetEnvironmentVariableW(L"ANTIMAL_COLD_BOOT", L"1");
+  }
+  if (const auto value = OptionValue(argc, argv, "--seed")) {
+    SetEnvironmentVariableW(L"ANTIMAL_SEED_OVERLAY",
+                            antimal::Utf8ToWide(*value).c_str());
   }
 
   antimal::HyperVOrchestrator orchestrator(config);

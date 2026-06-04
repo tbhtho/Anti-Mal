@@ -9665,12 +9665,39 @@ DetonationResult InHouseOrchestrator::PrepareAndRun(
     // "snapshot" fast-boot path; the seed file is copied, never modified.
     bool overlaySeeded = false;
     {
-      char seedBuf[1024]{};
-      size_t seedNeeded = 0;
-      if (getenv_s(&seedNeeded, seedBuf, sizeof(seedBuf),
-                   "ANTIMAL_SEED_OVERLAY") == 0 &&
-          seedNeeded > 1 && seedBuf[0] != '\0') {
-        const std::filesystem::path seedPath(seedBuf);
+      // Resolve the seed snapshot. Explicit ANTIMAL_SEED_OVERLAY wins; otherwise
+      // auto-discover a default desktop snapshot (AntiMalDesktop.cow) next to the
+      // base so detonation reaches a logged-in desktop reliably -- cold OOBE is
+      // intermittent, but resuming a post-OOBE snapshot is not. Opt out of
+      // seeding entirely with ANTIMAL_COLD_BOOT=1 (HostCli --cold).
+      auto envPath = [](const char *name) -> std::filesystem::path {
+        char buf[1024]{};
+        size_t n = 0;
+        if (getenv_s(&n, buf, sizeof(buf), name) == 0 && n > 1 &&
+            buf[0] != '\0') {
+          return std::filesystem::path(buf);
+        }
+        return {};
+      };
+      char coldBuf[8]{};
+      size_t coldNeeded = 0;
+      const bool coldBoot =
+          getenv_s(&coldNeeded, coldBuf, sizeof(coldBuf), "ANTIMAL_COLD_BOOT") ==
+              0 &&
+          coldNeeded >= 1 && coldBuf[0] == '1';
+
+      std::filesystem::path seedPath = coldBoot ? std::filesystem::path{}
+                                                : envPath("ANTIMAL_SEED_OVERLAY");
+      const bool explicitSeed = !seedPath.empty();
+      std::error_code de;
+      if (!coldBoot && seedPath.empty()) {
+        const auto def =
+            runConfig.baseVhdxPath.parent_path() / "AntiMalDesktop.cow";
+        if (std::filesystem::exists(def, de)) {
+          seedPath = def;
+        }
+      }
+      if (!seedPath.empty()) {
         std::error_code seedEc;
         if (std::filesystem::exists(seedPath, seedEc)) {
           std::filesystem::create_directories(
@@ -9685,6 +9712,7 @@ DetonationResult InHouseOrchestrator::PrepareAndRun(
                                              : "overlay.seed-failed",
                                result.overlayDiskPath,
                                {{"seed", PathToUtf8(seedPath)},
+                                {"auto", explicitSeed ? "false" : "true"},
                                 {"format", "vhdx-cow"}}),
               &events);
         }
