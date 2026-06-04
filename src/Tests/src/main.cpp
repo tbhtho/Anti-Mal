@@ -14,6 +14,7 @@
 #include "antimal/Json.h"
 #include "antimal/JsonValue.h"
 #include "antimal/NetworkTelemetry.h"
+#include "antimal/PacketInspector.h"
 #include "antimal/PeParser.h"
 #include "antimal/RegistryTelemetry.h"
 #include "antimal/ProcessTelemetry.h"
@@ -3622,6 +3623,84 @@ void TestFileSystemTelemetry() {
          "file: baseline is capped");
 }
 
+void TestPacketInspector() {
+  // Frame builders. IPv4 total-length is left 0 (the parser clamps to the
+  // captured length), so we only need structurally valid headers + payload.
+  auto eth = [](std::vector<uint8_t> &f, uint16_t ethertype) {
+    for (int i = 0; i < 12; ++i) f.push_back(0);  // dst+src MAC
+    f.push_back(static_cast<uint8_t>(ethertype >> 8));
+    f.push_back(static_cast<uint8_t>(ethertype & 0xFF));
+  };
+  auto ipv4 = [](std::vector<uint8_t> &f, uint8_t proto,
+                 std::array<uint8_t, 4> dst) {
+    const uint8_t hdr[] = {0x45, 0,  0,  0,  0, 0, 0, 0, 64, proto, 0, 0,
+                           10,   0,  2,  15};  // ver/ihl..proto..src 10.0.2.15
+    for (uint8_t b : hdr) f.push_back(b);
+    for (uint8_t b : dst) f.push_back(b);
+  };
+
+  // DNS query for example.com (UDP -> :53).
+  std::vector<uint8_t> dns;
+  eth(dns, 0x0800);
+  ipv4(dns, 17, {8, 8, 8, 8});
+  const uint8_t udp[] = {0xC0, 0x00, 0x00, 0x35, 0, 0, 0, 0};  // dst port 53
+  for (uint8_t b : udp) dns.push_back(b);
+  for (int i = 0; i < 12; ++i) dns.push_back(0);  // DNS header
+  for (const char *lbl : {"example", "com"}) {
+    dns.push_back(static_cast<uint8_t>(std::strlen(lbl)));
+    for (const char *p = lbl; *p; ++p) dns.push_back(static_cast<uint8_t>(*p));
+  }
+  dns.push_back(0);  // root label
+  const uint8_t qtc[] = {0x00, 0x01, 0x00, 0x01};  // qtype/qclass
+  for (uint8_t b : qtc) dns.push_back(b);
+  auto dnsEvents = antimal::InspectEthernetFrame(dns.data(), dns.size());
+  Expect(dnsEvents.size() == 1 && dnsEvents[0].action == "network.dns" &&
+             dnsEvents[0].target == "example.com" &&
+             dnsEvents[0].category == "network",
+         "packet: DNS query -> network.dns example.com");
+
+  // HTTP GET to :80 with a Host header.
+  std::vector<uint8_t> http;
+  eth(http, 0x0800);
+  ipv4(http, 6, {1, 2, 3, 4});
+  const uint8_t tcp80[] = {0xC0, 0x00, 0x00, 0x50, 0, 0, 0, 0, 0, 0,
+                           0,    0,    0x50, 0x18, 0, 0, 0, 0, 0, 0};
+  for (uint8_t b : tcp80) http.push_back(b);  // dst 80, PSH+ACK, 20-byte hdr
+  const std::string req =
+      "GET /malware.exe HTTP/1.1\r\nHost: evil.example.com\r\n\r\n";
+  for (char c : req) http.push_back(static_cast<uint8_t>(c));
+  auto httpEvents = antimal::InspectEthernetFrame(http.data(), http.size());
+  Expect(httpEvents.size() == 1 && httpEvents[0].action == "network.http" &&
+             httpEvents[0].target == "evil.example.com/malware.exe" &&
+             httpEvents[0].details["method"] == "GET" &&
+             httpEvents[0].details["host"] == "evil.example.com",
+         "packet: HTTP GET -> network.http with method/host/path");
+
+  // Bare TCP SYN to :443 -> a connection attempt.
+  std::vector<uint8_t> syn;
+  eth(syn, 0x0800);
+  ipv4(syn, 6, {93, 184, 216, 34});
+  const uint8_t tcpSyn[] = {0xC0, 0x00, 0x01, 0xBB, 0, 0, 0, 0, 0, 0,
+                            0,    0,    0x50, 0x02, 0, 0, 0, 0, 0, 0};
+  for (uint8_t b : tcpSyn) syn.push_back(b);  // dst 443, SYN
+  auto synEvents = antimal::InspectEthernetFrame(syn.data(), syn.size());
+  Expect(synEvents.size() == 1 && synEvents[0].action == "network.connect" &&
+             synEvents[0].target == "93.184.216.34:443",
+         "packet: TCP SYN -> network.connect");
+
+  // Malformed / non-IPv4 frames yield nothing (hardened against guest bytes).
+  Expect(antimal::InspectEthernetFrame(nullptr, 0).empty(),
+         "packet: null frame -> no events");
+  std::vector<uint8_t> tiny = {1, 2, 3};
+  Expect(antimal::InspectEthernetFrame(tiny.data(), tiny.size()).empty(),
+         "packet: short frame -> no events");
+  std::vector<uint8_t> arp;
+  eth(arp, 0x0806);
+  arp.resize(60, 0);
+  Expect(antimal::InspectEthernetFrame(arp.data(), arp.size()).empty(),
+         "packet: non-IPv4 (ARP) ignored");
+}
+
 void TestIntelLookupOffline() {
   // With enabled=false the lookup returns immediately, no transport.
   antimal::IntelLookupConfig cfg;
@@ -4419,6 +4498,7 @@ int main() {
     TestNetworkTelemetry();
     TestRegistryTelemetry();
     TestFileSystemTelemetry();
+    TestPacketInspector();
     TestHttpUrlEncode();
     TestFramebufferVisiblePixels();
     TestScreenshotCaptureBestEffort();
