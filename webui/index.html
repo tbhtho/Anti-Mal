@@ -19,16 +19,16 @@
         <button class="btn" data-cmd="scan.file">Scan File</button>
         <button class="btn" data-cmd="scan.folder">Scan Folder</button>
         <button class="btn" data-cmd="scan.computer">Scan Computer</button>
-        <button class="btn danger" data-cmd="detonate.selected">Detonate Selected</button>
+        <button class="btn danger" data-cmd="detonate.selected" disabled title="In-VM sample detonation is not wired yet — boots run a GuestAgent healthcheck only">Detonate Selected</button>
       </div>
-      <div class="segmented" id="network">
-        <button data-net="disabled" class="on">Disabled</button>
-        <button data-net="isolated">Isolated</button>
-        <button data-net="live">Live</button>
+      <div class="segmented" id="network" title="Display only — network mode is set in config/antimal.toml or via detonate --network">
+        <button data-net="disabled" class="on" disabled>Disabled</button>
+        <button data-net="isolated" disabled>Isolated</button>
+        <button data-net="live" disabled>Live</button>
       </div>
-      <span class="field">Flag &ge; <input id="flag" type="number" value="70" min="0" max="100"></span>
-      <span class="field">VM sec <input id="vmsec" type="number" value="180" min="10"></span>
-      <span class="toggle" id="autodet"><span class="track"></span>Auto-detonate</span>
+      <span class="field">Flag &ge; <input id="flag" type="number" value="70" min="0" max="100" disabled title="Display only — set the flag threshold via config or scan --threshold"></span>
+      <span class="field">VM sec <input id="vmsec" type="number" value="180" min="10" disabled title="Display only — set the VM timeout via config (default_timeout_sec) or detonate --timeout-sec"></span>
+      <span class="toggle disabled" id="autodet" title="Not wired — detonation is gated off (boots run a healthcheck only)"><span class="track"></span>Auto-detonate</span>
     </header>
 
     <div class="body">

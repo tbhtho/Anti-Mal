@@ -55,7 +55,10 @@ html, body {
 .btn.primary:hover { background: var(--blue-dim); }
 .btn.danger { border-color: #5b1f1f; color: #ffb4b4; }
 .btn.danger:hover { background: #3a1313; border-color: var(--red); }
-.btn:disabled { opacity: .4; cursor: not-allowed; }
+.btn:disabled, .btn:disabled:hover { opacity: .4; cursor: not-allowed; background: var(--panel2); border-color: var(--border2); }
+.segmented button:disabled { opacity: .5; cursor: not-allowed; }
+.field input:disabled { opacity: .55; cursor: not-allowed; }
+.toggle.disabled { opacity: .45; cursor: not-allowed; }
 
 /* segmented control (network) */
 .segmented { display: inline-flex; border: 1px solid var(--border2); border-radius: var(--radius-sm); overflow: hidden; }

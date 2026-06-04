@@ -127,7 +127,7 @@
         '<div id="vm-events"><p class="page-sub" style="margin:0">No events yet — boot the VM to stream live process activity from the GuestAgent over COM2.</p></div></div>' +
         '<div class="row"><div class="panel" style="flex:1;min-width:280px"><h2>VM State</h2>' +
         '<div id="vm-state"><p class="page-sub" style="margin:0">Loading…</p></div>' +
-        '<div class="actions" style="margin-top:12px"><button class="btn">Stage Sample</button><button class="btn primary">Boot VM</button><button class="btn">Stop VM</button><button class="btn danger" disabled title="Disabled until safety gates pass">Detonate Selected</button></div></div>' +
+        '<p class="page-sub" style="margin:8px 0 0">Use “Boot VM (live)” above to start a session. In-VM sample detonation is not wired yet (boots run a GuestAgent healthcheck only).</p></div>' +
         '<div class="panel" style="flex:1;min-width:260px"><h2>Boot Timeline</h2><ul class="timeline">' +
         steps.map(function (s) { return '<li class="' + s[1] + '"><span class="mark"></span>' + esc(s[0]) + '</li>'; }).join('') + '</ul></div></div>' +
         '<div class="panel"><h2>Safety Gates</h2><div id="vm-gates"><p class="page-sub" style="margin:0">Loading…</p></div></div>';
@@ -143,7 +143,7 @@
         '<div class="panel"><h2>Base Image Status</h2><div id="base-status"><p class="page-sub" style="margin:0">Checking…</p></div></div>' +
         '<div class="panel"><h2>Setup Steps</h2><ul class="timeline">' +
         steps.map(function (s, i) { return '<li class="' + (i === 0 ? 'cur' : 'todo') + '"><span class="mark"></span>' + esc((i + 1) + '. ' + s) + '</li>'; }).join('') +
-        '</ul><div class="actions" style="margin-top:12px"><button class="btn primary">Build Base</button><button class="btn">Import Base</button><button class="btn">Validate</button></div></div>' +
+        '</ul><p class="page-sub" style="margin:8px 0 0">Build or import the base image from the command line — see <span class="mono">tools\\New-AntiMalVmBase.ps1</span> (README → Base Image).</p></div>' +
         '<div class="panel"><h2>Requirements</h2>' + reqs.map(function (r) { return '<div class="gate"><span class="g">✓</span>' + esc(r) + '</div>'; }).join('') + '</div>';
     },
     browser: function () {
@@ -585,7 +585,7 @@
         appendLog(b.dataset.net === 'live' ? 'WARN' : 'SAFE', 'Network mode: ' + b.dataset.net + '.');
       };
     });
-    var at = $('#autodet'); at.onclick = function () { at.classList.toggle('on'); appendLog('WARN', 'Auto-detonate flagged: ' + (at.classList.contains('on') ? 'ON' : 'OFF') + '.'); };
+    var at = $('#autodet'); if (at) at.onclick = function () { appendLog('INFO', 'Auto-detonate is not wired — detonation is gated off (boots run a GuestAgent healthcheck only).'); };
     $all('.logtools .f').forEach(function (f) {
       f.onclick = function () { $all('.logtools .f').forEach(function (x) { x.classList.remove('on'); }); f.classList.add('on'); logFilter = f.dataset.filter; refilterLog(); };
     });
