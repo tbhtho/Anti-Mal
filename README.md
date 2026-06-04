@@ -17,7 +17,7 @@ AntiMal has two major layers:
 
 **The one thing not yet closed is reliability:** reaching a stable logged-in desktop *every automated run* is intermittent — one run reaches the desktop / "Preparing Windows", the next stalls or reboot-loops. The remaining work is VMM systems engineering (1-vCPU first-logon stalls and a 2-vCPU AP-bringup SMP race). Boots are **bounded** — they time out cleanly via `--timeout-sec` (an earlier "watchdog wedge / boots run for hours" diagnosis was a host-side PowerShell-poller artifact, not the VM) — so the blocker is the *hang itself*, not runaway boots. See `private development documentation` for the exact failure modes and the ordered plan.
 
-Real malware execution remains intentionally blocked. The project stages samples and creates reports, but `dynamic_execution_enabled = false` is the default and `sampleExecuted` stays false until the benign GuestAgent channel, overlay discard, artifact return, and report pipeline are proven end to end on a stable desktop.
+In-guest sample execution is **wired but gated off by default** behind a two-key gate: it arms only when `dynamic_execution_enabled = true` (config) **and** `--allow-execution` is passed to `detonate` (and the guest's own `ANTIMAL_GUEST_ALLOW_EXECUTION` is set). When armed, the host delivers the staged sample over COM2 and the GuestAgent launches it and streams its process subtree. Default runs stay healthcheck-only (`sampleExecuted=false`). **Live execution additionally requires a one-time re-deploy of the execute-capable GuestAgent into the base** (`tools\Test-AntiMalBaseBoot.ps1 -GuestAgentPath …` + re-snapshot) — the baked agent is healthcheck-only until then. See `historical design notes (not distributed)`.
 
 ## What Works Today
 
@@ -66,8 +66,8 @@ AntiMal is meant for malware analysis, so safety beats speed.
 - Network mode defaults to `disabled`.
 - Threat-intel HTTP lookups are off unless explicitly enabled.
 - The in-house VM stages samples but does not execute them by default.
-- GuestAgent now heartbeats over COM2 when no executable job is authorized.
-- Host-to-guest COM2 jobs are restricted to `kind=healthcheck` in this phase; submitted samples are staged but not launched.
+- GuestAgent heartbeats over COM2 when no executable job is authorized.
+- In-guest execution is behind a **two-key gate** (`dynamic_execution_enabled` config **and** per-run `--allow-execution`); with either key absent, the host sends only a `kind=healthcheck` job and submitted samples are staged but not launched.
 - A future execution gate must prove:
   - benign GuestAgent connection
   - disposable overlay writes
