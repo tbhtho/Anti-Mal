@@ -455,6 +455,7 @@ struct VmRunSummary {
   // PacketInspector over them (the Hypervisor layer can't depend on Common).
   std::vector<std::vector<uint8_t>> capturedNetworkFrames;
   uint64_t nicFramesTransmitted = 0;
+  uint64_t nicRegisterWrites = 0;
   uint64_t pitIrqsDelivered = 0;
   uint64_t rtcIrqsDelivered = 0;
   uint32_t framesCaptured = 0;

@@ -256,6 +256,7 @@ bool E1000Device::OnRead(uint64_t gpa, uint8_t /*accessSize*/, uint64_t *out) {
 
 bool E1000Device::OnWrite(uint64_t gpa, uint8_t /*accessSize*/, uint64_t value) {
   if (gpa < mmioBase_ || gpa > MmioLast()) return false;
+  ++mmioWrites_;
   // e1000 register access is 32-bit dword; drivers don't sub-dword write here.
   WriteReg(static_cast<uint32_t>(gpa - mmioBase_) & ~0x3u,
            static_cast<uint32_t>(value));

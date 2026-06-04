@@ -70,6 +70,9 @@ class E1000Device final : public IMmioDevice {
   // Diagnostics.
   uint64_t FramesTransmitted() const noexcept { return framesTransmitted_; }
   uint64_t BytesTransmitted() const noexcept { return bytesTransmitted_; }
+  // Register writes by the guest driver — >0 means the e1000 driver bound and
+  // touched the device (vs. never enumerated/bound).
+  uint64_t RegisterWrites() const noexcept { return mmioWrites_; }
 
  private:
   void WriteReg(uint32_t off, uint32_t value);
@@ -98,6 +101,7 @@ class E1000Device final : public IMmioDevice {
 
   uint64_t framesTransmitted_ = 0;
   uint64_t bytesTransmitted_ = 0;
+  uint64_t mmioWrites_ = 0;
 };
 
 }  // namespace antimal::hv

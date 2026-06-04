@@ -2962,6 +2962,7 @@ VmRunSummary VirtualMachine::RunLoop(
   collectIde(secondaryIde_);
   if (nic_) {
     summary.nicFramesTransmitted = nic_->FramesTransmitted();
+    summary.nicRegisterWrites = nic_->RegisterWrites();
     summary.capturedNetworkFrames = capturedNetworkFrames_;
   }
   if (ahci_) {
