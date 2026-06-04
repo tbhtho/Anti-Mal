@@ -218,6 +218,21 @@ CpuidExitResult Vcpu::EmulateCpuidExit() {
     rax = (rax & ~(0x3Fu << 26)) |
           ((std::min<uint32_t>(processorCount_, 64u) - 1u) << 26);
     break;
+  case 0x00000006u:
+    // Thermal & Power Management leaf. Report NO features. With the hypervisor
+    // bit hidden (anti-VM; leaf 1 ECX[31] cleared above), intelppm.sys otherwise
+    // believes it owns native CPU power management and spins probing C-state /
+    // P-state CPUID + MSRs this VMM does not emulate -- observed wedging a
+    // 1-vCPU boot in an intelppm CPUID loop (RIP FFFFF8043DB303F2, intelppm.pdb)
+    // for minutes before the desktop, so the network stack never came up. Zeroing
+    // leaf 6 leaves intelppm nothing to manage. Same rationale as masking
+    // x2APIC / TSC-deadline / CET above: never advertise a feature this
+    // hypervisor cannot faithfully emulate.
+    rax = 0;
+    rbx = 0;
+    rcx = 0;
+    rdx = 0;
+    break;
   case 0x0000000Bu:
   case 0x0000001Fu: {
     const uint32_t count = std::max<uint32_t>(1, processorCount_);
