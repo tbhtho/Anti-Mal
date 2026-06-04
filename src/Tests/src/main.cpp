@@ -3450,6 +3450,61 @@ void TestIntelLookupOffline() {
   Expect(vt2.known, "virustotal: malicious known=true");
   Expect(vt2.detectionRatio == 35, "virustotal: detections");
   Expect(vt2.family == "trojan.formbook", "virustotal: label parsed");
+
+  // Cache round-trip. Regression: cache reads used to dispatch on a
+  // "sourceName" field the raw API bodies never contain, so every cached hit
+  // decoded to an empty IntelHit. The cache now stores parsed hits per line.
+  std::vector<antimal::IntelHit> hits;
+  {
+    antimal::IntelHit a;
+    a.source = antimal::IntelSource::MalwareBazaar;
+    a.sourceName = "malwarebazaar";
+    a.known = true;
+    a.family = "AgentTesla";
+    a.tags = {"AgentTesla", "stealer"};
+    hits.push_back(a);
+    antimal::IntelHit b;
+    b.source = antimal::IntelSource::VirusTotal;
+    b.sourceName = "virustotal";
+    b.known = true;
+    b.family = "trojan.formbook";
+    b.detectionRatio = 35;
+    b.totalScanners = 70;
+    hits.push_back(b);
+  }
+  const auto blob = antimal::SerializeIntelCache(hits);
+  const auto round = antimal::ParseIntelCache(blob);
+  Expect(round.size() == 2, "intel cache: round-trip preserves hit count");
+  Expect(round.size() == 2 && round[0].sourceName == "malwarebazaar" &&
+             round[0].source == antimal::IntelSource::MalwareBazaar &&
+             round[0].known && round[0].family == "AgentTesla" &&
+             round[0].tags.size() == 2,
+         "intel cache: malwarebazaar hit round-trips with source + fields");
+  Expect(round.size() == 2 && round[1].sourceName == "virustotal" &&
+             round[1].source == antimal::IntelSource::VirusTotal &&
+             round[1].detectionRatio == 35 && round[1].totalScanners == 70 &&
+             round[1].family == "trojan.formbook",
+         "intel cache: virustotal hit round-trips with source + fields");
+
+  // End-to-end: LookupHash serves a fresh on-disk cache instead of the network.
+  {
+    const auto cacheDir =
+        std::filesystem::temp_directory_path() / "antimal_intel_cache_test";
+    std::error_code ec;
+    std::filesystem::remove_all(cacheDir, ec);
+    std::filesystem::create_directories(cacheDir, ec);
+    const std::string sha(64, 'a');
+    antimal::WriteTextFile(cacheDir / (sha + ".json"), blob);
+    antimal::IntelLookupConfig cc;
+    cc.enabled = true;
+    cc.cacheDir = cacheDir;
+    auto cachedResult = antimal::LookupHash(sha, cc);
+    Expect(cachedResult.fromCache, "intel cache: LookupHash served from cache");
+    Expect(cachedResult.hits.size() == 2 &&
+               cachedResult.hits[0].family == "AgentTesla",
+           "intel cache: cached hits carry parsed fields (not empty)");
+    std::filesystem::remove_all(cacheDir, ec);
+  }
 }
 
 void TestHttpUrlEncode() {

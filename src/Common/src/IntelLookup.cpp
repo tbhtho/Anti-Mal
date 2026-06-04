@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cstdio>
 #include <ctime>
 #include <regex>
 #include <sstream>
@@ -72,7 +73,92 @@ std::vector<std::string> FindStringArrayField(const std::string &json,
   return out;
 }
 
+std::string JsonEscape(const std::string &s) {
+  std::string out;
+  out.reserve(s.size() + 8);
+  for (char c : s) {
+    switch (c) {
+      case '"': out += "\\\""; break;
+      case '\\': out += "\\\\"; break;
+      case '\n': out += "\\n"; break;
+      case '\r': out += "\\r"; break;
+      case '\t': out += "\\t"; break;
+      default:
+        if (static_cast<unsigned char>(c) < 0x20) {
+          char buf[8];
+          std::snprintf(buf, sizeof(buf), "\\u%04x",
+                        static_cast<unsigned>(static_cast<unsigned char>(c)));
+          out += buf;
+        } else {
+          out += c;
+        }
+    }
+  }
+  return out;
+}
+
+// One cache line per hit: a compact JSON object carrying the parsed fields
+// (including sourceName) rather than the raw API body.
+std::string SerializeIntelHitLine(const IntelHit &h) {
+  std::string out = "{";
+  out += "\"sourceName\":\"" + JsonEscape(h.sourceName) + "\",";
+  out += "\"known\":" + std::string(h.known ? "true" : "false") + ",";
+  out += "\"family\":\"" + JsonEscape(h.family) + "\",";
+  out += "\"detectionRatio\":" + std::to_string(h.detectionRatio) + ",";
+  out += "\"totalScanners\":" + std::to_string(h.totalScanners) + ",";
+  out += "\"firstSeen\":\"" + JsonEscape(h.firstSeen) + "\",";
+  out += "\"lastSeen\":\"" + JsonEscape(h.lastSeen) + "\",";
+  out += "\"permalink\":\"" + JsonEscape(h.permalink) + "\",";
+  out += "\"error\":\"" + JsonEscape(h.error) + "\",";
+  out += "\"tags\":[";
+  for (size_t i = 0; i < h.tags.size(); ++i) {
+    if (i) out += ",";
+    out += "\"" + JsonEscape(h.tags[i]) + "\"";
+  }
+  out += "]}";
+  return out;
+}
+
+IntelHit ParseIntelHitLine(const std::string &line) {
+  IntelHit hit;
+  hit.sourceName = FindStringField(line, "sourceName");
+  hit.source = (hit.sourceName == "virustotal") ? IntelSource::VirusTotal
+                                                 : IntelSource::MalwareBazaar;
+  hit.known = line.find("\"known\":true") != std::string::npos;
+  hit.family = FindStringField(line, "family");
+  hit.detectionRatio = FindIntField(line, "detectionRatio", 0);
+  hit.totalScanners = FindIntField(line, "totalScanners", 0);
+  hit.firstSeen = FindStringField(line, "firstSeen");
+  hit.lastSeen = FindStringField(line, "lastSeen");
+  hit.permalink = FindStringField(line, "permalink");
+  hit.error = FindStringField(line, "error");
+  hit.tags = FindStringArrayField(line, "tags");
+  hit.rawJson = line;
+  return hit;
+}
+
 } // namespace
+
+std::string SerializeIntelCache(const std::vector<IntelHit> &hits) {
+  std::string out;
+  for (const auto &h : hits) {
+    out += SerializeIntelHitLine(h);
+    out += "\n";
+  }
+  return out;
+}
+
+std::vector<IntelHit> ParseIntelCache(const std::string &content) {
+  std::vector<IntelHit> hits;
+  std::istringstream s(content);
+  std::string line;
+  while (std::getline(s, line)) {
+    if (!line.empty() && line.back() == '\r') line.pop_back();
+    if (line.empty()) continue;
+    hits.push_back(ParseIntelHitLine(line));
+  }
+  return hits;
+}
 
 IntelHit ParseMalwareBazaarResponse(const std::string &json) {
   // MalwareBazaar /api/v1/ schema:
@@ -160,29 +246,18 @@ IntelLookupResult LookupHash(const std::string &sha256Hex,
 
   const std::string lowerHash = ToLowerAscii(sha256Hex);
 
-  // Check cache first.
+  // Check cache first. Each cached line carries its own sourceName, so reads
+  // reconstruct the hit directly (no re-dispatch on raw API bodies).
   const auto cached = ReadCacheIfFresh(config.cacheDir, lowerHash,
                                        config.maxAgeForCache);
   if (!cached.empty()) {
-    result.fromCache = true;
-    // Cache format: one IntelHit per line, JSON. Split on newlines.
-    std::istringstream s(cached);
-    std::string line;
-    while (std::getline(s, line)) {
-      if (line.empty()) continue;
-      IntelHit hit;
-      if (line.find("\"sourceName\":\"malwarebazaar\"") != std::string::npos) {
-        hit = ParseMalwareBazaarResponse(line);
-      } else if (line.find("\"sourceName\":\"virustotal\"") != std::string::npos) {
-        hit = ParseVirusTotalResponse(line);
-      }
-      hit.rawJson = line;
-      result.hits.push_back(std::move(hit));
+    auto cachedHits = ParseIntelCache(cached);
+    if (!cachedHits.empty()) {
+      result.fromCache = true;
+      result.hits = std::move(cachedHits);
+      return result;
     }
-    if (!result.hits.empty()) return result;
   }
-
-  std::string cacheBlob;
 
   if (config.malwareBazaarEnabled) {
     HttpRequest req;
@@ -200,7 +275,6 @@ IntelLookupResult LookupHash(const std::string &sha256Hex,
     } else {
       hit = ParseMalwareBazaarResponse(response.body);
     }
-    cacheBlob.append(response.body).append("\n");
     result.hits.push_back(std::move(hit));
   }
 
@@ -228,12 +302,24 @@ IntelLookupResult LookupHash(const std::string &sha256Hex,
       hit = ParseVirusTotalResponse(response.body);
       hit.permalink = "https://www.virustotal.com/gui/file/" + lowerHash;
     }
-    cacheBlob.append(response.body).append("\n");
     result.hits.push_back(std::move(hit));
   }
 
-  if (!cacheBlob.empty()) {
-    WriteCache(config.cacheDir, lowerHash, cacheBlob);
+  // Cache only complete, error-free result sets. Serialize the parsed hits
+  // (each line carries its sourceName). Skip caching if any configured source
+  // failed (transport error) so the next scan retries instead of serving a
+  // stale partial/error result for the cache lifetime.
+  if (!result.hits.empty()) {
+    bool allOk = true;
+    for (const auto &h : result.hits) {
+      if (!h.error.empty()) {
+        allOk = false;
+        break;
+      }
+    }
+    if (allOk) {
+      WriteCache(config.cacheDir, lowerHash, SerializeIntelCache(result.hits));
+    }
   }
   return result;
 }

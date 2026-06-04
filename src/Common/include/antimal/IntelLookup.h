@@ -61,4 +61,13 @@ IntelLookupResult LookupHash(const std::string &sha256Hex,
 IntelHit ParseMalwareBazaarResponse(const std::string &json);
 IntelHit ParseVirusTotalResponse(const std::string &json);
 
+// On-disk cache (de)serialization, exposed for tests. The cache stores one
+// IntelHit per line as a compact JSON object that includes "sourceName", so a
+// cache read reconstructs each hit's source/family/tags directly. (The earlier
+// format stored raw API bodies and dispatched cache reads on a "sourceName"
+// field the upstream APIs never emit — every cache hit decoded to an empty
+// IntelHit.) Round-trip: ParseIntelCache(SerializeIntelCache(hits)) == hits.
+std::string SerializeIntelCache(const std::vector<IntelHit> &hits);
+std::vector<IntelHit> ParseIntelCache(const std::string &content);
+
 } // namespace antimal
