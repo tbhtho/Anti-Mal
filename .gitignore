@@ -18,6 +18,10 @@ CMakeFiles/
 
 # Private development documentation
 
+# Built dev helper (source is tools/KdDrive.cs) + base-write backups
+tools/KdDrive.exe
+config/*.prevbase*
+
 /docs/
 
 /ARCHITECTURE.md
