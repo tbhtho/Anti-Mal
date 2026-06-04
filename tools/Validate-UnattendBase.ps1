@@ -33,7 +33,9 @@ $out = foreach ($ln in (Get-Content $cfg)) {
   elseif ($ln -match '^base_disk_path\s*=') { 'base_disk_path = "' + $rawFwd + '"' }
   else   { $ln }
 }
-Set-Content $cfg $out -Encoding UTF8
+# BOM-less UTF-8: Set-Content -Encoding UTF8 (PS 5.1) writes a BOM that the C++ TOML
+# parser does not strip, which makes base_vhdx_path on line 1 silently unparseable.
+[System.IO.File]::WriteAllLines((Resolve-Path $cfg).Path, $out, (New-Object System.Text.UTF8Encoding $false))
 Write-Host ("config base_vhdx_path -> {0}" -f $vhdxFwd)
 
 # REAL detonation config (matches Measure-DesktopReach) MINUS OOBE_KEYS: the baked
