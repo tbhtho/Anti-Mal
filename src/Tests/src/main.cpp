@@ -3761,6 +3761,25 @@ void TestE1000Device() {
   uint64_t status = 0;
   nic.OnRead(kMmio + 0x0008, 4, &status);
   Expect((status & 0x2) != 0, "e1000: STATUS link-up bit set");
+
+  // RX ring registers round-trip (the driver sets up the RX ring during init;
+  // storing them lets RX init complete so the driver starts and reaches TX).
+  w(0x2800, 0xCAFE0000);  // RDBAL
+  w(0x2808, 0x80);        // RDLEN
+  uint64_t rdbal = 0;
+  nic.OnRead(kMmio + 0x2800, 4, &rdbal);
+  Expect(rdbal == 0xCAFE0000, "e1000: RX ring base (RDBAL) round-trips");
+
+  // Enabling Link-Status-Change in IMS announces link-up via one interrupt, so
+  // the driver brings the interface up.
+  antimal::hv::E1000Device nic2;
+  nic2.SetMmioBase(kMmio);
+  nic2.OnWrite(kMmio + 0x00D0, 4, 0x04);  // IMS: enable LSC
+  Expect(nic2.InterruptPending(),
+         "e1000: enabling LSC announces link-up (interrupt asserted)");
+  uint64_t icr = 0;
+  nic2.OnRead(kMmio + 0x00C0, 4, &icr);
+  Expect((icr & 0x04) != 0, "e1000: ICR reports Link-Status-Change cause");
 }
 
 void TestNicPciConfig() {

@@ -87,7 +87,13 @@ class E1000Device final : public IMmioDevice {
   uint32_t ims_ = 0;
   uint32_t tctl_ = 0;
   uint32_t tdbal_ = 0, tdbah_ = 0, tdlen_ = 0, tdh_ = 0, tdt_ = 0;
+  // RX ring registers. We never deliver inbound packets (contained sandbox), but
+  // the driver sets up the RX ring during init and reads these back; storing
+  // them lets RX init complete so the driver starts and proceeds to TX.
+  uint32_t rctl_ = 0;
+  uint32_t rdbal_ = 0, rdbah_ = 0, rdlen_ = 0, rdh_ = 0, rdt_ = 0;
   uint32_t ral_ = 0, rah_ = 0;
+  bool linkAnnounced_ = false;  // raised one Link-Status-Change interrupt yet
   bool interruptPending_ = false;
 
   uint64_t framesTransmitted_ = 0;

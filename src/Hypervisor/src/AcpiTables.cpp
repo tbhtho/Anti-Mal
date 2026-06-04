@@ -406,9 +406,14 @@ std::vector<uint8_t> BuildDsdtAml(uint32_t processorCount) {
   // AHCI SATA HBA (dev 3 INTA -> GSI11) are PCI-native and DO ride _PRT: their
   // INTx interrupts arbitrate in PCI scope, which is exactly why AHCI works
   // where the compat IDE's ISA IRQ14 could not be granted.
+  // dev 4 INTA -> GSI 11 is the e1000 NIC (present only with ANTIMAL_ENABLE_NIC),
+  // sharing AHCI's PCI INTx GSI. Harmless when the NIC is absent: GSI 11 is
+  // already in the PCI pool for AHCI, so this reserves no new line, and Windows
+  // finds no device at dev 4 to route to.
   AppendName(pciTerms, "_PRT",
              PackageObject({PciRoutingEntry(2, 0, 10),
-                            PciRoutingEntry(3, 0, 11)}));
+                            PciRoutingEntry(3, 0, 11),
+                            PciRoutingEntry(4, 0, 11)}));
 
   std::vector<uint8_t> isaTerms;
   AppendName(isaTerms, "_ADR", IntegerObject(0x00010000u));

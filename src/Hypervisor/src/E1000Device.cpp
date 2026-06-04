@@ -21,10 +21,16 @@ constexpr uint32_t kRegTDH = 0x3810;
 constexpr uint32_t kRegTDT = 0x3818;
 constexpr uint32_t kRegRAL = 0x5400;
 constexpr uint32_t kRegRAH = 0x5404;
+constexpr uint32_t kRegRDBAL = 0x2800;
+constexpr uint32_t kRegRDBAH = 0x2804;
+constexpr uint32_t kRegRDLEN = 0x2808;
+constexpr uint32_t kRegRDH = 0x2810;
+constexpr uint32_t kRegRDT = 0x2818;
 
 constexpr uint32_t kStatusFD = 1u << 0;  // full duplex
 constexpr uint32_t kStatusLU = 1u << 1;  // link up
 constexpr uint32_t kIntTXDW = 1u << 0;   // transmit descriptor written back
+constexpr uint32_t kIntLSC = 1u << 2;    // link status change
 
 constexpr uint8_t kTxCmdEOP = 1u << 0;  // end of packet
 constexpr uint8_t kTxCmdRS = 1u << 3;   // report status (write back DD)
@@ -66,6 +72,8 @@ void E1000Device::Reset() noexcept {
   ims_ = 0;
   tctl_ = 0;
   tdbal_ = tdbah_ = tdlen_ = tdh_ = tdt_ = 0;
+  rctl_ = rdbal_ = rdbah_ = rdlen_ = rdh_ = rdt_ = 0;
+  linkAnnounced_ = false;
   interruptPending_ = false;
   // MAC (eeprom_ / ral_ / rah_) is retained across a guest reboot.
 }
@@ -109,6 +117,18 @@ uint32_t E1000Device::ReadReg(uint32_t off) {
       return ral_;
     case kRegRAH:
       return rah_;
+    case kRegRCTL:
+      return rctl_;
+    case kRegRDBAL:
+      return rdbal_;
+    case kRegRDBAH:
+      return rdbah_;
+    case kRegRDLEN:
+      return rdlen_;
+    case kRegRDH:
+      return rdh_;
+    case kRegRDT:
+      return rdt_;
     default:
       return 0;
   }
@@ -127,12 +147,36 @@ void E1000Device::WriteReg(uint32_t off, uint32_t value) {
       break;
     case kRegIMS:
       ims_ |= value;
+      // The driver enables interrupts (incl. Link Status Change) then waits for
+      // an LSC to learn the link is up. Announce link-up once so it brings the
+      // interface up and proceeds to TX (STATUS already reports LU=1).
+      if ((value & kIntLSC) && !linkAnnounced_) {
+        linkAnnounced_ = true;
+        icr_ |= kIntLSC;
+        interruptPending_ = true;
+      }
       break;
     case kRegIMC:
       ims_ &= ~value;
       break;
     case kRegRCTL:
-      break;  // receive control accepted, RX not modeled yet
+      rctl_ = value;
+      break;
+    case kRegRDBAL:
+      rdbal_ = value & ~0xFu;
+      break;
+    case kRegRDBAH:
+      rdbah_ = value;
+      break;
+    case kRegRDLEN:
+      rdlen_ = value & 0xFFF80u;
+      break;
+    case kRegRDH:
+      rdh_ = value;
+      break;
+    case kRegRDT:
+      rdt_ = value;
+      break;
     case kRegTCTL:
       tctl_ = value;
       break;

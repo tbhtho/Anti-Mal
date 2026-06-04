@@ -2600,6 +2600,15 @@ VmRunSummary VirtualMachine::RunLoop(
       }
     }
 
+    // The e1000 NIC (dev 4 INTA) shares the PCI INTx GSI 11 with AHCI (routed via
+    // PCI0._PRT). On a link-status-change or TX write-back we assert GSI 11; the
+    // guest's shared-interrupt chain runs both the AHCI and NIC ISRs.
+    if (nic_ && nic_->InterruptPending()) {
+      if (tryRaiseLegacyIrq(kAhciGsi) != IrqDeliveryBackend::Failed) {
+        nic_->ConsumeInterrupt();
+      }
+    }
+
     if (pcIo_.PitInterruptPending()) {
       const auto backend = tryRaiseLegacyIrq(0);
       if (backend != IrqDeliveryBackend::Failed) {
