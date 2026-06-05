@@ -843,12 +843,16 @@ void WebViewHost::RegisterHandlers() {
     if (!VmAlive()) {
       return std::string(R"({"live":false,"frame":""})");
     }
-    const AppConfig c = LoadConfig(DefaultConfigPath());
+    // Cache the workspace root: vm.frame is polled ~2x/sec while a VM is live and
+    // the root is fixed for the process lifetime, so re-parsing the TOML on every
+    // poll is pure waste.
+    static const fs::path workspaceRoot =
+        LoadConfig(DefaultConfigPath()).workspaceRoot;
     std::error_code ec;
     fs::path best;
     unsigned long long bestT = 0;
-    if (fs::is_directory(c.workspaceRoot, ec)) {
-      for (const auto &e : fs::directory_iterator(c.workspaceRoot, ec)) {
+    if (fs::is_directory(workspaceRoot, ec)) {
+      for (const auto &e : fs::directory_iterator(workspaceRoot, ec)) {
         if (!e.is_directory(ec)) {
           continue;
         }

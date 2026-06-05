@@ -10288,7 +10288,24 @@ DetonationResult InHouseOrchestrator::PrepareAndRun(
       // per second of guest time, so the multiplier must be large enough
       // that the timeout — not the step cap — is the binding constraint.
       request.maxSteps = std::numeric_limits<int>::max();
-      request.progressInterval = std::chrono::milliseconds{1500};
+      // Interactive (live-console) sessions capture frames ~3x more often so the
+      // stream feels like a live desktop instead of a slideshow and your own
+      // keystrokes/mouse show up promptly; automated runs (nobody watching live)
+      // stay at the cheaper cadence to limit screenshot churn. Override with
+      // ANTIMAL_LIVE_FRAME_MS.
+      uint32_t liveFrameMs = interactiveSession ? 500u : 1500u;
+      {
+        char fbuf[16]{};
+        size_t fneeded = 0;
+        if (getenv_s(&fneeded, fbuf, sizeof(fbuf), "ANTIMAL_LIVE_FRAME_MS") == 0 &&
+            fneeded > 1) {
+          const int v = std::atoi(fbuf);
+          if (v >= 100 && v <= 5000) {
+            liveFrameMs = static_cast<uint32_t>(v);
+          }
+        }
+      }
+      request.progressInterval = std::chrono::milliseconds{liveFrameMs};
       {
         char buf[16]{};
         size_t needed = 0;
