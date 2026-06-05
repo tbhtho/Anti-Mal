@@ -444,7 +444,10 @@ int RunHostChannelLoop(std::string reason, bool serviceMode) {
   // during the login transition. A no-login boot still detonates after the wait.
   bool sampleStaged = false;
   std::chrono::steady_clock::time_point launchDeadline{};
-  constexpr int kLaunchWaitSec = 150;
+  // Generous so a human has time to log in manually before the sample launches
+  // (it launches the moment the desktop session appears; this is just the upper
+  // bound after which it runs headless anyway).
+  constexpr int kLaunchWaitSec = 600;
   constexpr uint32_t kProcessPollEveryTicks = 2; // ~2s between snapshots
   constexpr uint32_t kFilePollEveryTicks = 5;    // file walk is heavier
   constexpr size_t kProcessBaselineCap = 64;

@@ -898,7 +898,9 @@ void WebViewHost::RegisterHandlers() {
       SetEnvironmentVariableW(L"ANTIMAL_PROBE_PRESS_ENTER_SEC", L"40");
       // Snapshot lands on the lock/login screen; plaintext autologon fails on
       // 25H2, so type the account password to reach the desktop hands-free.
-      SetEnvironmentVariableW(L"ANTIMAL_PROBE_LOGIN_PASSWORD", L"AntiMal!23");
+      // Manual login: the analyst types the password in the live console. No
+      // auto-typing (it was the unreliable ~50% path and fought manual input).
+      SetEnvironmentVariableW(L"ANTIMAL_PROBE_LOGIN_PASSWORD", nullptr);
     } else {
       SetEnvironmentVariableW(L"ANTIMAL_SEED_OVERLAY", nullptr);
       SetEnvironmentVariableW(L"ANTIMAL_PROBE_OOBE_KEYS", L"250");
@@ -971,7 +973,9 @@ void WebViewHost::RegisterHandlers() {
       SetEnvironmentVariableW(L"ANTIMAL_SEED_OVERLAY", seed.c_str());
       SetEnvironmentVariableW(L"ANTIMAL_PROBE_OOBE_KEYS", nullptr);
       SetEnvironmentVariableW(L"ANTIMAL_PROBE_PRESS_ENTER_SEC", L"40");
-      SetEnvironmentVariableW(L"ANTIMAL_PROBE_LOGIN_PASSWORD", L"AntiMal!23");
+      // Manual login: the analyst types the password in the live console. No
+      // auto-typing (it was the unreliable ~50% path and fought manual input).
+      SetEnvironmentVariableW(L"ANTIMAL_PROBE_LOGIN_PASSWORD", nullptr);
     } else {
       SetEnvironmentVariableW(L"ANTIMAL_SEED_OVERLAY", nullptr);
       SetEnvironmentVariableW(L"ANTIMAL_PROBE_OOBE_KEYS", L"250");

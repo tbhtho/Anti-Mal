@@ -290,11 +290,9 @@
     var run = $('#dash-run');
     if (run) {
       run.innerHTML = kv([['Verdict', lr.verdict || '—'], ['Scanner', (lr.scannerVerdict || '—') + ' (' + (lr.score | 0) + ')'], ['Run ID', lr.runId || '—'], ['When', lr.when || '—']]) +
-        '<div class="actions" style="margin-top:12px"><button class="btn" data-open-run="' + esc(lr.runDir || '') + '">Open Run Folder</button><button class="btn primary" data-watch-run="' + esc(lr.runDir || '') + '">Watch Live Telemetry</button></div>';
+        '<div class="actions" style="margin-top:12px"><button class="btn" data-open-run="' + esc(lr.runDir || '') + '">Open Run Folder</button></div>';
       var ob = run.querySelector('[data-open-run]');
       if (ob) ob.onclick = function () { var p = ob.getAttribute('data-open-run'); if (!p) return; send('run.open', { runDir: p }).then(function (rr) { appendLog(rr && rr.ok ? 'INFO' : 'ERROR', rr && rr.ok ? 'Opened run folder.' : 'Open failed.'); }); };
-      var wb = run.querySelector('[data-watch-run]');
-      if (wb) wb.onclick = function () { var p = wb.getAttribute('data-watch-run'); appendLog('INFO', 'Live telemetry tail requested.'); send('run.watch', p ? { runDir: p } : {}); };
     }
     var m = d.metrics || {};
     var cards = [['Events', m.events | 0], ['Frames', m.frames | 0], ['Network Domains', m.domains | 0], ['Artifacts', m.artifacts | 0], ['MITRE', m.mitre | 0], ['Errors', m.errors | 0]];
@@ -450,6 +448,18 @@
       });
       lf.addEventListener('contextmenu', function (e) { e.preventDefault(); });
     }
+    // If a VM is already running (e.g. you navigated away and came back), resume
+    // the live frame + input stream so the session stays controllable instead of
+    // freezing on a stale frame.
+    send('vm.frame').then(function (r) {
+      var res = (r && r.result) || {};
+      if (res.run && !livePollTimer) {
+        appendLog('INFO', 'Resuming live VM control…');
+        var s = $('#vm-live-status'); if (s) s.textContent = '· live';
+        var box = $('#live-frame'); if (box && res.frame) { box.innerHTML = ''; var im = document.createElement('img'); im.id = 'live-frame-img'; im.src = res.frame; box.appendChild(im); }
+        startLivePoll();
+      }
+    });
     send('config.get').then(function (r) {
       var c = (r && r.ok && r.result) ? r.result : {};
       var net = c.networkMode || 'disabled';
