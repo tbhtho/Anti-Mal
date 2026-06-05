@@ -42,6 +42,13 @@ void SerialConsole::OnWrite(uint16_t port, uint32_t value, uint8_t /*accessSize*
     } else {
       captured_.push_back(byte);
       ++stats_.dataWrites;
+      // THR was just consumed -> empty again (instantly, here). Re-arm the
+      // THRE interrupt edge if the guest has it enabled, so the next ISR pass
+      // is driven to write the following byte. This is what lets serial.sys
+      // stream a whole frame; it self-stops once it has no more to send.
+      if ((ier_ & kIerThrEmpty) != 0) {
+        threIntActive_ = true;
+      }
     }
     break;
   case kIer:
@@ -49,8 +56,16 @@ void SerialConsole::OnWrite(uint16_t port, uint32_t value, uint8_t /*accessSize*
       dlm_ = byte;
       ++stats_.dlmWrites;
     } else {
+      const uint8_t previous = ier_;
       ier_ = byte;
       ++stats_.ierWrites;
+      // Enabling ETBEI while THR is empty (always) asserts a THRE edge;
+      // disabling it deasserts the latch.
+      if ((byte & kIerThrEmpty) != 0 && (previous & kIerThrEmpty) == 0) {
+        threIntActive_ = true;
+      } else if ((byte & kIerThrEmpty) == 0) {
+        threIntActive_ = false;
+      }
     }
     break;
   case kFcr:
@@ -99,16 +114,13 @@ void SerialConsole::QueueRxBytes(const std::vector<uint8_t> &bytes) {
 bool SerialConsole::InterruptPending() const noexcept {
   const bool rxInt =
       !rxQueue_.empty() && ((ier_ & kIerReceivedDataAvailable) != 0);
-  // The transmit holding register is always "empty" in this model (a THR write
-  // is captured instantly), so whenever the guest enables the THR-empty
-  // interrupt (ETBEI) one is pending. Windows serial.sys is interrupt-driven on
-  // transmit: it enables ETBEI and writes bytes only from the THRE ISR. Without
-  // this it waits for a TX interrupt that never comes and every WriteFile times
-  // out (observed: the GuestAgent's COM2 Hello timed out at 1000ms with
-  // com2DataWrites=0). serial.sys masks ETBEI once its buffer drains, so this
-  // self-terminates after the transmit burst rather than storming.
-  const bool txInt = (ier_ & kIerThrEmpty) != 0;
-  return rxInt || txInt;
+  // Windows serial.sys is interrupt-driven on transmit: it enables ETBEI and
+  // writes bytes only from the THR-empty ISR. We deliver that interrupt via the
+  // edge latch (set on ETBEI-enable / THR-write, cleared on IIR read) so a guest
+  // write actually drains. Without it every COM2 WriteFile timed out at 1000ms
+  // (com2DataWrites=0); modeling it as a level instead storms (serial.pdb wedge,
+  // 111M IRQs) because THR is perpetually empty.
+  return rxInt || threIntActive_;
 }
 
 SerialConsoleStats SerialConsole::Stats() const noexcept {
@@ -172,13 +184,16 @@ uint32_t SerialConsole::OnRead(uint16_t port, uint8_t /*accessSize*/) {
     // 16550 IIR priority: received-data-available (0x04) outranks
     // transmitter-empty (0x02). serial.sys reads this to pick the ISR path, so
     // a TX interrupt MUST report 0x02 (not 0x04, which would make it try to read
-    // a non-existent RX byte).
+    // a non-existent RX byte). Reading the IIR when THRE is the source CLEARS
+    // the THRE interrupt (16550 semantics); a subsequent THR write re-arms it.
+    // RX is level (cleared by draining the RX FIFO), so it is not cleared here.
     const bool rxInt =
         !rxQueue_.empty() && ((ier_ & kIerReceivedDataAvailable) != 0);
     if (rxInt) {
       return kIirReceivedDataAvailable;
     }
-    if ((ier_ & kIerThrEmpty) != 0) {
+    if (threIntActive_) {
+      threIntActive_ = false;
       return kIirThrEmpty;
     }
     return kIirNoInterruptPending;

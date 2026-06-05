@@ -406,6 +406,47 @@ void TestCom2UartFrames() {
          "COM2 UART: guest frame type preserved");
 }
 
+// The THR-empty (transmit) interrupt must be EDGE-triggered: asserted on
+// ETBEI-enable / THR-write, cleared on IIR read. A level model (always pending
+// while ETBEI set, since THR is perpetually empty) wedged a real boot in
+// serial.sys with 111M IRQ deliveries. This test pins the edge semantics so the
+// storm cannot regress while still delivering the interrupt serial.sys needs to
+// transmit at all.
+void TestSerialThreInterruptIsEdgeTriggered() {
+  using SC = antimal::hv::SerialConsole;
+  const uint16_t base = SC::kCom1Base;
+  SC com(base);
+  Expect(!com.InterruptPending(), "THRE: idle at reset");
+
+  // Enabling ETBEI (IER bit 1) asserts a THRE edge (THR is empty).
+  com.OnWrite(base + 1, 0x02, 1);
+  Expect(com.InterruptPending(), "THRE: pending after ETBEI enable");
+  // IIR reports transmitter-empty (0x02) AND reading it clears the edge.
+  Expect((com.OnRead(base + 2, 1) & 0x0Fu) == 0x02u, "THRE: IIR reports 0x02");
+  Expect(!com.InterruptPending(),
+         "THRE: cleared after IIR read (no storm)");
+  Expect((com.OnRead(base + 2, 1) & 0x0Fu) == 0x01u,
+         "THRE: IIR reports no-interrupt once drained");
+
+  // A THR write re-arms the edge so serial.sys is driven byte-by-byte.
+  com.OnWrite(base + 0, 'X', 1);
+  Expect(com.InterruptPending(), "THRE: re-armed after THR write");
+  Expect((com.OnRead(base + 2, 1) & 0x0Fu) == 0x02u, "THRE: 0x02 after THR write");
+  Expect(!com.InterruptPending(), "THRE: cleared again");
+
+  // Disabling ETBEI deasserts entirely.
+  com.OnWrite(base + 0, 'Y', 1); // re-arm
+  com.OnWrite(base + 1, 0x00, 1); // disable ETBEI
+  Expect(!com.InterruptPending(), "THRE: gone after ETBEI disabled");
+
+  // RX remains level: it stays pending after an IIR read until the FIFO drains,
+  // and outranks THRE in the IIR.
+  com.OnWrite(base + 1, 0x03, 1); // RX-available + ETBEI both enabled
+  com.QueueRxByte(0x5A);
+  Expect((com.OnRead(base + 2, 1) & 0x0Fu) == 0x04u, "THRE: RX (0x04) outranks THRE");
+  Expect(com.InterruptPending(), "THRE: RX still pending after IIR read (level)");
+}
+
 void TestKdSerialDebuggerPackets() {
   using Kd = antimal::hv::KdSerialDebugger;
   Kd kd;
@@ -4595,6 +4636,7 @@ int main() {
     TestHostSerialChannelFrames();
     TestProcessTelemetryDiff();
     TestCom2UartFrames();
+    TestSerialThreInterruptIsEdgeTriggered();
     TestPs2QueuedInput();
     TestTpm2CrbDevice();
     TestAcpiTables();

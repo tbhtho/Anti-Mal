@@ -114,6 +114,14 @@ private:
   uint8_t scr_ = 0;
   uint8_t dll_ = 0;
   uint8_t dlm_ = 0;
+  // THR-empty (transmit) interrupt latch. EDGE-triggered, not level: asserted
+  // when the guest enables ETBEI or writes a THR byte (THR goes empty again),
+  // CLEARED when the guest reads the IIR. Modeling it as a level (always pending
+  // while ETBEI set, since our THR is perpetually empty) storms — serial.sys
+  // leaves ETBEI on, so IRQ4/IRQ3 fires every host iteration forever (observed:
+  // 111M IRQ deliveries wedged in serial.sys). The edge latch fires once per
+  // byte and self-quiesces when the guest stops transmitting.
+  bool threIntActive_ = false;
   SerialConsoleStats stats_;
 };
 
