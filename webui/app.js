@@ -122,7 +122,8 @@
       return '<h1 class="page-title">VM Analysis</h1><p class="page-sub">In-house WHP sandbox: live view, state, boot timeline, and safety gates.</p>' +
         '<div class="panel"><h2>Live VM <span id="vm-live-status" class="page-sub" style="font-weight:400"></span></h2>' +
         '<div class="actions"><button class="btn primary" id="vm-boot-btn">Boot VM (live)</button><button class="btn danger" id="vm-detonate-btn">Detonate Sample (live)</button><button class="btn" id="vm-stop-btn">Stop</button></div>' +
-        '<div class="screenframe" id="live-frame" style="margin-top:12px">Click “Boot VM (live)” for a clean session, or “Detonate Sample (live)” to run a BENIGN sample inside it — watch it execute here.</div></div>' +
+        '<div class="screenframe" id="live-frame" tabindex="0" style="margin-top:12px;outline:none">Click “Boot VM (live)” for a clean session, or “Detonate Sample (live)” to run a BENIGN sample inside it — watch it execute here.</div>' +
+        '<p class="page-sub" id="vm-focus-hint" style="margin:6px 0 0">Click the frame to capture your keyboard &amp; mouse; click outside it to release.</p></div>' +
         '<div class="panel"><h2>Live Process Telemetry <span id="vm-telemetry-status" class="page-sub" style="font-weight:400"></span></h2>' +
         '<div id="vm-events"><p class="page-sub" style="margin:0">No events yet — boot the VM to stream live process activity from the GuestAgent over COM2.</p></div></div>' +
         '<div class="row"><div class="panel" style="flex:1;min-width:280px"><h2>VM State</h2>' +
@@ -435,6 +436,7 @@
         liveMouse.dy += (e.movementY || 0) * s.y;
       });
       lf.addEventListener('mousedown', function (e) {
+        lf.focus();          // capture keyboard so keys go to the guest, not the UI
         if (!livePollTimer) return;
         e.preventDefault();
         liveMouse.btn |= btnBit(e.button);
@@ -447,6 +449,26 @@
         send('vm.input', { mouse: { buttons: liveMouse.btn, dx: 0, dy: 0 } });
       });
       lf.addEventListener('contextmenu', function (e) { e.preventDefault(); });
+      // Keyboard goes to the guest ONLY while the frame is focused -- and we eat
+      // the event so it can never leak to the UI (Space/Enter activating a button
+      // and booting a second VM was exactly this leaking). Tab is also swallowed
+      // so focus can't escape the frame mid-session.
+      lf.addEventListener('keydown', function (e) {
+        if (!livePollTimer) return;
+        var sc = keyToScancodes(e);
+        if (!sc) { if (e.key === 'Tab') e.preventDefault(); return; }
+        e.preventDefault();
+        e.stopPropagation();
+        send('vm.input', { scancodes: sc });
+      });
+      lf.addEventListener('focus', function () {
+        lf.style.outline = '2px solid #4ea1ff';
+        var h = $('#vm-focus-hint'); if (h) { h.textContent = '● Capturing keyboard & mouse — click outside the frame to release.'; h.style.color = '#4ea1ff'; }
+      });
+      lf.addEventListener('blur', function () {
+        lf.style.outline = 'none';
+        var h = $('#vm-focus-hint'); if (h) { h.textContent = 'Click the frame to capture your keyboard & mouse; click outside it to release.'; h.style.color = ''; }
+      });
     }
     // If a VM is already running (e.g. you navigated away and came back), resume
     // the live frame + input stream so the session stays controllable instead of
@@ -616,17 +638,8 @@
     });
     $('#logsearch').oninput = function (e) { logQuery = e.target.value.toLowerCase(); refilterLog(); };
 
-    // Live VM keyboard: when the VM page is showing a live session, route key
-    // presses into the guest (skip when typing into a UI input field).
-    document.addEventListener('keydown', function (e) {
-      if (currentPage !== 'vm' || !livePollTimer) return;
-      var t = e.target;
-      if (t && (t.tagName === 'INPUT' || t.tagName === 'TEXTAREA')) return;
-      var sc = keyToScancodes(e);
-      if (!sc) return;
-      e.preventDefault();
-      send('vm.input', { scancodes: sc });
-    });
+    // (Live VM keyboard is handled on the #live-frame element itself, only while
+    // it has focus, so keys can never leak to the UI and trigger buttons.)
 
     route('dashboard');
 

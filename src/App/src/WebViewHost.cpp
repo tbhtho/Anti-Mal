@@ -869,6 +869,13 @@ void WebViewHost::RegisterHandlers() {
   // desktop snapshot if present, else run full OOBE automation).
   router_.Register("vm.boot", [this](const JsonValue &) -> std::string {
     namespace fs = std::filesystem;
+    // Never run two VMs at once -- a second boot would double the disk I/O
+    // (overlay + screenshots). Stop any prior session first.
+    if (vmPid_ != 0) {
+      HANDLE hOld = OpenProcess(PROCESS_TERMINATE, FALSE, vmPid_);
+      if (hOld) { TerminateProcess(hOld, 1); CloseHandle(hOld); }
+      vmPid_ = 0;
+    }
     const AppConfig c = LoadConfig(DefaultConfigPath());
     const std::wstring dir = ExeDir();
     const fs::path hostCli = fs::path(dir) / L"AntiMal.HostCli.exe";
@@ -947,6 +954,12 @@ void WebViewHost::RegisterHandlers() {
     const std::wstring sample = PickPath(hwnd_, false);
     if (sample.empty()) {
       return std::string(R"({"started":false,"cancelled":true})");
+    }
+    // Never run two VMs at once (double disk I/O). Stop any prior session.
+    if (vmPid_ != 0) {
+      HANDLE hOld = OpenProcess(PROCESS_TERMINATE, FALSE, vmPid_);
+      if (hOld) { TerminateProcess(hOld, 1); CloseHandle(hOld); }
+      vmPid_ = 0;
     }
     const AppConfig c = LoadConfig(DefaultConfigPath());
     const std::wstring dir = ExeDir();
