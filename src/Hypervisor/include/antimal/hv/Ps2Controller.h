@@ -30,7 +30,9 @@ public:
   // True when the controller has at least one byte ready for the guest to
   // read on port 0x60. Used by the host loop to decide whether to assert
   // IRQ 1 (keyboard) or IRQ 12 (mouse).
-  bool HasDataPending() const noexcept { return !outputQueue_.empty(); }
+  bool HasDataPending() const noexcept {
+    return !keyboardQueue_.empty() || !mouseQueue_.empty();
+  }
   uint8_t PendingIrqLine() const noexcept;
   void InjectKeyboardScancode(uint8_t scancode);
   void InjectKeyboardScancodes(const uint8_t *data, size_t size);
@@ -50,17 +52,20 @@ public:
   }
 
 private:
-  struct OutputByte {
-    uint8_t value = 0;
-    bool aux = false;
-  };
+  // Which device feeds the single 8042 output buffer next. Keyboard and mouse
+  // have SEPARATE input queues (so a mouse byte that currently cannot raise its
+  // IRQ can never head-of-line-block queued keystrokes, and vice-versa); this
+  // selects the byte the guest sees on its next 0x60 read.
+  enum class HeadSource { None, Keyboard, Mouse };
+  HeadSource SelectHead() const noexcept;
 
   void QueueKeyboardByte(uint8_t value);
   void QueueMouseByte(uint8_t value);
   void HandleCommand(uint8_t command);
   void HandleDataWrite(uint8_t value);
 
-  std::deque<OutputByte> outputQueue_;
+  std::deque<uint8_t> keyboardQueue_;
+  std::deque<uint8_t> mouseQueue_;
   uint8_t configurationByte_ = 0x67; // IRQ1 + IRQ12 enabled, translate on.
   uint8_t status_ = 0x14; // System flag set, command/data not pending, no data.
   uint8_t lastCommand_ = 0;

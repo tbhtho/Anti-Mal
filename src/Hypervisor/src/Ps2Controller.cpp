@@ -17,33 +17,75 @@ constexpr uint8_t kReplyPassedPortTest = 0x00;
 constexpr uint8_t kReplyKeyboardId0 = 0xAB;
 constexpr uint8_t kReplyKeyboardId1 = 0x83;
 
+// Cap on each device's input queue. The guest only drains 0x60 once its i8042
+// driver is up; live keyboard/mouse injected during the long pre-driver boot
+// would otherwise grow the host queue without bound (and later replay seconds of
+// stale input in one burst). Past the cap we drop the OLDEST byte, so memory is
+// bounded and only the most recent input survives to replay.
+constexpr size_t kMaxQueuedBytes = 4096;
+
 } // namespace
 
 Ps2Controller::Ps2Controller() = default;
 
 void Ps2Controller::QueueKeyboardByte(uint8_t value) {
-  outputQueue_.push_back({value, false});
+  if (keyboardQueue_.size() >= kMaxQueuedBytes) {
+    keyboardQueue_.pop_front();
+  }
+  keyboardQueue_.push_back(value);
   ++keyboardBytesQueued_;
   status_ = static_cast<uint8_t>(status_ | kStatusOutputBufferFull);
 }
 
 void Ps2Controller::QueueMouseByte(uint8_t value) {
-  outputQueue_.push_back({value, true});
+  if (mouseQueue_.size() >= kMaxQueuedBytes) {
+    mouseQueue_.pop_front();
+  }
+  mouseQueue_.push_back(value);
   ++mouseBytesQueued_;
   status_ = static_cast<uint8_t>(status_ | kStatusOutputBufferFull);
 }
 
+// Pick which device's byte the guest sees next. A keyboard byte whose IRQ is
+// deliverable wins (keyboard priority); otherwise a deliverable mouse byte.
+// If neither IRQ is enabled (the firmware/init POLLS the status port without
+// interrupts) fall back to keyboard-then-mouse so polled drains still work.
+// The key property: the two queues are independent, so a mouse byte that cannot
+// currently raise IRQ12 never blocks queued keystrokes (and vice-versa).
+Ps2Controller::HeadSource Ps2Controller::SelectHead() const noexcept {
+  const bool kbdIrq = !keyboardQueue_.empty() && keyboardPortEnabled_ &&
+                      keyboardScanningEnabled_ &&
+                      (configurationByte_ & 0x01u) != 0;
+  if (kbdIrq) {
+    return HeadSource::Keyboard;
+  }
+  const bool mouseIrq = !mouseQueue_.empty() && mousePortEnabled_ &&
+                        (configurationByte_ & 0x02u) != 0;
+  if (mouseIrq) {
+    return HeadSource::Mouse;
+  }
+  if (!keyboardQueue_.empty()) {
+    return HeadSource::Keyboard;
+  }
+  if (!mouseQueue_.empty()) {
+    return HeadSource::Mouse;
+  }
+  return HeadSource::None;
+}
+
 uint8_t Ps2Controller::PendingIrqLine() const noexcept {
-  if (outputQueue_.empty()) {
-    return 0;
-  }
-  if (outputQueue_.front().aux) {
+  switch (SelectHead()) {
+  case HeadSource::Keyboard:
+    return (keyboardPortEnabled_ && keyboardScanningEnabled_ &&
+            (configurationByte_ & 0x01u) != 0)
+               ? 1
+               : 0;
+  case HeadSource::Mouse:
     return (mousePortEnabled_ && (configurationByte_ & 0x02u) != 0) ? 12 : 0;
+  case HeadSource::None:
+    break;
   }
-  return (keyboardPortEnabled_ && keyboardScanningEnabled_ &&
-          (configurationByte_ & 0x01u) != 0)
-             ? 1
-             : 0;
+  return 0;
 }
 
 void Ps2Controller::InjectKeyboardScancode(uint8_t scancode) {
@@ -226,22 +268,24 @@ uint32_t Ps2Controller::OnRead(uint16_t port, uint8_t /*accessSize*/) {
     // boot CPU sink after intelppm was disabled).
     return static_cast<uint8_t>(
         (status_ & ~kStatusAuxData) | kStatusSystemFlag |
-        (!outputQueue_.empty() && outputQueue_.front().aux ? kStatusAuxData
-                                                           : 0));
+        (SelectHead() == HeadSource::Mouse ? kStatusAuxData : 0));
   }
   if (port == kDataPort) {
     ++dataReads_;
-    if (outputQueue_.empty()) {
+    const HeadSource head = SelectHead();
+    uint8_t value = 0;
+    if (head == HeadSource::Mouse) {
+      value = mouseQueue_.front();
+      mouseQueue_.pop_front();
+      ++mouseBytesRead_;
+    } else if (head == HeadSource::Keyboard) {
+      value = keyboardQueue_.front();
+      keyboardQueue_.pop_front();
+      ++keyboardBytesRead_;
+    } else {
       return 0;
     }
-    const uint8_t value = outputQueue_.front().value;
-    if (outputQueue_.front().aux) {
-      ++mouseBytesRead_;
-    } else {
-      ++keyboardBytesRead_;
-    }
-    outputQueue_.pop_front();
-    if (outputQueue_.empty()) {
+    if (keyboardQueue_.empty() && mouseQueue_.empty()) {
       status_ = static_cast<uint8_t>(status_ & ~kStatusOutputBufferFull);
     }
     return value;

@@ -22,6 +22,9 @@ intel_malwarebazaar = true
 virustotal_api_key = ""
 
 # Dynamic-observation knobs. Read by GuestAgent.
-dynamic_execution_enabled = true
+# Off by default: the GUI "Detonate Sample (live)" still executes (it arms the
+# per-run env keys + --allow-execution); this only keeps the CLI `detonate` path
+# from executing without an explicit --allow-execution. Restores the 2-key gate.
+dynamic_execution_enabled = false
 collect_screenshots = true
 screenshot_interval_ms = 2000

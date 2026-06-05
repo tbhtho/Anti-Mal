@@ -9957,11 +9957,17 @@ DetonationResult InHouseOrchestrator::PrepareAndRun(
            std::filesystem::directory_iterator(config_.workspaceRoot, wec)) {
         std::error_code dec;
         if (!entry.is_directory(dec)) continue;
-        const std::string name = entry.path().filename().string();
-        if (name.empty() || name[0] == '_' || name == result.runId) continue;
-        for (const char *ov : {"overlay.cow", "overlay.raw", "overlay.vhdx"}) {
+        // wstring throughout: filename().string() narrow-converts via the active
+        // code page and THROWS std::system_error on any non-ASCII sibling dir
+        // under workspace_root, which would abort the whole detonation here.
+        const std::wstring name = entry.path().filename().wstring();
+        if (name.empty() || name[0] == L'_') continue; // _base, _intel_cache
+        if (entry.path().filename() == std::filesystem::path(result.runId))
+          continue; // never the run being created
+        for (const wchar_t *ov :
+             {L"overlay.cow", L"overlay.raw", L"overlay.vhdx"}) {
           std::error_code rec;
-          std::filesystem::remove(entry.path() / "disk" / ov, rec);
+          std::filesystem::remove(entry.path() / L"disk" / ov, rec);
         }
       }
     }

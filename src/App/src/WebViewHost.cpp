@@ -240,8 +240,30 @@ void WebViewHost::Emit(HWND hwnd, const std::string &evt,
   }
   std::string envelope =
       "{\"evt\":" + JsonQuote(evt) + ",\"data\":" + dataJson + "}";
-  PostMessageW(hwnd, kEmitMessage, 0,
-               reinterpret_cast<LPARAM>(new std::string(std::move(envelope))));
+  auto *payload = new std::string(std::move(envelope));
+  // The WndProc kEmitMessage case owns and deletes the payload -- but only if the
+  // post succeeds. On failure (queue full / window gone) free it here so a long
+  // live run streaming hundreds of thousands of telemetry events can't leak.
+  if (!PostMessageW(hwnd, kEmitMessage, 0,
+                    reinterpret_cast<LPARAM>(payload))) {
+    delete payload;
+  }
+}
+
+bool WebViewHost::VmAlive() const {
+  return vmProcess_ != nullptr &&
+         WaitForSingleObject(static_cast<HANDLE>(vmProcess_), 0) == WAIT_TIMEOUT;
+}
+
+void WebViewHost::StopVmProcess() {
+  if (vmProcess_) {
+    // Terminate via the retained handle (which pins the PID) -- never via a
+    // re-OpenProcess of vmPid_, which the OS may have recycled to another app.
+    TerminateProcess(static_cast<HANDLE>(vmProcess_), 1);
+    CloseHandle(static_cast<HANDLE>(vmProcess_));
+    vmProcess_ = nullptr;
+  }
+  vmPid_ = 0;
 }
 
 HRESULT WebViewHost::OnControllerCreated(HRESULT result,
@@ -812,8 +834,15 @@ void WebViewHost::RegisterHandlers() {
 
   // Newest run dir by mtime that has a screenshots/ dir = the active detonation
   // (FindNewestRun needs report.json, which only exists after the run ends).
-  router_.Register("vm.frame", [](const JsonValue &) -> std::string {
+  router_.Register("vm.frame", [this](const JsonValue &) -> std::string {
     namespace fs = std::filesystem;
+    // Only report a live framebuffer while a VM process is actually running.
+    // Without this, on startup (no VM) the newest leftover run dir's final
+    // screenshot is served as if it were live -- the frozen "10:01" desktop the
+    // UI then "resumes control" of. No live process => no frame, no fake resume.
+    if (!VmAlive()) {
+      return std::string(R"({"live":false,"frame":""})");
+    }
     const AppConfig c = LoadConfig(DefaultConfigPath());
     std::error_code ec;
     fs::path best;
@@ -845,7 +874,7 @@ void WebViewHost::RegisterHandlers() {
       }
     }
     if (best.empty()) {
-      return std::string(R"({"frame":""})");
+      return std::string(R"({"live":true,"frame":""})");
     }
     const std::string dirName = Narrow(best.filename().wstring().c_str());
     std::wstring newest;
@@ -857,11 +886,11 @@ void WebViewHost::RegisterHandlers() {
       }
     }
     if (newest.empty()) {
-      return std::string(R"({"frame":""})");
+      return std::string(R"({"live":true,"frame":""})");
     }
     const std::string url = std::string("https://runs.antimal.local/") + dirName +
                             "/screenshots/" + Narrow(newest.c_str());
-    return std::string("{\"frame\":") + JsonQuote(url) +
+    return std::string("{\"live\":true,\"frame\":") + JsonQuote(url) +
            ",\"run\":" + JsonQuote(dirName) + "}";
   });
 
@@ -871,11 +900,7 @@ void WebViewHost::RegisterHandlers() {
     namespace fs = std::filesystem;
     // Never run two VMs at once -- a second boot would double the disk I/O
     // (overlay + screenshots). Stop any prior session first.
-    if (vmPid_ != 0) {
-      HANDLE hOld = OpenProcess(PROCESS_TERMINATE, FALSE, vmPid_);
-      if (hOld) { TerminateProcess(hOld, 1); CloseHandle(hOld); }
-      vmPid_ = 0;
-    }
+    StopVmProcess();
     const AppConfig c = LoadConfig(DefaultConfigPath());
     const std::wstring dir = ExeDir();
     const fs::path hostCli = fs::path(dir) / L"AntiMal.HostCli.exe";
@@ -937,8 +962,8 @@ void WebViewHost::RegisterHandlers() {
       return std::string(R"({"started":false,"error":"spawn failed"})");
     }
     vmPid_ = pi.dwProcessId;
+    vmProcess_ = pi.hProcess; // retain: liveness + recycle-safe terminate
     CloseHandle(pi.hThread);
-    CloseHandle(pi.hProcess);
     return std::string("{\"started\":true,\"seeded\":") +
            (seeded ? "true" : "false") + "}";
   });
@@ -956,11 +981,7 @@ void WebViewHost::RegisterHandlers() {
       return std::string(R"({"started":false,"cancelled":true})");
     }
     // Never run two VMs at once (double disk I/O). Stop any prior session.
-    if (vmPid_ != 0) {
-      HANDLE hOld = OpenProcess(PROCESS_TERMINATE, FALSE, vmPid_);
-      if (hOld) { TerminateProcess(hOld, 1); CloseHandle(hOld); }
-      vmPid_ = 0;
-    }
+    StopVmProcess();
     const AppConfig c = LoadConfig(DefaultConfigPath());
     const std::wstring dir = ExeDir();
     const fs::path hostCli = fs::path(dir) / L"AntiMal.HostCli.exe";
@@ -1020,8 +1041,8 @@ void WebViewHost::RegisterHandlers() {
       return std::string(R"({"started":false,"error":"spawn failed"})");
     }
     vmPid_ = pi.dwProcessId;
+    vmProcess_ = pi.hProcess; // retain: liveness + recycle-safe terminate
     CloseHandle(pi.hThread);
-    CloseHandle(pi.hProcess);
     const std::string sname =
         Narrow(fs::path(sample).filename().wstring().c_str());
     return std::string("{\"started\":true,\"seeded\":") +
@@ -1030,16 +1051,10 @@ void WebViewHost::RegisterHandlers() {
 
   // Stop the live VM (terminate the spawned HostCli process).
   router_.Register("vm.stop", [this](const JsonValue &) -> std::string {
-    if (vmPid_ == 0) {
-      return std::string(R"({"stopped":false})");
-    }
-    HANDLE hP = OpenProcess(PROCESS_TERMINATE, FALSE, vmPid_);
-    if (hP) {
-      TerminateProcess(hP, 1);
-      CloseHandle(hP);
-    }
-    vmPid_ = 0;
-    return std::string(R"({"stopped":true})");
+    const bool wasRunning = vmProcess_ != nullptr;
+    StopVmProcess();
+    return wasRunning ? std::string(R"({"stopped":true})")
+                      : std::string(R"({"stopped":false})");
   });
 
   // Live interactive input: append a framed record (from the UI) to the

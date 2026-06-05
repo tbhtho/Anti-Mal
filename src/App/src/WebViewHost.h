@@ -38,11 +38,19 @@ private:
   void RegisterHandlers();
   void HandleWebMessage(ICoreWebView2 *sender, const std::string &json);
 
+  // Live-VM process liveness. We RETAIN the process handle (not just the PID) so
+  // termination and the "is a VM running?" check can never act on a recycled PID
+  // -- and so vm.frame only reports a live framebuffer while the VM is actually
+  // running (otherwise a leftover run dir's last screenshot looks "live").
+  bool VmAlive() const;     // true iff the spawned VM process is still running
+  void StopVmProcess();     // terminate (if running) + close handle + clear PID
+
   HWND hwnd_ = nullptr;
   Microsoft::WRL::ComPtr<ICoreWebView2Controller> controller_;
   Microsoft::WRL::ComPtr<ICoreWebView2> webview_;
   BridgeRouter router_;
-  unsigned long vmPid_ = 0; // PID of the spawned live-VM HostCli process (P1).
+  unsigned long vmPid_ = 0;   // PID of the spawned live-VM HostCli process (P1).
+  void *vmProcess_ = nullptr; // HANDLE to that process while it runs (owned).
 };
 
 } // namespace antimal

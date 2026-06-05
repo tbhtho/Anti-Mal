@@ -476,8 +476,16 @@ int RunHostChannelLoop(std::string reason, bool serviceMode) {
   constexpr size_t kProcessBaselineCap = 64;
   constexpr size_t kProcessDeltaCap = 64;
   uint32_t tick = 0;
-  const uint32_t maxTicks = serviceMode ? 24u * 60u * 60u : 120u;
-  while (!g_stopRequested.load() && tick < maxTicks) {
+  // Base budget: a service run lingers all day; a bare console run exits after
+  // ~2 min. But once a sample is STAGED, a console run must outlast the deferred
+  // manual-login wait (kLaunchWaitSec) plus a short observation tail -- otherwise
+  // the 120s cap fires before the sample ever launches and nothing is reported.
+  const uint32_t baseMaxTicks = serviceMode ? 24u * 60u * 60u : 120u;
+  const uint32_t stagedMaxTicks =
+      serviceMode ? baseMaxTicks
+                  : static_cast<uint32_t>(kLaunchWaitSec) + 120u;
+  while (!g_stopRequested.load() &&
+         tick < (sampleStaged ? stagedMaxTicks : baseMaxTicks)) {
     if (!ReadCom2Frames(com2, &incoming)) {
       CloseHandle(com2);
       return 1;

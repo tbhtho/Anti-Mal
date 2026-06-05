@@ -20,6 +20,8 @@
   var currentPage = 'dashboard';
   var livePollTimer = null;
   var liveWatchRun = null; // run id whose live telemetry tail is already started
+  var liveSession = null;  // null | 'boot' | 'running' | 'detonate' (UI state)
+  var heldKeys = {};       // e.code -> break scancodes, flushed on blur/stop
   var liveMouse = { btn: 0, dx: 0, dy: 0 }; // accumulated relative mouse state
   var liveMouseTimer = null;                // flushes accumulated movement
   function send(cmd, args) {
@@ -335,37 +337,68 @@
       if (!r || !r.ok) appendLog('ERROR', 'Dashboard load failed: ' + String((r && r.error) || 'unknown'));
     });
   }
-  // Map a keydown event to Set-1 make/break scancodes (with LShift wrapping for
-  // uppercase + shifted symbols) for live host->guest keyboard input.
-  function keyToScancodes(e) {
-    var key = e.key;
-    var L = { a: 0x1E, b: 0x30, c: 0x2E, d: 0x20, e: 0x12, f: 0x21, g: 0x22, h: 0x23, i: 0x17, j: 0x24, k: 0x25, l: 0x26, m: 0x32, n: 0x31, o: 0x18, p: 0x19, q: 0x10, r: 0x13, s: 0x1F, t: 0x14, u: 0x16, v: 0x2F, w: 0x11, x: 0x2D, y: 0x15, z: 0x2C };
-    var D = { '1': 0x02, '2': 0x03, '3': 0x04, '4': 0x05, '5': 0x06, '6': 0x07, '7': 0x08, '8': 0x09, '9': 0x0A, '0': 0x0B };
-    var SYM = { '-': 0x0C, '=': 0x0D, '[': 0x1A, ']': 0x1B, ';': 0x27, "'": 0x28, '`': 0x29, '\\': 0x2B, ',': 0x33, '.': 0x34, '/': 0x35 };
-    var SH = { '!': 0x02, '@': 0x03, '#': 0x04, '$': 0x05, '%': 0x06, '^': 0x07, '&': 0x08, '*': 0x09, '(': 0x0A, ')': 0x0B, '_': 0x0C, '+': 0x0D, '{': 0x1A, '}': 0x1B, ':': 0x27, '"': 0x28, '~': 0x29, '|': 0x2B, '<': 0x33, '>': 0x34, '?': 0x35 };
-    var SPECIAL = { Enter: 0x1C, Backspace: 0x0E, Tab: 0x0F, Escape: 0x01, ' ': 0x39 };
-    // Extended (0xE0-prefixed) keys: arrows + navigation.
-    var EXT = { ArrowUp: 0x48, ArrowDown: 0x50, ArrowLeft: 0x4B, ArrowRight: 0x4D, Delete: 0x53, Home: 0x47, End: 0x4F, PageUp: 0x49, PageDown: 0x51, Insert: 0x52 };
-    if (EXT[key] != null) { var ec = EXT[key]; return [0xE0, ec, 0xE0, ec | 0x80]; }
-    var code = null, shift = false;
-    if (key && key.length === 1) {
-      var lc = key.toLowerCase();
-      if (L[lc] != null) { code = L[lc]; shift = (key !== lc); }
-      else if (D[key] != null) { code = D[key]; }
-      else if (SYM[key] != null) { code = SYM[key]; }
-      else if (SH[key] != null) { code = SH[key]; shift = true; }
-    } else if (SPECIAL[key] != null) { code = SPECIAL[key]; }
-    if (code == null) return null;
-    var out = [];
-    if (shift) out.push(0x2A);
-    out.push(code); out.push(code | 0x80);
-    if (shift) out.push(0xAA);
-    return out;
+  // Physical-key (e.code) -> Set-1 scancode maps. We send MAKE on keydown and
+  // BREAK on keyup so press / hold / release and real modifier keys (Shift, Ctrl,
+  // Alt, Win) all reach the guest exactly as on a local keyboard -- capitals,
+  // Ctrl/Alt chords, function and navigation keys included. e.code is layout-
+  // independent (KeyA is the physical A key regardless of shift/locale).
+  var SC = {
+    Escape: 0x01, Digit1: 0x02, Digit2: 0x03, Digit3: 0x04, Digit4: 0x05, Digit5: 0x06,
+    Digit6: 0x07, Digit7: 0x08, Digit8: 0x09, Digit9: 0x0A, Digit0: 0x0B, Minus: 0x0C,
+    Equal: 0x0D, Backspace: 0x0E, Tab: 0x0F, KeyQ: 0x10, KeyW: 0x11, KeyE: 0x12,
+    KeyR: 0x13, KeyT: 0x14, KeyY: 0x15, KeyU: 0x16, KeyI: 0x17, KeyO: 0x18, KeyP: 0x19,
+    BracketLeft: 0x1A, BracketRight: 0x1B, Enter: 0x1C, ControlLeft: 0x1D, KeyA: 0x1E,
+    KeyS: 0x1F, KeyD: 0x20, KeyF: 0x21, KeyG: 0x22, KeyH: 0x23, KeyJ: 0x24, KeyK: 0x25,
+    KeyL: 0x26, Semicolon: 0x27, Quote: 0x28, Backquote: 0x29, ShiftLeft: 0x2A,
+    Backslash: 0x2B, KeyZ: 0x2C, KeyX: 0x2D, KeyC: 0x2E, KeyV: 0x2F, KeyB: 0x30,
+    KeyN: 0x31, KeyM: 0x32, Comma: 0x33, Period: 0x34, Slash: 0x35, ShiftRight: 0x36,
+    NumpadMultiply: 0x37, AltLeft: 0x38, Space: 0x39, CapsLock: 0x3A, F1: 0x3B,
+    F2: 0x3C, F3: 0x3D, F4: 0x3E, F5: 0x3F, F6: 0x40, F7: 0x41, F8: 0x42, F9: 0x43,
+    F10: 0x44, NumLock: 0x45, ScrollLock: 0x46, Numpad7: 0x47, Numpad8: 0x48,
+    Numpad9: 0x49, NumpadSubtract: 0x4A, Numpad4: 0x4B, Numpad5: 0x4C, Numpad6: 0x4D,
+    NumpadAdd: 0x4E, Numpad1: 0x4F, Numpad2: 0x50, Numpad3: 0x51, Numpad0: 0x52,
+    NumpadDecimal: 0x53, IntlBackslash: 0x56, F11: 0x57, F12: 0x58
+  };
+  var SCE = { // 0xE0-prefixed (extended) keys
+    ControlRight: 0x1D, AltRight: 0x38, NumpadEnter: 0x1C, NumpadDivide: 0x35,
+    ArrowUp: 0x48, ArrowDown: 0x50, ArrowLeft: 0x4B, ArrowRight: 0x4D, Home: 0x47,
+    End: 0x4F, PageUp: 0x49, PageDown: 0x51, Insert: 0x52, Delete: 0x53,
+    MetaLeft: 0x5B, MetaRight: 0x5C
+  };
+  // Make (down=true) or break (down=false) scancodes for a physical key, or null.
+  function keyScancodes(code, down) {
+    if (SC[code] != null) { var s = SC[code]; return [down ? s : (s | 0x80)]; }
+    if (SCE[code] != null) { var e = SCE[code]; return [0xE0, down ? e : (e | 0x80)]; }
+    return null;
+  }
+  // Release every key currently held (used on blur / stop) so the guest can
+  // never be left with a stuck modifier when capture leaves the frame.
+  function releaseHeldKeys() {
+    for (var c in heldKeys) { if (heldKeys[c]) send('vm.input', { scancodes: heldKeys[c] }); }
+    heldKeys = {};
   }
   function stopLivePoll() {
     if (livePollTimer) { clearInterval(livePollTimer); livePollTimer = null; }
     if (liveMouseTimer) { clearInterval(liveMouseTimer); liveMouseTimer = null; }
     liveMouse = { btn: 0, dx: 0, dy: 0 };
+    releaseHeldKeys();
+  }
+  // Single source of truth for the VM status indicators (#vm-badge + #mode-badge +
+  // the inline #vm-live-status), so they can never desync. Replaces the ad-hoc
+  // writes scattered across the boot/detonate/stop/poll handlers.
+  function setVmState(state, detail) {
+    function badge(sel, cls, text) {
+      var el = $(sel); if (!el) return;
+      el.className = 'badge ' + cls;
+      el.innerHTML = '<span class="dot"></span>' + esc(text);
+    }
+    var live = $('#vm-live-status'), lt = '';
+    if (state === 'booting') { badge('#vm-badge', 'booting', 'VM Booting'); badge('#mode-badge', 'idle', 'Sandbox Ready'); lt = '· ' + (detail || 'booting…'); }
+    else if (state === 'running') { badge('#vm-badge', 'ready', 'VM Running'); badge('#mode-badge', 'idle', 'Sandbox Ready'); lt = '· ' + (detail || 'live'); }
+    else if (state === 'detonating') { badge('#vm-badge', 'ready', 'VM Running'); badge('#mode-badge', 'blocked', 'Detonating'); lt = '· ' + (detail || 'detonating'); }
+    else if (state === 'stopped') { badge('#vm-badge', 'idle', 'VM Idle'); badge('#mode-badge', 'idle', 'Sandbox Ready'); lt = '· stopped'; }
+    else { badge('#vm-badge', 'idle', 'VM Idle'); badge('#mode-badge', 'idle', 'Sandbox Ready'); lt = ''; }
+    if (live) live.textContent = lt;
   }
   // Flush accumulated relative mouse movement to the guest (~20/s). PS/2 mouse
   // Y is positive-up, screen Y is positive-down -> negate dy.
@@ -386,6 +419,15 @@
       if (!box) { stopLivePoll(); return; } // navigated away from VM page
       send('vm.frame').then(function (r) {
         var res = (r && r.result) || {};
+        // The host reports live:false once the VM process has exited. End the
+        // session cleanly instead of repainting a frozen frame forever.
+        if (res.live === false) {
+          stopLivePoll(); liveWatchRun = null; liveSession = null;
+          setVmState('idle');
+          var ts0 = $('#vm-telemetry-status'); if (ts0) ts0.textContent = '· ended';
+          appendLog('INFO', 'Live VM ended.');
+          return;
+        }
         // Once the live run dir is known, start its telemetry tail exactly once
         // (live mode keeps tailing through the quiet boot until the VM exits).
         var run = res.run;
@@ -400,6 +442,8 @@
         var img = document.getElementById('live-frame-img');
         if (!img) { box.innerHTML = ''; img = document.createElement('img'); img.id = 'live-frame-img'; box.appendChild(img); }
         img.src = f;
+        // First real frame of a plain boot: promote 'booting' -> 'running'.
+        if (liveSession === 'boot') { liveSession = 'running'; setVmState('running'); }
       });
     }, 1500);
   }
@@ -407,18 +451,28 @@
     var bb = $('#vm-boot-btn');
     if (bb) bb.onclick = function () {
       appendLog('INFO', 'Booting live VM…');
-      var s = $('#vm-live-status'); if (s) s.textContent = '· starting…';
+      setVmState('booting', 'starting…');
       send('vm.boot').then(function (r) {
         var ok = r && r.ok && r.result && r.result.started;
         appendLog(ok ? 'INFO' : 'ERROR', ok ? ('Live VM booting' + (r.result.seeded ? ' from snapshot' : ' (full OOBE)') + '…') : 'VM boot failed: ' + String((r && r.result && r.result.error) || 'unknown'));
-        if (ok && s) s.textContent = r.result.seeded ? '· booting from snapshot' : '· booting (full OOBE)';
-        if (ok) startLivePoll();
+        if (ok) {
+          liveSession = 'boot';
+          setVmState('booting', r.result.seeded ? 'from snapshot' : 'full OOBE');
+          startLivePoll();
+          var fr = $('#live-frame'); if (fr) fr.focus(); // capture keys with no extra click
+        } else { setVmState('idle'); }
       });
     };
     var db = $('#vm-detonate-btn');
     if (db) db.onclick = function () { onAction('detonate.selected'); };
     var sb = $('#vm-stop-btn');
-    if (sb) sb.onclick = function () { send('vm.stop'); stopLivePoll(); liveWatchRun = null; appendLog('WARN', 'Live VM stopped.'); var box = $('#live-frame'); if (box) box.textContent = 'Stopped.'; var s = $('#vm-live-status'); if (s) s.textContent = '· stopped'; var ts = $('#vm-telemetry-status'); if (ts) ts.textContent = '· stopped'; var mb = $('#mode-badge'); if (mb) { mb.className = 'badge idle'; mb.innerHTML = '<span class="dot"></span>Sandbox Ready'; } };
+    if (sb) sb.onclick = function () {
+      send('vm.stop'); stopLivePoll(); liveWatchRun = null; liveSession = null;
+      appendLog('WARN', 'Live VM stopped.');
+      var box = $('#live-frame'); if (box) box.textContent = 'Stopped.';
+      setVmState('stopped');
+      var ts = $('#vm-telemetry-status'); if (ts) ts.textContent = '· stopped';
+    };
     // Live mouse: route movement/clicks over the frame into the guest (relative
     // PS/2 mouse). Movement deltas are scaled from displayed px to guest px and
     // accumulated; flushLiveMouse sends them ~20/s. Buttons go immediately.
@@ -462,28 +516,41 @@
         // activate the page (arrows, space, Tab, Enter all stay in the VM).
         e.preventDefault();
         e.stopPropagation();
-        var sc = keyToScancodes(e);
-        if (sc) send('vm.input', { scancodes: sc });
+        var mk = keyScancodes(e.code, true);
+        if (!mk) return;
+        heldKeys[e.code] = keyScancodes(e.code, false); // remember its break
+        send('vm.input', { scancodes: mk });            // MAKE (auto-repeats too)
+      });
+      lf.addEventListener('keyup', function (e) {
+        if (!livePollTimer) return;
+        e.preventDefault();
+        e.stopPropagation();
+        var bk = keyScancodes(e.code, false);
+        delete heldKeys[e.code];
+        if (bk) send('vm.input', { scancodes: bk });    // BREAK on release
       });
       lf.addEventListener('focus', function () {
         lf.style.outline = '2px solid #4ea1ff';
         var h = $('#vm-focus-hint'); if (h) { h.textContent = '● Capturing keyboard & mouse — click outside the frame to release.'; h.style.color = '#4ea1ff'; }
       });
       lf.addEventListener('blur', function () {
+        releaseHeldKeys(); // never leave a modifier stuck down in the guest
         lf.style.outline = 'none';
         var h = $('#vm-focus-hint'); if (h) { h.textContent = 'Click the frame to capture your keyboard & mouse; click outside it to release.'; h.style.color = ''; }
       });
     }
-    // If a VM is already running (e.g. you navigated away and came back), resume
-    // the live frame + input stream so the session stays controllable instead of
-    // freezing on a stale frame.
+    // If a VM is actually running (navigated away and came back), resume the live
+    // frame + input stream. vm.frame reports live:false when no VM is running, so a
+    // leftover run dir can no longer masquerade as a live session on startup.
     send('vm.frame').then(function (r) {
       var res = (r && r.result) || {};
-      if (res.run && !livePollTimer) {
+      if (res.live && !livePollTimer) {
         appendLog('INFO', 'Resuming live VM control…');
-        var s = $('#vm-live-status'); if (s) s.textContent = '· live';
+        liveSession = 'running';
+        setVmState('running');
         var box = $('#live-frame'); if (box && res.frame) { box.innerHTML = ''; var im = document.createElement('img'); im.id = 'live-frame-img'; im.src = res.frame; box.appendChild(im); }
         startLivePoll();
+        if (box) box.focus();
       }
     });
     send('config.get').then(function (r) {
@@ -492,7 +559,7 @@
       var dyn = !!c.dynamicExecutionEnabled;
       var to = (c.defaultTimeoutSec != null ? c.defaultTimeoutSec : '—');
       var st = $('#vm-state');
-      if (st) st.innerHTML = kv([['State', 'Idle'], ['Base VHDX', c.baseVhdxPath || '—'], ['Workspace', c.workspaceRoot || '—'], ['Provider', c.vmProvider || '—'], ['Overlay', 'disposable (per run)'], ['Firmware', 'OVMF (debug)'], ['Timeout', to + ' sec'], ['Network', net]]);
+      if (st) st.innerHTML = kv([['State', liveSession ? 'Running' : 'Idle'], ['Base VHDX', c.baseVhdxPath || '—'], ['Workspace', c.workspaceRoot || '—'], ['Provider', c.vmProvider || '—'], ['Overlay', 'disposable (per run)'], ['Firmware', 'OVMF (debug)'], ['Timeout', to + ' sec'], ['Network', net]]);
       var gates = [
         ['Network ' + net + (net === 'disabled' ? '' : ' (review)'), net === 'disabled'],
         ['Disposable overlay active', true],
@@ -611,12 +678,13 @@
         if (res.cancelled) { appendLog('INFO', 'Detonate cancelled.'); return; }
         if (!res.started) { appendLog('ERROR', 'Detonate failed: ' + String(res.error || 'unknown')); return; }
         appendLog('WARN', 'Detonating ' + (res.sample || 'sample') + ' live' + (res.seeded ? ' (seed-boot)' : ' (cold boot)') + ' — watch it run on VM Analysis.');
-        var mb = $('#mode-badge'); if (mb) { mb.className = 'badge blocked'; mb.innerHTML = '<span class="dot"></span>Detonating'; }
+        liveSession = 'detonate';
         if (currentPage !== 'vm') route('vm');
         // The VM page just mounted; start streaming the framebuffer + telemetry.
         setTimeout(function () {
+          setVmState('detonating', res.sample || '');
           startLivePoll();
-          var s = $('#vm-live-status'); if (s) s.textContent = '· detonating ' + (res.sample || '');
+          var fr = $('#live-frame'); if (fr) fr.focus();
         }, 80);
       });
       return;
@@ -655,7 +723,7 @@
     send('ping', {}).then(function (r) {
       if (r && r.ok && r.result) {
         appendLog('INFO', 'Host bridge online (host v' + String(r.result.version || '?') + ').');
-        $('#vm-badge').className = 'badge idle';
+        setVmState('idle');
       } else {
         appendLog('ERROR', 'Host bridge not responding: ' + String((r && r.error) || 'unknown'));
       }
