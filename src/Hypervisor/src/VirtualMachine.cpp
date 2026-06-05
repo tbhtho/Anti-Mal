@@ -1385,6 +1385,7 @@ VmRunSummary VirtualMachine::RunLoop(
     }
   }
   auto lastLiveInputPoll = runStarted;    // throttle the live-input file poll
+  auto lastPacedCom2 = runStarted;        // throttle paced host->guest delivery
   KdSerialDebugger kdDebugger;
   size_t kdCom1Cursor = 0;
   // ANTIMAL_KD_PIPE: hand the raw COM1 KD byte stream to a real kernel debugger
@@ -2659,6 +2660,25 @@ VmRunSummary VirtualMachine::RunLoop(
         burst.scancodes.clear();
         madeProgress = true;
       }
+    }
+    // Paced host->guest delivery of the detonation execute payload. A one-shot
+    // ~100 KB QueueCom2Bytes overruns the guest serial driver's RX in-queue
+    // before the agent reads it, dropping the front (JobStart) frame -- which is
+    // exactly why the first live detonation read every byte yet never launched.
+    // Instead we drip it: start only once the agent has transmitted (it has
+    // opened COM2 and is draining), then a small burst at a time, gated on our RX
+    // queue being nearly empty and a >1s interval so the agent's per-tick read
+    // keeps pace. This bounds the in-flight bytes well under the guest in-queue.
+    if (pacedCom2Cursor_ < pacedCom2Payload_.size() &&
+        com2_.CapturedBytes() > 0 && com2_.RxQueuedBytes() < 1024 &&
+        now - lastPacedCom2 >= std::chrono::milliseconds{1100}) {
+      constexpr size_t kBurst = 2048;
+      const size_t remaining = pacedCom2Payload_.size() - pacedCom2Cursor_;
+      const size_t n = remaining < kBurst ? remaining : kBurst;
+      com2_.QueueRxBytes(pacedCom2Payload_.data() + pacedCom2Cursor_, n);
+      pacedCom2Cursor_ += n;
+      lastPacedCom2 = now;
+      madeProgress = true;
     }
     // Live interactive input: poll the input file (~every 100ms) for bytes the
     // UI process appended and inject them as Set-1 keyboard scancodes.

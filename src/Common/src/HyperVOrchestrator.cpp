@@ -63,6 +63,9 @@ struct HostChannelCapture {
   bool guestAgentConnected = false;
   uint32_t guestAgentHeartbeats = 0;
   bool reportComplete = false;
+  // True when the guest's ReportComplete reported an actually-detonated sample
+  // (status payload carries sampleExecuted=true), vs a benign healthcheck.
+  bool sampleExecuted = false;
   uint32_t eventsReturned = 0;
   std::vector<std::filesystem::path> artifacts;
   std::vector<std::string> milestones;
@@ -7679,6 +7682,12 @@ HostChannelCapture ProcessHostChannelOutput(
     case hv::HostChannelMessage::ReportComplete:
       capture.guestAgentConnected = true;
       capture.reportComplete = true;
+      // The execute success/terminal paths carry sampleExecuted=true|false in the
+      // status payload; a benign healthcheck has no such line. Surface it so the
+      // report reflects what the guest actually ran, not just "a report arrived".
+      if (payload.find("sampleExecuted=true") != std::string::npos) {
+        capture.sampleExecuted = true;
+      }
       AddMilestone(&capture.milestones, "GuestAgent report complete");
       break;
     default:
@@ -10868,19 +10877,26 @@ DetonationResult InHouseOrchestrator::PrepareAndRun(
             optsLocal.processorCount = postRebootVcpuCount;
           }
           hv::VirtualMachine vm(preflight.firmwarePath, disk, optsLocal);
-          vm.QueueCom2Bytes(firstBootCom2);
           if (executionAuthorized) {
-            // Durable provenance: record that the execute payload was (re)queued
-            // for this generation, so events.jsonl can distinguish "delivered"
-            // from "silently dropped on reboot" (vs the report's sampleExecuted,
-            // which reflects what the guest actually ran via ReportComplete).
+            // The execute payload (~100 KB) is delivered PACED + post-handshake
+            // (see SetPacedCom2Payload): a one-shot queue overruns the guest
+            // serial RX in-queue before the agent reads, dropping the JobStart.
+            // The small healthcheck stays a one-shot queue below.
+            vm.SetPacedCom2Payload(firstBootCom2);
+            // Durable provenance: record that the execute payload was armed for
+            // this generation, so events.jsonl distinguishes "delivered" from
+            // "silently dropped on reboot" (vs the report's sampleExecuted, which
+            // reflects what the guest actually ran via ReportComplete).
             AppendJournalEvent(
                 result.journalPath,
                 MakeSandboxEvent("run.execution.delivered", stagedSample,
                                  {{"runId", result.runId},
                                   {"generation", std::to_string(reboot)},
-                                  {"bytes", std::to_string(firstBootCom2.size())}}),
+                                  {"bytes", std::to_string(firstBootCom2.size())},
+                                  {"mode", "paced"}}),
                 &events);
+          } else {
+            vm.QueueCom2Bytes(firstBootCom2);
           }
           s = vm.Run(reqLocal);
           s.guestReboots = reboot;
@@ -11117,7 +11133,12 @@ DetonationResult InHouseOrchestrator::PrepareAndRun(
         result.dynamicSummary.status = "guest agent connected";
       }
       if (hostCapture.reportComplete && !result.dynamicSummary.crashed) {
-        result.dynamicSummary.status = "guest healthcheck complete";
+        if (hostCapture.sampleExecuted) {
+          result.dynamicSummary.sampleExecuted = true;
+          result.dynamicSummary.status = "sample executed";
+        } else {
+          result.dynamicSummary.status = "guest healthcheck complete";
+        }
       }
       result.status = result.dynamicSummary.status;
       result.completed = vmSummary.completed;
@@ -11406,7 +11427,8 @@ DetonationResult InHouseOrchestrator::PrepareAndRun(
            result.dynamicSummary.guestAgentConnected ? "true" : "false"},
           {"artifactsCaptured",
            std::to_string(result.dynamicSummary.artifactsCaptured)},
-          {"sampleExecuted", "false"}};
+          {"sampleExecuted",
+           result.dynamicSummary.sampleExecuted ? "true" : "false"}};
       if (result.dynamicSummary.ideSawRead) {
         details["ideReadLbaRange"] =
             std::to_string(result.dynamicSummary.ideMinReadLba) + "-" +

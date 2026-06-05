@@ -596,6 +596,17 @@ public:
   void QueueCom2Bytes(const std::vector<uint8_t> &bytes) {
     com2_.QueueRxBytes(bytes);
   }
+  // Host->guest payload delivered LAZILY by the run loop: dripped into COM2 in
+  // small bursts, and only AFTER the guest agent starts transmitting (proof it
+  // has opened COM2 and is actively draining the RX path). A one-shot ~100 KB
+  // QueueCom2Bytes overruns the guest serial driver's RX in-queue before the
+  // agent reads, silently dropping the front frame; pacing it post-handshake
+  // avoids that. Used for the authorized-detonation execute payload (the small
+  // healthcheck still goes via QueueCom2Bytes). Re-set per boot generation.
+  void SetPacedCom2Payload(std::vector<uint8_t> bytes) {
+    pacedCom2Payload_ = std::move(bytes);
+    pacedCom2Cursor_ = 0;
+  }
   std::string PullCom2Output() { return com2_.PullNew(); }
   void InjectKeyboardScancode(uint8_t scancode) {
     ps2_.InjectKeyboardScancode(scancode);
@@ -648,6 +659,8 @@ private:
   std::vector<std::unique_ptr<Vcpu>> apVcpus_;
   SerialConsole com1_;
   SerialConsole com2_;
+  std::vector<uint8_t> pacedCom2Payload_;
+  size_t pacedCom2Cursor_ = 0;
   PcIoDevices pcIo_;
   Ps2Controller ps2_;
   std::filesystem::path liveInputPath_; // live host->guest input file (framed)
