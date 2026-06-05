@@ -33,6 +33,35 @@ std::atomic_bool g_stopRequested{false};
 SERVICE_STATUS_HANDLE g_serviceStatusHandle = nullptr;
 SERVICE_STATUS g_serviceStatus{};
 
+// Diagnostic breadcrumb: append a timestamped line to a fixed on-disk log so a
+// post-boot overlay inspection can see how far the service actually got (the
+// agent runs with full Win32, unlike the offline host-side writer that can only
+// see COM2 byte counts). Best-effort, never throws; tries two locations in case
+// one is unwritable for the LocalSystem service account.
+void BootLog(const std::string &line) {
+  for (const wchar_t *path : {L"C:\\AntiMal\\agent-boot.log",
+                              L"C:\\Windows\\Temp\\antimal-agent-boot.log"}) {
+    HANDLE h = CreateFileW(path, FILE_APPEND_DATA, FILE_SHARE_READ, nullptr,
+                           OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (h == INVALID_HANDLE_VALUE) {
+      continue;
+    }
+    SYSTEMTIME st{};
+    GetSystemTime(&st);
+    char buf[64];
+    const int n =
+        _snprintf_s(buf, sizeof(buf), _TRUNCATE, "%02u:%02u:%02u.%03u ",
+                    st.wHour, st.wMinute, st.wSecond, st.wMilliseconds);
+    DWORD w = 0;
+    if (n > 0) {
+      WriteFile(h, buf, static_cast<DWORD>(n), &w, nullptr);
+    }
+    WriteFile(h, line.data(), static_cast<DWORD>(line.size()), &w, nullptr);
+    WriteFile(h, "\r\n", 2, &w, nullptr);
+    CloseHandle(h);
+  }
+}
+
 // Emits a placeholder journal line so the host UI has something to render
 // even when no in-guest collector is wired up yet. Real collectors (Sysmon
 // tail, ETW subscribers, file/registry watchers) replace these emit calls
@@ -278,19 +307,26 @@ bool ReadCom2Frames(HANDLE com2, antimal::HostSerialChannel *channel) {
 bool GuestExecutionAuthorized();
 
 int RunHostChannelLoop(std::string reason, bool serviceMode) {
+  BootLog("RunHostChannelLoop enter reason=" + reason +
+          " serviceMode=" + (serviceMode ? "1" : "0") +
+          " pid=" + std::to_string(GetCurrentProcessId()));
   HANDLE com2 = OpenCom2WithRetry();
   if (com2 == INVALID_HANDLE_VALUE) {
+    BootLog("COM2 open FAILED err=" + std::to_string(GetLastError()));
     std::cerr << "GuestAgent: COM2 unavailable for heartbeat: "
               << GetLastError() << "\n";
     return 1;
   }
+  BootLog("COM2 opened ok");
 
   const auto helloPayload = "AntiMal.GuestAgent hello; reason=" + reason +
                             "; pid=" + std::to_string(GetCurrentProcessId());
   if (!SendFrame(com2, antimal::HostChannelMessage::Hello, helloPayload)) {
+    BootLog("Hello send FAILED err=" + std::to_string(GetLastError()));
     CloseHandle(com2);
     return 1;
   }
+  BootLog("Hello sent ok");
 
   antimal::HostSerialChannel incoming;
   bool healthcheckComplete = false;
@@ -615,9 +651,12 @@ DWORD WINAPI ServiceControlHandler(DWORD control, DWORD, LPVOID, LPVOID) {
 }
 
 void WINAPI ServiceMain(DWORD, LPWSTR *) {
+  BootLog("ServiceMain entered");
   g_serviceStatusHandle = RegisterServiceCtrlHandlerExW(
       L"AntiMalGuestAgent", ServiceControlHandler, nullptr);
   if (!g_serviceStatusHandle) {
+    BootLog("RegisterServiceCtrlHandlerEx FAILED err=" +
+            std::to_string(GetLastError()));
     return;
   }
   g_stopRequested.store(false);
@@ -628,14 +667,18 @@ void WINAPI ServiceMain(DWORD, LPWSTR *) {
 }
 
 int RunAsService() {
+  BootLog("RunAsService: calling StartServiceCtrlDispatcher");
   SERVICE_TABLE_ENTRYW table[] = {
       {const_cast<LPWSTR>(L"AntiMalGuestAgent"), ServiceMain},
       {nullptr, nullptr},
   };
   if (StartServiceCtrlDispatcherW(table)) {
+    BootLog("StartServiceCtrlDispatcher returned 0 (clean)");
     return 0;
   }
-  if (GetLastError() == ERROR_FAILED_SERVICE_CONTROLLER_CONNECT) {
+  const DWORD err = GetLastError();
+  BootLog("StartServiceCtrlDispatcher FAILED err=" + std::to_string(err));
+  if (err == ERROR_FAILED_SERVICE_CONTROLLER_CONNECT) {
     return RunHostChannelLoop("service-console", false);
   }
   return 1;
@@ -653,6 +696,8 @@ bool HasArg(int argc, wchar_t **argv, std::wstring_view needle) {
 } // namespace
 
 int wmain(int argc, wchar_t **argv) {
+  BootLog("wmain start argc=" + std::to_string(argc) +
+          " service=" + (HasArg(argc, argv, L"--service") ? "1" : "0"));
   try {
     if (HasArg(argc, argv, L"--service")) {
       return RunAsService();

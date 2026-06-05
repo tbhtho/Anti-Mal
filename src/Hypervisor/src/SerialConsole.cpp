@@ -15,7 +15,9 @@ constexpr uint16_t kMsr = 6; // Modem Status
 constexpr uint16_t kScr = 7; // Scratch
 
 constexpr uint8_t kIerReceivedDataAvailable = 1u << 0;
+constexpr uint8_t kIerThrEmpty = 1u << 1; // ETBEI: transmitter-empty interrupt
 constexpr uint8_t kIirNoInterruptPending = 1u << 0;
+constexpr uint8_t kIirThrEmpty = 0x02;
 constexpr uint8_t kIirReceivedDataAvailable = 0x04;
 constexpr uint8_t kLcrDlab = 1u << 7;
 // LSR bits we care about: bit 0 = RX ready, bit 5 = THR empty,
@@ -95,7 +97,18 @@ void SerialConsole::QueueRxBytes(const std::vector<uint8_t> &bytes) {
 }
 
 bool SerialConsole::InterruptPending() const noexcept {
-  return !rxQueue_.empty() && ((ier_ & kIerReceivedDataAvailable) != 0);
+  const bool rxInt =
+      !rxQueue_.empty() && ((ier_ & kIerReceivedDataAvailable) != 0);
+  // The transmit holding register is always "empty" in this model (a THR write
+  // is captured instantly), so whenever the guest enables the THR-empty
+  // interrupt (ETBEI) one is pending. Windows serial.sys is interrupt-driven on
+  // transmit: it enables ETBEI and writes bytes only from the THRE ISR. Without
+  // this it waits for a TX interrupt that never comes and every WriteFile times
+  // out (observed: the GuestAgent's COM2 Hello timed out at 1000ms with
+  // com2DataWrites=0). serial.sys masks ETBEI once its buffer drains, so this
+  // self-terminates after the transmit burst rather than storming.
+  const bool txInt = (ier_ & kIerThrEmpty) != 0;
+  return rxInt || txInt;
 }
 
 SerialConsoleStats SerialConsole::Stats() const noexcept {
@@ -154,10 +167,22 @@ uint32_t SerialConsole::OnRead(uint16_t port, uint8_t /*accessSize*/) {
       return dlm_;
     }
     return ier_;
-  case kFcr:
+  case kFcr: {
     ++stats_.iirReads;
-    return InterruptPending() ? kIirReceivedDataAvailable
-                              : kIirNoInterruptPending;
+    // 16550 IIR priority: received-data-available (0x04) outranks
+    // transmitter-empty (0x02). serial.sys reads this to pick the ISR path, so
+    // a TX interrupt MUST report 0x02 (not 0x04, which would make it try to read
+    // a non-existent RX byte).
+    const bool rxInt =
+        !rxQueue_.empty() && ((ier_ & kIerReceivedDataAvailable) != 0);
+    if (rxInt) {
+      return kIirReceivedDataAvailable;
+    }
+    if ((ier_ & kIerThrEmpty) != 0) {
+      return kIirThrEmpty;
+    }
+    return kIirNoInterruptPending;
+  }
   case kLcr:
     return lcr_;
   case kMcr:

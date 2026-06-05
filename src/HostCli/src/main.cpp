@@ -724,6 +724,7 @@ public:
     bool directory = false;
     bool dataResident = false;
     std::vector<DataRun> dataRuns;
+    std::vector<uint8_t> residentData; // inline $DATA for small (resident) files
   };
 
   bool Init() {
@@ -816,11 +817,22 @@ public:
   uint32_t FileRecordBytes() const noexcept { return fileRecordBytes_; }
 
   std::vector<uint8_t> ReadFile(const Entry &entry, uint64_t maxBytes) {
-    if (entry.directory || entry.dataRuns.empty() || entry.size == 0) {
+    if (entry.directory || entry.size == 0) {
       return {};
     }
     const uint64_t bytes = std::min<uint64_t>(entry.size, maxBytes);
     if (bytes > static_cast<uint64_t>(std::numeric_limits<size_t>::max())) {
+      return {};
+    }
+    // Small files store their $DATA resident (inline in the MFT record); the
+    // breadcrumb logs land here. Non-resident files use the data-run path.
+    if (entry.dataResident) {
+      const size_t n =
+          std::min<size_t>(entry.residentData.size(), static_cast<size_t>(bytes));
+      return std::vector<uint8_t>(entry.residentData.begin(),
+                                  entry.residentData.begin() + n);
+    }
+    if (entry.dataRuns.empty()) {
       return {};
     }
     std::vector<uint8_t> out(static_cast<size_t>(bytes));
@@ -979,6 +991,7 @@ private:
       entry.dataResident = !attr.nonResident;
       entry.size = attr.nonResident ? attr.realSize : attr.residentData.size();
       entry.dataRuns = attr.runs;
+      entry.residentData = attr.residentData;
       return;
     }
   }
