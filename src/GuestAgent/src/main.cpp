@@ -110,6 +110,12 @@ HANDLE OpenCom2WithRetry() {
                                 0, nullptr, OPEN_EXISTING,
                                 FILE_ATTRIBUTE_NORMAL, nullptr);
     if (handle != INVALID_HANDLE_VALUE) {
+      // Enlarge the driver's receive buffer so paced host->guest bursts (the
+      // ~100 KB detonation payload) can't overrun it when a telemetry tick
+      // briefly delays the agent's next read -- an overrun drops bytes, fails a
+      // frame checksum, and aborts the strict in-order reassembler
+      // (sample-transfer-error). 1 MiB comfortably holds the whole payload.
+      (void)SetupComm(handle, 1u << 20, 4096);
       DCB dcb{};
       dcb.DCBlength = sizeof(dcb);
       if (GetCommState(handle, &dcb)) {
@@ -453,8 +459,10 @@ int RunHostChannelLoop(std::string reason, bool serviceMode) {
     while (const auto frame = incoming.PopFrame()) {
       if (frame->type == antimal::HostChannelMessage::SampleChunk) {
         // Sample bytes for an authorized execute job, arriving after the
-        // JobStart. Collect until complete, then write + launch.
-        if (!executeReq || !reassembler || sampleLaunched) {
+        // JobStart. Collect until complete, then write + launch. Once staged
+        // (transfer complete, awaiting the desktop) or launched, ignore any
+        // trailing chunk so it can't spuriously trip the reassembler.
+        if (!executeReq || !reassembler || sampleLaunched || sampleStaged) {
           continue;  // no pending transfer
         }
         const auto chunk = antimal::ParseSampleChunkPayload(frame->payload);
