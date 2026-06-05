@@ -30,6 +30,7 @@ struct SerialConsoleStats {
   uint64_t rxBytesQueued = 0;
   uint64_t rxBytesRead = 0;
   uint64_t rxBytesCleared = 0;
+  uint64_t rxFifoResetRequests = 0;
   uint64_t ierWrites = 0;
   uint64_t fcrWrites = 0;
   uint64_t lcrWrites = 0;

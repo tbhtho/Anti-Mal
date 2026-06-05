@@ -4526,6 +4526,8 @@ struct BootOverlayPatchResult {
   bool ciBypassWinloadPatched = false;
   bool winloadVoiceStubWritten = false;
   int ciBypassBootmgrFilesPatched = 0;
+  bool guestExecAuthProbeEnabled = false;
+  bool guestExecAuthArmed = false;
   std::vector<std::string> notes;
 };
 
@@ -4533,6 +4535,16 @@ bool PatchOverlaySystemBootStorage(hv::IBlockDevice &disk,
                                    BootOverlayPatchResult *result);
 bool PatchOverlayAutologon(hv::IBlockDevice &disk,
                            BootOverlayPatchResult *result);
+// Arms the THIRD key of the detonation gate (the guest-side authorization) by
+// adding ANTIMAL_GUEST_ALLOW_EXECUTION=1 to the AntiMalGuestAgent service's own
+// per-service Environment value in the overlay's SYSTEM hive. The SCM merges that
+// value into the LocalSystem service's process environment at start, so the agent
+// (which checks GetEnvironmentVariableW) sees the gate. Writes land in the open
+// (disposable) overlay only -- the promoted snapshot stays gated. Opt-in via
+// ANTIMAL_ARM_GUEST_EXEC so a normal run never arms the guest. Returns false (with
+// a note) on any failure, so a failed arm is observable rather than silent.
+bool ArmGuestExecAuthInOverlay(hv::IBlockDevice &disk,
+                               BootOverlayPatchResult *result);
 // Overwrites a large non-critical guest file (clobberNtfsPath) with the padded
 // execute-capable agent and repoints the AntiMalGuestAgent service ImagePath at
 // it, entirely within the same-size NTFS writer + same-size hive edit (the /MT
@@ -6274,6 +6286,15 @@ BootOverlayPatchResult ApplyEphemeralBootOverlay(hv::IBlockDevice &disk) {
   if (EnvFlagEnabled("ANTIMAL_PROBE_OOBE_AUTOLOGON")) {
     PatchOverlayAutologon(disk, &result);
   }
+  // Opt-in third detonation key: arm the guest-side execution authorization in
+  // THIS run's disposable overlay only (the promoted snapshot stays gated). With
+  // this and both host keys set, an authorized execute job is honored in-guest.
+  if (EnvFlagEnabled("ANTIMAL_ARM_GUEST_EXEC")) {
+    result.guestExecAuthProbeEnabled = true;
+    result.notes.push_back(
+        "guest-exec arm enabled by ANTIMAL_ARM_GUEST_EXEC");
+    ArmGuestExecAuthInOverlay(disk, &result);
+  }
   return result;
 }
 
@@ -6373,6 +6394,9 @@ BootOverlayPatchDetails(const BootOverlayPatchResult &patch) {
        patch.winloadVoiceStubWritten ? "true" : "false"},
       {"ciBypassBootmgrFilesPatched",
        std::to_string(patch.ciBypassBootmgrFilesPatched)},
+      {"guestExecAuthProbeEnabled",
+       patch.guestExecAuthProbeEnabled ? "true" : "false"},
+      {"guestExecAuthArmed", patch.guestExecAuthArmed ? "true" : "false"},
       {"scope", "overlay-only"}};
   if (!patch.notes.empty()) {
     details["notes"] = JoinStrings(patch.notes, "; ");
@@ -7368,6 +7392,113 @@ bool PatchOverlaySystemBootStorage(hv::IBlockDevice &disk,
   if (result) {
     result->bootStoragePatched = true;
   }
+  return true;
+}
+
+bool ArmGuestExecAuthInOverlay(hv::IBlockDevice &disk,
+                               BootOverlayPatchResult *result) {
+  auto note = [&](const std::string &m) {
+    if (result) result->notes.push_back("guest-exec arm: " + m);
+  };
+  const auto partitions = ReadGptPartitionsLite(disk);
+  const auto windows =
+      std::find_if(partitions.begin(), partitions.end(),
+                   [](const GptPartitionLite &p) {
+                     return IsWindowsBasicDataGuid(p.typeGuid);
+                   });
+  if (windows == partitions.end()) {
+    note("Windows partition not found");
+    return false;
+  }
+  NtfsBootFileLocator ntfs(disk, windows->firstLba);
+  if (!ntfs.Init()) {
+    note("Windows NTFS unreadable");
+    return false;
+  }
+  const auto system = ntfs.FindPath("Windows\\System32\\config\\SYSTEM");
+  if (!system) {
+    note("SYSTEM hive not found");
+    return false;
+  }
+  auto bytes = ntfs.ReadFile(*system, static_cast<size_t>(system->size));
+  if (bytes.size() != system->size) {
+    note("SYSTEM hive read truncated");
+    return false;
+  }
+  MutableHiveView hive(bytes);
+  if (!hive.IsValid()) {
+    note("SYSTEM hive invalid");
+    return false;
+  }
+  auto findPath = [&](std::initializer_list<std::string> comps)
+      -> std::optional<uint32_t> {
+    auto cur = hive.RootIndex();
+    for (const auto &c : comps) {
+      if (!cur) return std::nullopt;
+      cur = hive.FindSubkey(*cur, c);
+    }
+    return cur;
+  };
+  // Resolve the booted control set from Select\Current (do NOT hardcode
+  // ControlSet001 -- a LastKnownGood boot can select ControlSet002, and arming
+  // the wrong set leaves the gate invisible to smss/SCM).
+  std::string controlSet = "ControlSet001";
+  if (const auto select = findPath({"Select"})) {
+    if (const auto cur = hive.FindValue(*select, "Current")) {
+      const auto b = hive.ValueBytes(*cur);
+      if (b.size() >= 4) {
+        char buf[16];
+        _snprintf_s(buf, sizeof(buf), _TRUNCATE, "ControlSet%03u",
+                    ReadLe32(b.data()));
+        controlSet = buf;
+      }
+    }
+  }
+  const auto svc = findPath({controlSet, "Services", "AntiMalGuestAgent"});
+  if (!svc) {
+    note("service key missing: " + controlSet +
+         "\\Services\\AntiMalGuestAgent");
+    return false;
+  }
+  // Build the per-service Environment value: a REG_MULTI_SZ of UTF-16LE
+  // "ANTIMAL_GUEST_ALLOW_EXECUTION=1", terminated by the entry null AND the
+  // multi-sz null. The SCM merges these NAME=VALUE entries into the service's
+  // process environment, so GetEnvironmentVariableW(L"ANTIMAL_GUEST_ALLOW_EXECUTION")
+  // returns L"1" -- exactly what GuestExecutionAuthorized() requires.
+  const std::wstring entry = L"ANTIMAL_GUEST_ALLOW_EXECUTION=1";
+  std::vector<uint8_t> multi;
+  multi.reserve((entry.size() + 2) * 2);
+  for (wchar_t ch : entry) {
+    multi.push_back(static_cast<uint8_t>(ch & 0xFFu));
+    multi.push_back(static_cast<uint8_t>((ch >> 8) & 0xFFu));
+  }
+  multi.push_back(0); multi.push_back(0);  // end of the "NAME=VALUE" string
+  multi.push_back(0); multi.push_back(0);  // end of the REG_MULTI_SZ block
+  if (!hive.UpsertBinaryValueSameSize(*svc, "Environment", REG_MULTI_SZ, multi)) {
+    note("failed to set service Environment value (no free hive cell / size "
+         "mismatch?)");
+    return false;
+  }
+  // Hard verify the value reads back exactly, in-memory, before committing the
+  // hive -- a silent half-write here would boot an agent that streams telemetry
+  // but rejects every execute job, which looks like a working run minus the
+  // detonation.
+  const auto check = hive.FindValue(*svc, "Environment");
+  if (!check || check->type != REG_MULTI_SZ ||
+      hive.ValueBytes(*check) != multi) {
+    note("Environment value verification failed after write");
+    return false;
+  }
+  RefreshRegistryHiveHeader(bytes);
+  if (!ntfs.WriteFileSameSize(*system, bytes)) {
+    note("failed to write patched SYSTEM hive to overlay");
+    return false;
+  }
+  if (result) {
+    result->guestExecAuthArmed = true;
+  }
+  note("ANTIMAL_GUEST_ALLOW_EXECUTION=1 armed on " + controlSet +
+       "\\Services\\AntiMalGuestAgent\\Environment");
   return true;
 }
 
@@ -10356,6 +10487,13 @@ DetonationResult InHouseOrchestrator::PrepareAndRun(
           }
         }
       }
+      // Two-key execution gate decision, hoisted here so the live frame handler
+      // can see it: when execution is authorized the run must NOT auto-stop after
+      // the 2-heartbeat "agent alive" probe (the sample needs ~tens of seconds to
+      // be delivered, launched, and observed) -- it stops on ReportComplete or the
+      // detonation timeout instead.
+      const bool executionAuthorized =
+          config_.dynamicExecutionEnabled && PerRunExecutionAuthorized();
       auto stopAfterGuestAgentProbe = std::make_shared<std::atomic_bool>(false);
       request.cancelRequested = stopAfterGuestAgentProbe;
       auto liveHostChannel = std::make_shared<hv::HostSerialChannel>();
@@ -10370,7 +10508,7 @@ DetonationResult InHouseOrchestrator::PrepareAndRun(
                                   screenshotsDirCopy, journalPathCopy,
                                   interactiveSession, frameCounter,
                                   realFrameCounter, liveHostChannel,
-                                  liveHeartbeatCount,
+                                  liveHeartbeatCount, executionAuthorized,
                                   stopAfterGuestAgentProbe](
                                      const hv::VmProgressSnapshot &snap) {
           DetonationProgress progress{};
@@ -10409,8 +10547,12 @@ DetonationResult InHouseOrchestrator::PrepareAndRun(
                     1;
                 // The 2-heartbeat auto-stop is the non-interactive "agent is
                 // alive" probe. In an interactive session the human keeps the
-                // VM running, so never auto-stop on heartbeats there.
-                if (!interactiveSession && count >= 2) {
+                // VM running, so never auto-stop on heartbeats there. When an
+                // execution is authorized we also keep running past the probe:
+                // the sample still has to be delivered (tens of KB over COM2),
+                // launched, and observed, so the run ends on the guest's
+                // ReportComplete (or the detonation timeout), not the probe.
+                if (!interactiveSession && !executionAuthorized && count >= 2) {
                   stopAfterGuestAgentProbe->store(true,
                                                   std::memory_order_relaxed);
                 }
@@ -10654,13 +10796,12 @@ DetonationResult InHouseOrchestrator::PrepareAndRun(
           }
         }
       }
-      // Two-key execution gate: config (dynamic_execution_enabled) AND a per-run
-      // authorization (HostCli --allow-execution -> ANTIMAL_AUTHORIZE_EXECUTION).
-      // Only when BOTH hold does the first-boot COM2 payload carry the sample for
-      // in-guest detonation; otherwise it stays the benign healthcheck. The
-      // decision is journaled so every run records whether it armed execution.
-      const bool executionAuthorized =
-          config_.dynamicExecutionEnabled && PerRunExecutionAuthorized();
+      // Two-key execution gate (decision computed above): config
+      // (dynamic_execution_enabled) AND a per-run authorization (HostCli
+      // --allow-execution -> ANTIMAL_AUTHORIZE_EXECUTION). Only when BOTH hold
+      // does the first-boot COM2 payload carry the sample for in-guest
+      // detonation; otherwise it stays the benign healthcheck. The decision is
+      // journaled so every run records whether it armed execution.
       AppendJournalEvent(
           result.journalPath,
           MakeSandboxEvent(executionAuthorized ? "run.execution.authorized"
@@ -10689,6 +10830,22 @@ DetonationResult InHouseOrchestrator::PrepareAndRun(
             std::chrono::duration_cast<std::chrono::milliseconds>(request.timeout);
         const auto runStart = std::chrono::steady_clock::now();
         hv::VmRunSummary s;
+        // Build the first-boot COM2 payload ONCE (healthcheck JobStart, or -- when
+        // execution is authorized -- the execute JobStart + the sample as
+        // SampleChunk frames). It is (re)queued on EVERY boot generation below:
+        // the COM2 RX queue is per-VirtualMachine, so a guest-initiated reboot
+        // creates a fresh VM with an empty queue and would otherwise permanently
+        // lose an undelivered execute payload (on a cold boot the agent service
+        // isn't even up in generation 0). Re-queuing is safe -- each generation is
+        // a fresh agent process, and within a generation the guest rejects a
+        // duplicate execute job ("execute-already-active").
+        std::string jobNote;
+        const std::vector<uint8_t> firstBootCom2 = BuildFirstBootCom2Bytes(
+            executionAuthorized, result.runId, stagedSample,
+            static_cast<uint32_t>(totalTimeout.count()), networkMode, &jobNote);
+        if (!jobNote.empty()) {
+          fireProgress("booting", jobNote);
+        }
         for (int reboot = 0; reboot <= kMaxReboots; ++reboot) {
           const auto elapsed =
               std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -10711,15 +10868,19 @@ DetonationResult InHouseOrchestrator::PrepareAndRun(
             optsLocal.processorCount = postRebootVcpuCount;
           }
           hv::VirtualMachine vm(preflight.firmwarePath, disk, optsLocal);
-          if (reboot == 0) {
-            std::string jobNote;
-            vm.QueueCom2Bytes(BuildFirstBootCom2Bytes(
-                executionAuthorized, result.runId, stagedSample,
-                static_cast<uint32_t>(totalTimeout.count()), networkMode,
-                &jobNote));
-            if (!jobNote.empty()) {
-              fireProgress("booting", jobNote);
-            }
+          vm.QueueCom2Bytes(firstBootCom2);
+          if (executionAuthorized) {
+            // Durable provenance: record that the execute payload was (re)queued
+            // for this generation, so events.jsonl can distinguish "delivered"
+            // from "silently dropped on reboot" (vs the report's sampleExecuted,
+            // which reflects what the guest actually ran via ReportComplete).
+            AppendJournalEvent(
+                result.journalPath,
+                MakeSandboxEvent("run.execution.delivered", stagedSample,
+                                 {{"runId", result.runId},
+                                  {"generation", std::to_string(reboot)},
+                                  {"bytes", std::to_string(firstBootCom2.size())}}),
+                &events);
           }
           s = vm.Run(reqLocal);
           s.guestReboots = reboot;

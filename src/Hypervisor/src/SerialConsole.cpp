@@ -71,9 +71,16 @@ void SerialConsole::OnWrite(uint16_t port, uint32_t value, uint8_t /*accessSize*
   case kFcr:
     fcr_ = byte;
     ++stats_.fcrWrites;
+    // FCR bit 1 is "RX FIFO reset" — on real hardware it flushes the 16-byte
+    // receive FIFO. We deliberately do NOT flush rxQueue_ here: that deque is the
+    // host->guest delivery backlog (a JobStart + up to several MB of SampleChunk
+    // frames the host queues before the guest opens COM2), not a 16-byte hardware
+    // FIFO. serial.sys issues this reset during driver init, so flushing the
+    // backlog would silently drop an in-flight authorized sample mid-transfer
+    // (the "intermittent detonation" failure mode). We only record that a reset
+    // was requested.
     if ((byte & (1u << 1)) != 0) {
-      stats_.rxBytesCleared += rxQueue_.size();
-      rxQueue_.clear();
+      ++stats_.rxFifoResetRequests;
     }
     break;
   case kLcr:

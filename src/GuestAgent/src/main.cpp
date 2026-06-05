@@ -280,6 +280,19 @@ bool LaunchExecuteJob(HANDLE com2, const antimal::ExecuteJobRequest &req,
   return true;
 }
 
+// Terminal failure of an execute job: an agent.job.rejected Event AND a
+// ReportComplete(status=error) frame. The ReportComplete is the load-bearing
+// part -- without it the host has no completion signal and waits out the entire
+// detonation timeout, turning a fast clean failure into a multi-minute hang.
+void SendExecuteFailure(HANDLE com2, const std::string &reason) {
+  auto rejected = MakeAgentEvent("agent.job.rejected", "execute");
+  rejected.details["reason"] = reason;
+  (void)SendAgentEvent(com2, rejected);
+  (void)SendFrame(com2, antimal::HostChannelMessage::ReportComplete,
+                  std::string("status=error\nsampleExecuted=false\nreason=") +
+                      reason + "\n");
+}
+
 bool ReadCom2Frames(HANDLE com2, antimal::HostSerialChannel *channel) {
   if (!channel) {
     return false;
@@ -352,6 +365,12 @@ int RunHostChannelLoop(std::string reason, bool serviceMode) {
   HANDLE sampleProcess = nullptr;
   DWORD samplePid = 0;
   std::chrono::steady_clock::time_point sampleDeadline{};
+  // Bounds the sample TRANSFER (JobStart -> all SampleChunks). Without it, a lost
+  // chunk would leave the agent waiting on Complete() forever (24h in service
+  // mode). 90s is generous: the COM2 link is ~11 KB/s, so even an 8 MB sample
+  // (the cap) drains in well under that.
+  std::chrono::steady_clock::time_point transferDeadline{};
+  constexpr int kTransferTimeoutSec = 90;
   bool sampleLaunched = false;
   bool sampleReported = false;
   constexpr uint32_t kProcessPollEveryTicks = 2; // ~2s between snapshots
@@ -374,9 +393,7 @@ int RunHostChannelLoop(std::string reason, bool serviceMode) {
         }
         const auto chunk = antimal::ParseSampleChunkPayload(frame->payload);
         if (!chunk || !reassembler->Add(*chunk)) {
-          auto rejected = MakeAgentEvent("agent.job.rejected", "execute");
-          rejected.details["reason"] = "sample-transfer-error";
-          (void)SendAgentEvent(com2, rejected);
+          SendExecuteFailure(com2, "sample-transfer-error");
           executeReq.reset();
           reassembler.reset();
           continue;
@@ -386,6 +403,11 @@ int RunHostChannelLoop(std::string reason, bool serviceMode) {
               LaunchExecuteJob(com2, *executeReq, reassembler->Bytes(),
                                &sampleProcess, &samplePid, &sampleDeadline);
           if (!sampleLaunched) {
+            // LaunchExecuteJob already emitted the specific failure Event
+            // (write-failed / create-failed); add the completion signal.
+            (void)SendFrame(com2, antimal::HostChannelMessage::ReportComplete,
+                            "status=error\nsampleExecuted=false\n"
+                            "reason=sample-launch-failed\n");
             executeReq.reset();
             reassembler.reset();
           }
@@ -402,17 +424,22 @@ int RunHostChannelLoop(std::string reason, bool serviceMode) {
         // accepting the transfer; a host that armed execution without the guest
         // being authorized is rejected here.
         if (!GuestExecutionAuthorized()) {
+          // Terminal: the host armed execution but the guest's own key is not
+          // set. Report it so the operator sees the gate was closed in-guest.
+          SendExecuteFailure(com2, "sample-execution-not-authorized");
+        } else if (req.sampleBytes == 0) {
+          SendExecuteFailure(com2, "empty-sample");
+        } else if (executeReq || sampleLaunched) {
+          // A job is already in flight -- not terminal for that job, so this is
+          // a plain rejection with no ReportComplete.
           auto rejected = MakeAgentEvent("agent.job.rejected", "execute");
-          rejected.details["reason"] = "sample-execution-not-authorized";
-          (void)SendAgentEvent(com2, rejected);
-        } else if (req.sampleBytes == 0 || executeReq || sampleLaunched) {
-          auto rejected = MakeAgentEvent("agent.job.rejected", "execute");
-          rejected.details["reason"] =
-              req.sampleBytes == 0 ? "empty-sample" : "execute-already-active";
+          rejected.details["reason"] = "execute-already-active";
           (void)SendAgentEvent(com2, rejected);
         } else {
           executeReq = req;
           reassembler.emplace(req.sampleBytes);
+          transferDeadline = std::chrono::steady_clock::now() +
+                             std::chrono::seconds(kTransferTimeoutSec);
           auto started = MakeAgentEvent("agent.job.start", "execute");
           started.details["kind"] = "execute";
           started.details["sampleName"] = req.sampleName;
@@ -430,6 +457,23 @@ int RunHostChannelLoop(std::string reason, bool serviceMode) {
         rejected.details["reason"] = "unsupported-job";
         (void)SendAgentEvent(com2, rejected);
       }
+    }
+
+    // Transfer watchdog: an execute job was armed but the sample never fully
+    // arrived within the budget (a dropped/never-delivered chunk). Fail it with a
+    // ReportComplete so the host finalizes instead of heartbeating to maxTicks.
+    if (executeReq && !sampleLaunched &&
+        std::chrono::steady_clock::now() >= transferDeadline) {
+      auto note = MakeAgentEvent("agent.sample.transfer-timeout",
+                                 executeReq->sampleName);
+      note.details["received"] =
+          std::to_string(reassembler ? reassembler->Received() : 0);
+      note.details["expected"] =
+          std::to_string(reassembler ? reassembler->Expected() : 0);
+      (void)SendAgentEvent(com2, note);
+      SendExecuteFailure(com2, "sample-transfer-timeout");
+      executeReq.reset();
+      reassembler.reset();
     }
 
     // Track a launched sample to exit/timeout, then send ReportComplete. The

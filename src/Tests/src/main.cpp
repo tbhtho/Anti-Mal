@@ -447,6 +447,34 @@ void TestSerialThreInterruptIsEdgeTriggered() {
   Expect(com.InterruptPending(), "THRE: RX still pending after IIR read (level)");
 }
 
+// Regression for the detonation "intermittent delivery" failure: the host queues
+// a host->guest payload (a JobStart + the sample as SampleChunk frames) into the
+// COM2 RX deque before the guest opens COM2. serial.sys writes FCR with the
+// RX-FIFO-reset bit (bit 1) during driver init -- that must NOT flush the queued
+// delivery backlog (it models the 16-byte hardware FIFO on real hardware, not our
+// multi-KB delivery deque), or an in-flight authorized sample is silently dropped.
+void TestSerialRxFifoResetPreservesBacklog() {
+  using SC = antimal::hv::SerialConsole;
+  const uint16_t base = SC::kCom2Base;
+  SC com(base);
+  const std::vector<uint8_t> payload = {0x41, 0x4D, 0x43, 0x48, 0x01, 0x02, 0x03};
+  com.QueueRxBytes(payload);
+  Expect(com.RxQueuedBytes() == payload.size(), "RX reset: backlog queued");
+
+  com.OnWrite(base + 2, 0x02, 1); // FCR write with RX-FIFO-reset (bit 1)
+  Expect(com.RxQueuedBytes() == payload.size(),
+         "RX reset: FCR FIFO-reset preserves the host->guest backlog");
+  Expect(com.Stats().rxFifoResetRequests == 1,
+         "RX reset: the reset request is still recorded");
+  Expect(com.Stats().rxBytesCleared == 0, "RX reset: nothing was cleared");
+
+  for (size_t i = 0; i < payload.size(); ++i) {
+    Expect((com.OnRead(base + 5, 1) & 0x01u) != 0, "RX reset: data-ready stays set");
+    Expect(static_cast<uint8_t>(com.OnRead(base, 1) & 0xFFu) == payload[i],
+           "RX reset: every byte survives, in order");
+  }
+}
+
 void TestKdSerialDebuggerPackets() {
   using Kd = antimal::hv::KdSerialDebugger;
   Kd kd;
@@ -4637,6 +4665,7 @@ int main() {
     TestProcessTelemetryDiff();
     TestCom2UartFrames();
     TestSerialThreInterruptIsEdgeTriggered();
+    TestSerialRxFifoResetPreservesBacklog();
     TestPs2QueuedInput();
     TestTpm2CrbDevice();
     TestAcpiTables();
