@@ -266,6 +266,22 @@ bool LaunchSampleProcess(const std::filesystem::path &path, DWORD *pid,
   return true;
 }
 
+// True when an interactive user is logged in to the active console session (the
+// desktop is up). Used to defer the sample launch until SP5 can place it on the
+// visible desktop instead of headless session 0.
+bool HasInteractiveSession() {
+  const DWORD sid = WTSGetActiveConsoleSessionId();
+  if (sid == 0xFFFFFFFFu) {
+    return false;
+  }
+  HANDLE token = nullptr;
+  if (!WTSQueryUserToken(sid, &token)) {
+    return false;
+  }
+  CloseHandle(token);
+  return true;
+}
+
 // Writes the reassembled sample to a per-run guest directory and launches it.
 // Emits agent.sample.received + process.create over COM2. Returns true and fills
 // proc/pid/deadline on success; false (with a failure event) otherwise.
@@ -409,12 +425,20 @@ int RunHostChannelLoop(std::string reason, bool serviceMode) {
   std::chrono::steady_clock::time_point sampleDeadline{};
   // Bounds the sample TRANSFER (JobStart -> all SampleChunks). Without it, a lost
   // chunk would leave the agent waiting on Complete() forever (24h in service
-  // mode). 90s is generous: the COM2 link is ~11 KB/s, so even an 8 MB sample
-  // (the cap) drains in well under that.
+  // mode). Paced host->guest delivery (SetPacedCom2Payload) intentionally drips
+  // ~100 KB over ~80-100s to avoid overrunning the serial RX in-queue, so the
+  // deadline must clear that with headroom -- 300s bounds even a near-cap sample.
   std::chrono::steady_clock::time_point transferDeadline{};
-  constexpr int kTransferTimeoutSec = 90;
+  constexpr int kTransferTimeoutSec = 300;
   bool sampleLaunched = false;
   bool sampleReported = false;
+  // SP5 deferred launch: after the transfer completes the agent waits (up to
+  // kLaunchWaitSec) for a logged-in desktop session before launching, so the
+  // sample runs VISIBLY on the live desktop rather than headless in session 0
+  // during the login transition. A no-login boot still detonates after the wait.
+  bool sampleStaged = false;
+  std::chrono::steady_clock::time_point launchDeadline{};
+  constexpr int kLaunchWaitSec = 150;
   constexpr uint32_t kProcessPollEveryTicks = 2; // ~2s between snapshots
   constexpr uint32_t kFilePollEveryTicks = 5;    // file walk is heavier
   constexpr size_t kProcessBaselineCap = 64;
@@ -440,19 +464,17 @@ int RunHostChannelLoop(std::string reason, bool serviceMode) {
           reassembler.reset();
           continue;
         }
-        if (reassembler->Complete()) {
-          sampleLaunched =
-              LaunchExecuteJob(com2, *executeReq, reassembler->Bytes(),
-                               &sampleProcess, &samplePid, &sampleDeadline);
-          if (!sampleLaunched) {
-            // LaunchExecuteJob already emitted the specific failure Event
-            // (write-failed / create-failed); add the completion signal.
-            (void)SendFrame(com2, antimal::HostChannelMessage::ReportComplete,
-                            "status=error\nsampleExecuted=false\n"
-                            "reason=sample-launch-failed\n");
-            executeReq.reset();
-            reassembler.reset();
-          }
+        if (reassembler->Complete() && !sampleStaged) {
+          // Transfer done. Defer the launch until a desktop session is logged in
+          // (checked each tick below), so the sample lands ON the live desktop
+          // (SP5) instead of headless session 0 during the login transition.
+          sampleStaged = true;
+          launchDeadline = std::chrono::steady_clock::now() +
+                           std::chrono::seconds(kLaunchWaitSec);
+          auto staged =
+              MakeAgentEvent("agent.sample.staged", executeReq->sampleName);
+          staged.details["waitingForDesktop"] = "true";
+          (void)SendAgentEvent(com2, staged);
         }
         continue;
       }
@@ -504,7 +526,9 @@ int RunHostChannelLoop(std::string reason, bool serviceMode) {
     // Transfer watchdog: an execute job was armed but the sample never fully
     // arrived within the budget (a dropped/never-delivered chunk). Fail it with a
     // ReportComplete so the host finalizes instead of heartbeating to maxTicks.
-    if (executeReq && !sampleLaunched &&
+    // Suppressed once the transfer is staged (waiting on the desktop, not the
+    // transfer).
+    if (executeReq && !sampleLaunched && !sampleStaged &&
         std::chrono::steady_clock::now() >= transferDeadline) {
       auto note = MakeAgentEvent("agent.sample.transfer-timeout",
                                  executeReq->sampleName);
@@ -516,6 +540,26 @@ int RunHostChannelLoop(std::string reason, bool serviceMode) {
       SendExecuteFailure(com2, "sample-transfer-timeout");
       executeReq.reset();
       reassembler.reset();
+    }
+
+    // Deferred launch (SP5): the transfer is staged; launch the sample as soon as
+    // a desktop session is logged in (so it runs VISIBLY on the live desktop), or
+    // after the wait budget so a no-login boot still detonates (headless).
+    if (sampleStaged && !sampleLaunched && executeReq && reassembler) {
+      if (HasInteractiveSession() ||
+          std::chrono::steady_clock::now() >= launchDeadline) {
+        sampleLaunched =
+            LaunchExecuteJob(com2, *executeReq, reassembler->Bytes(),
+                             &sampleProcess, &samplePid, &sampleDeadline);
+        sampleStaged = false;
+        if (!sampleLaunched) {
+          (void)SendFrame(com2, antimal::HostChannelMessage::ReportComplete,
+                          "status=error\nsampleExecuted=false\n"
+                          "reason=sample-launch-failed\n");
+          executeReq.reset();
+          reassembler.reset();
+        }
+      }
     }
 
     // Track a launched sample to exit/timeout, then send ReportComplete. The
