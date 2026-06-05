@@ -22,6 +22,6 @@ intel_malwarebazaar = true
 virustotal_api_key = ""
 
 # Dynamic-observation knobs. Read by GuestAgent.
-dynamic_execution_enabled = false
+dynamic_execution_enabled = true
 collect_screenshots = true
 screenshot_interval_ms = 2000
