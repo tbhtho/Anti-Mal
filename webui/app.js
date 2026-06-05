@@ -344,6 +344,9 @@
     var SYM = { '-': 0x0C, '=': 0x0D, '[': 0x1A, ']': 0x1B, ';': 0x27, "'": 0x28, '`': 0x29, '\\': 0x2B, ',': 0x33, '.': 0x34, '/': 0x35 };
     var SH = { '!': 0x02, '@': 0x03, '#': 0x04, '$': 0x05, '%': 0x06, '^': 0x07, '&': 0x08, '*': 0x09, '(': 0x0A, ')': 0x0B, '_': 0x0C, '+': 0x0D, '{': 0x1A, '}': 0x1B, ':': 0x27, '"': 0x28, '~': 0x29, '|': 0x2B, '<': 0x33, '>': 0x34, '?': 0x35 };
     var SPECIAL = { Enter: 0x1C, Backspace: 0x0E, Tab: 0x0F, Escape: 0x01, ' ': 0x39 };
+    // Extended (0xE0-prefixed) keys: arrows + navigation.
+    var EXT = { ArrowUp: 0x48, ArrowDown: 0x50, ArrowLeft: 0x4B, ArrowRight: 0x4D, Delete: 0x53, Home: 0x47, End: 0x4F, PageUp: 0x49, PageDown: 0x51, Insert: 0x52 };
+    if (EXT[key] != null) { var ec = EXT[key]; return [0xE0, ec, 0xE0, ec | 0x80]; }
     var code = null, shift = false;
     if (key && key.length === 1) {
       var lc = key.toLowerCase();
@@ -455,11 +458,12 @@
       // so focus can't escape the frame mid-session.
       lf.addEventListener('keydown', function (e) {
         if (!livePollTimer) return;
-        var sc = keyToScancodes(e);
-        if (!sc) { if (e.key === 'Tab') e.preventDefault(); return; }
+        // Eat EVERY key while the frame is focused so nothing can scroll or
+        // activate the page (arrows, space, Tab, Enter all stay in the VM).
         e.preventDefault();
         e.stopPropagation();
-        send('vm.input', { scancodes: sc });
+        var sc = keyToScancodes(e);
+        if (sc) send('vm.input', { scancodes: sc });
       });
       lf.addEventListener('focus', function () {
         lf.style.outline = '2px solid #4ea1ff';
