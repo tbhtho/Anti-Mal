@@ -112,12 +112,34 @@ void LoopbackConnect() {
 
 }  // namespace
 
+// Opens Notepad on the probe's own dropped file. When the agent launches the
+// sample into the interactive desktop session (SP5), this window is VISIBLE on
+// the live desktop — the analyst sees the sample do something. In a headless
+// session-0 launch it simply runs without a visible window. Benign.
+void ShowVisibleWindow() {
+  STARTUPINFOW si{};
+  si.cb = sizeof(si);
+  si.dwFlags = STARTF_USESHOWWINDOW;
+  si.wShowWindow = SW_SHOWNORMAL;
+  PROCESS_INFORMATION pi{};
+  wchar_t cmd[] =
+      L"notepad.exe C:\\Users\\Public\\antimal-probe-drop.txt";
+  if (CreateProcessW(nullptr, cmd, nullptr, nullptr, FALSE, 0, nullptr, nullptr,
+                     &si, &pi)) {
+    CloseHandle(pi.hThread);
+    CloseHandle(pi.hProcess);
+  }
+}
+
 int main() {
   DropFile(L"C:\\Users\\Public\\antimal-probe-drop.txt",
-           "AntiMal benign detonation probe ran here.\n");
+           "AntiMal benign detonation probe ran here.\r\n"
+           "If you can see this in Notepad, the sample launched on the live "
+           "desktop (SP5 visible-session launch).\r\n");
   DropFile(L"C:\\Windows\\Temp\\antimal-probe-temp.txt",
            "AntiMal benign detonation probe temp drop.\n");
   WriteFakePersistence();
+  ShowVisibleWindow();
   SpawnChild();
   LoopbackConnect();
   return 0;

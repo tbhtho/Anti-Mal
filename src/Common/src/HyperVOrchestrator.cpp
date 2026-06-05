@@ -4531,6 +4531,7 @@ struct BootOverlayPatchResult {
   int ciBypassBootmgrFilesPatched = 0;
   bool guestExecAuthProbeEnabled = false;
   bool guestExecAuthArmed = false;
+  bool freshAgentDeployed = false;
   std::vector<std::string> notes;
 };
 
@@ -6298,6 +6299,42 @@ BootOverlayPatchResult ApplyEphemeralBootOverlay(hv::IBlockDevice &disk) {
         "guest-exec arm enabled by ANTIMAL_ARM_GUEST_EXEC");
     ArmGuestExecAuthInOverlay(disk, &result);
   }
+  // Opt-in: deploy a freshly-built GuestAgent into THIS run's disposable overlay
+  // (clobber+repoint, same as `base deploy-agent`) so agent iteration doesn't
+  // require mutating the promoted snapshot. ANTIMAL_FRESH_AGENT_PATH points at the
+  // built AntiMal.GuestAgent.exe. The snapshot already repoints the service at the
+  // Segoe-emoji font slot, so re-clobbering it in the overlay shadows the baked
+  // agent with the new one. Base VHDX untouched.
+  if (EnvFlagEnabled("ANTIMAL_DEPLOY_FRESH_AGENT")) {
+    result.notes.push_back(
+        "fresh-agent deploy enabled by ANTIMAL_DEPLOY_FRESH_AGENT");
+    char buf[1024]{};
+    size_t need = 0;
+    std::filesystem::path agentPath;
+    if (getenv_s(&need, buf, sizeof(buf), "ANTIMAL_FRESH_AGENT_PATH") == 0 &&
+        need > 1 && buf[0] != '\0') {
+      agentPath = std::filesystem::path(buf);
+    }
+    std::error_code aec;
+    if (agentPath.empty() || !std::filesystem::exists(agentPath, aec)) {
+      result.notes.push_back(
+          "fresh-agent deploy: ANTIMAL_FRESH_AGENT_PATH missing or not found");
+    } else {
+      std::vector<uint8_t> agentBytes;
+      try {
+        agentBytes = ReadAllBytes(agentPath);
+      } catch (...) {
+      }
+      if (agentBytes.empty()) {
+        result.notes.push_back("fresh-agent deploy: could not read agent bytes");
+      } else {
+        result.freshAgentDeployed = DeployExecAgentToOpenOverlay(
+            disk, agentBytes, "Windows\\Fonts\\seguiemj.ttf",
+            "C:\\Windows\\Fonts\\seguiemj.ttf", "AntiMalGuestAgent",
+            &result.notes);
+      }
+    }
+  }
   return result;
 }
 
@@ -6400,6 +6437,7 @@ BootOverlayPatchDetails(const BootOverlayPatchResult &patch) {
       {"guestExecAuthProbeEnabled",
        patch.guestExecAuthProbeEnabled ? "true" : "false"},
       {"guestExecAuthArmed", patch.guestExecAuthArmed ? "true" : "false"},
+      {"freshAgentDeployed", patch.freshAgentDeployed ? "true" : "false"},
       {"scope", "overlay-only"}};
   if (!patch.notes.empty()) {
     details["notes"] = JoinStrings(patch.notes, "; ");

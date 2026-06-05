@@ -43,8 +43,15 @@ $env:ANTIMAL_PROBE_WINLOAD_DEBUG = $null
 $env:ANTIMAL_PROBE_BCD_KERNEL_DEBUG = $null
 $env:ANTIMAL_PROBE_OOBE_KEYS = $null
 $env:ANTIMAL_PROBE_OOBE_AUTOLOGON = $null
+# Reach the logged-in desktop hands-free so SP5 can launch the sample VISIBLY in
+# the interactive session (plaintext autologon fails on 25H2; type the password).
+$env:ANTIMAL_PROBE_LOGIN_PASSWORD = "AntiMal!23"
 # Third detonation key: arm the guest-side gate in THIS run's disposable overlay.
 $env:ANTIMAL_ARM_GUEST_EXEC = "1"
+# Deploy the freshly-built GuestAgent into the disposable overlay (so SP5 / agent
+# changes take effect without re-snapshotting). Snapshot + base stay untouched.
+$env:ANTIMAL_DEPLOY_FRESH_AGENT = "1"
+$env:ANTIMAL_FRESH_AGENT_PATH = (Resolve-Path (Join-Path $bin "AntiMal.GuestAgent.exe")).Path
 
 Write-Host ("Detonating {0} (timeout {1}s) -- execution armed: config + --allow-execution + ANTIMAL_ARM_GUEST_EXEC" -f $Sample, $TimeoutSec)
 $vm = Start-Process "$bin\AntiMal.HostCli.exe" `

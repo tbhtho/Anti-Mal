@@ -13,6 +13,8 @@
 #include "antimal/Screenshot.h"
 
 #include <Windows.h>
+#include <UserEnv.h>   // CreateEnvironmentBlock (visible-session launch)
+#include <WtsApi32.h>  // WTSQueryUserToken (active console session token)
 
 #include <algorithm>
 #include <atomic>
@@ -207,20 +209,55 @@ bool WriteFileBytes(const std::filesystem::path &path,
   return ok;
 }
 
-// Launches the delivered sample. CreateProcessW runs it in the agent's session
-// (session 0 for the installed service); the process telemetry collector below
-// captures its subtree regardless of session. Visible-desktop launch
-// (CreateProcessAsUser into the active session) is a later refinement (SP5).
+// Launches the delivered sample. SP5: when an interactive console session is
+// logged in, launch the sample INTO that session (CreateProcessAsUserW on
+// winsta0\\default) so it runs VISIBLY on the desktop the analyst is watching --
+// the Any.Run experience. Falls back to a headless session-0 CreateProcessW when
+// no console session is available (e.g. still at the lock screen). The process
+// telemetry collector captures its subtree either way. `*interactive` reports
+// which path was taken so the host can show it.
 bool LaunchSampleProcess(const std::filesystem::path &path, DWORD *pid,
-                         HANDLE *proc) {
+                         HANDLE *proc, bool *interactive) {
+  if (interactive) *interactive = false;
+  std::wstring cmd = L"\"" + path.wstring() + L"\"";
+  cmd.push_back(L'\0');  // CreateProcess* may write into the buffer.
+  const std::wstring workdir = path.parent_path().wstring();
+  const wchar_t *cwd = workdir.empty() ? nullptr : workdir.c_str();
+
+  const DWORD sessionId = WTSGetActiveConsoleSessionId();
+  if (sessionId != 0xFFFFFFFFu) {
+    HANDLE userToken = nullptr;
+    if (WTSQueryUserToken(sessionId, &userToken)) {
+      STARTUPINFOW si{};
+      si.cb = sizeof(si);
+      wchar_t desktop[] = L"winsta0\\default";
+      si.lpDesktop = desktop;
+      PROCESS_INFORMATION pi{};
+      LPVOID env = nullptr;
+      const bool haveEnv =
+          CreateEnvironmentBlock(&env, userToken, FALSE) != FALSE;
+      const BOOL ok = CreateProcessAsUserW(
+          userToken, nullptr, cmd.data(), nullptr, nullptr, FALSE,
+          (haveEnv ? CREATE_UNICODE_ENVIRONMENT : 0u) | CREATE_NEW_CONSOLE,
+          haveEnv ? env : nullptr, cwd, &si, &pi);
+      if (haveEnv) DestroyEnvironmentBlock(env);
+      CloseHandle(userToken);
+      if (ok) {
+        CloseHandle(pi.hThread);
+        *pid = pi.dwProcessId;
+        *proc = pi.hProcess;
+        if (interactive) *interactive = true;
+        return true;
+      }
+      // No usable interactive session -> fall through to the session-0 launch.
+    }
+  }
+
   STARTUPINFOW si{};
   si.cb = sizeof(si);
   PROCESS_INFORMATION pi{};
-  std::wstring cmd = L"\"" + path.wstring() + L"\"";
-  cmd.push_back(L'\0');  // CreateProcessW may write into the buffer.
-  const std::wstring workdir = path.parent_path().wstring();
   if (!CreateProcessW(nullptr, cmd.data(), nullptr, nullptr, FALSE, 0, nullptr,
-                      workdir.empty() ? nullptr : workdir.c_str(), &si, &pi)) {
+                      cwd, &si, &pi)) {
     return false;
   }
   CloseHandle(pi.hThread);
@@ -259,7 +296,9 @@ bool LaunchExecuteJob(HANDLE com2, const antimal::ExecuteJobRequest &req,
 
   DWORD launchedPid = 0;
   HANDLE launchedProc = nullptr;
-  if (!LaunchSampleProcess(samplePath, &launchedPid, &launchedProc)) {
+  bool interactive = false;
+  if (!LaunchSampleProcess(samplePath, &launchedPid, &launchedProc,
+                           &interactive)) {
     auto fail = MakeAgentEvent("process.create-failed",
                                antimal::PathToUtf8(samplePath));
     fail.category = "process";
@@ -276,6 +315,9 @@ bool LaunchExecuteJob(HANDLE com2, const antimal::ExecuteJobRequest &req,
   created.category = "process";
   created.processId = launchedPid;
   created.details["sampleExecuted"] = "true";
+  // SP5: "desktop" = launched into the active interactive session (visible on
+  // the live desktop); "service" = headless session-0 fallback (no logon yet).
+  created.details["session"] = interactive ? "desktop" : "service";
   (void)SendAgentEvent(com2, created);
   return true;
 }
