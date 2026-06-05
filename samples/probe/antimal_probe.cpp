@@ -142,5 +142,9 @@ int main() {
   ShowVisibleWindow();
   SpawnChild();
   LoopbackConnect();
+  // Stay alive a while so the live desktop finishes rendering and the analyst
+  // (or the screenshot filmstrip) actually sees the Notepad window — the sample
+  // is launched the moment the desktop session appears, which can be mid-login.
+  std::this_thread::sleep_for(std::chrono::seconds(75));
   return 0;
 }
