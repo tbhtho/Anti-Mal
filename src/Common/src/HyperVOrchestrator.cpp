@@ -10539,8 +10539,14 @@ DetonationResult InHouseOrchestrator::PrepareAndRun(
       // the 2-heartbeat "agent alive" probe (the sample needs ~tens of seconds to
       // be delivered, launched, and observed) -- it stops on ReportComplete or the
       // detonation timeout instead.
+      // Key 1 is config dynamic_execution_enabled OR an explicit per-run override
+      // (ANTIMAL_FORCE_DYNAMIC_EXEC) the GUI sets when the analyst clicks Detonate
+      // -- the click IS the consent. It still requires key 2 (PerRunExecution-
+      // Authorized / --allow-execution), so this is not a silent bypass.
       const bool executionAuthorized =
-          config_.dynamicExecutionEnabled && PerRunExecutionAuthorized();
+          (config_.dynamicExecutionEnabled ||
+           EnvFlagEnabled("ANTIMAL_FORCE_DYNAMIC_EXEC")) &&
+          PerRunExecutionAuthorized();
       auto stopAfterGuestAgentProbe = std::make_shared<std::atomic_bool>(false);
       request.cancelRequested = stopAfterGuestAgentProbe;
       auto liveHostChannel = std::make_shared<hv::HostSerialChannel>();

@@ -121,13 +121,13 @@
       var steps = [['OVMF firmware', 'done'], ['bootmgfw.efi', 'done'], ['winload.efi', 'done'], ['ntoskrnl', 'done'], ['AHCI storage mount', 'done'], ['win32k / GUI stack', 'done'], ['Getting Ready (OOBE)', 'done'], ['GuestAgent heartbeat', 'cur'], ['Artifact return', 'todo']];
       return '<h1 class="page-title">VM Analysis</h1><p class="page-sub">In-house WHP sandbox: live view, state, boot timeline, and safety gates.</p>' +
         '<div class="panel"><h2>Live VM <span id="vm-live-status" class="page-sub" style="font-weight:400"></span></h2>' +
-        '<div class="actions"><button class="btn primary" id="vm-boot-btn">Boot VM (live)</button><button class="btn" id="vm-stop-btn">Stop</button></div>' +
-        '<div class="screenframe" id="live-frame" style="margin-top:12px">Click “Boot VM (live)” to start an isolated VM session and watch it here.</div></div>' +
+        '<div class="actions"><button class="btn primary" id="vm-boot-btn">Boot VM (live)</button><button class="btn danger" id="vm-detonate-btn">Detonate Sample (live)</button><button class="btn" id="vm-stop-btn">Stop</button></div>' +
+        '<div class="screenframe" id="live-frame" style="margin-top:12px">Click “Boot VM (live)” for a clean session, or “Detonate Sample (live)” to run a BENIGN sample inside it — watch it execute here.</div></div>' +
         '<div class="panel"><h2>Live Process Telemetry <span id="vm-telemetry-status" class="page-sub" style="font-weight:400"></span></h2>' +
         '<div id="vm-events"><p class="page-sub" style="margin:0">No events yet — boot the VM to stream live process activity from the GuestAgent over COM2.</p></div></div>' +
         '<div class="row"><div class="panel" style="flex:1;min-width:280px"><h2>VM State</h2>' +
         '<div id="vm-state"><p class="page-sub" style="margin:0">Loading…</p></div>' +
-        '<p class="page-sub" style="margin:8px 0 0">Use “Boot VM (live)” above to start a session. In-VM sample detonation is not wired yet (boots run a GuestAgent healthcheck only).</p></div>' +
+        '<p class="page-sub" style="margin:8px 0 0">“Boot VM (live)” starts a clean interactive session; “Detonate Sample (live)” runs a chosen BENIGN sample inside it and streams its process / registry / file / network behavior below.</p></div>' +
         '<div class="panel" style="flex:1;min-width:260px"><h2>Boot Timeline</h2><ul class="timeline">' +
         steps.map(function (s) { return '<li class="' + s[1] + '"><span class="mark"></span>' + esc(s[0]) + '</li>'; }).join('') + '</ul></div></div>' +
         '<div class="panel"><h2>Safety Gates</h2><div id="vm-gates"><p class="page-sub" style="margin:0">Loading…</p></div></div>';
@@ -413,8 +413,10 @@
         if (ok) startLivePoll();
       });
     };
+    var db = $('#vm-detonate-btn');
+    if (db) db.onclick = function () { onAction('detonate.selected'); };
     var sb = $('#vm-stop-btn');
-    if (sb) sb.onclick = function () { send('vm.stop'); stopLivePoll(); liveWatchRun = null; appendLog('WARN', 'Live VM stopped.'); var box = $('#live-frame'); if (box) box.textContent = 'Stopped.'; var s = $('#vm-live-status'); if (s) s.textContent = '· stopped'; var ts = $('#vm-telemetry-status'); if (ts) ts.textContent = '· stopped'; };
+    if (sb) sb.onclick = function () { send('vm.stop'); stopLivePoll(); liveWatchRun = null; appendLog('WARN', 'Live VM stopped.'); var box = $('#live-frame'); if (box) box.textContent = 'Stopped.'; var s = $('#vm-live-status'); if (s) s.textContent = '· stopped'; var ts = $('#vm-telemetry-status'); if (ts) ts.textContent = '· stopped'; var mb = $('#mode-badge'); if (mb) { mb.className = 'badge idle'; mb.innerHTML = '<span class="dot"></span>Sandbox Ready'; } };
     // Live mouse: route movement/clicks over the frame into the guest (relative
     // PS/2 mouse). Movement deltas are scaled from displayed px to guest px and
     // accumulated; flushLiveMouse sends them ~20/s. Buttons go immediately.
@@ -567,7 +569,20 @@
       return;
     }
     if (cmd === 'detonate.selected') {
-      appendLog('WARN', label + ' — dynamic execution wiring lands in P5.');
+      appendLog('WARN', 'Detonate — pick a BENIGN sample to execute live in the VM…');
+      send('vm.detonate').then(function (r) {
+        var res = (r && r.result) || {};
+        if (res.cancelled) { appendLog('INFO', 'Detonate cancelled.'); return; }
+        if (!res.started) { appendLog('ERROR', 'Detonate failed: ' + String(res.error || 'unknown')); return; }
+        appendLog('WARN', 'Detonating ' + (res.sample || 'sample') + ' live' + (res.seeded ? ' (seed-boot)' : ' (cold boot)') + ' — watch it run on VM Analysis.');
+        var mb = $('#mode-badge'); if (mb) { mb.className = 'badge blocked'; mb.innerHTML = '<span class="dot"></span>Detonating'; }
+        if (currentPage !== 'vm') route('vm');
+        // The VM page just mounted; start streaming the framebuffer + telemetry.
+        setTimeout(function () {
+          startLivePoll();
+          var s = $('#vm-live-status'); if (s) s.textContent = '· detonating ' + (res.sample || '');
+        }, 80);
+      });
       return;
     }
     appendLog('INFO', label + ' requested.');

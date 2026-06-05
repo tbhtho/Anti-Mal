@@ -906,6 +906,13 @@ void WebViewHost::RegisterHandlers() {
       // Full OOBE sets AutoAdminLogon via the in-guest script; no login typing.
       SetEnvironmentVariableW(L"ANTIMAL_PROBE_LOGIN_PASSWORD", nullptr);
     }
+    // vm.boot is always a non-executing healthcheck boot -- clear any stale
+    // detonate arming a prior vm.detonate left in this process's environment so
+    // a plain "Boot VM" can never execute a sample.
+    SetEnvironmentVariableW(L"ANTIMAL_FORCE_DYNAMIC_EXEC", nullptr);
+    SetEnvironmentVariableW(L"ANTIMAL_AUTHORIZE_EXECUTION", nullptr);
+    SetEnvironmentVariableW(L"ANTIMAL_ARM_GUEST_EXEC", nullptr);
+    SetEnvironmentVariableW(L"ANTIMAL_DEPLOY_FRESH_AGENT", nullptr);
     std::wstring cmd = L"\"" + hostCli.wstring() + L"\" detonate \"" +
                        sample.wstring() +
                        L"\" --network disabled --timeout-sec 1200";
@@ -925,6 +932,83 @@ void WebViewHost::RegisterHandlers() {
     CloseHandle(pi.hProcess);
     return std::string("{\"started\":true,\"seeded\":") +
            (seeded ? "true" : "false") + "}";
+  });
+
+  // Detonate a CHOSEN sample LIVE: same seed-boot as vm.boot, but picks a sample,
+  // arms the three-key execution gate (the Detonate click is the analyst's
+  // consent), and deploys the execute-capable agent into the disposable overlay,
+  // then runs `detonate <sample> --allow-execution`. The UI streams the
+  // framebuffer + telemetry so the sample is watched running on the live desktop.
+  // Base VHDX + promoted snapshot are never written. USE BENIGN SAMPLES.
+  router_.Register("vm.detonate", [this](const JsonValue &) -> std::string {
+    namespace fs = std::filesystem;
+    const std::wstring sample = PickPath(hwnd_, false);
+    if (sample.empty()) {
+      return std::string(R"({"started":false,"cancelled":true})");
+    }
+    const AppConfig c = LoadConfig(DefaultConfigPath());
+    const std::wstring dir = ExeDir();
+    const fs::path hostCli = fs::path(dir) / L"AntiMal.HostCli.exe";
+    const fs::path agent = fs::path(dir) / L"AntiMal.GuestAgent.exe";
+    const fs::path seed = c.workspaceRoot / L"_base" / L"AntiMalDesktop.cow";
+    std::error_code ec;
+    if (!fs::exists(hostCli, ec)) {
+      return std::string(R"({"started":false,"error":"HostCli missing"})");
+    }
+    SetEnvironmentVariableW(L"ANTIMAL_FIRMWARE_NAME", L"OVMF-debug.fd");
+    SetEnvironmentVariableW(L"ANTIMAL_VCPU_COUNT", L"1");
+    SetEnvironmentVariableW(L"ANTIMAL_PROBE_CI_POLICY_OFF", L"1");
+    SetEnvironmentVariableW(L"ANTIMAL_PROBE_CI_POLICY_OFF_AGGRESSIVE", L"1");
+    SetEnvironmentVariableW(L"ANTIMAL_PROBE_BCD_NOINTEGRITYCHECKS", L"1");
+    SetEnvironmentVariableW(L"ANTIMAL_PROBE_BCD_LEGACY_CONTEXT", L"1");
+    SetEnvironmentVariableW(L"ANTIMAL_PROBE_BCD_HYPERVISOR_LAUNCH_OFF", L"1");
+    SetEnvironmentVariableW(L"ANTIMAL_PROBE_SYSTEM_VBS_COMPAT", L"1");
+    const fs::path liveInput = c.workspaceRoot / L"_live-input.bin";
+    { std::ofstream trunc(liveInput, std::ios::binary | std::ios::trunc); }
+    SetEnvironmentVariableW(L"ANTIMAL_LIVE_INPUT", liveInput.wstring().c_str());
+    const bool seeded = fs::exists(seed, ec);
+    if (seeded) {
+      SetEnvironmentVariableW(L"ANTIMAL_SEED_OVERLAY", seed.c_str());
+      SetEnvironmentVariableW(L"ANTIMAL_PROBE_OOBE_KEYS", nullptr);
+      SetEnvironmentVariableW(L"ANTIMAL_PROBE_PRESS_ENTER_SEC", L"40");
+      SetEnvironmentVariableW(L"ANTIMAL_PROBE_LOGIN_PASSWORD", L"AntiMal!23");
+    } else {
+      SetEnvironmentVariableW(L"ANTIMAL_SEED_OVERLAY", nullptr);
+      SetEnvironmentVariableW(L"ANTIMAL_PROBE_OOBE_KEYS", L"250");
+      SetEnvironmentVariableW(L"ANTIMAL_PROBE_PRESS_ENTER_SEC", nullptr);
+      SetEnvironmentVariableW(L"ANTIMAL_PROBE_LOGIN_PASSWORD", nullptr);
+    }
+    // Three-key execution gate + deploy the execute-capable agent into the
+    // disposable overlay so the sample runs (and runs VISIBLY via SP5).
+    SetEnvironmentVariableW(L"ANTIMAL_FORCE_DYNAMIC_EXEC", L"1");   // key 1
+    SetEnvironmentVariableW(L"ANTIMAL_AUTHORIZE_EXECUTION", L"1");  // key 2
+    SetEnvironmentVariableW(L"ANTIMAL_ARM_GUEST_EXEC", L"1");       // key 3
+    SetEnvironmentVariableW(L"ANTIMAL_DEPLOY_FRESH_AGENT", L"1");
+    if (fs::exists(agent, ec)) {
+      SetEnvironmentVariableW(L"ANTIMAL_FRESH_AGENT_PATH",
+                              agent.wstring().c_str());
+    }
+    std::wstring cmd = L"\"" + hostCli.wstring() + L"\" detonate \"" + sample +
+                       L"\" --network disabled --timeout-sec 1200 "
+                       L"--allow-execution";
+    std::vector<wchar_t> cmdBuf(cmd.begin(), cmd.end());
+    cmdBuf.push_back(0);
+    STARTUPINFOW si{};
+    si.cb = sizeof(si);
+    PROCESS_INFORMATION pi{};
+    const BOOL ok =
+        CreateProcessW(nullptr, cmdBuf.data(), nullptr, nullptr, FALSE,
+                       CREATE_NO_WINDOW, nullptr, dir.c_str(), &si, &pi);
+    if (!ok) {
+      return std::string(R"({"started":false,"error":"spawn failed"})");
+    }
+    vmPid_ = pi.dwProcessId;
+    CloseHandle(pi.hThread);
+    CloseHandle(pi.hProcess);
+    const std::string sname =
+        Narrow(fs::path(sample).filename().wstring().c_str());
+    return std::string("{\"started\":true,\"seeded\":") +
+           (seeded ? "true" : "false") + ",\"sample\":" + JsonQuote(sname) + "}";
   });
 
   // Stop the live VM (terminate the spawned HostCli process).

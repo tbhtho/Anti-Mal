@@ -12,14 +12,14 @@
     <!-- Top status bar -->
     <header class="topbar">
       <span class="brand">AntiMal<span class="vx">.VX</span></span>
-      <span class="badge blocked" id="mode-badge"><span class="dot"></span>Execution Blocked</span>
+      <span class="badge idle" id="mode-badge"><span class="dot"></span>Sandbox Ready</span>
       <span class="badge idle" id="vm-badge"><span class="dot"></span>VM Idle</span>
       <span class="spacer"></span>
       <div class="actions">
         <button class="btn" data-cmd="scan.file">Scan File</button>
         <button class="btn" data-cmd="scan.folder">Scan Folder</button>
         <button class="btn" data-cmd="scan.computer">Scan Computer</button>
-        <button class="btn danger" data-cmd="detonate.selected" disabled title="In-VM sample detonation is not wired yet — boots run a GuestAgent healthcheck only">Detonate Selected</button>
+        <button class="btn danger" data-cmd="detonate.selected" title="Pick a BENIGN sample and run it live in the VM — watch it execute on the VM Analysis page">Detonate Sample</button>
       </div>
       <div class="segmented" id="network" title="Display only — network mode is set in config/antimal.toml or via detonate --network">
         <button data-net="disabled" class="on" disabled>Disabled</button>
