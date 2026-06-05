@@ -6920,6 +6920,21 @@ bool PatchSystemHivePiixCriticalDevices(std::vector<uint8_t> &bytes,
     }
   }
 
+  // Disable the CPU power-management drivers (intelppm / amdppm / processr).
+  // intelppm recurrently spins on a CPUID loop on the 1-vCPU VM (wedged 3/5
+  // boots in intelppm before the desktop, RIP in intelppm.sys). Native CPU power
+  // management is meaningless in the sandbox, so Start=4 (disabled) keeps it from
+  // loading and removes that hang. Overlay-only; the base is never touched.
+  // Best-effort: a missing service is fine, so it does not fail the patch.
+  for (const auto *svc : {"intelppm", "amdppm", "processr"}) {
+    if (const auto k = FindHivePath(hive, {*controlSet, "Services", svc})) {
+      UpsertHiveDword(hive, *k, "Start", 4);
+      if (const auto startOverride = hive.FindSubkey(*k, "StartOverride")) {
+        UpsertHiveDword(hive, *startOverride, "0", 4);
+      }
+    }
+  }
+
   const std::wstring classGuid =
       L"{4D36E96A-E325-11CE-BFC1-08002BE10318}";
   for (const auto *id : {"pci#ven_8086&dev_7111",
