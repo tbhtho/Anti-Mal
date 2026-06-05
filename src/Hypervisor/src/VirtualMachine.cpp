@@ -2847,6 +2847,11 @@ VmRunSummary VirtualMachine::RunLoop(
     } catch (...) {
       apState.rip = 0;
     }
+    // Identify which module the AP is spinning in (kernel RIPs are global, so
+    // the BSP's image walk resolves them) — names the AP-race rendezvous culprit.
+    if (apState.rip != 0) {
+      (void)IdentifyGuestImage(apState.rip, &apState.image);
+    }
     summary.apStates.push_back(apState);
   }
   if (!summary.fatal &&

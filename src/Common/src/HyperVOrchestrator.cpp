@@ -8815,6 +8815,14 @@ std::string FormatVmDiagnostics(const hv::VmRunSummary &vm) {
       std::string name = "ap" + std::to_string(ap.index) + "RipBytes";
       writeBytes(out, name.c_str(), ap.ripBytes, sizeof(ap.ripBytes));
     }
+    // Name the module the AP is spinning in during the SMP rendezvous (the
+    // documented 2-vCPU AP-race hang). Kernel RIPs are global, so the BSP's
+    // image walk resolves them; this points the next debug pass at the culprit.
+    if (ap.image.valid) {
+      out << "ap" << ap.index << "ImagePdb: " << ap.image.pdbPath << "\n";
+      out << "ap" << ap.index << "ImageBase: 0x" << std::hex << std::uppercase
+          << ap.image.base << std::dec << "\n";
+    }
   }
   out << "watchdogCancellations: " << vm.watchdogCancellations << "\n";
   out << "timerInterruptsRequested: " << vm.timerInterruptsRequested << "\n";

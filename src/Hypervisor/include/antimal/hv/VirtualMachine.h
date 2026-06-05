@@ -73,6 +73,10 @@ struct VmApRunState {
   uint16_t csSelector = 0;
   bool ripBytesValid = false;
   uint8_t ripBytes[32]{};
+  // The image the AP was executing at the capture point — identifies which
+  // driver/module the AP spins in during the 2-vCPU bring-up rendezvous (the
+  // documented AP-race hang). Without this the AP RIP is a bare address.
+  VmGuestImageInfo image;
 };
 
 struct VmRunSummary {
