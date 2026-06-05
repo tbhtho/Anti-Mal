@@ -103,6 +103,29 @@ VhdxRawConversionResult ConvertVhdxToRaw(const std::filesystem::path &vhdxPath,
                                          const std::filesystem::path &rawPath,
                                          bool force);
 
+// Offline deploy of the execute-capable GuestAgent into a COW overlay (the
+// disposable run overlay or a saved desktop snapshot), WITHOUT touching the
+// base VHDX. The in-house NTFS writer is same-size-only and the /MT agent is
+// larger than the agent slot already baked into the image, so this overwrites a
+// large, non-critical existing file (default: the Segoe UI Emoji font) with the
+// padded agent and repoints the AntiMalGuestAgent service ImagePath at it (a
+// same-size hive edit). All writes land in the overlay; the base is read-only.
+struct AgentOverlayDeployResult {
+  bool ok = false;
+  bool clobberWritten = false;
+  bool serviceRepointed = false;
+  uint64_t agentSize = 0;
+  std::vector<std::string> notes;
+};
+
+AgentOverlayDeployResult DeployExecuteAgentIntoOverlay(
+    const std::filesystem::path &baseVhdxPath,
+    const std::filesystem::path &overlayPath,
+    const std::filesystem::path &newAgentExe,
+    const std::string &clobberNtfsPath = "Windows\\Fonts\\seguiemj.ttf",
+    const std::string &clobberGuestPath = "C:\\Windows\\Fonts\\seguiemj.ttf",
+    const std::string &serviceName = "AntiMalGuestAgent");
+
 struct DetonationResult {
   bool started = false;
   bool completed = false;

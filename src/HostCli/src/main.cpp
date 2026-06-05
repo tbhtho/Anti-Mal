@@ -2278,6 +2278,69 @@ void PrintNtfsDataRuns(const std::string &path, const NtfsReader::Entry &entry,
   }
 }
 
+// base deploy-agent: offline-install the execute-capable GuestAgent into a COW
+// overlay (the saved desktop snapshot or a copy of it) WITHOUT touching the
+// base VHDX. Needed because the snapshot carries an older agent build that is
+// too small to overwrite in place; this repurposes a large non-critical file
+// (a font, by default) and repoints the AntiMalGuestAgent service at it.
+int CommandBaseDeployAgent(int argc, wchar_t **argv,
+                           const antimal::AppConfig &config) {
+  const auto vhdxText = OptionValue(argc, argv, "--vhdx");
+  const auto overlayText = OptionValue(argc, argv, "--overlay");
+  const auto agentText = OptionValue(argc, argv, "--agent");
+  const auto clobberText = OptionValue(argc, argv, "--clobber");
+  const auto guestPathText = OptionValue(argc, argv, "--clobber-guest-path");
+  const auto serviceText = OptionValue(argc, argv, "--service");
+  const std::filesystem::path vhdx =
+      vhdxText ? std::filesystem::path(Utf8ToWide(*vhdxText))
+               : config.baseVhdxPath;
+  if (vhdx.empty()) {
+    std::cerr << "base deploy-agent needs --vhdx, or configured base_vhdx_path.\n";
+    return 2;
+  }
+  if (!overlayText) {
+    std::cerr << "base deploy-agent needs --overlay <overlay.cow> (the snapshot "
+                 "to install into; the base VHDX is never modified).\n";
+    return 2;
+  }
+  const std::filesystem::path overlay(Utf8ToWide(*overlayText));
+  std::filesystem::path agent;
+  if (agentText) {
+    agent = std::filesystem::path(Utf8ToWide(*agentText));
+  } else {
+    wchar_t modulePath[MAX_PATH]{};
+    const DWORD n = GetModuleFileNameW(nullptr, modulePath, MAX_PATH);
+    const std::filesystem::path exeDir =
+        n > 0 ? std::filesystem::path(modulePath).parent_path()
+              : std::filesystem::current_path();
+    agent = exeDir / L"AntiMal.GuestAgent.exe";
+  }
+  const std::string clobberNtfs =
+      clobberText ? *clobberText : std::string("Windows\\Fonts\\seguiemj.ttf");
+  const std::string clobberGuest =
+      guestPathText ? *guestPathText
+                    : std::string("C:\\Windows\\Fonts\\seguiemj.ttf");
+  const std::string service =
+      serviceText ? *serviceText : std::string("AntiMalGuestAgent");
+
+  std::cout << "base deploy-agent:\n";
+  std::cout << "  base VHDX (read-only): " << antimal::PathToUtf8(vhdx) << "\n";
+  std::cout << "  overlay (written):     " << antimal::PathToUtf8(overlay)
+            << "\n";
+  std::cout << "  new agent:             " << antimal::PathToUtf8(agent) << "\n";
+  std::cout << "  clobber file:          " << clobberNtfs << "\n";
+  std::cout << "  service:               " << service << "\n";
+
+  const auto result = antimal::DeployExecuteAgentIntoOverlay(
+      vhdx, overlay, agent, clobberNtfs, clobberGuest, service);
+  for (const auto &n : result.notes) {
+    std::cout << "  " << n << "\n";
+  }
+  std::cout << "  agent size: " << result.agentSize << " bytes\n";
+  std::cout << (result.ok ? "DEPLOY OK\n" : "DEPLOY FAILED\n");
+  return result.ok ? 0 : 1;
+}
+
 int CommandBaseInspect(int argc, wchar_t **argv,
                        const antimal::AppConfig &config) {
   const auto vhdxText = OptionValue(argc, argv, "--vhdx");
@@ -2638,6 +2701,9 @@ int CommandBase(int argc, wchar_t **argv) {
   const auto subcommand = Arg(argc, argv, 2);
   if (subcommand == "inspect") {
     return CommandBaseInspect(argc, argv, config);
+  }
+  if (subcommand == "deploy-agent") {
+    return CommandBaseDeployAgent(argc, argv, config);
   }
   if (subcommand != "convert") {
     PrintUsage();

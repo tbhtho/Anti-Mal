@@ -4533,6 +4533,18 @@ bool PatchOverlaySystemBootStorage(hv::IBlockDevice &disk,
                                    BootOverlayPatchResult *result);
 bool PatchOverlayAutologon(hv::IBlockDevice &disk,
                            BootOverlayPatchResult *result);
+// Overwrites a large non-critical guest file (clobberNtfsPath) with the padded
+// execute-capable agent and repoints the AntiMalGuestAgent service ImagePath at
+// it, entirely within the same-size NTFS writer + same-size hive edit (the /MT
+// agent is bigger than the agent slot already in the image, so an in-place
+// replace of the agent file won't fit). Writes land in the open overlay only;
+// the base VHDX is never touched. Returns false (with notes) on any failure.
+bool DeployExecAgentToOpenOverlay(hv::IBlockDevice &disk,
+                                  const std::vector<uint8_t> &agentBytes,
+                                  const std::string &clobberNtfsPath,
+                                  const std::string &clobberGuestPath,
+                                  const std::string &serviceName,
+                                  std::vector<std::string> *notes);
 
 bool AddBcdElementRaw(MutableHiveView &hive, uint32_t elementsKey,
                       const std::string &elementId, uint32_t valueType,
@@ -7134,6 +7146,146 @@ bool PatchOverlayAutologon(hv::IBlockDevice &disk,
   return sys || sam || soft;
 }
 
+bool DeployExecAgentToOpenOverlay(hv::IBlockDevice &disk,
+                                  const std::vector<uint8_t> &agentBytes,
+                                  const std::string &clobberNtfsPath,
+                                  const std::string &clobberGuestPath,
+                                  const std::string &serviceName,
+                                  std::vector<std::string> *notes) {
+  auto note = [&](const std::string &m) {
+    if (notes) notes->push_back("deploy-agent: " + m);
+  };
+  if (agentBytes.size() < 64 || agentBytes[0] != 'M' || agentBytes[1] != 'Z') {
+    note("new agent bytes are not a PE image");
+    return false;
+  }
+  const auto parts = ReadGptPartitionsLite(disk);
+  const auto windows =
+      std::find_if(parts.begin(), parts.end(), [](const GptPartitionLite &p) {
+        return IsWindowsBasicDataGuid(p.typeGuid);
+      });
+  if (windows == parts.end()) {
+    note("Windows partition not found");
+    return false;
+  }
+  NtfsBootFileLocator ntfs(disk, windows->firstLba);
+  if (!ntfs.Init()) {
+    note("Windows NTFS unreadable");
+    return false;
+  }
+
+  // 1) Overwrite a large non-critical file with the padded agent. The in-house
+  //    NTFS writer is same-size only and the agent slot already in the image is
+  //    too small for the /MT agent, so we repurpose a big file (default: the
+  //    Segoe UI Emoji font -- clobbering it is purely cosmetic) and pad the
+  //    agent with trailing zeros to the file's exact size (the PE loader ignores
+  //    the trailing bytes, so it still runs).
+  const auto clobber = ntfs.FindPath(clobberNtfsPath);
+  if (!clobber) {
+    note("clobber file missing: " + clobberNtfsPath);
+    return false;
+  }
+  if (clobber->size < agentBytes.size()) {
+    note("clobber slot too small (" + std::to_string(clobber->size) + " < " +
+         std::to_string(agentBytes.size()) + "): " + clobberNtfsPath);
+    return false;
+  }
+  std::vector<uint8_t> padded = agentBytes;
+  padded.resize(static_cast<size_t>(clobber->size), 0);
+  if (!ntfs.WriteFileSameSize(*clobber, padded)) {
+    note("failed to write agent into clobber slot: " + clobberNtfsPath);
+    return false;
+  }
+
+  // 2) Repoint the AntiMalGuestAgent service ImagePath at the clobber file via a
+  //    same-size hive edit. The new command is shorter than the original, so we
+  //    pad it with trailing spaces (SCM ignores them) to keep the value byte
+  //    length identical -- a same-size in-place write that leaves the hive file
+  //    size unchanged.
+  const auto sysEntry = ntfs.FindPath("Windows\\System32\\config\\SYSTEM");
+  if (!sysEntry) {
+    note("SYSTEM hive missing");
+    return false;
+  }
+  auto hiveBytes = ntfs.ReadFile(*sysEntry, static_cast<size_t>(sysEntry->size));
+  if (hiveBytes.size() != sysEntry->size) {
+    note("SYSTEM hive read truncated");
+    return false;
+  }
+  MutableHiveView hive(hiveBytes);
+  if (!hive.IsValid()) {
+    note("SYSTEM hive invalid");
+    return false;
+  }
+  auto findPath = [&](std::initializer_list<std::string> comps)
+      -> std::optional<uint32_t> {
+    auto cur = hive.RootIndex();
+    for (const auto &c : comps) {
+      if (!cur) return std::nullopt;
+      cur = hive.FindSubkey(*cur, c);
+    }
+    return cur;
+  };
+  // Resolve the booted control set from Select\Current (defaults to 1).
+  std::string controlSet = "ControlSet001";
+  if (const auto select = findPath({"Select"})) {
+    if (const auto cur = hive.FindValue(*select, "Current")) {
+      const auto b = hive.ValueBytes(*cur);
+      if (b.size() >= 4) {
+        const uint32_t n = ReadLe32(b.data());
+        char buf[16];
+        _snprintf_s(buf, sizeof(buf), _TRUNCATE, "ControlSet%03u", n);
+        controlSet = buf;
+      }
+    }
+  }
+  const auto svc = findPath({controlSet, "Services", serviceName});
+  if (!svc) {
+    note("service key missing: " + controlSet + "\\Services\\" + serviceName);
+    return false;
+  }
+  const auto img = hive.FindValue(*svc, "ImagePath");
+  if (!img) {
+    note("ImagePath value missing on " + serviceName);
+    return false;
+  }
+  const auto orig = hive.ValueBytes(*img);
+  if (orig.size() < 4 || (orig.size() % 2) != 0) {
+    note("ImagePath value has unexpected length");
+    return false;
+  }
+  const std::string newCmd = "\"" + clobberGuestPath + "\" --service";
+  const size_t units = orig.size() / 2;   // UTF-16 code units incl. terminator.
+  const size_t availChars = units - 1;     // reserve the null terminator.
+  if (newCmd.size() > availChars) {
+    note("repoint command too long for ImagePath slot (" +
+         std::to_string(newCmd.size()) + " > " + std::to_string(availChars) +
+         ")");
+    return false;
+  }
+  std::vector<uint8_t> newVal(orig.size(), 0);
+  for (size_t i = 0; i < availChars; ++i) {
+    const char ch = i < newCmd.size() ? newCmd[i] : ' ';  // pad with spaces
+    newVal[i * 2] = static_cast<uint8_t>(ch);
+    newVal[i * 2 + 1] = 0;
+  }
+  // The final UTF-16 code unit stays 0x0000 (null terminator).
+  if (!hive.UpsertBinaryValueSameSize(*svc, "ImagePath", img->type, newVal)) {
+    note("failed to set same-size ImagePath");
+    return false;
+  }
+  RefreshRegistryHiveHeader(hiveBytes);
+  if (!ntfs.WriteFileSameSize(*sysEntry, hiveBytes)) {
+    note("failed to write patched SYSTEM hive");
+    return false;
+  }
+  note("ok: clobbered " + clobberNtfsPath + " (" +
+       std::to_string(clobber->size) + "B slot, agent " +
+       std::to_string(agentBytes.size()) + "B) and repointed " + controlSet +
+       "\\Services\\" + serviceName + " -> " + clobberGuestPath);
+  return true;
+}
+
 bool PatchOverlaySystemBootStorage(hv::IBlockDevice &disk,
                                    BootOverlayPatchResult *result) {
   const auto partitions = ReadGptPartitionsLite(disk);
@@ -9297,6 +9449,50 @@ std::string FormatVmDiagnostics(const hv::VmRunSummary &vm) {
 }
 
 } // namespace
+
+AgentOverlayDeployResult DeployExecuteAgentIntoOverlay(
+    const std::filesystem::path &baseVhdxPath,
+    const std::filesystem::path &overlayPath,
+    const std::filesystem::path &newAgentExe,
+    const std::string &clobberNtfsPath, const std::string &clobberGuestPath,
+    const std::string &serviceName) {
+  AgentOverlayDeployResult out;
+  std::vector<uint8_t> agentBytes;
+  {
+    std::ifstream in(newAgentExe, std::ios::binary | std::ios::ate);
+    if (!in) {
+      out.notes.push_back("deploy-agent: cannot open new agent: " +
+                          PathToUtf8(newAgentExe));
+      return out;
+    }
+    const std::streamoff sz = in.tellg();
+    if (sz <= 0) {
+      out.notes.push_back("deploy-agent: new agent is empty: " +
+                          PathToUtf8(newAgentExe));
+      return out;
+    }
+    in.seekg(0, std::ios::beg);
+    agentBytes.resize(static_cast<size_t>(sz));
+    in.read(reinterpret_cast<char *>(agentBytes.data()), sz);
+    if (!in) {
+      out.notes.push_back("deploy-agent: failed to read new agent bytes");
+      return out;
+    }
+  }
+  out.agentSize = agentBytes.size();
+  try {
+    auto base = hv::VhdxBlockDevice::Open(baseVhdxPath);
+    auto cow = hv::CowOverlayBlockDevice::Open(&base, overlayPath);
+    out.ok =
+        DeployExecAgentToOpenOverlay(cow, agentBytes, clobberNtfsPath,
+                                     clobberGuestPath, serviceName, &out.notes);
+    out.clobberWritten = out.ok;
+    out.serviceRepointed = out.ok;
+  } catch (const std::exception &ex) {
+    out.notes.push_back(std::string("deploy-agent: exception: ") + ex.what());
+  }
+  return out;
+}
 
 VhdxRawConversionResult ConvertVhdxToRaw(const std::filesystem::path &vhdxPath,
                                          const std::filesystem::path &rawPath,
