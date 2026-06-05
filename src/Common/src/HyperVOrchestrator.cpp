@@ -11532,9 +11532,14 @@ DetonationResult InHouseOrchestrator::PrepareAndRun(
                          &events);
     }
 
-    result.errors.push_back(
-        "Sample was staged but not executed; host/guest channel and safe sample execution remain disabled.");
-    result.dynamicSummary.sampleExecuted = false;
+    // Only claim "not executed" when the guest's ReportComplete did not confirm
+    // a detonation -- an authorized run that actually launched the sample sets
+    // sampleExecuted=true above (do not clobber it back to false here).
+    if (!result.dynamicSummary.sampleExecuted) {
+      result.errors.push_back(
+          "Sample was staged but not executed; host/guest channel and safe "
+          "sample execution remain disabled.");
+    }
     result.dynamicSummary.eventsCaptured = static_cast<uint32_t>(events.size());
     result.dynamicSummary.artifactsCaptured =
         static_cast<uint32_t>(returnedArtifacts.size());
