@@ -218,8 +218,14 @@ void Ps2Controller::OnWrite(uint16_t port, uint32_t value,
 uint32_t Ps2Controller::OnRead(uint16_t port, uint8_t /*accessSize*/) {
   if (port == kStatusCommandPort) {
     ++statusReads_;
+    // The System Flag (bit 2) is set once the controller passes POST — firmware
+    // and i8042prt poll for it during init, and a real controller reports it set
+    // by the time the OS runs. Our controller always "passes," so report it set
+    // (it was never set before, which can make the init handshake retry —
+    // observed: i8042prt busy-polling the status port ~1.5M times, the dominant
+    // boot CPU sink after intelppm was disabled).
     return static_cast<uint8_t>(
-        (status_ & ~kStatusAuxData) |
+        (status_ & ~kStatusAuxData) | kStatusSystemFlag |
         (!outputQueue_.empty() && outputQueue_.front().aux ? kStatusAuxData
                                                            : 0));
   }
