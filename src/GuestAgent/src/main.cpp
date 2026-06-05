@@ -383,7 +383,30 @@ bool ReadCom2Frames(HANDLE com2, antimal::HostSerialChannel *channel) {
 // (ANTIMAL_GUEST_ALLOW_EXECUTION=1) is set.
 bool GuestExecutionAuthorized();
 
+// Force a High-Performance power profile so the single vCPU isn't parked or
+// downclocked by the default Balanced plan (a major cause of guest micro-stutter
+// and the sluggishness on the in-house VM). Activates High Performance and pins
+// the minimum processor state to 100%. Best-effort; runs once per process.
+void SetHighPerformancePowerPlan() {
+  STARTUPINFOW si{};
+  si.cb = sizeof(si);
+  PROCESS_INFORMATION pi{};
+  wchar_t cmd[] =
+      L"cmd.exe /c powercfg /setactive scheme_min & "
+      L"powercfg /setacvalueindex scheme_current sub_processor PROCTHROTTLEMIN "
+      L"100 & powercfg /setactive scheme_current";
+  if (CreateProcessW(nullptr, cmd, nullptr, nullptr, FALSE, CREATE_NO_WINDOW,
+                     nullptr, nullptr, &si, &pi)) {
+    CloseHandle(pi.hThread);
+    CloseHandle(pi.hProcess);
+  }
+}
+
 int RunHostChannelLoop(std::string reason, bool serviceMode) {
+  static std::atomic_bool powerPlanSet{false};
+  if (!powerPlanSet.exchange(true)) {
+    SetHighPerformancePowerPlan();
+  }
   BootLog("RunHostChannelLoop enter reason=" + reason +
           " serviceMode=" + (serviceMode ? "1" : "0") +
           " pid=" + std::to_string(GetCurrentProcessId()));

@@ -9947,6 +9947,25 @@ DetonationResult InHouseOrchestrator::PrepareAndRun(
   DetonationResult result;
   result.runId = MakeRunId();
   result.runDir = config_.workspaceRoot / result.runId;
+  // QoL + disk safety: reclaim the disposable overlays from PAST runs (each up to
+  // ~3 GB and only needed during its own run). Analysis artifacts (report.json,
+  // events.jsonl, screenshots) are kept. Opt out with ANTIMAL_KEEP_OVERLAYS=1.
+  if (!EnvFlagEnabled("ANTIMAL_KEEP_OVERLAYS")) {
+    std::error_code wec;
+    if (std::filesystem::is_directory(config_.workspaceRoot, wec)) {
+      for (const auto &entry :
+           std::filesystem::directory_iterator(config_.workspaceRoot, wec)) {
+        std::error_code dec;
+        if (!entry.is_directory(dec)) continue;
+        const std::string name = entry.path().filename().string();
+        if (name.empty() || name[0] == '_' || name == result.runId) continue;
+        for (const char *ov : {"overlay.cow", "overlay.raw", "overlay.vhdx"}) {
+          std::error_code rec;
+          std::filesystem::remove(entry.path() / "disk" / ov, rec);
+        }
+      }
+    }
+  }
   result.jobPath = result.runDir / "job.json";
   result.journalPath = result.runDir / "events.jsonl";
   result.screenshotsDir = result.runDir / "screenshots";
