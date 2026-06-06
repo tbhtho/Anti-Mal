@@ -583,6 +583,11 @@ struct VmRunRequest {
   // for newly-appended raw Set-1 keyboard scancodes and injects them into the
   // PS/2 controller, giving the UI process real-time keyboard control of the VM.
   std::filesystem::path liveInputPath;
+  // Live framebuffer publishing (guest->host). When set, the run loop mirrors the
+  // Bochs VBE framebuffer into a named shared-memory section ~30x/s so the UI
+  // process can render it straight to a <canvas> (no PNG encode / disk in the
+  // path). Empty = disabled. This is the production "real VM display" channel.
+  std::wstring liveFrameShmName;
 };
 
 class VirtualMachine {
@@ -665,6 +670,7 @@ private:
   Ps2Controller ps2_;
   std::filesystem::path liveInputPath_; // live host->guest input file (framed)
   std::vector<uint8_t> liveInputRemainder_; // partial framed live-input record
+  std::wstring liveFrameShmName_; // named shm section for the live framebuffer
   IoApic ioApic_;
   int whpIoApicGpaProbeResult_ = 0;
   uint64_t whpMmioGapBitmap_ = 0;

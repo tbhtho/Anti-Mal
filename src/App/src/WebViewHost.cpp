@@ -6,6 +6,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <filesystem>
@@ -38,6 +39,23 @@ using Microsoft::WRL::ComPtr;
 namespace antimal {
 
 namespace {
+
+// Named shared-memory section the live VM (HostCli) publishes its framebuffer
+// into and this UI process maps read-only to blit to a <canvas>. Session-local
+// ("Local\") since the App spawns HostCli in the same session; only one live VM
+// runs at a time, so a fixed name is fine.
+constexpr wchar_t kLiveFrameShmName[] = L"Local\\AntiMalLiveFrameV1";
+
+// Mirror of the VM-side publisher's shared-memory layout (VirtualMachine.cpp):
+// a 64-byte header then raw 32bpp BGRX pixels. The writer bumps frameSeq AFTER
+// the pixel copy, so a frameSeq that is stable across the read = an untorn frame.
+struct LiveFrameHeader {
+  uint32_t magic, version, width, height, bpp, format, byteLength, reserved;
+  volatile uint64_t frameSeq; // volatile: the seqlock re-check must re-read it
+};
+constexpr uint32_t kLiveFrameMagic = 0x414D4C46u; // 'AMLF'
+constexpr size_t kLiveFrameHeaderBytes = 64;
+constexpr uint64_t kLiveFrameMaxBytes = 16ull * 1024 * 1024;
 
 std::wstring Widen(const std::string &s) {
   if (s.empty()) {
@@ -209,6 +227,11 @@ LRESULT CALLBACK WebViewHost::WndProc(HWND hwnd, UINT msg, WPARAM wParam,
     delete payload;
     return 0;
   }
+  case WM_TIMER:
+    if (self && wParam == kFrameTimerId) {
+      self->PumpLiveFrame();
+    }
+    return 0;
   case WM_DESTROY:
     if (self) {
       self->StopVmProcess(); // don't orphan the live VM when the UI closes
@@ -267,6 +290,7 @@ void WebViewHost::StopVmProcess() {
     vmProcess_ = nullptr;
   }
   vmPid_ = 0;
+  StopFramePump();
 }
 
 void WebViewHost::SetHostFullscreen(bool on) {
@@ -295,6 +319,120 @@ void WebViewHost::SetHostFullscreen(bool on) {
                  SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOOWNERZORDER |
                      SWP_FRAMECHANGED);
     isFullscreen_ = false;
+  }
+}
+
+void WebViewHost::StartFramePump() {
+  if (frameTimerActive_ || !hwnd_) {
+    return;
+  }
+  lastFrameSeq_ = 0;
+  // ~60 Hz. Frames only arrive as fast as the VM publishes (~30 Hz), so the page
+  // never sees more than the guest actually produced; the timer is just the pull.
+  if (SetTimer(hwnd_, kFrameTimerId, 16, nullptr)) {
+    frameTimerActive_ = true;
+  }
+}
+
+void WebViewHost::StopFramePump() {
+  if (frameTimerActive_ && hwnd_) {
+    KillTimer(hwnd_, kFrameTimerId);
+  }
+  frameTimerActive_ = false;
+  if (frameShmView_) {
+    UnmapViewOfFile(frameShmView_);
+    frameShmView_ = nullptr;
+  }
+  if (frameShmHandle_) {
+    CloseHandle(frameShmHandle_);
+    frameShmHandle_ = nullptr;
+  }
+  lastFrameSeq_ = 0;
+  frameBufferPosted_ = false;
+}
+
+void WebViewHost::PumpLiveFrame() {
+  if (!VmAlive()) {
+    StopFramePump(); // VM gone -> release the mapping, stop pulling
+    return;
+  }
+  // Lazily open the shm section -- HostCli may not have created it yet at boot.
+  if (!frameShmView_) {
+    frameShmHandle_ = OpenFileMappingW(FILE_MAP_READ, FALSE, kLiveFrameShmName);
+    if (!frameShmHandle_) {
+      return; // not published yet; retry next tick
+    }
+    frameShmView_ = static_cast<const unsigned char *>(MapViewOfFile(
+        frameShmHandle_, FILE_MAP_READ, 0, 0,
+        static_cast<SIZE_T>(kLiveFrameHeaderBytes + kLiveFrameMaxBytes)));
+    if (!frameShmView_) {
+      CloseHandle(frameShmHandle_);
+      frameShmHandle_ = nullptr;
+      return;
+    }
+  }
+  const auto *hdr = reinterpret_cast<const LiveFrameHeader *>(frameShmView_);
+  if (hdr->magic != kLiveFrameMagic) {
+    return;
+  }
+  const uint64_t seq = hdr->frameSeq;
+  if (seq == lastFrameSeq_) {
+    return; // no new frame since last push
+  }
+  const uint32_t w = hdr->width, h = hdr->height, len = hdr->byteLength;
+  if (w == 0 || h == 0 || len == 0 ||
+      static_cast<uint64_t>(len) > kLiveFrameMaxBytes ||
+      static_cast<uint64_t>(w) * h * 4ull != len || !webview_ || !env_) {
+    return;
+  }
+  // One max-sized SharedBuffer covers any guest resolution; create it once.
+  if (!frameBuffer_) {
+    ComPtr<ICoreWebView2Environment12> env12;
+    if (FAILED(env_.As(&env12)) || !env12) {
+      return; // runtime too old for shared buffers -> JS uses the PNG fallback
+    }
+    if (FAILED(env12->CreateSharedBuffer(kLiveFrameMaxBytes, &frameBuffer_)) ||
+        !frameBuffer_) {
+      return;
+    }
+  }
+  BYTE *dst = nullptr;
+  UINT64 dstSize = 0;
+  if (FAILED(frameBuffer_->get_Buffer(&dst)) || !dst ||
+      FAILED(frameBuffer_->get_Size(&dstSize)) || dstSize < len) {
+    return;
+  }
+  // Swizzle BGRX -> RGBA straight from the shm into the page-shared buffer.
+  const unsigned char *src = frameShmView_ + kLiveFrameHeaderBytes;
+  const uint32_t pixels = w * h;
+  for (uint32_t i = 0; i < pixels; ++i) {
+    dst[i * 4 + 0] = src[i * 4 + 2];
+    dst[i * 4 + 1] = src[i * 4 + 1];
+    dst[i * 4 + 2] = src[i * 4 + 0];
+    dst[i * 4 + 3] = 0xFF;
+  }
+  // Seqlock: if the writer bumped frameSeq during the copy the frame may be torn
+  // -> don't post it, just retry next tick.
+  if (hdr->frameSeq != seq) {
+    return;
+  }
+  lastFrameSeq_ = seq;
+  char meta[96];
+  std::snprintf(meta, sizeof(meta),
+                "{\"evt\":\"vmframe\",\"w\":%u,\"h\":%u,\"seq\":%llu}", w, h,
+                static_cast<unsigned long long>(seq));
+  if (!frameBufferPosted_) {
+    // Hand the buffer to the page once; the page caches the ArrayBuffer and
+    // re-reads it on every subsequent 'vmframe' signal.
+    ComPtr<ICoreWebView2_17> wv17;
+    if (SUCCEEDED(webview_.As(&wv17)) && wv17 &&
+        SUCCEEDED(wv17->PostSharedBufferToScript(
+            frameBuffer_.Get(), COREWEBVIEW2_SHARED_BUFFER_ACCESS_READ_ONLY,
+            Widen(meta).c_str()))) {
+      frameBufferPosted_ = true;
+    }
+  } else {
+    webview_->PostWebMessageAsJson(Widen(meta).c_str());
   }
 }
 
@@ -990,6 +1128,7 @@ void WebViewHost::RegisterHandlers() {
     const fs::path liveInput = c.workspaceRoot / L"_live-input.bin";
     { std::ofstream trunc(liveInput, std::ios::binary | std::ios::trunc); }
     SetEnvironmentVariableW(L"ANTIMAL_LIVE_INPUT", liveInput.wstring().c_str());
+    SetEnvironmentVariableW(L"ANTIMAL_LIVE_FRAME_SHM", kLiveFrameShmName);
     const bool seeded = fs::exists(seed, ec);
     if (seeded) {
       SetEnvironmentVariableW(L"ANTIMAL_SEED_OVERLAY", seed.c_str());
@@ -1031,6 +1170,7 @@ void WebViewHost::RegisterHandlers() {
     vmPid_ = pi.dwProcessId;
     vmProcess_ = pi.hProcess; // retain: liveness + recycle-safe terminate
     CloseHandle(pi.hThread);
+    StartFramePump(); // begin pulling the live framebuffer for the <canvas>
     return std::string("{\"started\":true,\"seeded\":") +
            (seeded ? "true" : "false") + "}";
   });
@@ -1069,6 +1209,7 @@ void WebViewHost::RegisterHandlers() {
     const fs::path liveInput = c.workspaceRoot / L"_live-input.bin";
     { std::ofstream trunc(liveInput, std::ios::binary | std::ios::trunc); }
     SetEnvironmentVariableW(L"ANTIMAL_LIVE_INPUT", liveInput.wstring().c_str());
+    SetEnvironmentVariableW(L"ANTIMAL_LIVE_FRAME_SHM", kLiveFrameShmName);
     const bool seeded = fs::exists(seed, ec);
     if (seeded) {
       SetEnvironmentVariableW(L"ANTIMAL_SEED_OVERLAY", seed.c_str());
@@ -1110,6 +1251,7 @@ void WebViewHost::RegisterHandlers() {
     vmPid_ = pi.dwProcessId;
     vmProcess_ = pi.hProcess; // retain: liveness + recycle-safe terminate
     CloseHandle(pi.hThread);
+    StartFramePump(); // begin pulling the live framebuffer for the <canvas>
     const std::string sname =
         Narrow(fs::path(sample).filename().wstring().c_str());
     return std::string("{\"started\":true,\"seeded\":") +
@@ -1211,6 +1353,7 @@ int WebViewHost::Run(HINSTANCE hInstance, int nCmdShow) {
             if (FAILED(envResult) || !env) {
               return envResult;
             }
+            env_ = env; // retained for CreateSharedBuffer (live frame channel)
             return env->CreateCoreWebView2Controller(
                 hwnd_,
                 Callback<

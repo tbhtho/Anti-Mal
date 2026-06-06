@@ -24,6 +24,8 @@
   var heldKeys = {};       // e.code -> break scancodes, flushed on blur/stop
   var liveMouse = { btn: 0, dx: 0, dy: 0 }; // accumulated relative mouse state
   var liveMouseTimer = null;                // flushes accumulated movement
+  var liveFrameBuffer = null;    // host-shared ArrayBuffer of live RGBA pixels
+  var usingSharedFrames = false; // true once the canvas path is live (no <img>)
   function send(cmd, args) {
     var reqId = nextReqId++;
     return new Promise(function (resolve) {
@@ -47,6 +49,18 @@
       if (m.evt === 'browser.data' && m.data) onBrowserData(m.data);
       if (m.evt === 'run.status' && m.data) onRunStatus(m.data);
       if (m.evt === 'telemetry' && m.data) onTelemetry(m.data);
+      if (m.evt === 'vmframe' && m.w) onVmFrame(m.w, m.h);
+    });
+    // The host shares the VM framebuffer as a zero-copy SharedBuffer (created
+    // once, reused). 'sharedbufferreceived' delivers/updates the ArrayBuffer and
+    // its first frame's dimensions; later frames just signal via 'vmframe'.
+    window.chrome.webview.addEventListener('sharedbufferreceived', function (e) {
+      try {
+        liveFrameBuffer = e.getBuffer();
+        var d = e.additionalData;
+        if (typeof d === 'string') { try { d = JSON.parse(d); } catch (x) { d = null; } }
+        if (d && d.w) onVmFrame(d.w, d.h);
+      } catch (x) { /* ignore */ }
     });
   }
 
@@ -430,6 +444,7 @@
     if (livePollTimer) { clearInterval(livePollTimer); livePollTimer = null; }
     if (liveMouseTimer) { clearInterval(liveMouseTimer); liveMouseTimer = null; }
     liveMouse = { btn: 0, dx: 0, dy: 0 };
+    usingSharedFrames = false; // next boot re-establishes the shared canvas path
     releaseHeldKeys();
   }
   // Single source of truth for the VM status indicators (#vm-badge + #mode-badge +
@@ -459,6 +474,35 @@
       send('vm.input', { mouse: { buttons: liveMouse.btn, dx: dx, dy: -dy } });
     }
   }
+  // Render a host-shared framebuffer (zero-copy) straight to a <canvas> — the
+  // production "real VM display" path: no PNG encode, no disk, no decode. Falls
+  // back to the <img>/PNG poll automatically if no shared frame ever arrives
+  // (older WebView2 runtime).
+  function ensureLiveCanvas() {
+    var box = $('#live-frame'); if (!box) return null;
+    var cv = document.getElementById('live-frame-canvas');
+    if (!cv) {
+      box.innerHTML = '';
+      cv = document.createElement('canvas');
+      cv.id = 'live-frame-canvas';
+      box.appendChild(cv);
+    }
+    return cv;
+  }
+  function onVmFrame(w, h) {
+    if (!liveFrameBuffer || !w || !h) return;
+    var need = w * h * 4;
+    if (liveFrameBuffer.byteLength < need) return;
+    var cv = ensureLiveCanvas(); if (!cv) return;
+    if (cv.width !== w) cv.width = w;
+    if (cv.height !== h) cv.height = h;
+    var ctx = cv.getContext('2d'); if (!ctx) return;
+    try {
+      ctx.putImageData(new ImageData(new Uint8ClampedArray(liveFrameBuffer, 0, need), w, h), 0, 0);
+    } catch (x) { return; }
+    usingSharedFrames = true;
+    if (liveSession === 'boot') { liveSession = 'running'; setVmState('running'); }
+  }
   function startLivePoll() {
     stopLivePoll();
     liveWatchRun = null; // each boot re-tails the new run's journal
@@ -485,6 +529,12 @@
           appendLog('INFO', 'Live telemetry tail starting for ' + run + '…');
           var ts = $('#vm-telemetry-status'); if (ts) ts.textContent = '· tailing ' + run;
           send('run.watch', { runDir: run, live: true });
+        }
+        // Pixels come from the shared-buffer <canvas> when active; only fall back
+        // to the <img>/PNG frame if no shared frame has arrived (older runtime).
+        if (usingSharedFrames) {
+          if (liveSession === 'boot') { liveSession = 'running'; setVmState('running'); }
+          return;
         }
         var f = res.frame || '';
         if (!f) return;
@@ -538,6 +588,10 @@
     var lf = $('#live-frame');
     if (lf) {
       function frameScale() {
+        var cv = document.getElementById('live-frame-canvas');
+        if (cv && cv.clientWidth > 0 && cv.width > 0) {
+          return { x: cv.width / cv.clientWidth, y: cv.height / Math.max(1, cv.clientHeight) };
+        }
         var img = document.getElementById('live-frame-img');
         if (img && img.clientWidth > 0 && img.naturalWidth > 0) {
           return { x: img.naturalWidth / img.clientWidth, y: img.naturalHeight / Math.max(1, img.clientHeight) };

@@ -10276,6 +10276,19 @@ DetonationResult InHouseOrchestrator::PrepareAndRun(
           request.liveInputPath = std::filesystem::path(liBuf);
         }
       }
+      // ANTIMAL_LIVE_FRAME_SHM=<name>: mirror the guest framebuffer into this
+      // named shared-memory section ~30x/s so the UI process can blit it to a
+      // <canvas> with no PNG encode / disk in the path.
+      {
+        char fbBuf[256]{};
+        size_t fbNeeded = 0;
+        if (getenv_s(&fbNeeded, fbBuf, sizeof(fbBuf), "ANTIMAL_LIVE_FRAME_SHM") ==
+                0 &&
+            fbNeeded > 1 && fbBuf[0] != '\0') {
+          request.liveFrameShmName =
+              std::wstring(fbBuf, fbBuf + (fbNeeded - 1));
+        }
+      }
       // A live-input path means a human is driving the VM from the UI (the
       // interactive "freely interact" view). Such a session must NOT be
       // auto-stopped when the GuestAgent first checks in (that early stop is the

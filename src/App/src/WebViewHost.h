@@ -50,15 +50,31 @@ private:
   // monitor.
   void SetHostFullscreen(bool on);
 
+  // Live framebuffer pump: maps the VM's shared-memory framebuffer section
+  // read-only and, on a UI-thread timer, swizzles each new frame (BGRX->RGBA)
+  // into a WebView2 SharedBuffer and signals the page to blit it to a <canvas>.
+  // This is the production "real VM display" path (no PNG encode / disk).
+  static constexpr UINT_PTR kFrameTimerId = 0xA11F;
+  void StartFramePump();    // begin the ~60Hz UI timer (called on VM boot)
+  void StopFramePump();     // stop the timer + release the shm mapping
+  void PumpLiveFrame();     // one timer tick: publish the newest frame, if any
+
   HWND hwnd_ = nullptr;
   bool isFullscreen_ = false;
   WINDOWPLACEMENT savedPlacement_{sizeof(WINDOWPLACEMENT)};
   LONG_PTR savedStyle_ = 0;
   Microsoft::WRL::ComPtr<ICoreWebView2Controller> controller_;
   Microsoft::WRL::ComPtr<ICoreWebView2> webview_;
+  Microsoft::WRL::ComPtr<ICoreWebView2Environment> env_; // for CreateSharedBuffer
+  Microsoft::WRL::ComPtr<ICoreWebView2SharedBuffer> frameBuffer_; // page-shared
   BridgeRouter router_;
   unsigned long vmPid_ = 0;   // PID of the spawned live-VM HostCli process (P1).
   void *vmProcess_ = nullptr; // HANDLE to that process while it runs (owned).
+  void *frameShmHandle_ = nullptr;        // OpenFileMapping handle (live frame)
+  const unsigned char *frameShmView_ = nullptr; // read-only mapped view
+  unsigned long long lastFrameSeq_ = 0;   // last frame sequence pushed to page
+  bool frameBufferPosted_ = false;        // SharedBuffer handed to the page yet
+  bool frameTimerActive_ = false;
 };
 
 } // namespace antimal
