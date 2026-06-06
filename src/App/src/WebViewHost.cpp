@@ -210,6 +210,9 @@ LRESULT CALLBACK WebViewHost::WndProc(HWND hwnd, UINT msg, WPARAM wParam,
     return 0;
   }
   case WM_DESTROY:
+    if (self) {
+      self->StopVmProcess(); // don't orphan the live VM when the UI closes
+    }
     PostQuitMessage(0);
     return 0;
   default:
@@ -264,6 +267,35 @@ void WebViewHost::StopVmProcess() {
     vmProcess_ = nullptr;
   }
   vmPid_ = 0;
+}
+
+void WebViewHost::SetHostFullscreen(bool on) {
+  if (!hwnd_ || on == isFullscreen_) {
+    return;
+  }
+  if (on) {
+    savedStyle_ = GetWindowLongPtrW(hwnd_, GWL_STYLE);
+    savedPlacement_.length = sizeof(WINDOWPLACEMENT);
+    GetWindowPlacement(hwnd_, &savedPlacement_);
+    MONITORINFO mi{};
+    mi.cbSize = sizeof(mi);
+    if (GetMonitorInfoW(MonitorFromWindow(hwnd_, MONITOR_DEFAULTTOPRIMARY),
+                        &mi)) {
+      SetWindowLongPtrW(hwnd_, GWL_STYLE, savedStyle_ & ~WS_OVERLAPPEDWINDOW);
+      SetWindowPos(hwnd_, HWND_TOP, mi.rcMonitor.left, mi.rcMonitor.top,
+                   mi.rcMonitor.right - mi.rcMonitor.left,
+                   mi.rcMonitor.bottom - mi.rcMonitor.top,
+                   SWP_NOOWNERZORDER | SWP_FRAMECHANGED);
+      isFullscreen_ = true;
+    }
+  } else {
+    SetWindowLongPtrW(hwnd_, GWL_STYLE, savedStyle_);
+    SetWindowPlacement(hwnd_, &savedPlacement_);
+    SetWindowPos(hwnd_, nullptr, 0, 0, 0, 0,
+                 SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOOWNERZORDER |
+                     SWP_FRAMECHANGED);
+    isFullscreen_ = false;
+  }
 }
 
 HRESULT WebViewHost::OnControllerCreated(HRESULT result,
@@ -370,6 +402,20 @@ void WebViewHost::RegisterHandlers() {
              ICoreWebView2NavigationCompletedEventArgs *) -> HRESULT {
             sender->PostWebMessageAsJson(
                 LR"({"evt":"log","data":{"level":"INFO","msg":"AntiMal host bridge online"}})");
+            return S_OK;
+          })
+          .Get(),
+      &token);
+
+  // Page fullscreen (the VM "Fullscreen" button calls element.requestFullscreen):
+  // drive the host window borderless-fullscreen so the VM fills the monitor, not
+  // just the WebView control area.
+  webview_->add_ContainsFullScreenElementChanged(
+      Callback<ICoreWebView2ContainsFullScreenElementChangedEventHandler>(
+          [this](ICoreWebView2 *sender, IUnknown *) -> HRESULT {
+            BOOL fs = FALSE;
+            sender->get_ContainsFullScreenElement(&fs);
+            SetHostFullscreen(fs == TRUE);
             return S_OK;
           })
           .Get(),

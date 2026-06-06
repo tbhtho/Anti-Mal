@@ -44,8 +44,16 @@ private:
   // running (otherwise a leftover run dir's last screenshot looks "live").
   bool VmAlive() const;     // true iff the spawned VM process is still running
   void StopVmProcess();     // terminate (if running) + close handle + clear PID
+  // Drive the host window borderless-fullscreen when the page requests it (the
+  // VM "Fullscreen" button -> JS requestFullscreen -> WebView2 fullscreen event).
+  // Without this, requestFullscreen only fills the WebView control, not the
+  // monitor.
+  void SetHostFullscreen(bool on);
 
   HWND hwnd_ = nullptr;
+  bool isFullscreen_ = false;
+  WINDOWPLACEMENT savedPlacement_{sizeof(WINDOWPLACEMENT)};
+  LONG_PTR savedStyle_ = 0;
   Microsoft::WRL::ComPtr<ICoreWebView2Controller> controller_;
   Microsoft::WRL::ComPtr<ICoreWebView2> webview_;
   BridgeRouter router_;

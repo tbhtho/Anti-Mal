@@ -123,6 +123,9 @@ html, body {
 .screenframe { background: #000; border: 1px solid var(--border2); border-radius: var(--radius-sm); aspect-ratio: 16/10;
   display: flex; align-items: center; justify-content: center; color: var(--muted); font-size: 12px; overflow: hidden; }
 .screenframe img { width: 100%; height: 100%; object-fit: contain; display: block; }
+/* Fullscreen VM: fill the whole display, keep the guest aspect via contain. */
+#live-frame:fullscreen { aspect-ratio: auto; width: 100vw; height: 100vh; border: 0; border-radius: 0; outline: 0 !important; }
+#live-frame:fullscreen img { width: 100%; height: 100%; object-fit: contain; }
 .kv { display: grid; grid-template-columns: auto 1fr; gap: 6px 14px; font-size: 12.5px; }
 .kv .k { color: var(--muted); }
 .kv .v { color: var(--text); font-family: Consolas, "Cascadia Mono", monospace; word-break: break-all; }

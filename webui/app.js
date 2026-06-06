@@ -123,9 +123,11 @@
       var steps = [['OVMF firmware', 'done'], ['bootmgfw.efi', 'done'], ['winload.efi', 'done'], ['ntoskrnl', 'done'], ['AHCI storage mount', 'done'], ['win32k / GUI stack', 'done'], ['Getting Ready (OOBE)', 'done'], ['GuestAgent heartbeat', 'cur'], ['Artifact return', 'todo']];
       return '<h1 class="page-title">VM Analysis</h1><p class="page-sub">In-house WHP sandbox: live view, state, boot timeline, and safety gates.</p>' +
         '<div class="panel"><h2>Live VM <span id="vm-live-status" class="page-sub" style="font-weight:400"></span></h2>' +
-        '<div class="actions"><button class="btn primary" id="vm-boot-btn">Boot VM (live)</button><button class="btn danger" id="vm-detonate-btn">Detonate Sample (live)</button><button class="btn" id="vm-stop-btn">Stop</button></div>' +
+        '<div class="actions"><button class="btn primary" id="vm-boot-btn">Boot VM (live)</button><button class="btn danger" id="vm-detonate-btn">Detonate Sample (live)</button><button class="btn" id="vm-stop-btn">Stop</button><button class="btn" id="vm-fs-btn" title="Fill the screen with the VM (Esc to exit)">⛶ Fullscreen</button></div>' +
         '<div class="screenframe" id="live-frame" tabindex="0" style="margin-top:12px;outline:none">Click “Boot VM (live)” for a clean session, or “Detonate Sample (live)” to run a BENIGN sample inside it — watch it execute here.</div>' +
-        '<p class="page-sub" id="vm-focus-hint" style="margin:6px 0 0">Click the frame to capture your keyboard &amp; mouse; click outside it to release.</p></div>' +
+        '<p class="page-sub" id="vm-focus-hint" style="margin:6px 0 0">Click the frame (or go Fullscreen) to capture your keyboard &amp; mouse; click outside it to release.</p>' +
+        '<div class="actions" style="margin-top:8px;flex-wrap:wrap"><input id="vm-text" type="text" autocomplete="off" placeholder="Type text to send into the VM (e.g. the password)…" style="flex:1;min-width:200px;background:var(--panel2);border:1px solid var(--border2);color:var(--text,#e6edf3);border-radius:8px;padding:7px 10px"><button class="btn" id="vm-send-text">Send Text ⏎</button><button class="btn primary" id="vm-send-pw" title="Types the default seed account password then Enter, paced so the guest reliably accepts it">Send Login Password</button><button class="btn" id="vm-send-enter">Send Enter</button></div>' +
+        '<p class="page-sub" style="margin:6px 0 0">Live typing can be flaky at the boot/login screen; the paced buttons above are the reliable way in. Once at the desktop, direct keyboard/mouse work normally.</p></div>' +
         '<div class="panel"><h2>Live Process Telemetry <span id="vm-telemetry-status" class="page-sub" style="font-weight:400"></span></h2>' +
         '<div id="vm-events"><p class="page-sub" style="margin:0">No events yet — boot the VM to stream live process activity from the GuestAgent over COM2.</p></div></div>' +
         '<div class="row"><div class="panel" style="flex:1;min-width:280px"><h2>VM State</h2>' +
@@ -377,6 +379,53 @@
     for (var c in heldKeys) { if (heldKeys[c]) send('vm.input', { scancodes: heldKeys[c] }); }
     heldKeys = {};
   }
+  // Character -> a complete Set-1 tap (optional LShift wrap + key make/break) for
+  // reliably "typing" a string (e.g. the login password) into the guest.
+  var CH = {
+    a: 0x1E, b: 0x30, c: 0x2E, d: 0x20, e: 0x12, f: 0x21, g: 0x22, h: 0x23, i: 0x17, j: 0x24, k: 0x25, l: 0x26, m: 0x32, n: 0x31, o: 0x18, p: 0x19, q: 0x10, r: 0x13, s: 0x1F, t: 0x14, u: 0x16, v: 0x2F, w: 0x11, x: 0x2D, y: 0x15, z: 0x2C,
+    '1': 0x02, '2': 0x03, '3': 0x04, '4': 0x05, '5': 0x06, '6': 0x07, '7': 0x08, '8': 0x09, '9': 0x0A, '0': 0x0B,
+    '-': 0x0C, '=': 0x0D, '[': 0x1A, ']': 0x1B, ';': 0x27, "'": 0x28, '`': 0x29, '\\': 0x2B, ',': 0x33, '.': 0x34, '/': 0x35, ' ': 0x39
+  };
+  var CHS = { '!': 0x02, '@': 0x03, '#': 0x04, '$': 0x05, '%': 0x06, '^': 0x07, '&': 0x08, '*': 0x09, '(': 0x0A, ')': 0x0B, '_': 0x0C, '+': 0x0D, '{': 0x1A, '}': 0x1B, ':': 0x27, '"': 0x28, '~': 0x29, '|': 0x2B, '<': 0x33, '>': 0x34, '?': 0x35 };
+  function charToScancodes(ch) {
+    var shift = false, code = null;
+    if (ch >= 'A' && ch <= 'Z') { code = CH[ch.toLowerCase()]; shift = true; }
+    else if (CH[ch] != null) { code = CH[ch]; }
+    else if (CHS[ch] != null) { code = CHS[ch]; shift = true; }
+    if (code == null) return null;
+    var out = [];
+    if (shift) out.push(0x2A);
+    out.push(code, code | 0x80);
+    if (shift) out.push(0xAA);
+    return out;
+  }
+  // Type a string into the guest one keystroke per ~70ms burst. Unpaced bursts
+  // get mangled by the guest keyboard stack (consecutive keys lost) -- pacing is
+  // exactly what makes the password reliably accepted. Optional trailing Enter.
+  function sendTextToGuest(text, withEnter) {
+    if (!livePollTimer) { appendLog('WARN', 'Boot a VM first — no live session to type into.'); return; }
+    var seq = [];
+    for (var i = 0; i < text.length; i++) {
+      var sc = charToScancodes(text[i]);
+      if (sc) seq.push(sc);
+    }
+    if (withEnter) seq.push([0x1C, 0x9C]); // Enter make/break
+    if (!seq.length) return;
+    var k = 0;
+    (function step() {
+      if (k >= seq.length) { appendLog('INFO', 'Sent ' + seq.length + ' keystroke(s) to the VM.'); return; }
+      send('vm.input', { scancodes: seq[k++] });
+      // >100ms so each keystroke lands in its own host input-poll window (the VM
+      // polls _live-input.bin every 100ms); batching multiple keys per poll is
+      // what the guest keyboard stack drops, so spacing them out is the fix.
+      setTimeout(step, 120);
+    })();
+  }
+  function toggleFullscreen() {
+    var lf = $('#live-frame'); if (!lf) return;
+    if (document.fullscreenElement) { document.exitFullscreen(); }
+    else if (lf.requestFullscreen) { lf.requestFullscreen().then(function () { lf.focus(); }).catch(function () {}); }
+  }
   function stopLivePoll() {
     if (livePollTimer) { clearInterval(livePollTimer); livePollTimer = null; }
     if (liveMouseTimer) { clearInterval(liveMouseTimer); liveMouseTimer = null; }
@@ -445,7 +494,7 @@
         // First real frame of a plain boot: promote 'booting' -> 'running'.
         if (liveSession === 'boot') { liveSession = 'running'; setVmState('running'); }
       });
-    }, 300); // matches the interactive host frame cadence for a live-desktop feel
+    }, 200); // matches the interactive host frame cadence for a live-desktop feel
   }
   function loadVm() {
     var bb = $('#vm-boot-btn');
@@ -473,6 +522,16 @@
       setVmState('stopped');
       var ts = $('#vm-telemetry-status'); if (ts) ts.textContent = '· stopped';
     };
+    var fsb = $('#vm-fs-btn');
+    if (fsb) fsb.onclick = toggleFullscreen;
+    var stb = $('#vm-send-text');
+    if (stb) stb.onclick = function () { var t = $('#vm-text'); if (t && t.value) sendTextToGuest(t.value, true); };
+    var spw = $('#vm-send-pw');
+    if (spw) spw.onclick = function () { appendLog('INFO', 'Sending login password (paced)…'); sendTextToGuest('AntiMal!23', true); };
+    var sen = $('#vm-send-enter');
+    if (sen) sen.onclick = function () { if (livePollTimer) send('vm.input', { scancodes: [0x1C, 0x9C] }); else appendLog('WARN', 'No live VM.'); };
+    var vt = $('#vm-text');
+    if (vt) vt.addEventListener('keydown', function (e) { if (e.key === 'Enter') { e.preventDefault(); if (vt.value) sendTextToGuest(vt.value, true); } });
     // Live mouse: route movement/clicks over the frame into the guest (relative
     // PS/2 mouse). Movement deltas are scaled from displayed px to guest px and
     // accumulated; flushLiveMouse sends them ~20/s. Buttons go immediately.

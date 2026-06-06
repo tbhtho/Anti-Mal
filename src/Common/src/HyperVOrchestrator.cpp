@@ -10293,7 +10293,7 @@ DetonationResult InHouseOrchestrator::PrepareAndRun(
       // keystrokes/mouse show up promptly; automated runs (nobody watching live)
       // stay at the cheaper cadence to limit screenshot churn. Override with
       // ANTIMAL_LIVE_FRAME_MS.
-      uint32_t liveFrameMs = interactiveSession ? 300u : 1500u;
+      uint32_t liveFrameMs = interactiveSession ? 200u : 1500u;
       {
         char fbuf[16]{};
         size_t fneeded = 0;
