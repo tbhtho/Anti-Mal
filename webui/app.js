@@ -445,7 +445,7 @@
         // First real frame of a plain boot: promote 'booting' -> 'running'.
         if (liveSession === 'boot') { liveSession = 'running'; setVmState('running'); }
       });
-    }, 500); // matches the interactive host frame cadence for a live-desktop feel
+    }, 300); // matches the interactive host frame cadence for a live-desktop feel
   }
   function loadVm() {
     var bb = $('#vm-boot-btn');

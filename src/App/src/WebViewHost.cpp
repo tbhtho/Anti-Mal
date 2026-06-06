@@ -881,6 +881,23 @@ void WebViewHost::RegisterHandlers() {
       return std::string(R"({"live":true,"frame":""})");
     }
     const std::string dirName = Narrow(best.filename().wstring().c_str());
+    // Prefer the rolling live.png (freshest frame, overwritten every interactive
+    // frame). ?v=<mtime> cache-busts so the UI re-fetches only when a new frame
+    // actually lands; older runs without live.png fall back to the numbered roll.
+    {
+      WIN32_FILE_ATTRIBUTE_DATA lf{};
+      if (GetFileAttributesExW((best / L"screenshots" / L"live.png").c_str(),
+                               GetFileExInfoStandard, &lf)) {
+        ULARGE_INTEGER v{};
+        v.LowPart = lf.ftLastWriteTime.dwLowDateTime;
+        v.HighPart = lf.ftLastWriteTime.dwHighDateTime;
+        const std::string url = std::string("https://runs.antimal.local/") +
+                                dirName + "/screenshots/live.png?v=" +
+                                std::to_string(v.QuadPart);
+        return std::string("{\"live\":true,\"frame\":") + JsonQuote(url) +
+               ",\"run\":" + JsonQuote(dirName) + "}";
+      }
+    }
     std::wstring newest;
     for (const auto &f : fs::directory_iterator(best / L"screenshots", ec)) {
       const std::wstring fn = f.path().filename().wstring();

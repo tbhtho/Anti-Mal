@@ -10293,7 +10293,7 @@ DetonationResult InHouseOrchestrator::PrepareAndRun(
       // keystrokes/mouse show up promptly; automated runs (nobody watching live)
       // stay at the cheaper cadence to limit screenshot churn. Override with
       // ANTIMAL_LIVE_FRAME_MS.
-      uint32_t liveFrameMs = interactiveSession ? 500u : 1500u;
+      uint32_t liveFrameMs = interactiveSession ? 300u : 1500u;
       {
         char fbuf[16]{};
         size_t fneeded = 0;
@@ -10599,10 +10599,12 @@ DetonationResult InHouseOrchestrator::PrepareAndRun(
       const std::filesystem::path journalPathCopy = result.journalPath;
       auto frameCounter = std::make_shared<std::atomic<uint32_t>>(0);
       auto realFrameCounter = std::make_shared<std::atomic<uint32_t>>(0);
+      auto lastNumberedMs = std::make_shared<std::atomic<uint64_t>>(0);
       request.progressCallback = [progressCallback, runIdCopy, runDirCopy,
                                   screenshotsDirCopy, journalPathCopy,
                                   interactiveSession, frameCounter,
-                                  realFrameCounter, liveHostChannel,
+                                  realFrameCounter, lastNumberedMs,
+                                  liveHostChannel,
                                   liveHeartbeatCount, executionAuthorized,
                                   stopAfterGuestAgentProbe](
                                      const hv::VmProgressSnapshot &snap) {
@@ -10739,6 +10741,22 @@ DetonationResult InHouseOrchestrator::PrepareAndRun(
           // captions animate live, even before the guest has a real
           // framebuffer to display.
           {
+            // Throttle the numbered frame roll (livevm-*/guest-*, used by the
+            // report filmstrip) to ~1.5s for interactive sessions, so a fast live
+            // cadence doesn't accumulate a PNG per frame on disk; the live view
+            // uses the single overwritten live.png written below.
+            bool writeNumbered = true;
+            if (interactiveSession) {
+              const uint64_t nowMs = progress.elapsedMs;
+              const uint64_t last =
+                  lastNumberedMs->load(std::memory_order_relaxed);
+              if (last != 0 && nowMs >= last && nowMs - last < 1500) {
+                writeNumbered = false;
+              } else {
+                lastNumberedMs->store(nowMs, std::memory_order_relaxed);
+              }
+            }
+            if (writeNumbered) {
             std::ostringstream frameText;
             frameText << "AntiMal Live VM   run "
                       << runIdCopy.substr(0, 8) << "\n";
@@ -10810,6 +10828,42 @@ DetonationResult InHouseOrchestrator::PrepareAndRun(
                   }
                 } catch (...) {
                   // Encoding must not break the VM run loop.
+                }
+              }
+            }
+            } // end if (writeNumbered) -- numbered roll is throttled above
+
+            // Rolling latest-frame for the LIVE view: encode the current guest
+            // framebuffer to a temp file then atomically rename it onto a single
+            // live.png every interactive frame. The UI always shows the freshest
+            // frame at full cadence with NO per-frame disk accumulation, and the
+            // atomic rename means a reader never sees a half-written PNG.
+            if (interactiveSession && snap.framebufferEnabled &&
+                snap.framebufferHost && snap.framebufferWidth > 0 &&
+                snap.framebufferHeight > 0 && snap.framebufferBpp == 32) {
+              const size_t lneeded =
+                  static_cast<size_t>(snap.framebufferWidth) *
+                  static_cast<size_t>(snap.framebufferHeight) * 4ull;
+              if (lneeded <= snap.framebufferBytes &&
+                  FramebufferHasVisiblePixels(
+                      snap.framebufferHost, snap.framebufferWidth,
+                      snap.framebufferHeight, snap.framebufferBpp / 8)) {
+                const auto livePath = screenshotsDirCopy / L"live.png";
+                const auto liveTmp = screenshotsDirCopy / L"live.png.tmp";
+                try {
+                  if (EncodeFramebufferPng(liveTmp, snap.framebufferHost,
+                                           snap.framebufferWidth,
+                                           snap.framebufferHeight,
+                                           snap.framebufferBpp / 8)) {
+                    std::error_code lrec;
+                    std::filesystem::rename(liveTmp, livePath, lrec);
+                    if (lrec) {
+                      std::error_code lrm;
+                      std::filesystem::remove(liveTmp, lrm);
+                    }
+                  }
+                } catch (...) {
+                  // Live-frame encoding must not break the VM run loop.
                 }
               }
             }
