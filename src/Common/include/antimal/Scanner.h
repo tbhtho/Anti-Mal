@@ -41,6 +41,14 @@ std::string IdentifyFileType(const std::vector<uint8_t> &data);
 // the defining trait of a dropper/installer payload. Capped to a sane maximum.
 int CountEmbeddedExecutables(const std::vector<uint8_t> &data);
 
+// Maps the import table to coarse behavioral capabilities (anti-debug,
+// keylogging, screen capture, clipboard, crypto, process discovery, privilege
+// adjustment, runtime API resolution, service control). Pure over the import
+// name list (entries shaped "dll!func"), returns one finding per capability
+// present. The Any.Run-style "what can this do" row, derived statically.
+std::vector<ScanFinding>
+DetectImportCapabilities(const std::vector<std::string> &imports);
+
 ScanResult ScanFile(const std::filesystem::path &path);
 ScanResult ScanFile(const std::filesystem::path &path,
                     const ScannerOptions &options);

@@ -2373,6 +2373,54 @@ void TestFileTypeId() {
          "scanned test exe is detected as pe by magic bytes");
 }
 
+// Import-table -> behavioral-capability mapping (the static "what can this do"
+// row). Pure over a synthetic "dll!func" import list.
+void TestImportCapabilities() {
+  using antimal::DetectImportCapabilities;
+  auto has = [](const std::vector<antimal::ScanFinding> &f, const char *id) {
+    for (const auto &x : f) {
+      if (x.ruleId == id) {
+        return true;
+      }
+    }
+    return false;
+  };
+
+  Expect(DetectImportCapabilities({"kernel32!closehandle", "kernel32!readfile"})
+             .empty(),
+         "benign imports yield no capability findings");
+
+  auto klog = DetectImportCapabilities(
+      {"user32!setwindowshookexw", "user32!getasynckeystate"});
+  Expect(has(klog, "capability.keylogging"), "keylogging APIs -> keylogging cap");
+
+  // Dynamic API resolution requires BOTH GetProcAddress and LoadLibrary.
+  Expect(!has(DetectImportCapabilities({"kernel32!getprocaddress"}),
+              "capability.dynamic_api"),
+         "GetProcAddress alone is not flagged");
+  Expect(has(DetectImportCapabilities(
+                 {"kernel32!getprocaddress", "kernel32!loadlibrarya"}),
+             "capability.dynamic_api"),
+         "GetProcAddress + LoadLibrary -> dynamic API resolution");
+
+  // Screen capture needs a device-context acquire AND a blit/desktop handle.
+  Expect(!has(DetectImportCapabilities({"gdi32!bitblt"}),
+              "capability.screen_capture"),
+         "BitBlt alone is not screen-capture");
+  Expect(has(DetectImportCapabilities({"gdi32!bitblt", "user32!getdc"}),
+             "capability.screen_capture"),
+         "BitBlt + GetDC -> screen capture");
+
+  auto multi = DetectImportCapabilities(
+      {"advapi32!cryptencrypt", "kernel32!createtoolhelp32snapshot",
+       "advapi32!adjusttokenprivileges", "advapi32!openprocesstoken"});
+  Expect(has(multi, "capability.crypto"), "crypto API -> crypto cap");
+  Expect(has(multi, "capability.process_discovery"),
+         "toolhelp snapshot -> process discovery");
+  Expect(has(multi, "capability.token_privilege"),
+         "token-adjust + open-token -> privilege cap");
+}
+
 void TestBrowserRisk() {
   std::vector<antimal::BrowserRisk> records;
   antimal::BrowserRisk a;
@@ -5035,6 +5083,7 @@ int main() {
     TestPeParser();
     TestMd5AndImphash();
     TestFileTypeId();
+    TestImportCapabilities();
     TestBrowserRisk();
     TestStringExtraction();
     TestIocMining();

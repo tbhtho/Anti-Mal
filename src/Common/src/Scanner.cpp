@@ -326,6 +326,77 @@ int CountEmbeddedExecutables(const std::vector<uint8_t> &data) {
   return count;
 }
 
+std::vector<ScanFinding>
+DetectImportCapabilities(const std::vector<std::string> &imports) {
+  std::vector<ScanFinding> out;
+  auto any = [&](std::initializer_list<const char *> names) {
+    for (const char *n : names) {
+      if (ImportContains(imports, n)) {
+        return true;
+      }
+    }
+    return false;
+  };
+  auto all = [&](std::initializer_list<const char *> names) {
+    for (const char *n : names) {
+      if (!ImportContains(imports, n)) {
+        return false;
+      }
+    }
+    return true;
+  };
+  auto add = [&](const char *id, const char *msg, int score) {
+    out.push_back({id, msg, score});
+  };
+
+  if (any({"IsDebuggerPresent", "CheckRemoteDebuggerPresent",
+           "NtQueryInformationProcess", "NtSetInformationThread",
+           "OutputDebugString"})) {
+    add("capability.anti_debug",
+        "Imports anti-debugging / debugger-detection APIs", 15);
+  }
+  if (all({"GetProcAddress", "LoadLibrary"})) {
+    add("capability.dynamic_api",
+        "Resolves APIs at runtime (GetProcAddress + LoadLibrary), a common way "
+        "to hide intent from static analysis",
+        10);
+  }
+  if (any({"SetWindowsHookEx", "GetAsyncKeyState", "GetKeyState",
+           "RegisterRawInputDevices"})) {
+    add("capability.keylogging", "Imports keyboard input-capture APIs (keylogger)",
+        25);
+  }
+  if (any({"BitBlt", "CreateCompatibleBitmap", "GetDesktopWindow"}) &&
+      any({"GetDC", "GetWindowDC"})) {
+    add("capability.screen_capture",
+        "Imports screen-capture APIs (screenshot / spyware)", 20);
+  }
+  if (any({"OpenClipboard", "GetClipboardData", "SetClipboardViewer"})) {
+    add("capability.clipboard", "Reads or monitors the clipboard", 15);
+  }
+  if (any({"OpenSCManager", "CreateService", "StartService",
+           "ChangeServiceConfig"})) {
+    add("capability.service",
+        "Imports service-control APIs (persistence / privileged execution)", 15);
+  }
+  if (any({"CryptEncrypt", "CryptDecrypt", "CryptAcquireContext", "BCryptEncrypt",
+           "CryptGenKey"})) {
+    add("capability.crypto",
+        "Imports cryptographic APIs (ransomware / config protection)", 10);
+  }
+  if (any({"CreateToolhelp32Snapshot", "Process32First", "Process32Next",
+           "EnumProcesses"})) {
+    add("capability.process_discovery",
+        "Enumerates running processes (discovery / targeting)", 10);
+  }
+  if (any({"AdjustTokenPrivileges", "LookupPrivilegeValue"}) &&
+      any({"OpenProcessToken"})) {
+    add("capability.token_privilege",
+        "Adjusts process token privileges (privilege escalation)", 20);
+  }
+  return out;
+}
+
 ScanResult ScanFile(const std::filesystem::path &path) {
   return ScanFile(path, ScannerOptions{});
 }
@@ -439,6 +510,13 @@ ScanResult ScanFile(const std::filesystem::path &path,
           ImportContains(result.imports, "RegCreateKey")) {
         AddFinding(result, "imports.registry_persistence",
                    "Imports registry write APIs that may support persistence", 10);
+      }
+
+      // Coarse capability surfacing from the import table (the "what can this
+      // do" row). Modest scores: capabilities inform triage; aggregation drives
+      // the verdict.
+      for (const auto &cap : DetectImportCapabilities(result.imports)) {
+        AddFinding(result, cap.ruleId, cap.message, cap.score);
       }
     }
 
