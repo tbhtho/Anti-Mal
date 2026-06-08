@@ -309,6 +309,40 @@ int CommandDetonate(int argc, wchar_t **argv) {
   const auto result = orchestrator.PrepareAndRun(
       std::filesystem::path(argv[2]), timeout, network, true, progress);
 
+  // Machine-readable result for automation / CI / SOAR pipelines. Stable shape;
+  // exit code is still 0 (no errors) / 20 (errors) so callers can branch on it.
+  if (HasFlag(argc, argv, "--json")) {
+    const bool haveReport = std::filesystem::exists(result.reportPath);
+    antimal::AnalysisReport report;
+    if (haveReport) {
+      report = antimal::LoadReportBestEffort(result.reportPath);
+      antimal::WriteReportHtml(result.runDir / "report.html", report);
+    }
+    std::string j = "{";
+    j += "\"runId\":" + antimal::JsonQuote(result.runId) + ",";
+    j += "\"runDir\":" + antimal::JsonQuote(antimal::PathToUtf8(result.runDir)) + ",";
+    j += "\"reportPath\":" +
+         antimal::JsonQuote(haveReport ? antimal::PathToUtf8(result.reportPath)
+                                       : std::string()) + ",";
+    j += "\"status\":" + antimal::JsonQuote(result.status) + ",";
+    j += "\"sandboxVerdict\":" +
+         antimal::JsonQuote(haveReport ? antimal::ToString(report.sandboxVerdict)
+                                       : std::string("error")) + ",";
+    j += std::string("\"sampleExecuted\":") +
+         ((haveReport && report.dynamicSummary.sampleExecuted) ? "true" : "false") +
+         ",";
+    j += "\"events\":" +
+         std::to_string(haveReport ? report.events.size() : size_t{0}) + ",";
+    j += "\"errors\":[";
+    for (size_t i = 0; i < result.errors.size(); ++i) {
+      if (i) j += ",";
+      j += antimal::JsonQuote(result.errors[i]);
+    }
+    j += "]}";
+    std::cout << j << "\n";
+    return result.errors.empty() ? 0 : 20;
+  }
+
   std::cout << "Run ID: " << result.runId << "\n";
   std::cout << "Run dir: " << antimal::PathToUtf8(result.runDir) << "\n";
   std::cout << "Job: " << antimal::PathToUtf8(result.jobPath) << "\n";
