@@ -644,9 +644,10 @@ IdeController::BuildIdentifyData(const IBlockDevice *disk) {
   PutWord(data, 1, 16383);        // Logical cylinders.
   PutWord(data, 3, 16);           // Logical heads.
   PutWord(data, 6, 63);           // Logical sectors per track.
-  PutAtaString(data, 10, 10, "AM0000000001");
-  PutAtaString(data, 23, 4, "0001");
-  PutAtaString(data, 27, 20, "AntiMal In-House IDE Disk");
+  // Anti-evasion: realistic SSD identity, not a sandbox-identifying name.
+  PutAtaString(data, 10, 10, "S3Z2NB0K500127T");
+  PutAtaString(data, 23, 4, "RVT04B6Q");
+  PutAtaString(data, 27, 20, "Samsung SSD 860 EVO 500GB");
   PutWord(data, 49, 0x0200);      // Capabilities: LBA supported (PIO, no DMA).
   PutWord(data, 53, 0x0007);      // Words 54-58, 64-70, 88 valid.
   PutWord(data, 60, static_cast<uint16_t>(lba28 & 0xFFFFu));

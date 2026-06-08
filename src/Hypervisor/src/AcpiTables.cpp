@@ -74,11 +74,16 @@ uint32_t BeginSdt(std::vector<uint8_t> &out, std::string_view signature,
   PutLe32(out, 0); // Length patched by EndSdt.
   out.push_back(revision);
   out.push_back(0); // Checksum patched by EndSdt.
-  AppendFixedAscii(out, "AMAL", 6);
-  AppendFixedAscii(out, "ANTIMAL", 8);
+  // Anti-evasion: the ACPI OEM identity must NOT spell out a sandbox name (any
+  // sample enumerating ACPI tables would detect "ANTIMAL" by string). Present the
+  // canonical real-PC AMI signature instead -- these are not hypervisor markers,
+  // and the checksum is recomputed by the loader (EndSdt leaves it 0), so this is
+  // boot-safe. OEMID / OEM Table ID / OEM Creator ID:
+  AppendFixedAscii(out, "ALASKA", 6);
+  AppendFixedAscii(out, "A M I", 8);
   PutLe32(out, 1);
-  AppendFixedAscii(out, "AMAL", 4);
-  PutLe32(out, 1);
+  AppendFixedAscii(out, "INTL", 4);
+  PutLe32(out, 0x20190703);
   return offset;
 }
 
@@ -844,7 +849,7 @@ std::vector<uint8_t> BuildRsdp(uint32_t rsdtOffset, uint32_t xsdtOffset) {
   std::vector<uint8_t> out;
   AppendFixedAscii(out, "RSD PTR ", 8, '\0'); // 0..7  signature
   out.push_back(0);                  // 8      checksum (loader recomputes)
-  AppendFixedAscii(out, "AMAL", 6);  // 9..14  OEMID
+  AppendFixedAscii(out, "ALASKA", 6); // 9..14  OEMID (anti-evasion: real-PC OEM)
   out.push_back(2);                  // 15     revision = ACPI 2.0+
   PutLe32(out, rsdtOffset);          // 16..19 RsdtAddress (loader relocates)
   PutLe32(out, 36);                  // 20..23 Length

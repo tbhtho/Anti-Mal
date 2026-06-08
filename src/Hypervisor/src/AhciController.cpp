@@ -53,9 +53,11 @@ AhciController::BuildIdentify(const IBlockDevice *disk) {
   };
   const uint64_t sectors = disk ? disk->SectorCount() : 0;
   putWord(0, 0x0040);                      // Fixed disk.
-  putStr(10, 10, "AM0000000001");          // Serial number.
-  putStr(23, 4, "0001");                   // Firmware revision.
-  putStr(27, 20, "AntiMal In-House SATA Disk");
+  // Anti-evasion: present a realistic consumer SSD, NOT a sandbox-identifying
+  // name. A sample reading Win32_DiskDrive.Model must not see "AntiMal" and bail.
+  putStr(10, 10, "S3Z2NB0K500127T");        // Serial number.
+  putStr(23, 4, "RVT04B6Q");                // Firmware revision.
+  putStr(27, 20, "Samsung SSD 860 EVO 500GB");
   putWord(47, 0x8000);
   putWord(49, 0x0300);                     // LBA + DMA supported.
   putWord(50, 0x4000);
