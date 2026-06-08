@@ -1352,6 +1352,29 @@ void WebViewHost::RegisterHandlers() {
     return std::string("{\"ok\":true,\"n\":") + std::to_string(rec.size()) +
            "}";
   });
+
+  // Host clipboard -> guest paste: return the host's CF_UNICODETEXT so the page
+  // can type it into the guest with the paced typer. Host->guest only (reads the
+  // host clipboard, never writes it); unsupported chars are skipped by the typer.
+  // Capped so a huge clipboard can't be typed key-by-key forever.
+  router_.Register("vm.paste", [](const JsonValue &) -> std::string {
+    std::string text;
+    if (OpenClipboard(nullptr)) {
+      HANDLE hData = GetClipboardData(CF_UNICODETEXT);
+      if (hData) {
+        const wchar_t *w = static_cast<const wchar_t *>(GlobalLock(hData));
+        if (w) {
+          text = Narrow(w);
+          GlobalUnlock(hData);
+        }
+      }
+      CloseClipboard();
+    }
+    if (text.size() > 4096) {
+      text.resize(4096);
+    }
+    return std::string("{\"text\":") + JsonQuote(text) + "}";
+  });
 }
 
 int WebViewHost::Run(HINSTANCE hInstance, int nCmdShow) {

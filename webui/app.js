@@ -164,7 +164,7 @@
         '<div class="actions"><button class="btn primary" id="vm-boot-btn">Boot VM (live)</button><button class="btn danger" id="vm-detonate-btn">Detonate Sample (live)</button><button class="btn" id="vm-stop-btn">Stop</button><button class="btn" id="vm-fs-btn" title="Fill the screen with the VM (Esc to exit)">⛶ Fullscreen</button></div>' +
         '<div class="screenframe" id="live-frame" tabindex="0" style="margin-top:12px;outline:none">Click “Boot VM (live)” for a clean session, or “Detonate Sample (live)” to run a BENIGN sample inside it — watch it execute here.</div>' +
         '<p class="page-sub" id="vm-focus-hint" style="margin:6px 0 0">Click the frame (or go Fullscreen) to capture your keyboard &amp; mouse; click outside it to release.</p>' +
-        '<div class="actions" style="margin-top:8px;flex-wrap:wrap"><input id="vm-text" type="text" autocomplete="off" placeholder="Type text to send into the VM (e.g. the password)…" style="flex:1;min-width:200px;background:var(--panel2);border:1px solid var(--border2);color:var(--text,#e6edf3);border-radius:8px;padding:7px 10px"><button class="btn" id="vm-send-text">Send Text ⏎</button><button class="btn primary" id="vm-send-pw" title="Types the default seed account password then Enter, paced so the guest reliably accepts it">Send Login Password</button><button class="btn" id="vm-send-enter">Send Enter</button><button class="btn" id="vm-send-cad" title="Send the Ctrl+Alt+Del secure-attention sequence to the VM">Ctrl+Alt+Del</button></div>' +
+        '<div class="actions" style="margin-top:8px;flex-wrap:wrap"><input id="vm-text" type="text" autocomplete="off" placeholder="Type text to send into the VM (e.g. the password)…" style="flex:1;min-width:200px;background:var(--panel2);border:1px solid var(--border2);color:var(--text,#e6edf3);border-radius:8px;padding:7px 10px"><button class="btn" id="vm-send-text">Send Text ⏎</button><button class="btn primary" id="vm-send-pw" title="Types the default seed account password then Enter, paced so the guest reliably accepts it">Send Login Password</button><button class="btn" id="vm-send-enter">Send Enter</button><button class="btn" id="vm-send-cad" title="Send the Ctrl+Alt+Del secure-attention sequence to the VM">Ctrl+Alt+Del</button><button class="btn" id="vm-paste" title="Type the host clipboard text into the VM">Paste</button></div>' +
         '<p class="page-sub" style="margin:6px 0 0">Live typing can be flaky at the boot/login screen; the paced buttons above are the reliable way in. Once at the desktop, direct keyboard/mouse work normally.</p></div>' +
         '<div class="panel"><h2>Live Process Telemetry <span id="vm-telemetry-status" class="page-sub" style="font-weight:400"></span></h2>' +
         '<div id="vm-events"><p class="page-sub" style="margin:0">No events yet — boot the VM to stream live process activity from the GuestAgent over COM2.</p></div></div>' +
@@ -628,6 +628,15 @@
     // LCtrl + LAlt + Delete(ext) make, then break in reverse — the secure
     // attention sequence (unlock / Task Manager / sign-out screen).
     if (scad) scad.onclick = function () { if (livePollTimer) { send('vm.input', { scancodes: [0x1D, 0x38, 0xE0, 0x53, 0xE0, 0xD3, 0xB8, 0x9D] }); appendLog('INFO', 'Sent Ctrl+Alt+Del.'); } else appendLog('WARN', 'No live VM.'); };
+    var vp = $('#vm-paste');
+    if (vp) vp.onclick = function () {
+      if (!livePollTimer) { appendLog('WARN', 'No live VM.'); return; }
+      send('vm.paste').then(function (r) {
+        var t = r && r.result && r.result.text;
+        if (t) { appendLog('INFO', 'Pasting ' + t.length + ' char(s) from host clipboard…'); sendTextToGuest(t, false); }
+        else appendLog('INFO', 'Host clipboard is empty (or not text).');
+      });
+    };
     var vt = $('#vm-text');
     if (vt) vt.addEventListener('keydown', function (e) { if (e.key === 'Enter') { e.preventDefault(); if (vt.value) sendTextToGuest(vt.value, true); } });
     // Live mouse: route movement/clicks over the frame into the guest (relative
