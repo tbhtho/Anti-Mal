@@ -8018,18 +8018,90 @@ void AppendJournalEvent(const std::filesystem::path &journalPath,
   }
 }
 
+// Map a completed in-house run to a sandbox verdict from what the guest actually
+// did. A VM/host failure is Error; a run where the sample never executed (gated
+// or healthcheck) is Unknown (NOT Error -- that was the long-standing bug where
+// every run badged "error"); an executed sample is scored from its observed
+// behavior. A calibrated model is the T07 follow-up; this is a conservative
+// first-order heuristic over the captured EventRecords.
+Verdict DeriveSandboxVerdict(const DynamicRunSummary &s,
+                             const std::vector<EventRecord> &events) {
+  if (s.crashed) {
+    return Verdict::Error;
+  }
+  if (!s.sampleExecuted) {
+    return Verdict::Unknown;
+  }
+  auto lower = [](std::string v) {
+    for (char &c : v) {
+      c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    }
+    return v;
+  };
+  auto has = [](const std::string &h, const char *n) {
+    return h.find(n) != std::string::npos;
+  };
+  auto endsWith = [](const std::string &h, const char *suf) {
+    const size_t n = std::strlen(suf);
+    return h.size() >= n && h.compare(h.size() - n, n, suf) == 0;
+  };
+  // External = anything not obviously loopback/local (conservative: a private-LAN
+  // contact still counts as noteworthy egress for triage purposes).
+  auto externalEndpoint = [&](const std::string &t) {
+    return !t.empty() && !has(t, "127.0.0.1") && !has(t, "::1") &&
+           !has(t, "localhost");
+  };
+  int persistence = 0, injection = 0, extNet = 0, exeDrops = 0, mitre = 0;
+  for (const auto &e : events) {
+    const std::string cat = lower(e.category);
+    const std::string act = lower(e.action);
+    const std::string tgtL = lower(e.target);
+    if (cat == "registry" &&
+        (has(tgtL, "\\run") || has(tgtL, "winlogon") || has(tgtL, "services\\") ||
+         has(tgtL, "currentversion\\run"))) {
+      ++persistence;
+    }
+    if (cat == "process" &&
+        (has(act, "inject") || has(act, "remote") || has(act, "hollow"))) {
+      ++injection;
+    }
+    if (cat == "network" &&
+        (has(act, "connect") || has(act, "connection") || has(act, "dns")) &&
+        externalEndpoint(e.target)) {
+      ++extNet;
+    }
+    if (cat == "file" && has(act, "create") &&
+        (endsWith(tgtL, ".exe") || endsWith(tgtL, ".dll") ||
+         endsWith(tgtL, ".scr") || endsWith(tgtL, ".sys"))) {
+      ++exeDrops;
+    }
+    if (!e.mitre.empty()) {
+      ++mitre;
+    }
+  }
+  const int total = persistence + injection + extNet + exeDrops;
+  if ((injection > 0 && extNet > 0) || total >= 4 || mitre >= 3) {
+    return Verdict::Malicious;
+  }
+  if (total >= 1 || mitre >= 1) {
+    return Verdict::Suspicious;
+  }
+  return Verdict::Clean; // executed and exited with no noteworthy behavior
+}
+
 void WriteErrorReport(const std::filesystem::path &reportPath,
                       const std::string &runId,
                       const std::filesystem::path &samplePath,
                       const std::vector<std::string> &errors,
                       const std::vector<EventRecord> &events = {},
                       const DynamicRunSummary &dynamicSummary = {},
-                      const std::vector<std::filesystem::path> &artifacts = {}) {
+                      const std::vector<std::filesystem::path> &artifacts = {},
+                      Verdict sandboxVerdict = Verdict::Error) {
   AnalysisReport report;
   report.runId = runId;
   report.samplePath = samplePath;
   report.scannerVerdict = ScanFile(samplePath);
-  report.sandboxVerdict = Verdict::Error;
+  report.sandboxVerdict = sandboxVerdict;
   report.dynamicSummary = dynamicSummary;
   report.events = events;
   report.artifacts = artifacts;
@@ -8048,7 +8120,7 @@ void WriteStagedReport(const std::filesystem::path &reportPath,
   report.runId = runId;
   report.samplePath = samplePath;
   report.scannerVerdict = ScanFile(samplePath);
-  report.sandboxVerdict = Verdict::Error;
+  report.sandboxVerdict = Verdict::Unknown; // staged/healthcheck: sample not run
   report.dynamicSummary = dynamicSummary;
   report.events = events;
   report.artifacts = artifacts;
@@ -11007,6 +11079,16 @@ DetonationResult InHouseOrchestrator::PrepareAndRun(
             static_cast<uint32_t>(totalTimeout.count()), networkMode, &jobNote);
         if (!jobNote.empty()) {
           fireProgress("booting", jobNote);
+          // An AUTHORIZED run that fell back to a healthcheck (oversize /
+          // unreadable / read-failed sample) did NOT detonate -- make that a
+          // first-class report condition, not just a transient log line, so the
+          // operator never mistakes a silent no-op for "the sample did nothing".
+          if (executionAuthorized &&
+              jobNote.find("healthcheck") != std::string::npos) {
+            result.errors.push_back(
+                "EXECUTION SKIPPED -- the sample was NOT detonated: " + jobNote);
+            result.dynamicSummary.status = "execution-skipped";
+          }
         }
         for (int reboot = 0; reboot <= kMaxReboots; ++reboot) {
           const auto elapsed =
@@ -11697,8 +11779,11 @@ DetonationResult InHouseOrchestrator::PrepareAndRun(
     result.dynamicSummary.artifactsCaptured =
         static_cast<uint32_t>(returnedArtifacts.size());
     WriteTextFile(vmSummaryPath, ToJson(result.dynamicSummary));
+    // Verdict from what the guest actually did (crash -> Error, executed ->
+    // scored behavior, never-ran -> Unknown), not a blanket "error".
     WriteErrorReport(result.reportPath, result.runId, samplePath, result.errors,
-                     events, result.dynamicSummary, returnedArtifacts);
+                     events, result.dynamicSummary, returnedArtifacts,
+                     DeriveSandboxVerdict(result.dynamicSummary, events));
   } else {
     result.status = "staged";
     result.dynamicSummary.status = "staged";

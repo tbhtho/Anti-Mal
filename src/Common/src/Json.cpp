@@ -41,6 +41,8 @@ std::string ToString(Verdict verdict) {
     return "suspicious";
   case Verdict::Malicious:
     return "malicious";
+  case Verdict::Unknown:
+    return "unknown";
   case Verdict::Error:
     return "error";
   }

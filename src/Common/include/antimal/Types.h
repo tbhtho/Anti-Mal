@@ -20,7 +20,8 @@ enum class Verdict {
   Clean,
   Suspicious,
   Malicious,
-  Error,
+  Unknown, // ran but inconclusive, or sample never executed (gated/healthcheck)
+  Error,   // the run itself failed (VM crash, boot failure, host exception)
 };
 
 struct EventRecord {

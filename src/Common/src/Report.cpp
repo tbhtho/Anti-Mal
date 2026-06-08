@@ -219,6 +219,7 @@ Verdict ParseVerdictValue(const JsonValue *value) {
   if (text == "malicious") return Verdict::Malicious;
   if (text == "suspicious") return Verdict::Suspicious;
   if (text == "clean") return Verdict::Clean;
+  if (text == "unknown") return Verdict::Unknown;
   return Verdict::Error;
 }
 
