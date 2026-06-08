@@ -1223,21 +1223,25 @@ void WebViewHost::RegisterHandlers() {
     if (seeded) {
       SetEnvironmentVariableW(L"ANTIMAL_SEED_OVERLAY", seed.c_str());
       SetEnvironmentVariableW(L"ANTIMAL_PROBE_OOBE_KEYS", nullptr);
-      SetEnvironmentVariableW(L"ANTIMAL_PROBE_PRESS_ENTER_SEC", L"40");
       // The seed snapshot lands on the Win11 lock/login screen. Reach the desktop
-      // hands-free per config.vmLoginMode (the interactive run loop stays alive
-      // through the login window, so the scheduled attempts land):
-      //   "password"  -> auto-type the account password (verified to reach the
-      //                  logged-in desktop on this build),
+      // per config.vmLoginMode (the interactive run loop stays alive through the
+      // login window):
+      //   "password"  -> dismiss the lock screen + auto-type the account password
+      //                  (verified to reach the logged-in desktop on this build),
       //   "autologon" -> patch the disposable overlay for AutoAdminLogon so NO
       //                  password is typed (the "no password" mode),
-      //   "manual"    -> type nothing; the analyst logs in via the live console.
+      //   "manual"    -> inject NOTHING. The VM sits at the lock screen and the
+      //                  analyst drives everything (dismiss + type) via the live
+      //                  console -- no surprise auto-input.
       SetEnvironmentVariableW(L"ANTIMAL_PROBE_LOGIN_PASSWORD", nullptr);
       SetEnvironmentVariableW(L"ANTIMAL_PROBE_OOBE_AUTOLOGON", nullptr);
+      SetEnvironmentVariableW(L"ANTIMAL_PROBE_PRESS_ENTER_SEC", nullptr);
       if (c.vmLoginMode == "password" && !c.vmLoginPassword.empty()) {
+        SetEnvironmentVariableW(L"ANTIMAL_PROBE_PRESS_ENTER_SEC", L"40");
         SetEnvironmentVariableW(L"ANTIMAL_PROBE_LOGIN_PASSWORD",
                                 Widen(c.vmLoginPassword).c_str());
       } else if (c.vmLoginMode == "autologon") {
+        SetEnvironmentVariableW(L"ANTIMAL_PROBE_PRESS_ENTER_SEC", L"40");
         SetEnvironmentVariableW(L"ANTIMAL_PROBE_OOBE_AUTOLOGON", L"1");
       }
     } else {

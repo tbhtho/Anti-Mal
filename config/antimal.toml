@@ -28,3 +28,9 @@ virustotal_api_key = ""
 dynamic_execution_enabled = false
 collect_screenshots = true
 screenshot_interval_ms = 2000
+
+# Live-VM hands-free login: password | autologon (no password) | manual.
+# "manual" = you drive the login yourself in the live console (click the password
+# box, type the password, press Enter). The account password is below.
+vm_login_mode = "manual"
+vm_login_password = "AntiMal!23"

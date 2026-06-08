@@ -70,7 +70,6 @@
       if (m.evt === 'scan.progress' && m.data) onScanProgress(m.data);
       if (m.evt === 'reports.data' && m.data) onReportsData(m.data);
       if (m.evt === 'dashboard.data' && m.data) onDashboardData(m.data);
-      if (m.evt === 'browser.data' && m.data) onBrowserData(m.data);
       if (m.evt === 'run.status' && m.data) onRunStatus(m.data);
       if (m.evt === 'telemetry' && m.data) onTelemetry(m.data);
       if (m.evt === 'vmframe' && m.w) onVmFrame(m.w, m.h);
@@ -162,10 +161,8 @@
       return '<h1 class="page-title">VM Analysis</h1><p class="page-sub">In-house WHP sandbox: live view, state, boot timeline, and safety gates.</p>' +
         '<div class="panel"><h2>Live VM <span id="vm-live-status" class="page-sub" style="font-weight:400"></span><span id="vm-display-mode" class="page-sub" style="font-weight:600;margin-left:10px;font-size:12px"></span></h2>' +
         '<div class="actions"><button class="btn primary" id="vm-boot-btn">Boot VM (live)</button><button class="btn danger" id="vm-detonate-btn">Detonate Sample (live)</button><button class="btn" id="vm-stop-btn">Stop</button><button class="btn" id="vm-fs-btn" title="Fill the screen with the VM (Esc to exit)">⛶ Fullscreen</button></div>' +
-        '<div class="screenframe" id="live-frame" tabindex="0" style="margin-top:12px;outline:none">Click “Boot VM (live)” for a clean session, or “Detonate Sample (live)” to run a BENIGN sample inside it — watch it execute here.</div>' +
-        '<p class="page-sub" id="vm-focus-hint" style="margin:6px 0 0">Click the frame (or go Fullscreen) to capture your keyboard &amp; mouse; click outside it to release.</p>' +
-        '<div class="actions" style="margin-top:8px;flex-wrap:wrap"><input id="vm-text" type="text" autocomplete="off" placeholder="Type text to send into the VM (e.g. the password)…" style="flex:1;min-width:200px;background:var(--panel2);border:1px solid var(--border2);color:var(--text,#e6edf3);border-radius:8px;padding:7px 10px"><button class="btn" id="vm-send-text">Send Text ⏎</button><button class="btn primary" id="vm-send-pw" title="Types the default seed account password then Enter, paced so the guest reliably accepts it">Send Login Password</button><button class="btn" id="vm-send-enter">Send Enter</button><button class="btn" id="vm-send-cad" title="Send the Ctrl+Alt+Del secure-attention sequence to the VM">Ctrl+Alt+Del</button><button class="btn" id="vm-paste" title="Type the host clipboard text into the VM">Paste</button></div>' +
-        '<p class="page-sub" style="margin:6px 0 0">Live typing can be flaky at the boot/login screen; the paced buttons above are the reliable way in. Once at the desktop, direct keyboard/mouse work normally.</p></div>' +
+        '<div class="screenframe" id="live-frame" tabindex="0" style="margin-top:12px;outline:none">Click “Boot VM (live)” for a clean session, or “Detonate Sample (live)” to run a BENIGN sample inside it.</div>' +
+        '</div>' +
         '<div class="panel"><h2>Live Process Telemetry <span id="vm-telemetry-status" class="page-sub" style="font-weight:400"></span></h2>' +
         '<div id="vm-events"><p class="page-sub" style="margin:0">No events yet — boot the VM to stream live process activity from the GuestAgent over COM2.</p></div></div>' +
         '<div class="row"><div class="panel" style="flex:1;min-width:280px"><h2>VM State</h2>' +
@@ -188,10 +185,6 @@
         steps.map(function (s, i) { return '<li class="' + (i === 0 ? 'cur' : 'todo') + '"><span class="mark"></span>' + esc((i + 1) + '. ' + s) + '</li>'; }).join('') +
         '</ul><p class="page-sub" style="margin:8px 0 0">Build or import the base image from the command line — see <span class="mono">tools\\New-AntiMalVmBase.ps1</span> (README → Base Image).</p></div>' +
         '<div class="panel"><h2>Requirements</h2>' + reqs.map(function (r) { return '<div class="gate"><span class="g">✓</span>' + esc(r) + '</div>'; }).join('') + '</div>';
-    },
-    browser: function () {
-      return '<h1 class="page-title">Browser Risk</h1><p class="page-sub">Saved browser sites and credentials potentially exposed by the latest run’s network activity. Decrypting stored secrets is a separate, gated action — never run automatically.</p>' +
-        '<div class="panel"><h2>Impact Assessment</h2><div id="browser-body"><p class="page-sub" style="margin:0">Loading…</p></div></div>';
     },
     config: function () {
       return '<h1 class="page-title">Config</h1><p class="page-sub">Live settings loaded from config/antimal.toml via the host bridge.</p>' +
@@ -588,20 +581,13 @@
     liveFrameCount++;
     if (liveSession === 'boot') { liveSession = 'running'; setVmState('running'); }
   }
-  // Surface whether the live view is the real shared-memory <canvas> (~30fps) or
-  // the legacy PNG-screenshot fallback, so "it's a real VM, not a screenshot" is
-  // observable. Runs once per second while a session is live.
+  // Clean FPS readout while a live session runs. No "fallback" label clutter.
   function updateDisplayMode() {
     var el = $('#vm-display-mode'); if (!el) return;
-    if (!livePollTimer) { el.textContent = ''; return; }
-    if (usingSharedFrames) {
-      liveFps = liveFrameCount; liveFrameCount = 0;
-      el.textContent = '● live canvas · ' + liveFps + ' fps';
-      el.style.color = '#7ee2a8';
-    } else {
-      el.textContent = '○ PNG screenshots (fallback)';
-      el.style.color = '#e0b85a';
-    }
+    if (!livePollTimer || !usingSharedFrames) { el.textContent = ''; return; }
+    liveFps = liveFrameCount; liveFrameCount = 0;
+    el.textContent = liveFps + ' FPS';
+    el.style.color = '#7ee2a8';
   }
   function startLivePoll() {
     stopLivePoll();
@@ -675,27 +661,6 @@
     };
     var fsb = $('#vm-fs-btn');
     if (fsb) fsb.onclick = toggleFullscreen;
-    var stb = $('#vm-send-text');
-    if (stb) stb.onclick = function () { var t = $('#vm-text'); if (t && t.value) sendTextToGuest(t.value, true); };
-    var spw = $('#vm-send-pw');
-    if (spw) spw.onclick = function () { appendLog('INFO', 'Sending login password (paced)…'); sendTextToGuest('AntiMal!23', true); };
-    var sen = $('#vm-send-enter');
-    if (sen) sen.onclick = function () { if (livePollTimer) send('vm.input', { scancodes: [0x1C, 0x9C] }); else appendLog('WARN', 'No live VM.'); };
-    var scad = $('#vm-send-cad');
-    // LCtrl + LAlt + Delete(ext) make, then break in reverse — the secure
-    // attention sequence (unlock / Task Manager / sign-out screen).
-    if (scad) scad.onclick = function () { if (livePollTimer) { send('vm.input', { scancodes: [0x1D, 0x38, 0xE0, 0x53, 0xE0, 0xD3, 0xB8, 0x9D] }); appendLog('INFO', 'Sent Ctrl+Alt+Del.'); } else appendLog('WARN', 'No live VM.'); };
-    var vp = $('#vm-paste');
-    if (vp) vp.onclick = function () {
-      if (!livePollTimer) { appendLog('WARN', 'No live VM.'); return; }
-      send('vm.paste').then(function (r) {
-        var t = r && r.result && r.result.text;
-        if (t) { appendLog('INFO', 'Pasting ' + t.length + ' char(s) from host clipboard…'); sendTextToGuest(t, false); }
-        else appendLog('INFO', 'Host clipboard is empty (or not text).');
-      });
-    };
-    var vt = $('#vm-text');
-    if (vt) vt.addEventListener('keydown', function (e) { if (e.key === 'Enter') { e.preventDefault(); if (vt.value) sendTextToGuest(vt.value, true); } });
     // Live mouse: route movement/clicks over the frame into the guest (relative
     // PS/2 mouse). Movement deltas are scaled from displayed px to guest px and
     // accumulated; flushLiveMouse sends them ~20/s. Buttons go immediately.
@@ -713,58 +678,66 @@
         return { x: 1, y: 1 };
       }
       function btnBit(b) { return b === 2 ? 0x02 : (b === 1 ? 0x04 : 0x01); }
-      lf.addEventListener('mousemove', function (e) {
-        if (!livePollTimer) return;
-        var s = frameScale();
-        liveMouse.dx += (e.movementX || 0) * s.x;
-        liveMouse.dy += (e.movementY || 0) * s.y;
-      });
+      // Captured = the pointer is locked to the frame. Like a VirtualBox window,
+      // the first click captures the mouse: the host cursor vanishes and only the
+      // guest's cursor shows; movement/clicks/keys all go to the VM. Esc releases.
+      // Query by id (never close over a specific element) so this stays correct
+      // across page remounts.
+      function vmCaptured() { var pl = document.pointerLockElement; return !!pl && pl.id === 'live-frame'; }
+      // Per-mount: the frame element is recreated on every VM-page mount, so its
+      // own listeners die with it. First click grabs the mouse.
       lf.addEventListener('mousedown', function (e) {
-        lf.focus();          // capture keyboard so keys go to the guest, not the UI
         if (!livePollTimer) return;
         e.preventDefault();
+        if (!vmCaptured()) { if (lf.requestPointerLock) { try { lf.requestPointerLock(); } catch (_) {} } lf.focus(); return; }
         liveMouse.btn |= btnBit(e.button);
         send('vm.input', { mouse: { buttons: liveMouse.btn, dx: 0, dy: 0 } });
       });
-      lf.addEventListener('mouseup', function (e) {
-        if (!livePollTimer) return;
-        e.preventDefault();
-        liveMouse.btn &= ~btnBit(e.button);
-        send('vm.input', { mouse: { buttons: liveMouse.btn, dx: 0, dy: 0 } });
-      });
       lf.addEventListener('contextmenu', function (e) { e.preventDefault(); });
-      // Keyboard goes to the guest ONLY while the frame is focused -- and we eat
-      // the event so it can never leak to the UI (Space/Enter activating a button
-      // and booting a second VM was exactly this leaking). Tab is also swallowed
-      // so focus can't escape the frame mid-session.
-      lf.addEventListener('keydown', function (e) {
-        if (!livePollTimer) return;
-        // Eat EVERY key while the frame is focused so nothing can scroll or
-        // activate the page (arrows, space, Tab, Enter all stay in the VM).
-        e.preventDefault();
-        e.stopPropagation();
-        var mk = keyScancodes(e.code, true);
-        if (!mk) return;
-        heldKeys[e.code] = keyScancodes(e.code, false); // remember its break
-        send('vm.input', { scancodes: mk });            // MAKE (auto-repeats too)
-      });
-      lf.addEventListener('keyup', function (e) {
-        if (!livePollTimer) return;
-        e.preventDefault();
-        e.stopPropagation();
-        var bk = keyScancodes(e.code, false);
-        delete heldKeys[e.code];
-        if (bk) send('vm.input', { scancodes: bk });    // BREAK on release
-      });
-      lf.addEventListener('focus', function () {
-        lf.style.outline = '2px solid #4ea1ff';
-        var h = $('#vm-focus-hint'); if (h) { h.textContent = '● Capturing keyboard & mouse — click outside the frame to release.'; h.style.color = '#4ea1ff'; }
-      });
-      lf.addEventListener('blur', function () {
-        releaseHeldKeys(); // never leave a modifier stuck down in the guest
-        lf.style.outline = 'none';
-        var h = $('#vm-focus-hint'); if (h) { h.textContent = 'Click the frame to capture your keyboard & mouse; click outside it to release.'; h.style.color = ''; }
-      });
+      // Document-level listeners attach ONCE -- they outlive page remounts, so
+      // attaching them per-mount would stack duplicates and double every keystroke.
+      // They act only while the live frame holds the pointer lock.
+      if (!loadVm._inputWired) {
+        loadVm._inputWired = true;
+        document.addEventListener('pointerlockchange', function () {
+          var f = document.getElementById('live-frame');
+          if (vmCaptured()) { if (f) f.style.outline = '2px solid #4ea1ff'; }
+          else { if (f) f.style.outline = 'none'; releaseHeldKeys(); } // never leave a key stuck
+        });
+        // Relative motion (movementX/Y) keeps coming under pointer lock even past
+        // the window edge -- exactly what a guest mouse expects.
+        document.addEventListener('mousemove', function (e) {
+          if (!livePollTimer || !vmCaptured()) return;
+          var s = frameScale();
+          liveMouse.dx += (e.movementX || 0) * s.x;
+          liveMouse.dy += (e.movementY || 0) * s.y;
+        });
+        document.addEventListener('mouseup', function (e) {
+          if (!livePollTimer || !vmCaptured()) return;
+          e.preventDefault();
+          liveMouse.btn &= ~btnBit(e.button);
+          send('vm.input', { mouse: { buttons: liveMouse.btn, dx: 0, dy: 0 } });
+        });
+        // CRITICAL: skip the OS key auto-repeat (a held key fires keydown over and
+        // over). Re-sending the MAKE each repeat is what typed garbled/duplicated
+        // passwords. Send ONE make per physical press; break goes on keyup.
+        document.addEventListener('keydown', function (e) {
+          if (!livePollTimer || !vmCaptured()) return;
+          e.preventDefault(); e.stopPropagation();
+          if (heldKeys[e.code]) return;                   // OS auto-repeat -> ignore
+          var mk = keyScancodes(e.code, true);
+          if (!mk) return;
+          heldKeys[e.code] = keyScancodes(e.code, false); // remember its break
+          send('vm.input', { scancodes: mk });            // MAKE (once)
+        });
+        document.addEventListener('keyup', function (e) {
+          if (!livePollTimer || !vmCaptured()) return;
+          e.preventDefault(); e.stopPropagation();
+          var bk = keyScancodes(e.code, false);
+          delete heldKeys[e.code];
+          if (bk) send('vm.input', { scancodes: bk });    // BREAK on release
+        });
+      }
     }
     // If a VM is actually running (navigated away and came back), resume the live
     // frame + input stream. vm.frame reports live:false when no VM is running, so a
@@ -822,31 +795,6 @@
       if (banner) banner.textContent = dyn ? 'WARNING: dynamic execution is ENABLED — detonations will run live samples.' : 'Dynamic execution is blocked by default.';
     });
   }
-  function loadBrowser() {
-    var box = $('#browser-body'); if (box) box.innerHTML = '<p class="page-sub" style="margin:0">Analyzing latest run…</p>';
-    send('browser.get').then(function (r) {
-      if ((!r || !r.ok) && box) { box.innerHTML = '<p class="page-sub" style="margin:0">Browser analysis failed.</p>'; appendLog('ERROR', 'Browser analysis failed: ' + String((r && r.error) || 'unknown')); }
-    });
-  }
-  function onBrowserData(d) {
-    var box = $('#browser-body'); if (!box) return;
-    var risks = (d && d.risks) || [];
-    var domains = (d && d.domains) | 0;
-    if (!risks.length) {
-      box.innerHTML = '<p class="page-sub" style="margin:0">No browser-credential exposure detected. The latest run contacted ' + domains + ' domain(s).</p>';
-      appendLog('INFO', 'Browser risk: clean (' + domains + ' domains contacted).');
-      return;
-    }
-    var rows = risks.map(function (x) {
-      var flags = [];
-      if (x.contactedBySample) flags.push('contacted');
-      if (x.savedCredentials) flags.push('saved creds');
-      if (x.cookiesPresent) flags.push('cookies');
-      return '<tr><td>' + esc(x.site || x.domain || '—') + '</td><td class="mono">' + esc(x.domain || '—') + '</td><td>' + tags(flags) + '</td><td>' + esc(x.recommendation || '') + '</td></tr>';
-    }).join('');
-    box.innerHTML = '<table class="grid"><thead><tr><th>Site</th><th>Domain</th><th>Signals</th><th>Recommendation</th></tr></thead><tbody>' + rows + '</tbody></table>';
-    appendLog('WARN', risks.length + ' site(s) flagged for browser-credential risk.');
-  }
   function fmtBytes(n) {
     n = Number(n) || 0;
     if (n <= 0) return '0 B';
@@ -868,7 +816,7 @@
       appendLog(exists ? 'INFO' : 'WARN', exists ? 'Base image ready (' + fmtBytes(c.baseSizeBytes) + ').' : 'Base image not built yet.');
     });
   }
-  var mounts = { dashboard: loadDashboard, vm: loadVm, base: loadBase, config: loadConfig, scan: renderScans, reports: loadReports, browser: loadBrowser, safety: loadSafety };
+  var mounts = { dashboard: loadDashboard, vm: loadVm, base: loadBase, config: loadConfig, scan: renderScans, reports: loadReports, safety: loadSafety };
 
   // ---------- router ----------
   function route(page) {
