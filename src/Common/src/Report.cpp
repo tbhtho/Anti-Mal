@@ -360,6 +360,9 @@ ScanResult ParseScan(const JsonValue *value) {
   scan.authenticodeSigned = BoolValue(Member(*value, "authenticodeSigned"));
   scan.imports = StringArrayValue(Member(*value, "imports"));
   scan.peTimestamp = static_cast<uint32_t>(DoubleValue(Member(*value, "peTimestamp")));
+  scan.peOverlaySize =
+      static_cast<uint64_t>(DoubleValue(Member(*value, "peOverlaySize")));
+  scan.peOverlayEntropy = DoubleValue(Member(*value, "peOverlayEntropy"));
   scan.peSections = ParseSections(Member(*value, "peSections"));
   scan.findings = ParseFindings(Member(*value, "findings"));
   scan.score = IntValue(Member(*value, "score"));
@@ -1438,7 +1441,7 @@ std::string BuildHtmlReportWithFrames(const AnalysisReport &report,
   // writable+executable or high-entropy section is the visible packer tell.
   if (scan.isPe && !scan.peSections.empty()) {
     html << "<section class=\"panel\"><h2>PE sections</h2>";
-    if (scan.imphash.size() || scan.peTimestamp) {
+    if (scan.imphash.size() || scan.peTimestamp || scan.peOverlaySize) {
       html << "<div class=\"kv\">";
       if (!scan.imphash.empty()) {
         html << "<div class=\"k\">imphash</div><div class=\"mono\">"
@@ -1447,6 +1450,12 @@ std::string BuildHtmlReportWithFrames(const AnalysisReport &report,
       if (scan.peTimestamp) {
         html << "<div class=\"k\">compiled (epoch)</div><div class=\"mono\">"
              << scan.peTimestamp << "</div>";
+      }
+      if (scan.peOverlaySize) {
+        char ob[32];
+        std::snprintf(ob, sizeof(ob), "%.2f", scan.peOverlayEntropy);
+        html << "<div class=\"k\">overlay</div><div class=\"mono\">"
+             << scan.peOverlaySize << " bytes, entropy " << ob << "</div>";
       }
       html << "</div>";
     }

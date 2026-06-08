@@ -147,6 +147,7 @@ PeInfo ParsePe(const std::vector<uint8_t> &data) {
 
   // Section table + per-section entropy (parsed before the import-directory
   // early-outs below, so a PE with no imports still reports its sections).
+  uint64_t maxRawEnd = 0;
   if (const IMAGE_SECTION_HEADER *first = Sections(data, nt)) {
     const auto firstOffset =
         static_cast<size_t>(reinterpret_cast<const uint8_t *>(first) - data.data());
@@ -166,6 +167,10 @@ PeInfo ParsePe(const std::vector<uint8_t> &data) {
       sec.writable = (sh->Characteristics & IMAGE_SCN_MEM_WRITE) != 0;
       size_t off = sh->PointerToRawData;
       size_t len = sh->SizeOfRawData;
+      if (sh->SizeOfRawData > 0) {
+        maxRawEnd = std::max<uint64_t>(
+            maxRawEnd, static_cast<uint64_t>(sh->PointerToRawData) + sh->SizeOfRawData);
+      }
       if (off < data.size()) {
         if (len > data.size() - off) {
           len = data.size() - off;
@@ -174,6 +179,17 @@ PeInfo ParsePe(const std::vector<uint8_t> &data) {
       }
       info.sections.push_back(std::move(sec));
     }
+  }
+
+  // Overlay: bytes appended after the last section's raw data. Common in
+  // installers, and a frequent home for appended encrypted/packed payloads. For
+  // a SIGNED PE this region also holds the Authenticode certificate, so the
+  // Scanner only treats a high-entropy overlay on an UNSIGNED file as a tell.
+  if (maxRawEnd > 0 && data.size() > maxRawEnd) {
+    info.overlayOffset = maxRawEnd;
+    info.overlaySize = static_cast<uint64_t>(data.size()) - maxRawEnd;
+    info.overlayEntropy = ByteEntropy(
+        data.data() + maxRawEnd, static_cast<size_t>(info.overlaySize));
   }
 
   DWORD importRva = 0;

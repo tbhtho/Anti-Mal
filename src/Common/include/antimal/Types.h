@@ -124,6 +124,8 @@ struct ScanResult {
   bool authenticodeSigned = false;
   uint32_t peTimestamp = 0;          // PE compile timestamp (unix epoch secs)
   std::vector<PeSection> peSections; // section table + per-section entropy
+  uint64_t peOverlaySize = 0;        // bytes appended after the last section
+  double peOverlayEntropy = 0.0;     // entropy of that overlay region
   std::vector<std::string> imports;
   std::vector<ScanFinding> findings;
   int score = 0;

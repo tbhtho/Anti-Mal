@@ -2234,6 +2234,28 @@ void TestPeParser() {
     }
   }
   Expect(sawExecCode, "at least one executable code section with real entropy");
+  // Overlay accounting must be self-consistent: a reported overlay starts past
+  // the last section and its size is the tail of the file.
+  if (pe.overlaySize > 0) {
+    Expect(pe.overlayOffset > 0, "overlay offset is past the headers/sections");
+    Expect(pe.overlayEntropy >= 0.0 && pe.overlayEntropy <= 8.0,
+           "overlay entropy is in range");
+  }
+  // Synthetic check: append a high-entropy blob to the parsed image bytes and
+  // confirm the overlay grows by exactly that many bytes (the dropper signal).
+  {
+    auto img = antimal::ReadAllBytes(modulePath);
+    const uint64_t before = antimal::ParsePe(img).overlaySize;
+    std::vector<uint8_t> blob(8192);
+    for (size_t i = 0; i < blob.size(); ++i) {
+      blob[i] = static_cast<uint8_t>((i * 2654435761u) >> 13); // spread bytes
+    }
+    img.insert(img.end(), blob.begin(), blob.end());
+    const auto pe2 = antimal::ParsePe(img);
+    Expect(pe2.overlaySize == before + blob.size(),
+           "appended bytes are accounted as overlay growth");
+    Expect(pe2.overlayEntropy > 3.0, "appended pseudo-random overlay has entropy");
+  }
 }
 
 // MD5 (triage hash) + the pefile-compatible imphash. MD5 is checked against the

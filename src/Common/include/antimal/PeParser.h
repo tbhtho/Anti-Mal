@@ -28,6 +28,9 @@ struct PeInfo {
   uint16_t subsystem = 0;
   uint32_t timeDateStamp = 0; // IMAGE_FILE_HEADER.TimeDateStamp (unix epoch secs)
   std::vector<PeSection> sections;
+  uint64_t overlayOffset = 0;  // file offset where post-last-section data begins
+  uint64_t overlaySize = 0;    // appended bytes (includes any Authenticode cert)
+  double overlayEntropy = 0.0; // Shannon entropy of the overlay region
   std::vector<std::string> imports;
   // pefile-compatible import hash: MD5 of the comma-joined, lowercased
   // "libname_no_ext.funcname" tokens in import-table order (ordinal imports

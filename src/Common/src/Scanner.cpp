@@ -340,6 +340,8 @@ ScanResult ScanFile(const std::filesystem::path &path,
     result.imphash = pe.imphash;
     result.peTimestamp = pe.timeDateStamp;
     result.peSections = pe.sections;
+    result.peOverlaySize = pe.overlaySize;
+    result.peOverlayEntropy = pe.overlayEntropy;
 
     if (result.entropy > 7.2) {
       AddFinding(result, "entropy.high", "File entropy is above packed/encrypted threshold", 25);
@@ -365,6 +367,17 @@ ScanResult ScanFile(const std::filesystem::path &path,
                    "Unsigned PE from a user-writable or transient path", 20);
       } else if (!result.authenticodeSigned) {
         AddFinding(result, "signature.unsigned_pe", "Unsigned PE executable", 10);
+      }
+
+      // A large, near-random overlay on an UNSIGNED PE is a classic appended-
+      // payload / packed-stage tell. Signed PEs are excluded because their
+      // Authenticode certificate legitimately lives in the overlay region.
+      if (!result.authenticodeSigned && result.peOverlaySize > 4096 &&
+          result.peOverlayEntropy > 7.0) {
+        AddFinding(result, "pe.overlay_high_entropy",
+                   "Large high-entropy overlay appended after the last section "
+                   "(possible encrypted/packed payload)",
+                   25);
       }
 
       const bool injection =
@@ -479,6 +492,10 @@ std::string FormatScanText(const ScanResult &result) {
   for (const auto &sec : result.peSections) {
     out << "  section " << sec.name << ": entropy " << sec.entropy
         << (sec.executable ? " X" : "") << (sec.writable ? " W" : "") << "\n";
+  }
+  if (result.peOverlaySize > 0) {
+    out << "  overlay: " << result.peOverlaySize << " bytes, entropy "
+        << result.peOverlayEntropy << "\n";
   }
   for (const auto &finding : result.findings) {
     out << "  - [" << finding.ruleId << "] +" << finding.score << " "
