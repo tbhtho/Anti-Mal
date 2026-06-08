@@ -113,6 +113,8 @@ struct ScanDieDetection {
 struct ScanResult {
   std::filesystem::path path;
   std::string sha256;
+  std::string md5;     // triage cross-reference hash (identification only)
+  std::string imphash; // pefile-compatible import hash; empty for non-PE / no imports
   double entropy = 0.0;
   bool isPe = false;
   bool authenticodeSigned = false;

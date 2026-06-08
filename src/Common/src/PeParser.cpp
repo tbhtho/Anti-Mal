@@ -1,5 +1,6 @@
 #include "antimal/PeParser.h"
 
+#include "antimal/Crypto.h"
 #include "antimal/FileUtil.h"
 
 #include <Windows.h>
@@ -65,6 +66,32 @@ std::string ReadAsciiZ(const std::vector<uint8_t> &data, size_t offset) {
 
 } // namespace
 
+std::string ComputeImphash(
+    const std::vector<std::pair<std::string, std::string>> &imports) {
+  std::string joined;
+  for (const auto &entry : imports) {
+    std::string lib = ToLowerAscii(entry.first);
+    // pefile strips a single trailing .dll/.ocx/.sys before hashing.
+    const size_t dot = lib.find_last_of('.');
+    if (dot != std::string::npos) {
+      const std::string ext = lib.substr(dot + 1);
+      if (ext == "dll" || ext == "ocx" || ext == "sys") {
+        lib.erase(dot);
+      }
+    }
+    if (!joined.empty()) {
+      joined.push_back(',');
+    }
+    joined += lib;
+    joined.push_back('.');
+    joined += ToLowerAscii(entry.second);
+  }
+  if (joined.empty()) {
+    return std::string();
+  }
+  return Md5Hex(std::vector<uint8_t>(joined.begin(), joined.end()));
+}
+
 PeInfo ParsePe(const std::vector<uint8_t> &data) {
   PeInfo info;
   const auto *dos = PtrAt<IMAGE_DOS_HEADER>(data, 0);
@@ -100,6 +127,11 @@ PeInfo ParsePe(const std::vector<uint8_t> &data) {
     return info;
   }
 
+  // Imports in raw import-table order (named + ordinal), used to compute the
+  // pefile-compatible imphash. info.imports keeps its existing contract (sorted,
+  // deduped, named-only) for the tagger / IOC consumers.
+  std::vector<std::pair<std::string, std::string>> orderedImports;
+
   for (size_t descIndex = 0; descIndex < 512; ++descIndex) {
     const auto *desc = PtrAt<IMAGE_IMPORT_DESCRIPTOR>(
         data, importOffset + descIndex * sizeof(IMAGE_IMPORT_DESCRIPTOR));
@@ -125,6 +157,8 @@ PeInfo ParsePe(const std::vector<uint8_t> &data) {
         }
         thunk = t->u1.AddressOfData;
         if (IMAGE_SNAP_BY_ORDINAL64(thunk)) {
+          orderedImports.emplace_back(
+              dll, "ord" + std::to_string(IMAGE_ORDINAL64(thunk)));
           continue;
         }
       } else {
@@ -135,6 +169,9 @@ PeInfo ParsePe(const std::vector<uint8_t> &data) {
         }
         thunk = t->u1.AddressOfData;
         if (IMAGE_SNAP_BY_ORDINAL32(static_cast<DWORD>(thunk))) {
+          orderedImports.emplace_back(
+              dll,
+              "ord" + std::to_string(IMAGE_ORDINAL32(static_cast<DWORD>(thunk))));
           continue;
         }
       }
@@ -147,10 +184,12 @@ PeInfo ParsePe(const std::vector<uint8_t> &data) {
       std::string name = ReadAsciiZ(data, nameOffset + offsetof(IMAGE_IMPORT_BY_NAME, Name));
       if (!name.empty()) {
         info.imports.push_back(dll + "!" + name);
+        orderedImports.emplace_back(dll, name);
       }
     }
   }
 
+  info.imphash = ComputeImphash(orderedImports);
   std::sort(info.imports.begin(), info.imports.end());
   info.imports.erase(std::unique(info.imports.begin(), info.imports.end()), info.imports.end());
   return info;

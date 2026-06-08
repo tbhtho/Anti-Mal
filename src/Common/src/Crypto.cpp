@@ -42,10 +42,11 @@ std::string Hex(const std::vector<uint8_t> &bytes) {
   return out.str();
 }
 
-} // namespace
-
-std::string Sha256Hex(const std::vector<uint8_t> &data) {
-  BCryptAlg alg(BCRYPT_SHA256_ALGORITHM);
+// Shared one-shot BCrypt hash: open the named algorithm, hash all of `data`,
+// return the lowercase-hex digest. Used by both Sha256Hex and Md5Hex so the
+// error handling / digest-length plumbing lives in exactly one place.
+std::string HashHex(const wchar_t *algorithm, const std::vector<uint8_t> &data) {
+  BCryptAlg alg(algorithm);
 
   DWORD hashLength = 0;
   DWORD cbData = 0;
@@ -76,8 +77,22 @@ std::string Sha256Hex(const std::vector<uint8_t> &data) {
   return Hex(digest);
 }
 
+} // namespace
+
+std::string Sha256Hex(const std::vector<uint8_t> &data) {
+  return HashHex(BCRYPT_SHA256_ALGORITHM, data);
+}
+
 std::string Sha256File(const std::filesystem::path &path) {
   return Sha256Hex(ReadAllBytes(path));
+}
+
+std::string Md5Hex(const std::vector<uint8_t> &data) {
+  return HashHex(BCRYPT_MD5_ALGORITHM, data);
+}
+
+std::string Md5File(const std::filesystem::path &path) {
+  return Md5Hex(ReadAllBytes(path));
 }
 
 std::optional<std::vector<uint8_t>> DpapiUnprotect(const std::vector<uint8_t> &ciphertext) {

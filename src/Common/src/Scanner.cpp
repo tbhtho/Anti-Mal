@@ -250,11 +250,13 @@ ScanResult ScanFile(const std::filesystem::path &path,
   try {
     const auto data = ReadAllBytes(path);
     result.sha256 = Sha256Hex(data);
+    result.md5 = Md5Hex(data);
     result.entropy = CalculateEntropy(data);
 
     const PeInfo pe = ParsePe(data);
     result.isPe = pe.isPe;
     result.imports = pe.imports;
+    result.imphash = pe.imphash;
 
     if (result.entropy > 7.2) {
       AddFinding(result, "entropy.high", "File entropy is above packed/encrypted threshold", 25);
@@ -362,6 +364,12 @@ std::string FormatScanText(const ScanResult &result) {
   std::ostringstream out;
   out << PathToUtf8(result.path) << "\n";
   out << "  sha256: " << result.sha256 << "\n";
+  if (!result.md5.empty()) {
+    out << "  md5: " << result.md5 << "\n";
+  }
+  if (!result.imphash.empty()) {
+    out << "  imphash: " << result.imphash << "\n";
+  }
   out << "  score: " << result.score << " (" << ToString(result.verdict) << ")\n";
   out << "  entropy: " << result.entropy << "\n";
   out << "  pe: " << (result.isPe ? "yes" : "no")

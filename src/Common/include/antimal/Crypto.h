@@ -10,6 +10,11 @@ namespace antimal {
 
 std::string Sha256Hex(const std::vector<uint8_t> &data);
 std::string Sha256File(const std::filesystem::path &path);
+// MD5 is cryptographically broken but remains the lingua franca of malware
+// triage (imphash, AV feeds, MalwareBazaar/VT cross-referencing) -- exposed for
+// IDENTIFICATION ONLY, never for a security decision.
+std::string Md5Hex(const std::vector<uint8_t> &data);
+std::string Md5File(const std::filesystem::path &path);
 std::optional<std::vector<uint8_t>> DpapiUnprotect(const std::vector<uint8_t> &ciphertext);
 std::optional<std::vector<uint8_t>> AesGcmDecrypt(const std::vector<uint8_t> &key,
                                                   const std::vector<uint8_t> &nonce,

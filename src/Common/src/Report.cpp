@@ -331,6 +331,8 @@ ScanResult ParseScan(const JsonValue *value) {
   if (!value) return scan;
   scan.path = Utf8ToWide(StringValue(Member(*value, "path")));
   scan.sha256 = StringValue(Member(*value, "sha256"));
+  scan.md5 = StringValue(Member(*value, "md5"));
+  scan.imphash = StringValue(Member(*value, "imphash"));
   scan.entropy = DoubleValue(Member(*value, "entropy"));
   scan.isPe = BoolValue(Member(*value, "isPe"));
   scan.authenticodeSigned = BoolValue(Member(*value, "authenticodeSigned"));
@@ -1086,8 +1088,14 @@ std::string BuildHtmlReportWithFrames(const AnalysisReport &report,
   // Header
   html << "<header><div class=\"icon\">AM</div><div><h1>"
        << HtmlEscape(PathToUtf8(report.samplePath.empty() ? scan.path : report.samplePath))
-       << "</h1><div class=\"sub\">SHA-256 " << HtmlEscape(scan.sha256)
-       << " &nbsp;&middot;&nbsp; run " << HtmlEscape(report.runId) << "</div></div>";
+       << "</h1><div class=\"sub\">SHA-256 " << HtmlEscape(scan.sha256);
+  if (!scan.md5.empty()) {
+    html << " &nbsp;&middot;&nbsp; MD5 " << HtmlEscape(scan.md5);
+  }
+  if (!scan.imphash.empty()) {
+    html << " &nbsp;&middot;&nbsp; imphash " << HtmlEscape(scan.imphash);
+  }
+  html << " &nbsp;&middot;&nbsp; run " << HtmlEscape(report.runId) << "</div></div>";
   html << "<div class=\"tags\">";
   EmitTags(html, scan.tags);
   html << "</div></header>";

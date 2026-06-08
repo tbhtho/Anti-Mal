@@ -63,6 +63,7 @@
 #include <map>
 #include <stdexcept>
 #include <string>
+#include <utility>
 #include <atomic>
 #include <chrono>
 #include <stop_token>
@@ -2213,6 +2214,53 @@ void TestPeParser() {
   GetModuleFileNameW(nullptr, modulePath, MAX_PATH);
   const auto pe = antimal::ParsePeFile(modulePath);
   Expect(pe.isPe, "current test executable parses as PE");
+  // The test exe links bcrypt/kernel32/etc., so it has a non-trivial import
+  // table -> a well-formed, deterministic imphash.
+  Expect(pe.imphash.size() == 32, "imphash is a 32-char MD5 for an importing PE");
+  Expect(antimal::ParsePeFile(modulePath).imphash == pe.imphash,
+         "imphash is deterministic across parses");
+}
+
+// MD5 (triage hash) + the pefile-compatible imphash. MD5 is checked against the
+// canonical RFC-1321 test vectors; imphash canonicalization (lowercase, strip a
+// trailing .dll/.ocx/.sys, "ordN" ordinals, comma-join, then MD5) is checked by
+// constructing the expected canonical string BY HAND and MD5-ing it -- so the
+// test independently re-derives the contract rather than trusting the producer.
+void TestMd5AndImphash() {
+  auto bytes = [](const std::string &s) {
+    return std::vector<uint8_t>(s.begin(), s.end());
+  };
+  // RFC 1321 vectors.
+  Expect(antimal::Md5Hex(bytes("")) == "d41d8cd98f00b204e9800998ecf8427e",
+         "md5 of empty input");
+  Expect(antimal::Md5Hex(bytes("abc")) == "900150983cd24fb0d6963f7d28e17f72",
+         "md5 of 'abc'");
+  Expect(antimal::Md5Hex(bytes("The quick brown fox jumps over the lazy dog")) ==
+             "9e107d9d372bb6826bd81d3542a419d6",
+         "md5 of the pangram");
+
+  using antimal::ComputeImphash;
+  Expect(ComputeImphash({}).empty(), "imphash of no imports is empty");
+
+  // Lib case-folded + .dll/.DLL stripped; func lowercased; ordinal kept as-is;
+  // import-table ORDER preserved (not sorted).
+  {
+    std::vector<std::pair<std::string, std::string>> imps = {
+        {"KERNEL32.dll", "CreateFileA"},
+        {"kernel32.DLL", "CloseHandle"},
+        {"WS2_32.dll", "ord3"},
+    };
+    const std::string canon =
+        "kernel32.createfilea,kernel32.closehandle,ws2_32.ord3";
+    Expect(ComputeImphash(imps) == antimal::Md5Hex(bytes(canon)),
+           "imphash folds case, strips .dll, keeps order + ordinals");
+  }
+  // .sys / .ocx are stripped; other extensions (e.g. .exe) are NOT.
+  Expect(ComputeImphash({{"hal.sys", "X"}}) == antimal::Md5Hex(bytes("hal.x")),
+         "imphash strips .sys");
+  Expect(ComputeImphash({{"loader.exe", "Run"}}) ==
+             antimal::Md5Hex(bytes("loader.exe.run")),
+         "imphash does not strip non-.dll/.ocx/.sys extensions");
 }
 
 void TestBrowserRisk() {
@@ -4875,6 +4923,7 @@ int main() {
     TestIdeInterruptRetriedUntilDelivered();
     TestMmioBusRouting();
     TestPeParser();
+    TestMd5AndImphash();
     TestBrowserRisk();
     TestStringExtraction();
     TestIocMining();
