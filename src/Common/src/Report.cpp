@@ -363,6 +363,7 @@ ScanResult ParseScan(const JsonValue *value) {
   scan.peOverlaySize =
       static_cast<uint64_t>(DoubleValue(Member(*value, "peOverlaySize")));
   scan.peOverlayEntropy = DoubleValue(Member(*value, "peOverlayEntropy"));
+  scan.embeddedExecutables = IntValue(Member(*value, "embeddedExecutables"));
   scan.peSections = ParseSections(Member(*value, "peSections"));
   scan.findings = ParseFindings(Member(*value, "findings"));
   scan.score = IntValue(Member(*value, "score"));

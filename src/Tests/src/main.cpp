@@ -2333,6 +2333,39 @@ void TestFileTypeId() {
   Expect(IdentifyFileType(b({0x00, 0x01, 0x02})).empty(),
          "unknown leading bytes -> empty type");
   Expect(IdentifyFileType({}).empty(), "empty input -> empty type");
+
+  // Embedded-executable (dropper) detection: a benign container with a synthetic
+  // PE planted at a non-zero offset must count exactly one; a plain "MZ" with no
+  // valid PE header must not false-positive.
+  using antimal::CountEmbeddedExecutables;
+  {
+    std::vector<uint8_t> host(0x100, 0x00); // host header region, no inner MZ
+    Expect(CountEmbeddedExecutables(host) == 0, "no embedded PE in clean buffer");
+    // Plant an MZ at 0x80 with e_lfanew=0x40 -> PE\0\0 at 0xC0.
+    std::vector<uint8_t> drop = host;
+    drop.resize(0x80);
+    drop.push_back('M');
+    drop.push_back('Z');
+    drop.resize(0x80 + 0x3C, 0);
+    drop.push_back(0x40); // e_lfanew low byte = 0x40
+    drop.push_back(0x00);
+    drop.push_back(0x00);
+    drop.push_back(0x00);
+    drop.resize(0x80 + 0x40, 0); // pad to the PE offset (0x80 + 0x40 = 0xC0)
+    drop.push_back('P');
+    drop.push_back('E');
+    drop.push_back(0x00);
+    drop.push_back(0x00);
+    Expect(CountEmbeddedExecutables(drop) == 1,
+           "one synthetic embedded PE is detected");
+    // An "MZ" whose e_lfanew points at garbage must not count.
+    std::vector<uint8_t> fake(0x100, 0);
+    fake[0x80] = 'M';
+    fake[0x81] = 'Z';
+    fake[0x80 + 0x3C] = 0x40; // points to 0xC0, which is zeros (not 'PE\0\0')
+    Expect(CountEmbeddedExecutables(fake) == 0,
+           "MZ without a valid PE header does not count");
+  }
   // The running test exe must identify as a PE by content.
   wchar_t modulePath[MAX_PATH]{};
   GetModuleFileNameW(nullptr, modulePath, MAX_PATH);

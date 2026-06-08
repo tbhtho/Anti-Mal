@@ -298,6 +298,34 @@ std::string IdentifyFileType(const std::vector<uint8_t> &data) {
   return "";
 }
 
+int CountEmbeddedExecutables(const std::vector<uint8_t> &data) {
+  if (data.size() < 0x40) {
+    return 0;
+  }
+  int count = 0;
+  // Start at 1 so the host's own header at offset 0 is not counted.
+  for (size_t i = 1; i + 0x40 <= data.size(); ++i) {
+    if (data[i] != 'M' || data[i + 1] != 'Z') {
+      continue;
+    }
+    const uint32_t lfanew = static_cast<uint32_t>(data[i + 0x3C]) |
+                            (static_cast<uint32_t>(data[i + 0x3D]) << 8) |
+                            (static_cast<uint32_t>(data[i + 0x3E]) << 16) |
+                            (static_cast<uint32_t>(data[i + 0x3F]) << 24);
+    if (lfanew < 0x40) {
+      continue; // e_lfanew must clear the DOS header
+    }
+    const size_t peOff = i + lfanew;
+    if (peOff + 4 <= data.size() && data[peOff] == 'P' && data[peOff + 1] == 'E' &&
+        data[peOff + 2] == 0 && data[peOff + 3] == 0) {
+      if (++count >= 256) {
+        break; // cap: enough to say "this is a dropper"
+      }
+    }
+  }
+  return count;
+}
+
 ScanResult ScanFile(const std::filesystem::path &path) {
   return ScanFile(path, ScannerOptions{});
 }
@@ -314,6 +342,16 @@ ScanResult ScanFile(const std::filesystem::path &path,
     result.md5 = Md5Hex(data);
     result.detectedType = IdentifyFileType(data);
     result.entropy = CalculateEntropy(data);
+
+    // Embedded executables (any host type): a dropper/installer carrying one or
+    // more additional PEs. Strong signal even inside a non-PE container.
+    result.embeddedExecutables = CountEmbeddedExecutables(data);
+    if (result.embeddedExecutables > 0) {
+      AddFinding(result, "dropper.embedded_pe",
+                 "Carries " + std::to_string(result.embeddedExecutables) +
+                     " embedded executable(s) past the file header",
+                 30);
+    }
 
     // Masquerade: a PE wearing a document/media/archive extension is a classic
     // delivery trick (invoice.pdf.exe truncated in the UI, or a plain rename).
@@ -496,6 +534,9 @@ std::string FormatScanText(const ScanResult &result) {
   if (result.peOverlaySize > 0) {
     out << "  overlay: " << result.peOverlaySize << " bytes, entropy "
         << result.peOverlayEntropy << "\n";
+  }
+  if (result.embeddedExecutables > 0) {
+    out << "  embedded executables: " << result.embeddedExecutables << "\n";
   }
   for (const auto &finding : result.findings) {
     out << "  - [" << finding.ruleId << "] +" << finding.score << " "

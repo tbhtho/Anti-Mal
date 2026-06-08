@@ -35,6 +35,12 @@ double CalculateEntropy(const std::vector<uint8_t> &data);
 // extension/content masquerading (e.g. invoice.pdf that is really a PE).
 std::string IdentifyFileType(const std::vector<uint8_t> &data);
 
+// Counts PE images embedded at a NON-zero offset (an "MZ" whose e_lfanew points
+// at a valid "PE\0\0"). The host file's own header at offset 0 is excluded, so a
+// non-zero count means the file carries one or more additional executables --
+// the defining trait of a dropper/installer payload. Capped to a sane maximum.
+int CountEmbeddedExecutables(const std::vector<uint8_t> &data);
+
 ScanResult ScanFile(const std::filesystem::path &path);
 ScanResult ScanFile(const std::filesystem::path &path,
                     const ScannerOptions &options);
