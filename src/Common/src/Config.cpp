@@ -71,6 +71,10 @@ void ApplyConfigValue(AppConfig &config, std::string key, std::string value) {
     config.collectScreenshots = ParseBool(value);
   } else if (key == "dynamic_execution_enabled") {
     config.dynamicExecutionEnabled = ParseBool(value);
+  } else if (key == "vm_login_mode") {
+    config.vmLoginMode = value;
+  } else if (key == "vm_login_password") {
+    config.vmLoginPassword = value;
   }
 }
 
@@ -140,6 +144,9 @@ std::string SerializeConfig(const AppConfig &config) {
   out << "dynamic_execution_enabled = " << boolStr(config.dynamicExecutionEnabled) << "\n";
   out << "collect_screenshots = " << boolStr(config.collectScreenshots) << "\n";
   out << "screenshot_interval_ms = " << config.screenshotIntervalMs << "\n";
+  out << "\n# Live-VM hands-free login: password | autologon (no password) | manual.\n";
+  out << "vm_login_mode = \"" << config.vmLoginMode << "\"\n";
+  out << "vm_login_password = \"" << config.vmLoginPassword << "\"\n";
   return out.str();
 }
 

@@ -33,6 +33,15 @@ struct AppConfig {
   uint32_t screenshotIntervalMs = 2000;
   bool collectScreenshots = true;
   bool dynamicExecutionEnabled = false;
+
+  // Live-VM ("Boot VM (live)") hands-free login. The seed snapshot lands on the
+  // Win11 lock/login screen; this controls how the desktop is reached:
+  //   "password"  — auto-type vmLoginPassword (proven to reach the desktop)
+  //   "autologon" — patch the disposable overlay for AutoAdminLogon (no password
+  //                 typed at all; the user-requested "no password" mode)
+  //   "manual"    — type nothing; the analyst logs in via the live console
+  std::string vmLoginMode = "password";
+  std::string vmLoginPassword = "AntiMal!23";
 };
 
 AppConfig LoadConfig(const std::filesystem::path &path);

@@ -595,7 +595,9 @@ void WebViewHost::RegisterHandlers() {
     }
     j += "\"baseExists\":" + b(baseExists) + ",";
     j += "\"baseSizeBytes\":" + std::to_string(baseSize) + ",";
-    j += "\"dynamicExecutionEnabled\":" + b(c.dynamicExecutionEnabled);
+    j += "\"dynamicExecutionEnabled\":" + b(c.dynamicExecutionEnabled) + ",";
+    j += "\"vmLoginMode\":" + JsonQuote(c.vmLoginMode) + ",";
+    j += "\"vmLoginPasswordSet\":" + b(!c.vmLoginPassword.empty());
     j += "}";
     return j;
   });
@@ -639,6 +641,8 @@ void WebViewHost::RegisterHandlers() {
     boolean("enrichTagger", c.enrichTagger);
     u32("screenshotIntervalMs", c.screenshotIntervalMs);
     boolean("dynamicExecutionEnabled", c.dynamicExecutionEnabled);
+    str("vmLoginMode", c.vmLoginMode);
+    str("vmLoginPassword", c.vmLoginPassword);
     try {
       std::ofstream out(DefaultConfigPath(), std::ios::binary | std::ios::trunc);
       if (!out) {
@@ -1220,11 +1224,22 @@ void WebViewHost::RegisterHandlers() {
       SetEnvironmentVariableW(L"ANTIMAL_SEED_OVERLAY", seed.c_str());
       SetEnvironmentVariableW(L"ANTIMAL_PROBE_OOBE_KEYS", nullptr);
       SetEnvironmentVariableW(L"ANTIMAL_PROBE_PRESS_ENTER_SEC", L"40");
-      // Snapshot lands on the lock/login screen; plaintext autologon fails on
-      // 25H2, so type the account password to reach the desktop hands-free.
-      // Manual login: the analyst types the password in the live console. No
-      // auto-typing (it was the unreliable ~50% path and fought manual input).
+      // The seed snapshot lands on the Win11 lock/login screen. Reach the desktop
+      // hands-free per config.vmLoginMode (the interactive run loop stays alive
+      // through the login window, so the scheduled attempts land):
+      //   "password"  -> auto-type the account password (verified to reach the
+      //                  logged-in desktop on this build),
+      //   "autologon" -> patch the disposable overlay for AutoAdminLogon so NO
+      //                  password is typed (the "no password" mode),
+      //   "manual"    -> type nothing; the analyst logs in via the live console.
       SetEnvironmentVariableW(L"ANTIMAL_PROBE_LOGIN_PASSWORD", nullptr);
+      SetEnvironmentVariableW(L"ANTIMAL_PROBE_OOBE_AUTOLOGON", nullptr);
+      if (c.vmLoginMode == "password" && !c.vmLoginPassword.empty()) {
+        SetEnvironmentVariableW(L"ANTIMAL_PROBE_LOGIN_PASSWORD",
+                                Widen(c.vmLoginPassword).c_str());
+      } else if (c.vmLoginMode == "autologon") {
+        SetEnvironmentVariableW(L"ANTIMAL_PROBE_OOBE_AUTOLOGON", L"1");
+      }
     } else {
       SetEnvironmentVariableW(L"ANTIMAL_SEED_OVERLAY", nullptr);
       SetEnvironmentVariableW(L"ANTIMAL_PROBE_OOBE_KEYS", L"250");
