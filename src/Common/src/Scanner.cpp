@@ -258,9 +258,24 @@ ScanResult ScanFile(const std::filesystem::path &path,
     result.isPe = pe.isPe;
     result.imports = pe.imports;
     result.imphash = pe.imphash;
+    result.peTimestamp = pe.timeDateStamp;
+    result.peSections = pe.sections;
 
     if (result.entropy > 7.2) {
       AddFinding(result, "entropy.high", "File entropy is above packed/encrypted threshold", 25);
+    }
+
+    // Evidence-backed packer tell: an executable section whose raw bytes are
+    // near-random. Far more specific than whole-file entropy (which a large
+    // embedded resource can inflate on a perfectly benign binary).
+    for (const auto &sec : pe.sections) {
+      if (sec.executable && sec.entropy > 7.0 && sec.rawSize > 0) {
+        AddFinding(result, "section.high_entropy_exec",
+                   "Executable section '" + sec.name +
+                       "' has near-random entropy (likely packed/encrypted code)",
+                   30);
+        break;
+      }
     }
 
     if (pe.isPe) {
@@ -378,6 +393,10 @@ std::string FormatScanText(const ScanResult &result) {
   out << "  entropy: " << result.entropy << "\n";
   out << "  pe: " << (result.isPe ? "yes" : "no")
       << ", signed: " << (result.authenticodeSigned ? "yes" : "no") << "\n";
+  for (const auto &sec : result.peSections) {
+    out << "  section " << sec.name << ": entropy " << sec.entropy
+        << (sec.executable ? " X" : "") << (sec.writable ? " W" : "") << "\n";
+  }
   for (const auto &finding : result.findings) {
     out << "  - [" << finding.ruleId << "] +" << finding.score << " "
         << finding.message << "\n";

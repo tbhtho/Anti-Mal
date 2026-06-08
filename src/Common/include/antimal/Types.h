@@ -8,6 +8,8 @@
 #include <string>
 #include <vector>
 
+#include "antimal/PeParser.h" // PeSection (reported in ScanResult)
+
 namespace antimal {
 
 enum class NetworkMode {
@@ -119,6 +121,8 @@ struct ScanResult {
   double entropy = 0.0;
   bool isPe = false;
   bool authenticodeSigned = false;
+  uint32_t peTimestamp = 0;          // PE compile timestamp (unix epoch secs)
+  std::vector<PeSection> peSections; // section table + per-section entropy
   std::vector<std::string> imports;
   std::vector<ScanFinding> findings;
   int score = 0;

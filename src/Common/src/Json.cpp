@@ -467,6 +467,24 @@ std::string ToJson(const ScanResult &scan) {
   }
   findings << "]";
 
+  std::ostringstream sections;
+  sections << "[";
+  for (size_t i = 0; i < scan.peSections.size(); ++i) {
+    if (i) {
+      sections << ",";
+    }
+    JsonObjectBuilder s;
+    s.AddString("name", scan.peSections[i].name);
+    s.AddNumber("virtualSize", scan.peSections[i].virtualSize);
+    s.AddNumber("rawSize", scan.peSections[i].rawSize);
+    s.AddNumber("characteristics", scan.peSections[i].characteristics);
+    s.AddDouble("entropy", scan.peSections[i].entropy);
+    s.AddBool("executable", scan.peSections[i].executable);
+    s.AddBool("writable", scan.peSections[i].writable);
+    sections << s.Finish();
+  }
+  sections << "]";
+
   JsonObjectBuilder obj;
   obj.AddString("path", PathToUtf8(scan.path));
   obj.AddString("sha256", scan.sha256);
@@ -476,6 +494,8 @@ std::string ToJson(const ScanResult &scan) {
   obj.AddDouble("entropy", scan.entropy);
   obj.AddBool("isPe", scan.isPe);
   obj.AddBool("authenticodeSigned", scan.authenticodeSigned);
+  obj.AddNumber("peTimestamp", scan.peTimestamp);
+  obj.AddRaw("peSections", sections.str());
   obj.AddRaw("imports", JsonStringArray(scan.imports));
   obj.AddRaw("findings", findings.str());
   obj.AddNumber("score", scan.score);

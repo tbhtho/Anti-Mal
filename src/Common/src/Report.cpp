@@ -8,6 +8,7 @@
 #include <set>
 #include <sstream>
 #include <cctype>
+#include <cstdio>
 #include <cstring>
 #include <cstdlib>
 
@@ -250,6 +251,25 @@ std::vector<ScanFinding> ParseFindings(const JsonValue *value) {
   return findings;
 }
 
+std::vector<PeSection> ParseSections(const JsonValue *value) {
+  std::vector<PeSection> sections;
+  if (!value || value->type != JsonValue::Type::Array) return sections;
+  for (const auto &item : value->array) {
+    PeSection sec;
+    sec.name = StringValue(Member(item, "name"));
+    // DoubleValue (not IntValue): section characteristics flags exceed INT_MAX.
+    sec.virtualSize = static_cast<uint32_t>(DoubleValue(Member(item, "virtualSize")));
+    sec.rawSize = static_cast<uint32_t>(DoubleValue(Member(item, "rawSize")));
+    sec.characteristics =
+        static_cast<uint32_t>(DoubleValue(Member(item, "characteristics")));
+    sec.entropy = DoubleValue(Member(item, "entropy"));
+    sec.executable = BoolValue(Member(item, "executable"));
+    sec.writable = BoolValue(Member(item, "writable"));
+    sections.push_back(std::move(sec));
+  }
+  return sections;
+}
+
 std::vector<ScanTag> ParseTags(const JsonValue *value) {
   std::vector<ScanTag> tags;
   if (!value || value->type != JsonValue::Type::Array) return tags;
@@ -338,6 +358,8 @@ ScanResult ParseScan(const JsonValue *value) {
   scan.isPe = BoolValue(Member(*value, "isPe"));
   scan.authenticodeSigned = BoolValue(Member(*value, "authenticodeSigned"));
   scan.imports = StringArrayValue(Member(*value, "imports"));
+  scan.peTimestamp = static_cast<uint32_t>(DoubleValue(Member(*value, "peTimestamp")));
+  scan.peSections = ParseSections(Member(*value, "peSections"));
   scan.findings = ParseFindings(Member(*value, "findings"));
   scan.score = IntValue(Member(*value, "score"));
   scan.verdict = ParseVerdictValue(Member(*value, "verdict"));
@@ -1410,6 +1432,37 @@ std::string BuildHtmlReportWithFrames(const AnalysisReport &report,
   }
 
   html << "</section>";
+
+  // PE static analysis: hashes + section table with per-section entropy. A
+  // writable+executable or high-entropy section is the visible packer tell.
+  if (scan.isPe && !scan.peSections.empty()) {
+    html << "<section class=\"panel\"><h2>PE sections</h2>";
+    if (scan.imphash.size() || scan.peTimestamp) {
+      html << "<div class=\"kv\">";
+      if (!scan.imphash.empty()) {
+        html << "<div class=\"k\">imphash</div><div class=\"mono\">"
+             << HtmlEscape(scan.imphash) << "</div>";
+      }
+      if (scan.peTimestamp) {
+        html << "<div class=\"k\">compiled (epoch)</div><div class=\"mono\">"
+             << scan.peTimestamp << "</div>";
+      }
+      html << "</div>";
+    }
+    html << "<table><thead><tr><th>Name</th><th>Virtual</th><th>Raw</th>"
+            "<th>Entropy</th><th>Flags</th></tr></thead><tbody>";
+    for (const auto &sec : scan.peSections) {
+      const bool hot = sec.executable && sec.entropy > 7.0;
+      html << "<tr><td class=\"mono\">" << HtmlEscape(sec.name) << "</td><td>"
+           << sec.virtualSize << "</td><td>" << sec.rawSize << "</td><td"
+           << (hot ? " class=\"badge Malicious\"" : "") << ">";
+      char buf[16];
+      std::snprintf(buf, sizeof(buf), "%.2f", sec.entropy);
+      html << buf << "</td><td class=\"mono\">" << (sec.executable ? "X" : "-")
+           << (sec.writable ? "W" : "-") << "</td></tr>";
+    }
+    html << "</tbody></table></section>";
+  }
 
   // Center column: screenshots + events + findings
   html << "<section class=\"panel\">";

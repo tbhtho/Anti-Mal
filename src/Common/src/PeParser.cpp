@@ -9,6 +9,8 @@
 #include <wintrust.h>
 
 #include <algorithm>
+#include <array>
+#include <cmath>
 #include <stdexcept>
 
 namespace antimal {
@@ -64,6 +66,39 @@ std::string ReadAsciiZ(const std::vector<uint8_t> &data, size_t offset) {
   return value;
 }
 
+// Shannon entropy (bits/byte, 0..8) over a raw byte range. Local copy so the PE
+// parser doesn't depend on the higher-level Scanner.
+double ByteEntropy(const uint8_t *p, size_t n) {
+  if (!p || n == 0) {
+    return 0.0;
+  }
+  std::array<size_t, 256> freq{};
+  for (size_t i = 0; i < n; ++i) {
+    ++freq[p[i]];
+  }
+  double entropy = 0.0;
+  const double len = static_cast<double>(n);
+  for (size_t count : freq) {
+    if (!count) {
+      continue;
+    }
+    const double pr = static_cast<double>(count) / len;
+    entropy -= pr * std::log2(pr);
+  }
+  return entropy;
+}
+
+// The 8-byte section name is space/NUL padded and not guaranteed terminated;
+// stop at the first NUL and sanitize non-printables.
+std::string SectionName(const BYTE name[IMAGE_SIZEOF_SHORT_NAME]) {
+  std::string s;
+  for (int i = 0; i < IMAGE_SIZEOF_SHORT_NAME && name[i] != 0; ++i) {
+    const char c = static_cast<char>(name[i]);
+    s.push_back((c >= 0x20 && c < 0x7f) ? c : '?');
+  }
+  return s;
+}
+
 } // namespace
 
 std::string ComputeImphash(
@@ -108,6 +143,38 @@ PeInfo ParsePe(const std::vector<uint8_t> &data) {
   info.isPe = true;
   info.machine = nt->FileHeader.Machine;
   info.numberOfSections = nt->FileHeader.NumberOfSections;
+  info.timeDateStamp = nt->FileHeader.TimeDateStamp;
+
+  // Section table + per-section entropy (parsed before the import-directory
+  // early-outs below, so a PE with no imports still reports its sections).
+  if (const IMAGE_SECTION_HEADER *first = Sections(data, nt)) {
+    const auto firstOffset =
+        static_cast<size_t>(reinterpret_cast<const uint8_t *>(first) - data.data());
+    const WORD count = nt->FileHeader.NumberOfSections;
+    for (WORD i = 0; i < count && i < 96; ++i) {
+      const auto *sh = PtrAt<IMAGE_SECTION_HEADER>(
+          data, firstOffset + static_cast<size_t>(i) * sizeof(IMAGE_SECTION_HEADER));
+      if (!sh) {
+        break;
+      }
+      PeSection sec;
+      sec.name = SectionName(sh->Name);
+      sec.virtualSize = sh->Misc.VirtualSize;
+      sec.rawSize = sh->SizeOfRawData;
+      sec.characteristics = sh->Characteristics;
+      sec.executable = (sh->Characteristics & IMAGE_SCN_MEM_EXECUTE) != 0;
+      sec.writable = (sh->Characteristics & IMAGE_SCN_MEM_WRITE) != 0;
+      size_t off = sh->PointerToRawData;
+      size_t len = sh->SizeOfRawData;
+      if (off < data.size()) {
+        if (len > data.size() - off) {
+          len = data.size() - off;
+        }
+        sec.entropy = ByteEntropy(data.data() + off, len);
+      }
+      info.sections.push_back(std::move(sec));
+    }
+  }
 
   DWORD importRva = 0;
   DWORD importSize = 0;

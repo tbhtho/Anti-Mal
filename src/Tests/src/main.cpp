@@ -2219,6 +2219,21 @@ void TestPeParser() {
   Expect(pe.imphash.size() == 32, "imphash is a 32-char MD5 for an importing PE");
   Expect(antimal::ParsePeFile(modulePath).imphash == pe.imphash,
          "imphash is deterministic across parses");
+  // Section table: the test exe has a real one, with a non-zero compile stamp
+  // and the canonical .text code section (executable, non-trivial entropy).
+  Expect(!pe.sections.empty(), "PE section table parsed");
+  Expect(pe.sections.size() == pe.numberOfSections,
+         "section count matches the file header");
+  Expect(pe.timeDateStamp != 0, "PE compile timestamp parsed");
+  bool sawExecCode = false;
+  for (const auto &sec : pe.sections) {
+    Expect(sec.entropy >= 0.0 && sec.entropy <= 8.0,
+           "section entropy is in the valid 0..8 bits/byte range");
+    if (sec.executable && sec.rawSize > 0 && sec.entropy > 0.0) {
+      sawExecCode = true;
+    }
+  }
+  Expect(sawExecCode, "at least one executable code section with real entropy");
 }
 
 // MD5 (triage hash) + the pefile-compatible imphash. MD5 is checked against the
