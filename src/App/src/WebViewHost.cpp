@@ -614,6 +614,7 @@ void WebViewHost::RegisterHandlers() {
     const bool isFolder = pickFolder;
     std::thread([h, path, isFolder]() {
       CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+      try {
       WebViewHost::Emit(h, "scan.progress", R"({"stage":"start","pct":5})");
       ScannerOptions opts;
       if (isFolder) {
@@ -630,6 +631,12 @@ void WebViewHost::RegisterHandlers() {
         WebViewHost::Emit(h, "scan.result", ToJson(r));
         WebViewHost::Emit(h, "scan.progress",
                           R"({"stage":"done","pct":100,"count":1})");
+      }
+      } catch (...) {
+        // A worker exception must never std::terminate the whole UI process.
+        WebViewHost::Emit(
+            h, "log",
+            R"({"level":"ERROR","msg":"a background task error - see status"})");
       }
       CoUninitialize();
     }).detach();
@@ -652,6 +659,7 @@ void WebViewHost::RegisterHandlers() {
     const HWND h = hwnd_;
     std::thread([h]() {
       CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+      try {
       namespace fs = std::filesystem;
       const AppConfig c = LoadConfig(DefaultConfigPath());
       struct Entry {
@@ -715,6 +723,12 @@ void WebViewHost::RegisterHandlers() {
                             ",\"total\":" + std::to_string(totalFound) +
                             ",\"shown\":" + std::to_string(entries.size()) +
                             "}");
+      } catch (...) {
+        // A worker exception must never std::terminate the whole UI process.
+        WebViewHost::Emit(
+            h, "log",
+            R"({"level":"ERROR","msg":"a background task error - see status"})");
+      }
       CoUninitialize();
     }).detach();
     return std::string(R"({"loading":true})");
@@ -753,6 +767,7 @@ void WebViewHost::RegisterHandlers() {
     const HWND h = hwnd_;
     std::thread([h]() {
       CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+      try {
       namespace fs = std::filesystem;
       const AppConfig c = LoadConfig(DefaultConfigPath());
       std::error_code ec;
@@ -850,6 +865,12 @@ void WebViewHost::RegisterHandlers() {
           ",\"metrics\":" + met.Finish() + ",\"frames\":" + framesArr +
           ",\"events\":" + evArr + "}";
       WebViewHost::Emit(h, "dashboard.data", payload);
+      } catch (...) {
+        // A worker exception must never std::terminate the whole UI process.
+        WebViewHost::Emit(
+            h, "log",
+            R"({"level":"ERROR","msg":"a background task error - see status"})");
+      }
       CoUninitialize();
     }).detach();
     return std::string(R"({"loading":true})");
@@ -862,6 +883,7 @@ void WebViewHost::RegisterHandlers() {
     const HWND h = hwnd_;
     std::thread([h]() {
       CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+      try {
       const AppConfig c = LoadConfig(DefaultConfigPath());
       const NewestRun nr = FindNewestRun(c.workspaceRoot);
       std::vector<std::string> domains;
@@ -893,6 +915,12 @@ void WebViewHost::RegisterHandlers() {
                         std::string("{\"risks\":") + arr +
                             ",\"domains\":" + std::to_string(domains.size()) +
                             ",\"runId\":" + JsonQuote(runId) + "}");
+      } catch (...) {
+        // A worker exception must never std::terminate the whole UI process.
+        WebViewHost::Emit(
+            h, "log",
+            R"({"level":"ERROR","msg":"a background task error - see status"})");
+      }
       CoUninitialize();
     }).detach();
     return std::string(R"({"loading":true})");
@@ -914,6 +942,7 @@ void WebViewHost::RegisterHandlers() {
     const unsigned long vmPid = live ? vmPid_ : 0;
     std::thread([h, argDir, live, vmPid]() {
       CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+      try {
       namespace fs = std::filesystem;
       const AppConfig c = LoadConfig(DefaultConfigPath());
       // A bare run name (no path separators) is resolved against workspace_root
@@ -1007,6 +1036,12 @@ void WebViewHost::RegisterHandlers() {
       WebViewHost::Emit(h, "run.status",
                         std::string("{\"state\":\"done\",\"streamed\":") +
                             std::to_string(streamed) + "}");
+      } catch (...) {
+        // A worker exception must never std::terminate the whole UI process.
+        WebViewHost::Emit(
+            h, "log",
+            R"({"level":"ERROR","msg":"a background task error - see status"})");
+      }
       CoUninitialize();
     }).detach();
     return std::string(R"({"watching":true})");
