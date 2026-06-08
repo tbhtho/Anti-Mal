@@ -49,6 +49,7 @@
   var liveMouseTimer = null;                // flushes accumulated movement
   var liveFrameBuffer = null;    // host-shared ArrayBuffer of live RGBA pixels
   var usingSharedFrames = false; // true once the canvas path is live (no <img>)
+  var liveFrameCount = 0, liveFps = 0, liveFpsTimer = null; // canvas fps readout
   function send(cmd, args) {
     var reqId = nextReqId++;
     return new Promise(function (resolve) {
@@ -159,11 +160,11 @@
     vm: function () {
       var steps = [['OVMF firmware', 'done'], ['bootmgfw.efi', 'done'], ['winload.efi', 'done'], ['ntoskrnl', 'done'], ['AHCI storage mount', 'done'], ['win32k / GUI stack', 'done'], ['Getting Ready (OOBE)', 'done'], ['GuestAgent heartbeat', 'cur'], ['Artifact return', 'todo']];
       return '<h1 class="page-title">VM Analysis</h1><p class="page-sub">In-house WHP sandbox: live view, state, boot timeline, and safety gates.</p>' +
-        '<div class="panel"><h2>Live VM <span id="vm-live-status" class="page-sub" style="font-weight:400"></span></h2>' +
+        '<div class="panel"><h2>Live VM <span id="vm-live-status" class="page-sub" style="font-weight:400"></span><span id="vm-display-mode" class="page-sub" style="font-weight:600;margin-left:10px;font-size:12px"></span></h2>' +
         '<div class="actions"><button class="btn primary" id="vm-boot-btn">Boot VM (live)</button><button class="btn danger" id="vm-detonate-btn">Detonate Sample (live)</button><button class="btn" id="vm-stop-btn">Stop</button><button class="btn" id="vm-fs-btn" title="Fill the screen with the VM (Esc to exit)">⛶ Fullscreen</button></div>' +
         '<div class="screenframe" id="live-frame" tabindex="0" style="margin-top:12px;outline:none">Click “Boot VM (live)” for a clean session, or “Detonate Sample (live)” to run a BENIGN sample inside it — watch it execute here.</div>' +
         '<p class="page-sub" id="vm-focus-hint" style="margin:6px 0 0">Click the frame (or go Fullscreen) to capture your keyboard &amp; mouse; click outside it to release.</p>' +
-        '<div class="actions" style="margin-top:8px;flex-wrap:wrap"><input id="vm-text" type="text" autocomplete="off" placeholder="Type text to send into the VM (e.g. the password)…" style="flex:1;min-width:200px;background:var(--panel2);border:1px solid var(--border2);color:var(--text,#e6edf3);border-radius:8px;padding:7px 10px"><button class="btn" id="vm-send-text">Send Text ⏎</button><button class="btn primary" id="vm-send-pw" title="Types the default seed account password then Enter, paced so the guest reliably accepts it">Send Login Password</button><button class="btn" id="vm-send-enter">Send Enter</button></div>' +
+        '<div class="actions" style="margin-top:8px;flex-wrap:wrap"><input id="vm-text" type="text" autocomplete="off" placeholder="Type text to send into the VM (e.g. the password)…" style="flex:1;min-width:200px;background:var(--panel2);border:1px solid var(--border2);color:var(--text,#e6edf3);border-radius:8px;padding:7px 10px"><button class="btn" id="vm-send-text">Send Text ⏎</button><button class="btn primary" id="vm-send-pw" title="Types the default seed account password then Enter, paced so the guest reliably accepts it">Send Login Password</button><button class="btn" id="vm-send-enter">Send Enter</button><button class="btn" id="vm-send-cad" title="Send the Ctrl+Alt+Del secure-attention sequence to the VM">Ctrl+Alt+Del</button></div>' +
         '<p class="page-sub" style="margin:6px 0 0">Live typing can be flaky at the boot/login screen; the paced buttons above are the reliable way in. Once at the desktop, direct keyboard/mouse work normally.</p></div>' +
         '<div class="panel"><h2>Live Process Telemetry <span id="vm-telemetry-status" class="page-sub" style="font-weight:400"></span></h2>' +
         '<div id="vm-events"><p class="page-sub" style="margin:0">No events yet — boot the VM to stream live process activity from the GuestAgent over COM2.</p></div></div>' +
@@ -466,8 +467,11 @@
   function stopLivePoll() {
     if (livePollTimer) { clearInterval(livePollTimer); livePollTimer = null; }
     if (liveMouseTimer) { clearInterval(liveMouseTimer); liveMouseTimer = null; }
+    if (liveFpsTimer) { clearInterval(liveFpsTimer); liveFpsTimer = null; }
     liveMouse = { btn: 0, dx: 0, dy: 0 };
     usingSharedFrames = false; // next boot re-establishes the shared canvas path
+    liveFrameCount = 0; liveFps = 0;
+    var dm = $('#vm-display-mode'); if (dm) dm.textContent = '';
     releaseHeldKeys();
   }
   // Single source of truth for the VM status indicators (#vm-badge + #mode-badge +
@@ -524,12 +528,29 @@
       ctx.putImageData(new ImageData(new Uint8ClampedArray(liveFrameBuffer, 0, need), w, h), 0, 0);
     } catch (x) { return; }
     usingSharedFrames = true;
+    liveFrameCount++;
     if (liveSession === 'boot') { liveSession = 'running'; setVmState('running'); }
+  }
+  // Surface whether the live view is the real shared-memory <canvas> (~30fps) or
+  // the legacy PNG-screenshot fallback, so "it's a real VM, not a screenshot" is
+  // observable. Runs once per second while a session is live.
+  function updateDisplayMode() {
+    var el = $('#vm-display-mode'); if (!el) return;
+    if (!livePollTimer) { el.textContent = ''; return; }
+    if (usingSharedFrames) {
+      liveFps = liveFrameCount; liveFrameCount = 0;
+      el.textContent = '● live canvas · ' + liveFps + ' fps';
+      el.style.color = '#7ee2a8';
+    } else {
+      el.textContent = '○ PNG screenshots (fallback)';
+      el.style.color = '#e0b85a';
+    }
   }
   function startLivePoll() {
     stopLivePoll();
     liveWatchRun = null; // each boot re-tails the new run's journal
     liveMouseTimer = setInterval(flushLiveMouse, 50);
+    liveFpsTimer = setInterval(updateDisplayMode, 1000);
     livePollTimer = setInterval(function () {
       var box = $('#live-frame');
       if (!box) { stopLivePoll(); return; } // navigated away from VM page
@@ -603,6 +624,10 @@
     if (spw) spw.onclick = function () { appendLog('INFO', 'Sending login password (paced)…'); sendTextToGuest('AntiMal!23', true); };
     var sen = $('#vm-send-enter');
     if (sen) sen.onclick = function () { if (livePollTimer) send('vm.input', { scancodes: [0x1C, 0x9C] }); else appendLog('WARN', 'No live VM.'); };
+    var scad = $('#vm-send-cad');
+    // LCtrl + LAlt + Delete(ext) make, then break in reverse — the secure
+    // attention sequence (unlock / Task Manager / sign-out screen).
+    if (scad) scad.onclick = function () { if (livePollTimer) { send('vm.input', { scancodes: [0x1D, 0x38, 0xE0, 0x53, 0xE0, 0xD3, 0xB8, 0x9D] }); appendLog('INFO', 'Sent Ctrl+Alt+Del.'); } else appendLog('WARN', 'No live VM.'); };
     var vt = $('#vm-text');
     if (vt) vt.addEventListener('keydown', function (e) { if (e.key === 'Enter') { e.preventDefault(); if (vt.value) sendTextToGuest(vt.value, true); } });
     // Live mouse: route movement/clicks over the frame into the guest (relative
