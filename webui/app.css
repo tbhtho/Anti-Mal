@@ -175,6 +175,16 @@ table.grid tbody tr:hover { background: var(--panel2); }
 .danger-zone { border: 1px solid #5b1f1f; background: #1c1010; }
 .danger-zone h2 { color: #ff9b9b; }
 
+/* ---------- Confirm modal ---------- */
+.modal-overlay { position: fixed; inset: 0; background: rgba(0,0,0,.6); z-index: 1000;
+  display: flex; align-items: center; justify-content: center; }
+.modal { background: var(--panel, #15171c); border: 1px solid var(--border2, #2a2f3a);
+  border-radius: var(--radius, 12px); padding: 20px 22px; max-width: 460px; width: calc(100% - 48px);
+  box-shadow: 0 18px 60px rgba(0,0,0,.55); }
+.modal h3 { margin: 0 0 8px; font-size: 16px; color: var(--text, #e6edf3); }
+.modal p { margin: 0 0 18px; font-size: 13.5px; line-height: 1.5; color: var(--muted, #9aa4b2); }
+.modal-actions { display: flex; gap: 10px; justify-content: flex-end; }
+
 /* ---------- Right status log ---------- */
 .logpanel { background: var(--bg2); border-left: 1px solid var(--border); display: flex; flex-direction: column; min-height: 0; }
 .logpanel h2 { margin: 0; padding: 12px 14px 8px; font-size: 12px; font-weight: 600; color: var(--muted); text-transform: uppercase; letter-spacing: .6px; }

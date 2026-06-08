@@ -13,6 +13,29 @@
   }
   function $(sel, root) { return (root || document).querySelector(sel); }
   function $all(sel, root) { return Array.prototype.slice.call((root || document).querySelectorAll(sel)); }
+  // CSP-safe confirm dialog (built with createElement/textContent, no innerHTML).
+  // Resolves true (confirm) / false (cancel). Esc or backdrop = cancel.
+  function confirmModal(title, body, confirmLabel) {
+    return new Promise(function (resolve) {
+      var ov = document.createElement('div'); ov.className = 'modal-overlay';
+      var box = document.createElement('div'); box.className = 'modal';
+      var h = document.createElement('h3'); h.textContent = title;
+      var p = document.createElement('p'); p.textContent = body;
+      var acts = document.createElement('div'); acts.className = 'modal-actions';
+      var no = document.createElement('button'); no.className = 'btn'; no.textContent = 'Cancel';
+      var yes = document.createElement('button'); yes.className = 'btn danger'; yes.textContent = confirmLabel || 'Confirm';
+      acts.appendChild(no); acts.appendChild(yes);
+      box.appendChild(h); box.appendChild(p); box.appendChild(acts); ov.appendChild(box);
+      function close(v) { if (ov.parentNode) ov.parentNode.removeChild(ov); document.removeEventListener('keydown', onKey, true); resolve(v); }
+      function onKey(e) { if (e.key === 'Escape') { e.preventDefault(); close(false); } else if (e.key === 'Enter') { e.preventDefault(); close(true); } }
+      no.onclick = function () { close(false); };
+      yes.onclick = function () { close(true); };
+      ov.addEventListener('mousedown', function (e) { if (e.target === ov) close(false); });
+      document.addEventListener('keydown', onKey, true);
+      document.body.appendChild(ov);
+      yes.focus();
+    });
+  }
 
   // ---------- bridge ----------
   var nextReqId = 1, pending = new Map();
@@ -785,20 +808,25 @@
       return;
     }
     if (cmd === 'detonate.selected') {
-      appendLog('WARN', 'Detonate — pick a BENIGN sample to execute live in the VM…');
-      send('vm.detonate').then(function (r) {
-        var res = (r && r.result) || {};
-        if (res.cancelled) { appendLog('INFO', 'Detonate cancelled.'); return; }
-        if (!res.started) { appendLog('ERROR', 'Detonate failed: ' + String(res.error || 'unknown')); return; }
-        appendLog('WARN', 'Detonating ' + (res.sample || 'sample') + ' live' + (res.seeded ? ' (seed-boot)' : ' (cold boot)') + ' — watch it run on VM Analysis.');
-        liveSession = 'detonate';
-        if (currentPage !== 'vm') route('vm');
-        // The VM page just mounted; start streaming the framebuffer + telemetry.
-        setTimeout(function () {
-          setVmState('detonating', res.sample || '');
-          startLivePoll();
-          var fr = $('#live-frame'); if (fr) fr.focus();
-        }, 80);
+      confirmModal('Detonate a sample LIVE in the VM?',
+        'This ARMS in-guest execution and will RUN the file you pick inside the sandbox. Use a BENIGN sample only — never real malware on a non-disposable host.',
+        'Detonate').then(function (ok) {
+        if (!ok) { appendLog('INFO', 'Detonate cancelled.'); return; }
+        appendLog('WARN', 'Detonate — pick a BENIGN sample to execute live in the VM…');
+        send('vm.detonate').then(function (r) {
+          var res = (r && r.result) || {};
+          if (res.cancelled) { appendLog('INFO', 'Detonate cancelled.'); return; }
+          if (!res.started) { appendLog('ERROR', 'Detonate failed: ' + String(res.error || 'unknown')); return; }
+          appendLog('WARN', 'Detonating ' + (res.sample || 'sample') + ' live' + (res.seeded ? ' (seed-boot)' : ' (cold boot)') + ' — watch it run on VM Analysis.');
+          liveSession = 'detonate';
+          if (currentPage !== 'vm') route('vm');
+          // The VM page just mounted; start streaming the framebuffer + telemetry.
+          setTimeout(function () {
+            setVmState('detonating', res.sample || '');
+            startLivePoll();
+            var fr = $('#live-frame'); if (fr) fr.focus();
+          }, 80);
+        });
       });
       return;
     }
