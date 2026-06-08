@@ -2,6 +2,7 @@
 
 #include "antimal/hv/KdPipeBridge.h"
 #include "antimal/hv/LiveFrameShm.h"
+#include "antimal/hv/LiveInputProtocol.h"
 
 #include <Windows.h>
 
@@ -2728,43 +2729,21 @@ VmRunSummary VirtualMachine::RunLoop(
             // A record split across polls stays buffered until it completes.
             liveInputRemainder_.insert(liveInputRemainder_.end(), lbuf.begin(),
                                        lbuf.begin() + got);
-            auto &buf = liveInputRemainder_;
-            size_t off = 0;
-            for (;;) {
-              if (off >= buf.size()) {
-                break;
-              }
-              const uint8_t tag = buf[off];
-              if (tag == 'K') {
-                if (off + 2 > buf.size()) {
-                  break; // need tag + count
-                }
-                const uint8_t n = buf[off + 1];
-                if (off + 2 + static_cast<size_t>(n) > buf.size()) {
-                  break; // need all scancodes
-                }
-                if (n > 0) {
-                  ps2_.InjectKeyboardScancodes(&buf[off + 2], n);
-                  summary.keyboardScancodesInjected += static_cast<int>(n);
-                  madeProgress = true;
-                }
-                off += 2 + static_cast<size_t>(n);
-              } else if (tag == 'M') {
-                if (off + 4 > buf.size()) {
-                  break; // need tag + buttons + dx + dy
-                }
-                const uint8_t buttons = buf[off + 1];
-                const int8_t dx = static_cast<int8_t>(buf[off + 2]);
-                const int8_t dy = static_cast<int8_t>(buf[off + 3]);
-                ps2_.InjectMousePacket(buttons, dx, dy);
+            std::vector<LiveInputEvent> events;
+            ParseLiveInput(liveInputRemainder_, events);
+            for (const auto &ev : events) {
+              if (ev.type == LiveInputEvent::Type::Keyboard &&
+                  !ev.scancodes.empty()) {
+                ps2_.InjectKeyboardScancodes(
+                    ev.scancodes.data(),
+                    static_cast<uint8_t>(ev.scancodes.size()));
+                summary.keyboardScancodesInjected +=
+                    static_cast<int>(ev.scancodes.size());
                 madeProgress = true;
-                off += 4;
-              } else {
-                off += 1; // unknown tag: resync by skipping one byte
+              } else if (ev.type == LiveInputEvent::Type::Mouse) {
+                ps2_.InjectMousePacket(ev.buttons, ev.dx, ev.dy);
+                madeProgress = true;
               }
-            }
-            if (off > 0) {
-              buf.erase(buf.begin(), buf.begin() + off);
             }
           }
         }

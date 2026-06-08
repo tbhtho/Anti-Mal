@@ -37,6 +37,7 @@
 #include "antimal/hv/KdPipeBridge.h"
 #include "antimal/hv/KdSerialDebugger.h"
 #include "antimal/hv/LiveFrameShm.h"
+#include "antimal/hv/LiveInputProtocol.h"
 #include "antimal/hv/MmioBus.h"
 #include "antimal/hv/MmioEmulator.h"
 #include "antimal/hv/PcIoDevices.h"
@@ -708,6 +709,81 @@ void TestLiveFrameShmContract() {
     UnmapViewOfFile(base);
   }
   CloseHandle(rh);
+}
+
+// Locks the host->guest live-input wire format (the framed 'K'/'M' keyboard +
+// mouse protocol the UI appends to _live-input.bin and the VM run loop tails).
+// The subtle, easy-to-break parts are split records across polls and resync on
+// garbage -- exactly what makes the live VM feel interactive, and exactly what
+// can't be exercised without a boot unless the parser is pulled out. Mirrors the
+// run loop: a persistent remainder buffer fed in chunks.
+void TestLiveInputProtocol() {
+  using antimal::hv::LiveInputEvent;
+  using antimal::hv::ParseLiveInput;
+
+  // A clean keyboard record then a clean mouse record, all bytes present.
+  {
+    std::vector<uint8_t> buf = {'K', 3, 0x1E, 0x9E, 0x1C,         // 3 scancodes
+                                'M', 0x01, static_cast<uint8_t>(-4),
+                                static_cast<uint8_t>(7)};         // btn,dx,dy
+    std::vector<LiveInputEvent> ev;
+    ParseLiveInput(buf, ev);
+    Expect(ev.size() == 2, "two complete records decode to two events");
+    Expect(ev[0].type == LiveInputEvent::Type::Keyboard &&
+               ev[0].scancodes.size() == 3 && ev[0].scancodes[1] == 0x9E,
+           "keyboard record carries its scancodes verbatim");
+    Expect(ev[1].type == LiveInputEvent::Type::Mouse && ev[1].buttons == 0x01 &&
+               ev[1].dx == -4 && ev[1].dy == 7,
+           "mouse record carries signed dx/dy + buttons");
+    Expect(buf.empty(), "fully-consumed buffer is drained");
+  }
+
+  // A record split across two polls must stay buffered until it completes -- no
+  // event, no bytes lost.
+  {
+    std::vector<uint8_t> buf = {'K', 3, 0x1E}; // header says 3, only 1 present
+    std::vector<LiveInputEvent> ev;
+    ParseLiveInput(buf, ev);
+    Expect(ev.empty(), "incomplete record yields no event");
+    Expect(buf.size() == 3, "incomplete record stays fully buffered");
+    // Remaining scancodes arrive on the next poll.
+    buf.push_back(0x9E);
+    buf.push_back(0x1C);
+    ParseLiveInput(buf, ev);
+    Expect(ev.size() == 1 && ev[0].scancodes.size() == 3,
+           "record completes once its tail arrives");
+    Expect(buf.empty(), "completed record is drained");
+  }
+
+  // A split tag/count boundary ('K' alone) must also wait.
+  {
+    std::vector<uint8_t> buf = {'K'};
+    std::vector<LiveInputEvent> ev;
+    ParseLiveInput(buf, ev);
+    Expect(ev.empty() && buf.size() == 1, "lone 'K' tag waits for its count");
+  }
+
+  // Garbage bytes are skipped one at a time to resync onto the next real record.
+  {
+    std::vector<uint8_t> buf = {0xAB, 0xCD, 'M', 0x00, 0x05, 0x06};
+    std::vector<LiveInputEvent> ev;
+    ParseLiveInput(buf, ev);
+    Expect(ev.size() == 1 && ev[0].type == LiveInputEvent::Type::Mouse &&
+               ev[0].dx == 5 && ev[0].dy == 6,
+           "parser resyncs past garbage onto the next valid record");
+    Expect(buf.empty(), "garbage + record fully consumed");
+  }
+
+  // An empty 'K' record (count 0) consumes its 2 header bytes but emits nothing.
+  {
+    std::vector<uint8_t> buf = {'K', 0, 'M', 0x02, 0x00, 0x00};
+    std::vector<LiveInputEvent> ev;
+    ParseLiveInput(buf, ev);
+    Expect(ev.size() == 1 && ev[0].type == LiveInputEvent::Type::Mouse &&
+               ev[0].buttons == 0x02,
+           "empty 'K' is consumed without an event; following record decodes");
+    Expect(buf.empty(), "empty-K + mouse fully consumed");
+  }
 }
 
 void TestPs2QueuedInput() {
@@ -4767,6 +4843,7 @@ int main() {
     TestSerialThreInterruptIsEdgeTriggered();
     TestSerialRxFifoResetPreservesBacklog();
     TestPs2QueuedInput();
+    TestLiveInputProtocol();
     TestLiveFrameShmContract();
     TestTpm2CrbDevice();
     TestAcpiTables();
