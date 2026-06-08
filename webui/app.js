@@ -254,12 +254,39 @@
     send('config.get').then(function (r) {
       var c = (r && r.ok && r.result) ? r.result : {};
       function section(t, b) { return '<div class="panel" style="flex:1;min-width:300px"><h2>' + esc(t) + '</h2>' + b + '</div>'; }
-      function yn(v) { return v ? 'on' : 'off'; }
-      var html = section('VM / Sandbox', kv([['Base VHDX', c.baseVhdxPath || '—'], ['Workspace', c.workspaceRoot || '—'], ['Provider', c.vmProvider || '—'], ['Network default', c.networkMode || '—'], ['VM timeout', (c.defaultTimeoutSec != null ? c.defaultTimeoutSec : '—') + ' sec'], ['Screenshot interval', (c.screenshotIntervalMs != null ? c.screenshotIntervalMs : '—') + ' ms']])) +
-        section('Scanner', kv([['YARA', yn(c.enrichYara)], ['capa', yn(c.enrichCapa)], ['Detect It Easy', yn(c.enrichDie)], ['Tagger', yn(c.enrichTagger)]])) +
-        section('Threat Intel', '<p class="page-sub" style="margin:0 0 8px">Network lookups <b>' + (c.intelEnabled ? 'enabled' : 'disabled by default') + '</b>.</p>' + kv([['MalwareBazaar', yn(c.intelMalwareBazaar)], ['VirusTotal key', c.virusTotalKeySet ? 'set ••••••' : 'not set']])) +
-        section('General', kv([['Theme', 'Dark (security)'], ['Base disk format', c.baseDiskFormat || '—'], ['Dynamic execution', c.dynamicExecutionEnabled ? 'ENABLED' : 'blocked']]));
-      var body = $('#cfg-body'); if (body) { body.innerHTML = html; }
+      function chk(id, label, on) { return '<label style="display:flex;gap:8px;align-items:center;margin:6px 0;font-size:13px"><input type="checkbox" id="' + id + '"' + (on ? ' checked' : '') + '> ' + esc(label) + '</label>'; }
+      var inp = 'background:var(--panel2);border:1px solid var(--border2);color:var(--text,#e6edf3);border-radius:6px;padding:5px 8px;width:100%';
+      function lbl(t) { return '<label style="display:block;margin:8px 0 2px;font-size:12px;color:var(--muted)">' + esc(t) + '</label>'; }
+      var net = c.networkMode || 'disabled';
+      var vmSec = '<div class="kv" style="margin-bottom:10px"><div class="k">Base VHDX</div><div class="v mono">' + esc(c.baseVhdxPath || '—') +
+        '</div><div class="k">Workspace</div><div class="v mono">' + esc(c.workspaceRoot || '—') + '</div><div class="k">Provider</div><div class="v">' + esc(c.vmProvider || '—') + '</div></div>' +
+        lbl('Network mode') + '<select id="cfg-net" style="' + inp + '">' + ['disabled', 'hostonly', 'nat'].map(function (o) { return '<option value="' + o + '"' + (net === o ? ' selected' : '') + '>' + o + '</option>'; }).join('') + '</select>' +
+        lbl('VM timeout (sec)') + '<input id="cfg-timeout" type="number" min="10" value="' + (c.defaultTimeoutSec != null ? c.defaultTimeoutSec : 180) + '" style="' + inp + '">' +
+        lbl('Live frame interval (ms)') + '<input id="cfg-shot" type="number" min="100" value="' + (c.screenshotIntervalMs != null ? c.screenshotIntervalMs : 2000) + '" style="' + inp + '">';
+      var scanSec = chk('cfg-yara', 'YARA', c.enrichYara) + chk('cfg-capa', 'capa', c.enrichCapa) + chk('cfg-die', 'Detect It Easy', c.enrichDie) + chk('cfg-tagger', 'Tagger', c.enrichTagger);
+      var intelSec = chk('cfg-intel', 'Enable network lookups (off by default)', c.intelEnabled) + chk('cfg-mb', 'MalwareBazaar', c.intelMalwareBazaar) +
+        lbl('VirusTotal API key' + (c.virusTotalKeySet ? ' (currently set)' : '')) + '<input id="cfg-vt" type="password" autocomplete="off" placeholder="' + (c.virusTotalKeySet ? '•••••• (blank = keep)' : 'not set') + '" style="' + inp + '">';
+      var safeSec = chk('cfg-dyn', 'Dynamic execution enabled (DANGER — lets the CLI run samples)', c.dynamicExecutionEnabled) +
+        '<p class="page-sub" style="margin:6px 0 0">Theme: Dark (security) · Base disk format: ' + esc(c.baseDiskFormat || '—') + '</p>';
+      var html = section('VM / Sandbox', vmSec) + section('Scanner', scanSec) + section('Threat Intel', intelSec) + section('Safety / General', safeSec);
+      var body = $('#cfg-body'); if (body) { body.innerHTML = html + '<div style="flex-basis:100%;display:flex;gap:12px;align-items:center;margin-top:4px"><button class="btn primary" id="cfg-save">Save Settings</button><span class="page-sub" id="cfg-save-status"></span></div>'; }
+      var save = $('#cfg-save');
+      if (save) save.onclick = function () {
+        var vt = ($('#cfg-vt') && $('#cfg-vt').value) || '';
+        var payload = {
+          networkMode: $('#cfg-net').value,
+          defaultTimeoutSec: parseInt($('#cfg-timeout').value, 10) || 180,
+          screenshotIntervalMs: parseInt($('#cfg-shot').value, 10) || 2000,
+          enrichYara: $('#cfg-yara').checked, enrichCapa: $('#cfg-capa').checked, enrichDie: $('#cfg-die').checked, enrichTagger: $('#cfg-tagger').checked,
+          intelEnabled: $('#cfg-intel').checked, intelMalwareBazaar: $('#cfg-mb').checked, dynamicExecutionEnabled: $('#cfg-dyn').checked
+        };
+        if (vt) payload.virusTotalApiKey = vt; // blank = keep existing key
+        send('config.set', payload).then(function (rr) {
+          var ok = rr && rr.ok && rr.result && rr.result.ok;
+          var st = $('#cfg-save-status'); if (st) { st.textContent = ok ? '✓ saved to antimal.toml' : '✗ ' + String((rr && rr.result && rr.result.error) || 'save failed'); st.style.color = ok ? '#7ee2a8' : '#ff9b9b'; }
+          appendLog(ok ? 'INFO' : 'ERROR', ok ? 'Settings saved to antimal.toml.' : 'Settings save failed.');
+        });
+      };
       appendLog(r && r.ok ? 'INFO' : 'ERROR', r && r.ok ? 'Config loaded from host.' : 'Config load failed.');
     });
   }

@@ -600,6 +600,57 @@ void WebViewHost::RegisterHandlers() {
     return j;
   });
 
+  // Write a curated, safe-to-edit subset of settings back to antimal.toml (the
+  // Settings UI). Re-serializes the FULL config so nothing else is lost; paths /
+  // provider / disk format are intentionally not editable here.
+  router_.Register("config.set", [](const JsonValue &args) -> std::string {
+    AppConfig c = LoadConfig(DefaultConfigPath());
+    auto str = [&](const char *k, std::string &dst) {
+      const JsonValue &v = args.At(k);
+      if (v.IsString()) dst = v.AsString();
+    };
+    auto boolean = [&](const char *k, bool &dst) {
+      const JsonValue &v = args.At(k);
+      if (v.IsBool()) dst = v.AsBool();
+    };
+    auto u32 = [&](const char *k, uint32_t &dst) {
+      const JsonValue &v = args.At(k);
+      if (v.IsNumber()) {
+        const int64_t n = v.AsInt64();
+        if (n >= 0) dst = static_cast<uint32_t>(n);
+      }
+    };
+    {
+      const JsonValue &v = args.At("networkMode");
+      if (v.IsString()) {
+        const std::string s = v.AsString();
+        if (s == "disabled") c.networkMode = NetworkMode::Disabled;
+        else if (s == "hostonly") c.networkMode = NetworkMode::HostOnly;
+        else if (s == "nat") c.networkMode = NetworkMode::Nat;
+      }
+    }
+    u32("defaultTimeoutSec", c.defaultTimeoutSec);
+    str("virusTotalApiKey", c.virusTotalApiKey);
+    boolean("intelEnabled", c.intelEnabled);
+    boolean("intelMalwareBazaar", c.intelMalwareBazaar);
+    boolean("enrichYara", c.enrichYara);
+    boolean("enrichCapa", c.enrichCapa);
+    boolean("enrichDie", c.enrichDie);
+    boolean("enrichTagger", c.enrichTagger);
+    u32("screenshotIntervalMs", c.screenshotIntervalMs);
+    boolean("dynamicExecutionEnabled", c.dynamicExecutionEnabled);
+    try {
+      std::ofstream out(DefaultConfigPath(), std::ios::binary | std::ios::trunc);
+      if (!out) {
+        return std::string(R"({"ok":false,"error":"cannot open config for write"})");
+      }
+      out << SerializeConfig(c);
+    } catch (...) {
+      return std::string(R"({"ok":false,"error":"config write failed"})");
+    }
+    return std::string(R"({"ok":true})");
+  });
+
   // P3: static scan. The native picker runs on this (UI/STA) thread; the scan
   // itself runs on a detached worker that streams scan.result + scan.progress
   // events back via Emit() (a stale HWND posts nowhere, so worker outliving the
