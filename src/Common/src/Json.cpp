@@ -470,6 +470,7 @@ std::string ToJson(const ScanResult &scan) {
   JsonObjectBuilder obj;
   obj.AddString("path", PathToUtf8(scan.path));
   obj.AddString("sha256", scan.sha256);
+  obj.AddString("sha1", scan.sha1);
   obj.AddString("md5", scan.md5);
   obj.AddString("imphash", scan.imphash);
   obj.AddDouble("entropy", scan.entropy);

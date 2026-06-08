@@ -331,6 +331,7 @@ ScanResult ParseScan(const JsonValue *value) {
   if (!value) return scan;
   scan.path = Utf8ToWide(StringValue(Member(*value, "path")));
   scan.sha256 = StringValue(Member(*value, "sha256"));
+  scan.sha1 = StringValue(Member(*value, "sha1"));
   scan.md5 = StringValue(Member(*value, "md5"));
   scan.imphash = StringValue(Member(*value, "imphash"));
   scan.entropy = DoubleValue(Member(*value, "entropy"));
@@ -1089,6 +1090,9 @@ std::string BuildHtmlReportWithFrames(const AnalysisReport &report,
   html << "<header><div class=\"icon\">AM</div><div><h1>"
        << HtmlEscape(PathToUtf8(report.samplePath.empty() ? scan.path : report.samplePath))
        << "</h1><div class=\"sub\">SHA-256 " << HtmlEscape(scan.sha256);
+  if (!scan.sha1.empty()) {
+    html << " &nbsp;&middot;&nbsp; SHA-1 " << HtmlEscape(scan.sha1);
+  }
   if (!scan.md5.empty()) {
     html << " &nbsp;&middot;&nbsp; MD5 " << HtmlEscape(scan.md5);
   }

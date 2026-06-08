@@ -2238,6 +2238,13 @@ void TestMd5AndImphash() {
   Expect(antimal::Md5Hex(bytes("The quick brown fox jumps over the lazy dog")) ==
              "9e107d9d372bb6826bd81d3542a419d6",
          "md5 of the pangram");
+  // SHA-1 vectors (FIPS 180 / RFC 3174).
+  Expect(antimal::Sha1Hex(bytes("")) ==
+             "da39a3ee5e6b4b0d3255bfef95601890afd80709",
+         "sha1 of empty input");
+  Expect(antimal::Sha1Hex(bytes("abc")) ==
+             "a9993e364706816aba3e25717850c26c9cd0d89d",
+         "sha1 of 'abc'");
 
   using antimal::ComputeImphash;
   Expect(ComputeImphash({}).empty(), "imphash of no imports is empty");

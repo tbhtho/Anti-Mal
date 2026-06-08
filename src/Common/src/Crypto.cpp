@@ -95,6 +95,14 @@ std::string Md5File(const std::filesystem::path &path) {
   return Md5Hex(ReadAllBytes(path));
 }
 
+std::string Sha1Hex(const std::vector<uint8_t> &data) {
+  return HashHex(BCRYPT_SHA1_ALGORITHM, data);
+}
+
+std::string Sha1File(const std::filesystem::path &path) {
+  return Sha1Hex(ReadAllBytes(path));
+}
+
 std::optional<std::vector<uint8_t>> DpapiUnprotect(const std::vector<uint8_t> &ciphertext) {
   if (ciphertext.empty()) {
     return std::nullopt;

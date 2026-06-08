@@ -250,6 +250,7 @@ ScanResult ScanFile(const std::filesystem::path &path,
   try {
     const auto data = ReadAllBytes(path);
     result.sha256 = Sha256Hex(data);
+    result.sha1 = Sha1Hex(data);
     result.md5 = Md5Hex(data);
     result.entropy = CalculateEntropy(data);
 
@@ -364,6 +365,9 @@ std::string FormatScanText(const ScanResult &result) {
   std::ostringstream out;
   out << PathToUtf8(result.path) << "\n";
   out << "  sha256: " << result.sha256 << "\n";
+  if (!result.sha1.empty()) {
+    out << "  sha1: " << result.sha1 << "\n";
+  }
   if (!result.md5.empty()) {
     out << "  md5: " << result.md5 << "\n";
   }
