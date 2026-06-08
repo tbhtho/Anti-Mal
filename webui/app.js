@@ -302,6 +302,26 @@
       }
     });
   }
+  // Show a run's report.html in an in-app modal iframe (served read-only from
+  // runs.antimal.local), so analysts never have to leave the console for Explorer.
+  function viewReportModal(folder) {
+    var ov = document.createElement('div'); ov.className = 'modal-overlay';
+    var box = document.createElement('div'); box.className = 'modal-wide';
+    var bar = document.createElement('div'); bar.className = 'modal-bar';
+    var ttl = document.createElement('span'); ttl.textContent = 'Report — ' + folder;
+    var cls = document.createElement('button'); cls.className = 'btn'; cls.textContent = 'Close';
+    bar.appendChild(ttl); bar.appendChild(cls);
+    var frame = document.createElement('iframe'); frame.className = 'modal-frame';
+    frame.setAttribute('sandbox', 'allow-same-origin'); // render content, no scripts
+    frame.src = 'https://runs.antimal.local/' + encodeURIComponent(folder) + '/report.html';
+    box.appendChild(bar); box.appendChild(frame); ov.appendChild(box);
+    function close() { if (ov.parentNode) ov.parentNode.removeChild(ov); document.removeEventListener('keydown', onKey, true); }
+    function onKey(e) { if (e.key === 'Escape') { e.preventDefault(); close(); } }
+    cls.onclick = close;
+    ov.addEventListener('mousedown', function (e) { if (e.target === ov) close(); });
+    document.addEventListener('keydown', onKey, true);
+    document.body.appendChild(ov);
+  }
   function onReportsData(d) {
     var body = $('#reports-rows'); if (!body) return;
     var list = (d && d.reports) || [];
@@ -311,9 +331,14 @@
       return;
     }
     body.innerHTML = list.map(function (x) {
+      var folder = String(x.runDir || '').split(/[\\/]/).filter(Boolean).pop() || '';
+      var viewBtn = (x.type && x.type.indexOf('HTML') >= 0 && folder) ? '<button class="iconbtn" title="View report in-app" data-view="' + esc(folder) + '">&#128065;</button> ' : '';
       return '<tr><td class="mono">' + esc(String(x.id || '').slice(0, 8)) + '</td><td>' + esc(x.file || '—') + '</td><td>' + riskChip(x.score | 0) + '</td><td>' + verdictBadge(x.verdict || '?') +
-        '</td><td class="mono">' + esc(x.created || '—') + '</td><td>' + esc(x.type || '—') + '</td><td><button class="iconbtn" title="Open run folder" data-open="' + esc(x.runDir || '') + '">▤</button></td></tr>';
+        '</td><td class="mono">' + esc(x.created || '—') + '</td><td>' + esc(x.type || '—') + '</td><td>' + viewBtn + '<button class="iconbtn" title="Open run folder" data-open="' + esc(x.runDir || '') + '">▤</button></td></tr>';
     }).join('');
+    $all('#reports-rows [data-view]').forEach(function (b) {
+      b.onclick = function () { var f = b.getAttribute('data-view'); if (f) viewReportModal(f); };
+    });
     $all('#reports-rows [data-open]').forEach(function (b) {
       b.onclick = function () {
         var p = b.getAttribute('data-open'); if (!p) return;

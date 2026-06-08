@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8">
   <meta http-equiv="Content-Security-Policy"
-        content="default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self' data: https://runs.antimal.local; connect-src 'none'; base-uri 'none'; form-action 'none';">
+        content="default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self' data: https://runs.antimal.local; frame-src https://runs.antimal.local; connect-src 'none'; base-uri 'none'; form-action 'none';">
   <title>AntiMal - Scanner and VM Analysis</title>
   <link rel="stylesheet" href="app.css">
 </head>
@@ -40,6 +40,7 @@
           <a data-page="scan"><span class="ico">⌕</span>Scan</a>
           <a data-page="vm"><span class="ico">▷</span>VM Analysis</a>
           <a data-page="reports"><span class="ico">▤</span>Reports</a>
+          <a data-page="browser"><span class="ico">⛁</span>Browser Risk</a>
           <a data-page="base"><span class="ico">⚙</span>Base Setup</a>
           <a data-page="config"><span class="ico">⚙</span>Config</a>
           <a data-page="safety"><span class="ico">⛨</span>Safety</a>
