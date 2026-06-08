@@ -1,0 +1,39 @@
+name: CI
+
+# Build the solution and run the self-contained test binary on every push / PR.
+# The WHP/OVMF tests self-SKIP when the HypervisorPlatform feature is unavailable
+# (it is on hosted runners), so they don't need a VM-capable runner. The Windows
+# SDK is retargeted to the latest installed (10.0) so CI doesn't pin an exact
+# build that a runner image may lack.
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build-and-test:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Add MSBuild to PATH
+        uses: microsoft/setup-msbuild@v2
+
+      - name: Build (Release | x64)
+        run: >
+          msbuild AntiMal.sln
+          /p:Configuration=Release
+          /p:Platform=x64
+          /p:WindowsTargetPlatformVersion=10.0
+          /m /v:minimal /clp:Summary
+
+      - name: Run tests
+        shell: pwsh
+        run: |
+          $exe = "bin\x64\Release\AntiMal.Tests.exe"
+          if (-not (Test-Path $exe)) { Write-Error "Test binary not found at $exe"; exit 1 }
+          & $exe
+          if ($LASTEXITCODE -ne 0) { Write-Error "AntiMal.Tests.exe reported $LASTEXITCODE failure(s)"; exit 1 }
+          Write-Host "All tests passed."
