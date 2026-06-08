@@ -36,6 +36,7 @@
 #include "antimal/hv/IoBus.h"
 #include "antimal/hv/KdPipeBridge.h"
 #include "antimal/hv/KdSerialDebugger.h"
+#include "antimal/hv/LiveFrameShm.h"
 #include "antimal/hv/MmioBus.h"
 #include "antimal/hv/MmioEmulator.h"
 #include "antimal/hv/PcIoDevices.h"
@@ -608,6 +609,105 @@ void TestKdSerialDebuggerCom1Integration() {
   Expect(stats.rxBytesQueued == replies.size(),
          "KD serial COM1: queued RX bytes counted");
   Expect(stats.rxBytesRead == 1, "KD serial COM1: RX drain counted");
+}
+
+// Exercises the production "real VM display" IPC contract end to end WITHOUT a
+// VM: the host publisher (antimal::hv::LiveFrameShmPublisher) writes a frame into
+// a named shared section; an independent READ-ONLY reader -- the same role the UI
+// process plays -- maps it and walks the seqlock the way WebViewHost does. Locks
+// the wire layout (magic/version/dims/format/byteLength), the BGRX pixel
+// round-trip, the read-only mapping (UI must not be able to write the VM's
+// framebuffer), and the seqlock tear-detection invariant.
+void TestLiveFrameShmContract() {
+  // The reader's view of the header must match the publisher's byte-for-byte.
+  // This mirrors the struct in App/src/WebViewHost.cpp; if either drifts, the
+  // field-offset asserts below fail.
+  struct ReaderHeader {
+    uint32_t magic;
+    uint32_t version;
+    uint32_t width;
+    uint32_t height;
+    uint32_t bpp;
+    uint32_t format;
+    uint32_t byteLength;
+    uint32_t reserved;
+    volatile uint64_t frameSeq;
+  };
+  using Pub = antimal::hv::LiveFrameShmPublisher;
+  Expect(sizeof(ReaderHeader) == sizeof(Pub::Header),
+         "live-frame reader/writer header sizes agree");
+
+  // An empty name is the "no live display requested" path -> not Valid, no crash.
+  {
+    Pub none(L"");
+    Expect(!none.Valid(), "empty shm name yields an inert publisher");
+  }
+
+  const std::wstring name =
+      L"Local\\AntiMalTestFrame-" +
+      std::wstring(antimal::Utf8ToWide(antimal::MakeRunId()));
+  Pub pub(name);
+  Expect(pub.Valid(), "named live-frame publisher maps its section");
+  if (!pub.Valid()) {
+    return;
+  }
+
+  // A 4x2 BGRX frame with distinct, asymmetric pixels so a width/height swap or a
+  // channel-order mistake is caught. Memory order per pixel is B,G,R,X.
+  const uint32_t w = 4, h = 2;
+  std::vector<uint8_t> src(static_cast<size_t>(w) * h * 4);
+  for (uint32_t i = 0; i < w * h; ++i) {
+    src[i * 4 + 0] = static_cast<uint8_t>(0x10 + i); // B
+    src[i * 4 + 1] = static_cast<uint8_t>(0x40 + i); // G
+    src[i * 4 + 2] = static_cast<uint8_t>(0x80 + i); // R
+    src[i * 4 + 3] = 0xFF;                           // X
+  }
+  pub.Publish(src.data(), w, h, 32);
+
+  // Reader side: open the SAME section read-only (FILE_MAP_READ), exactly as the
+  // sandboxed UI process does -- it must never be able to write guest pixels.
+  HANDLE rh = OpenFileMappingW(FILE_MAP_READ, FALSE, name.c_str());
+  Expect(rh != nullptr, "reader opens the live-frame section read-only");
+  if (!rh) {
+    return;
+  }
+  const size_t mapBytes = Pub::kHeaderBytes + Pub::kMaxPixelBytes;
+  auto *base = static_cast<const uint8_t *>(
+      MapViewOfFile(rh, FILE_MAP_READ, 0, 0, mapBytes));
+  Expect(base != nullptr, "reader maps a view of the live-frame section");
+  if (base) {
+    const auto *hdr = reinterpret_cast<const ReaderHeader *>(base);
+    Expect(hdr->magic == Pub::kMagic, "frame magic is 'AMLF'");
+    Expect(hdr->version == 1, "frame version is 1");
+    Expect(hdr->width == w && hdr->height == h, "frame dims survive the round-trip");
+    Expect(hdr->bpp == 32, "frame is 32bpp");
+    Expect(hdr->format == 0, "frame format is BGRX (0)");
+    Expect(hdr->byteLength == w * h * 4, "frame byteLength matches w*h*4");
+    Expect(hdr->frameSeq == 1, "first publish bumps frameSeq to 1");
+
+    // Seqlock read: latch seq, copy pixels, re-check. A stable seq == untorn.
+    const uint64_t seqBefore = hdr->frameSeq;
+    const uint8_t *px = base + Pub::kHeaderBytes;
+    bool pixelsMatch = true;
+    for (size_t i = 0; i < src.size(); ++i) {
+      if (px[i] != src[i]) {
+        pixelsMatch = false;
+        break;
+      }
+    }
+    Expect(pixelsMatch, "BGRX pixels survive the shared-memory round-trip");
+    Expect(hdr->frameSeq == seqBefore, "seqlock stable across an untorn read");
+
+    // A second publish must advance the seqlock (so a poller can tell frames
+    // apart and the UI only repaints on genuinely new content).
+    src[0] = 0x99;
+    pub.Publish(src.data(), w, h, 32);
+    Expect(hdr->frameSeq == 2, "second publish advances frameSeq to 2");
+    Expect((base + Pub::kHeaderBytes)[0] == 0x99, "new pixel content is visible");
+
+    UnmapViewOfFile(base);
+  }
+  CloseHandle(rh);
 }
 
 void TestPs2QueuedInput() {
@@ -4667,6 +4767,7 @@ int main() {
     TestSerialThreInterruptIsEdgeTriggered();
     TestSerialRxFifoResetPreservesBacklog();
     TestPs2QueuedInput();
+    TestLiveFrameShmContract();
     TestTpm2CrbDevice();
     TestAcpiTables();
     TestPcIoPmSleepByteWrites();

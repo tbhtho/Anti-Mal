@@ -1,6 +1,7 @@
 ﻿#include "antimal/hv/VirtualMachine.h"
 
 #include "antimal/hv/KdPipeBridge.h"
+#include "antimal/hv/LiveFrameShm.h"
 
 #include <Windows.h>
 
@@ -25,88 +26,8 @@ uint64_t IoAccessSizeMask(uint8_t size) {
   return size == 1 ? 0xFFull : size == 2 ? 0xFFFFull : 0xFFFFFFFFull;
 }
 
-// Mirrors the guest Bochs-VBE framebuffer into a named shared-memory section so
-// the UI process can map it read-only and blit it straight to a <canvas> -- no
-// PNG encode / disk in the path. This is the production "real VM display"
-// channel. Layout: a fixed 64-byte header followed by the raw 32bpp BGRX pixels.
-// The writer bumps frameSeq AFTER copying the pixels (release barrier) so a
-// reader that observes a new seq is guaranteed a complete, untorn frame.
-class LiveFrameShmPublisher {
-public:
-  static constexpr uint32_t kMagic = 0x414D4C46u; // 'AMLF'
-  static constexpr size_t kHeaderBytes = 64;
-  static constexpr size_t kMaxPixelBytes = 16ull * 1024 * 1024; // <= VBE fb size
-
-  struct Header {
-    uint32_t magic;
-    uint32_t version;
-    uint32_t width;
-    uint32_t height;
-    uint32_t bpp;
-    uint32_t format; // 0 = BGRX (little-endian 0x00RRGGBB in memory)
-    uint32_t byteLength;
-    uint32_t reserved;
-    volatile uint64_t frameSeq;
-  };
-
-  explicit LiveFrameShmPublisher(const std::wstring &name) {
-    if (name.empty()) {
-      return;
-    }
-    const uint64_t total = kHeaderBytes + kMaxPixelBytes;
-    handle_ = CreateFileMappingW(INVALID_HANDLE_VALUE, nullptr, PAGE_READWRITE,
-                                 static_cast<DWORD>(total >> 32),
-                                 static_cast<DWORD>(total & 0xFFFFFFFFull),
-                                 name.c_str());
-    if (!handle_) {
-      return;
-    }
-    view_ = static_cast<uint8_t *>(MapViewOfFile(
-        handle_, FILE_MAP_WRITE, 0, 0, static_cast<SIZE_T>(total)));
-    if (view_) {
-      auto *h = reinterpret_cast<Header *>(view_);
-      h->magic = kMagic;
-      h->version = 1;
-      h->frameSeq = 0;
-    }
-  }
-  ~LiveFrameShmPublisher() {
-    if (view_) {
-      UnmapViewOfFile(view_);
-    }
-    if (handle_) {
-      CloseHandle(handle_);
-    }
-  }
-  LiveFrameShmPublisher(const LiveFrameShmPublisher &) = delete;
-  LiveFrameShmPublisher &operator=(const LiveFrameShmPublisher &) = delete;
-
-  bool Valid() const noexcept { return view_ != nullptr; }
-
-  void Publish(const uint8_t *pixels, uint32_t width, uint32_t height,
-               uint32_t bpp) {
-    if (!view_ || !pixels || bpp != 32 || width == 0 || height == 0) {
-      return;
-    }
-    const uint64_t bytes = static_cast<uint64_t>(width) * height * 4ull;
-    if (bytes > kMaxPixelBytes) {
-      return;
-    }
-    auto *h = reinterpret_cast<Header *>(view_);
-    std::memcpy(view_ + kHeaderBytes, pixels, static_cast<size_t>(bytes));
-    h->width = width;
-    h->height = height;
-    h->bpp = bpp;
-    h->format = 0;
-    h->byteLength = static_cast<uint32_t>(bytes);
-    MemoryBarrier();
-    h->frameSeq = h->frameSeq + 1;
-  }
-
-private:
-  HANDLE handle_ = nullptr;
-  uint8_t *view_ = nullptr;
-};
+// LiveFrameShmPublisher (the production "real VM display" channel) now lives in
+// antimal/hv/LiveFrameShm.h so its IPC contract can be unit-tested without a VM.
 
 constexpr uint64_t kPageSize = 0x1000ull;
 constexpr uint64_t kPageMask = 0x000FFFFFFFFFF000ull;
