@@ -24,7 +24,15 @@ param(
   [string]$SeedOverlay = "",
   # Optional login password for a seed whose account is password-protected (not needed for
   # an AutoAdminLogon snapshot).
-  [string]$LoginPassword = ""
+  [string]$LoginPassword = "",
+  # Interactive: set ANTIMAL_LIVE_INPUT so the run is treated as a live session and is NOT
+  # auto-stopped after the agent healthcheck -- the VM stays alive through the 120-360s login
+  # window, so login can actually run. WITHOUT this the VM stops before login and you only
+  # measure "OS up at the lock screen", not the interactive desktop.
+  [switch]$Interactive,
+  # NoPassword: patch the overlay for AutoAdminLogon (built-in Administrator, blank password)
+  # instead of typing a password -- the hands-free "no password" path.
+  [switch]$NoPassword
 )
 $ws  = "C:\AntiMalRuns"
 $bin = "bin\x64\Release"
@@ -48,14 +56,32 @@ if ($SeedOverlay -ne "" -and (Test-Path $SeedOverlay)) {
   $env:ANTIMAL_SEED_OVERLAY = $SeedOverlay
   $env:ANTIMAL_PROBE_OOBE_KEYS = $null
   $env:ANTIMAL_PROBE_PRESS_ENTER_SEC = "30"
-  if ($LoginPassword -ne "") { $env:ANTIMAL_PROBE_LOGIN_PASSWORD = $LoginPassword }
-  else { $env:ANTIMAL_PROBE_LOGIN_PASSWORD = $null }
+  if ($NoPassword) {
+    # No password typed: AutoAdminLogon (Administrator, blank pw) via the overlay patch.
+    $env:ANTIMAL_PROBE_OOBE_AUTOLOGON = "1"
+    $env:ANTIMAL_PROBE_LOGIN_PASSWORD = $null
+    $mode = "seed/no-password"
+  } else {
+    $env:ANTIMAL_PROBE_OOBE_AUTOLOGON = $null
+    if ($LoginPassword -ne "") { $env:ANTIMAL_PROBE_LOGIN_PASSWORD = $LoginPassword }
+    else { $env:ANTIMAL_PROBE_LOGIN_PASSWORD = $null }
+  }
 } else {
   # COLD mode: paced OOBE automation creates the account + AutoAdminLogon + reboot.
   $env:ANTIMAL_SEED_OVERLAY = $null
   $env:ANTIMAL_PROBE_OOBE_KEYS = "$OobeStartSec"
   $env:ANTIMAL_PROBE_PRESS_ENTER_SEC = $null
   $env:ANTIMAL_PROBE_LOGIN_PASSWORD = $null
+}
+# Interactive keep-alive: a live-input file makes the run NOT auto-stop after the agent
+# probe, so the VM stays alive through the 120-360s login window (login can actually run).
+if ($Interactive) {
+  $li = Join-Path $ws "_measure-live-input.bin"
+  if (-not (Test-Path $li)) { New-Item -ItemType File $li | Out-Null }
+  $env:ANTIMAL_LIVE_INPUT = $li
+  $mode = "$mode/interactive"
+} else {
+  $env:ANTIMAL_LIVE_INPUT = $null
 }
 Write-Host ("mode: {0}  (seed={1})" -f $mode, $(if ($SeedOverlay -ne "") { $SeedOverlay } else { "<none>" }))
 
@@ -97,13 +123,21 @@ for ($i = 1; $i -le $Boots; $i++) {
   }
   $hostChannelBytes = AsInt (Field $c "hostChannelBytes")
 
-  # Classify furthest stage reached.
+  # A session-0 agent streams telemetry from the LOCK SCREEN too, so telemetry alone is
+  # NOT proof of an interactive desktop. A rendered desktop is a distinctly large frame
+  # (~1.2 MB w/ wallpaper+icons) vs the ~745 KB lock screen -- use the frame size to tell
+  # them apart. Threshold 1000 KB sits cleanly between the two observed sizes.
+  $osUp = ($agentConnected -or $hostChannelBytes -gt 0 -or $procEvents -gt 0)
+  $desktopRendered = ($maxFrameKB -ge 1000)
+
+  # Classify furthest stage reached (DESKTOP = telemetry AND a rendered desktop frame).
   $stage = "early"
-  if     ($agentConnected -or $hostChannelBytes -gt 0 -or $procEvents -gt 0) { $stage = "DESKTOP+AGENT" }
-  elseif ($bootStage -eq "logon-ui")                                         { $stage = "logon-ui" }
-  elseif ($bootStage -eq "user-mode" -or $maxFrameKB -ge 500)               { $stage = "user-mode/preparing" }
-  elseif ($bootStage -eq "kernel")                                           { $stage = "kernel" }
-  elseif ($bootStage -ne "")                                                 { $stage = $bootStage }
+  if     ($osUp -and $desktopRendered)        { $stage = "DESKTOP" }
+  elseif ($osUp)                              { $stage = "os-up/lockscreen" }
+  elseif ($bootStage -eq "logon-ui")          { $stage = "logon-ui" }
+  elseif ($bootStage -eq "user-mode" -or $maxFrameKB -ge 500) { $stage = "user-mode/preparing" }
+  elseif ($bootStage -eq "kernel")            { $stage = "kernel" }
+  elseif ($bootStage -ne "")                  { $stage = $bootStage }
 
   $rows += [PSCustomObject]@{
     boot=$i; run=$run.Name.Substring(0,8); stage=$stage; bootStage=$bootStage
@@ -118,8 +152,11 @@ for ($i = 1; $i -le $Boots; $i++) {
 
 Write-Host "`n================= DESKTOP-REACH SUMMARY ================="
 $rows | Format-Table boot,run,stage,reboots,frames,maxKB,hostCh,procEv,timedOut,fatalPdb -AutoSize | Out-String | Write-Host
-$desktop = ($rows | Where-Object { $_.stage -eq "DESKTOP+AGENT" }).Count
-$userPlus = ($rows | Where-Object { $_.stage -in @("DESKTOP+AGENT","logon-ui","user-mode/preparing") }).Count
-Write-Host ("RENDERED-LOGGED-IN-DESKTOP (agent streamed): {0}/{1}" -f $desktop, $rows.Count)
-Write-Host ("reached user-mode or beyond:                 {0}/{1}" -f $userPlus, $rows.Count)
-Write-Host ("`nFor any DESKTOP+AGENT run, inspect screenshots\guest-*.png (largest) to visually confirm the desktop, and events.jsonl for process.* telemetry.")
+$desktop = ($rows | Where-Object { $_.stage -eq "DESKTOP" }).Count
+$osUpCount = ($rows | Where-Object { $_.stage -in @("DESKTOP","os-up/lockscreen") }).Count
+Write-Host ("RENDERED INTERACTIVE DESKTOP (telemetry + >=1MB frame): {0}/{1}" -f $desktop, $rows.Count)
+Write-Host ("OS up / agent streaming (desktop OR lock screen):       {0}/{1}" -f $osUpCount, $rows.Count)
+if (-not $Interactive) {
+  Write-Host ("`nNOTE: not -Interactive -> the VM is auto-stopped after the agent probe, BEFORE the 120-360s login window, so 'os-up/lockscreen' is expected. Re-run with -Interactive to measure the actual desktop-reach.")
+}
+Write-Host ("`nFor any DESKTOP run, inspect screenshots\guest-*.png (largest) to visually confirm the desktop, and events.jsonl for process.* telemetry.")
