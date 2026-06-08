@@ -2285,6 +2285,39 @@ void TestMd5AndImphash() {
          "imphash does not strip non-.dll/.ocx/.sys extensions");
 }
 
+// Magic-byte file-type identification (extension-independent), the basis for
+// masquerade detection (a PE wearing a .pdf name, etc.).
+void TestFileTypeId() {
+  using antimal::IdentifyFileType;
+  auto b = [](std::initializer_list<int> v) {
+    std::vector<uint8_t> out;
+    for (int x : v) {
+      out.push_back(static_cast<uint8_t>(x));
+    }
+    return out;
+  };
+  Expect(IdentifyFileType(b({'M', 'Z', 0x90, 0x00})) == "pe", "MZ -> pe");
+  Expect(IdentifyFileType(b({0x7F, 'E', 'L', 'F'})) == "elf", "ELF magic");
+  Expect(IdentifyFileType(b({'%', 'P', 'D', 'F', '-', '1', '.', '7'})) == "pdf",
+         "%PDF -> pdf");
+  Expect(IdentifyFileType(b({'P', 'K', 0x03, 0x04})) == "zip", "PK -> zip");
+  Expect(IdentifyFileType(b({0xD0, 0xCF, 0x11, 0xE0, 0xA1, 0xB1, 0x1A, 0xE1})) ==
+             "ole",
+         "OLE compound document magic");
+  Expect(IdentifyFileType(b({0x1F, 0x8B, 0x08})) == "gzip", "gzip magic");
+  Expect(IdentifyFileType(b({'R', 'a', 'r', '!'})) == "rar", "rar magic");
+  Expect(IdentifyFileType(b({'#', '!', '/', 'b', 'i', 'n'})) == "script",
+         "shebang -> script");
+  Expect(IdentifyFileType(b({0x00, 0x01, 0x02})).empty(),
+         "unknown leading bytes -> empty type");
+  Expect(IdentifyFileType({}).empty(), "empty input -> empty type");
+  // The running test exe must identify as a PE by content.
+  wchar_t modulePath[MAX_PATH]{};
+  GetModuleFileNameW(nullptr, modulePath, MAX_PATH);
+  Expect(antimal::ScanFile(modulePath).detectedType == "pe",
+         "scanned test exe is detected as pe by magic bytes");
+}
+
 void TestBrowserRisk() {
   std::vector<antimal::BrowserRisk> records;
   antimal::BrowserRisk a;
@@ -4946,6 +4979,7 @@ int main() {
     TestMmioBusRouting();
     TestPeParser();
     TestMd5AndImphash();
+    TestFileTypeId();
     TestBrowserRisk();
     TestStringExtraction();
     TestIocMining();

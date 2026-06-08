@@ -29,6 +29,12 @@ struct ScannerOptions {
 
 double CalculateEntropy(const std::vector<uint8_t> &data);
 
+// Magic-byte file-type identification, independent of the file extension. Returns
+// a short lowercase label ("pe", "elf", "macho", "pdf", "zip", "ole", "rtf",
+// "elf", "script", "lnk", ...) or "" when nothing matches. Used to flag
+// extension/content masquerading (e.g. invoice.pdf that is really a PE).
+std::string IdentifyFileType(const std::vector<uint8_t> &data);
+
 ScanResult ScanFile(const std::filesystem::path &path);
 ScanResult ScanFile(const std::filesystem::path &path,
                     const ScannerOptions &options);

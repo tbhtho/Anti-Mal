@@ -115,6 +115,7 @@ struct ScanDieDetection {
 struct ScanResult {
   std::filesystem::path path;
   std::string sha256;
+  std::string detectedType; // magic-byte file type ("pe","pdf","zip",...); "" if unknown
   std::string sha1;    // triage cross-reference hash (identification only)
   std::string md5;     // triage cross-reference hash (identification only)
   std::string imphash; // pefile-compatible import hash; empty for non-PE / no imports

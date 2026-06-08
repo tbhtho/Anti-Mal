@@ -354,6 +354,7 @@ ScanResult ParseScan(const JsonValue *value) {
   scan.sha1 = StringValue(Member(*value, "sha1"));
   scan.md5 = StringValue(Member(*value, "md5"));
   scan.imphash = StringValue(Member(*value, "imphash"));
+  scan.detectedType = StringValue(Member(*value, "detectedType"));
   scan.entropy = DoubleValue(Member(*value, "entropy"));
   scan.isPe = BoolValue(Member(*value, "isPe"));
   scan.authenticodeSigned = BoolValue(Member(*value, "authenticodeSigned"));

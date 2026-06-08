@@ -238,6 +238,66 @@ double CalculateEntropy(const std::vector<uint8_t> &data) {
   return entropy;
 }
 
+std::string IdentifyFileType(const std::vector<uint8_t> &data) {
+  auto has = [&](std::initializer_list<int> sig, size_t at = 0) {
+    if (at + sig.size() > data.size()) {
+      return false;
+    }
+    size_t i = at;
+    for (int b : sig) {
+      if (data[i++] != static_cast<uint8_t>(b)) {
+        return false;
+      }
+    }
+    return true;
+  };
+  if (has({'M', 'Z'})) {
+    return "pe";
+  }
+  if (has({0x7F, 'E', 'L', 'F'})) {
+    return "elf";
+  }
+  if (has({0xFE, 0xED, 0xFA, 0xCE}) || has({0xFE, 0xED, 0xFA, 0xCF}) ||
+      has({0xCE, 0xFA, 0xED, 0xFE}) || has({0xCF, 0xFA, 0xED, 0xFE})) {
+    return "macho";
+  }
+  if (has({'%', 'P', 'D', 'F'})) {
+    return "pdf";
+  }
+  if (has({'P', 'K', 0x03, 0x04}) || has({'P', 'K', 0x05, 0x06}) ||
+      has({'P', 'K', 0x07, 0x08})) {
+    return "zip"; // also office-OOXML / jar / apk (all zip containers)
+  }
+  if (has({0xD0, 0xCF, 0x11, 0xE0, 0xA1, 0xB1, 0x1A, 0xE1})) {
+    return "ole"; // legacy doc/xls/ppt/msi
+  }
+  if (has({'{', '\\', 'r', 't', 'f'})) {
+    return "rtf";
+  }
+  if (has({'7', 'z', 0xBC, 0xAF, 0x27, 0x1C})) {
+    return "7z";
+  }
+  if (has({'R', 'a', 'r', '!'})) {
+    return "rar";
+  }
+  if (has({0x1F, 0x8B})) {
+    return "gzip";
+  }
+  if (has({'M', 'S', 'C', 'F'})) {
+    return "cab";
+  }
+  if (has({0x4C, 0x00, 0x00, 0x00, 0x01, 0x14, 0x02, 0x00})) {
+    return "lnk"; // Windows shell link header GUID
+  }
+  if (has({'#', '!'})) {
+    return "script";
+  }
+  if (has({'<', '?', 'p', 'h', 'p'})) {
+    return "php";
+  }
+  return "";
+}
+
 ScanResult ScanFile(const std::filesystem::path &path) {
   return ScanFile(path, ScannerOptions{});
 }
@@ -252,7 +312,27 @@ ScanResult ScanFile(const std::filesystem::path &path,
     result.sha256 = Sha256Hex(data);
     result.sha1 = Sha1Hex(data);
     result.md5 = Md5Hex(data);
+    result.detectedType = IdentifyFileType(data);
     result.entropy = CalculateEntropy(data);
+
+    // Masquerade: a PE wearing a document/media/archive extension is a classic
+    // delivery trick (invoice.pdf.exe truncated in the UI, or a plain rename).
+    if (result.detectedType == "pe") {
+      std::string ext = PathToUtf8(path.extension());
+      for (char &c : ext) {
+        c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+      }
+      static const std::vector<std::string> kDecoyExts = {
+          ".pdf", ".doc",  ".docx", ".xls", ".xlsx", ".ppt", ".rtf", ".txt",
+          ".jpg", ".jpeg", ".png",  ".gif", ".mp3",  ".mp4", ".csv", ".htm",
+          ".html", ".zip", ".rar"};
+      if (std::find(kDecoyExts.begin(), kDecoyExts.end(), ext) != kDecoyExts.end()) {
+        AddFinding(result, "filetype.masquerade_pe",
+                   "Executable (PE) wearing a non-executable '" + ext +
+                       "' extension",
+                   40);
+      }
+    }
 
     const PeInfo pe = ParsePe(data);
     result.isPe = pe.isPe;
@@ -391,6 +471,9 @@ std::string FormatScanText(const ScanResult &result) {
   }
   out << "  score: " << result.score << " (" << ToString(result.verdict) << ")\n";
   out << "  entropy: " << result.entropy << "\n";
+  if (!result.detectedType.empty()) {
+    out << "  type: " << result.detectedType << " (by magic bytes)\n";
+  }
   out << "  pe: " << (result.isPe ? "yes" : "no")
       << ", signed: " << (result.authenticodeSigned ? "yes" : "no") << "\n";
   for (const auto &sec : result.peSections) {
