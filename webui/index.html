@@ -21,14 +21,6 @@
         <button class="btn" data-cmd="scan.computer">Scan Computer</button>
         <button class="btn danger" data-cmd="detonate.selected" title="Pick a BENIGN sample and run it live in the VM — watch it execute on the VM Analysis page">Detonate Sample</button>
       </div>
-      <div class="segmented" id="network" title="Display only — network mode is set in config/antimal.toml or via detonate --network">
-        <button data-net="disabled" class="on" disabled>Disabled</button>
-        <button data-net="isolated" disabled>Isolated</button>
-        <button data-net="live" disabled>Live</button>
-      </div>
-      <span class="field">Flag &ge; <input id="flag" type="number" value="70" min="0" max="100" disabled title="Display only — set the flag threshold via config or scan --threshold"></span>
-      <span class="field">VM sec <input id="vmsec" type="number" value="180" min="10" disabled title="Display only — set the VM timeout via config (default_timeout_sec) or detonate --timeout-sec"></span>
-      <span class="toggle disabled" id="autodet" title="Not wired — detonation is gated off (boots run a healthcheck only)"><span class="track"></span>Auto-detonate</span>
     </header>
 
     <div class="body">

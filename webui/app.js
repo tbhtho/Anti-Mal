@@ -47,6 +47,12 @@
   var heldKeys = {};       // e.code -> break scancodes, flushed on blur/stop
   var liveMouse = { btn: 0, dx: 0, dy: 0 }; // accumulated relative mouse state
   var liveMouseTimer = null;                // flushes accumulated movement
+  // The guest draws its pointer as a HARDWARE cursor sprite that is NOT in the
+  // linear framebuffer we capture, so once Pointer Lock hides the host cursor
+  // there'd be no visible pointer. We reconstruct an absolute position from the
+  // same relative deltas we feed the guest and draw a synthetic pointer on the
+  // canvas (an aiming aid — it can drift slightly from the guest's own ballistics).
+  var liveCursor = { x: 0, y: 0, valid: false };
   var liveFrameBuffer = null;    // host-shared ArrayBuffer of live RGBA pixels
   var usingSharedFrames = false; // true once the canvas path is live (no <img>)
   var liveFrameCount = 0, liveFps = 0, liveFpsTimer = null; // canvas fps readout
@@ -382,7 +388,12 @@
     }
     var run = $('#dash-run');
     if (run) {
-      run.innerHTML = kv([['Verdict', lr.verdict || '—'], ['Scanner', (lr.scannerVerdict || '—') + ' (' + (lr.score | 0) + ')'], ['Run ID', lr.runId || '—'], ['When', lr.when || '—']]) +
+      // Boot/healthcheck runs have no real analysis target — don't show a scanner
+      // verdict for the bundled test binary (it was 'malicious (100)' noise).
+      var rows = (lr.kind === 'boot')
+        ? [['Verdict', lr.verdict || 'boot session'], ['Run ID', lr.runId || '—'], ['When', lr.when || '—']]
+        : [['Verdict', lr.verdict || '—'], ['Scanner', (lr.scannerVerdict || '—') + ' (' + (lr.score | 0) + ')'], ['Run ID', lr.runId || '—'], ['When', lr.when || '—']];
+      run.innerHTML = kv(rows) +
         '<div class="actions" style="margin-top:12px"><button class="btn" data-open-run="' + esc(lr.runDir || '') + '">Open Run Folder</button></div>';
       var ob = run.querySelector('[data-open-run]');
       if (ob) ob.onclick = function () { var p = ob.getAttribute('data-open-run'); if (!p) return; send('run.open', { runDir: p }).then(function (rr) { appendLog(rr && rr.ok ? 'INFO' : 'ERROR', rr && rr.ok ? 'Opened run folder.' : 'Open failed.'); }); };
@@ -577,9 +588,31 @@
     try {
       ctx.putImageData(new ImageData(new Uint8ClampedArray(liveFrameBuffer, 0, need), w, h), 0, 0);
     } catch (x) { return; }
+    // putImageData overwrites the whole canvas, so the synthetic pointer is
+    // redrawn on top each frame with no erase bookkeeping. Only while captured.
+    if (liveCursor.valid && document.pointerLockElement &&
+        document.pointerLockElement.id === 'live-frame') {
+      drawLiveCursor(ctx, liveCursor.x, liveCursor.y);
+    }
     usingSharedFrames = true;
     liveFrameCount++;
     if (liveSession === 'boot') { liveSession = 'running'; setVmState('running'); }
+  }
+  // A crisp white arrow with a dark outline so it reads on any background.
+  function drawLiveCursor(ctx, x, y) {
+    var p = [[0, 0], [0, 16], [4, 12], [7, 18], [9, 17], [6, 11], [11, 11]];
+    ctx.save();
+    ctx.beginPath();
+    ctx.moveTo(x + p[0][0], y + p[0][1]);
+    for (var i = 1; i < p.length; i++) ctx.lineTo(x + p[i][0], y + p[i][1]);
+    ctx.closePath();
+    ctx.fillStyle = '#fff';
+    ctx.strokeStyle = '#000';
+    ctx.lineWidth = 1.5;
+    ctx.lineJoin = 'round';
+    ctx.fill();
+    ctx.stroke();
+    ctx.restore();
   }
   // Clean FPS readout while a live session runs. No "fallback" label clutter.
   function updateDisplayMode() {
@@ -701,16 +734,26 @@
         loadVm._inputWired = true;
         document.addEventListener('pointerlockchange', function () {
           var f = document.getElementById('live-frame');
-          if (vmCaptured()) { if (f) f.style.outline = '2px solid #4ea1ff'; }
-          else { if (f) f.style.outline = 'none'; releaseHeldKeys(); } // never leave a key stuck
+          if (vmCaptured()) {
+            if (f) f.style.outline = '2px solid #4ea1ff';
+            var cv = document.getElementById('live-frame-canvas'); // center the synthetic pointer on capture
+            liveCursor.x = cv ? cv.width / 2 : 0; liveCursor.y = cv ? cv.height / 2 : 0; liveCursor.valid = !!cv;
+          } else { if (f) f.style.outline = 'none'; liveCursor.valid = false; releaseHeldKeys(); } // never leave a key stuck
         });
         // Relative motion (movementX/Y) keeps coming under pointer lock even past
         // the window edge -- exactly what a guest mouse expects.
         document.addEventListener('mousemove', function (e) {
           if (!livePollTimer || !vmCaptured()) return;
           var s = frameScale();
-          liveMouse.dx += (e.movementX || 0) * s.x;
-          liveMouse.dy += (e.movementY || 0) * s.y;
+          var gx = (e.movementX || 0) * s.x, gy = (e.movementY || 0) * s.y;
+          liveMouse.dx += gx;            // delta -> guest (relative PS/2)
+          liveMouse.dy += gy;
+          var cv = document.getElementById('live-frame-canvas'); // integrate -> synthetic pointer
+          if (cv) {
+            liveCursor.x = Math.max(0, Math.min(cv.width, liveCursor.x + gx));
+            liveCursor.y = Math.max(0, Math.min(cv.height, liveCursor.y + gy));
+            liveCursor.valid = true;
+          }
         });
         document.addEventListener('mouseup', function (e) {
           if (!livePollTimer || !vmCaptured()) return;
@@ -877,14 +920,6 @@
     logEl = $('#log');
     $all('#nav a').forEach(function (a) { a.onclick = function () { route(a.dataset.page); }; });
     $all('.topbar [data-cmd]').forEach(function (b) { b.onclick = function () { onAction(b.dataset.cmd); }; });
-    $all('#network button').forEach(function (b) {
-      b.onclick = function () {
-        $all('#network button').forEach(function (x) { x.classList.remove('on', 'live'); });
-        b.classList.add('on'); if (b.dataset.net === 'live') b.classList.add('live');
-        appendLog(b.dataset.net === 'live' ? 'WARN' : 'SAFE', 'Network mode: ' + b.dataset.net + '.');
-      };
-    });
-    var at = $('#autodet'); if (at) at.onclick = function () { appendLog('INFO', 'Auto-detonate is not wired — detonation is gated off (boots run a GuestAgent healthcheck only).'); };
     $all('.logtools .f').forEach(function (f) {
       f.onclick = function () { $all('.logtools .f').forEach(function (x) { x.classList.remove('on'); }); f.classList.add('on'); logFilter = f.dataset.filter; refilterLog(); };
     });

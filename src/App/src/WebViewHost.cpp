@@ -151,6 +151,17 @@ struct NewestRun {
   std::filesystem::path dir;
   std::filesystem::path json;
 };
+// mtime of a path as a 64-bit FILETIME value; 0 if it doesn't exist.
+unsigned long long PathMtime(const std::filesystem::path &p) {
+  WIN32_FILE_ATTRIBUTE_DATA fad{};
+  if (!GetFileAttributesExW(p.c_str(), GetFileExInfoStandard, &fad)) {
+    return 0;
+  }
+  ULARGE_INTEGER t{};
+  t.LowPart = fad.ftLastWriteTime.dwLowDateTime;
+  t.HighPart = fad.ftLastWriteTime.dwHighDateTime;
+  return t.QuadPart;
+}
 NewestRun FindNewestRun(const std::filesystem::path &workspaceRoot) {
   namespace fs = std::filesystem;
   NewestRun best;
@@ -167,17 +178,22 @@ NewestRun FindNewestRun(const std::filesystem::path &workspaceRoot) {
         continue;
       }
       const fs::path json = dir / L"report.json";
-      WIN32_FILE_ATTRIBUTE_DATA fad{};
-      if (!GetFileAttributesExW(json.c_str(), GetFileExInfoStandard, &fad)) {
+      // Rank by the most recent ACTIVITY in the run dir, NOT by report.json
+      // existence. An interactive "Boot VM (live)" that the user stopped has
+      // events.jsonl + screenshots but no report.json (it's only written when a
+      // detonate run completes) -- yet it is the newest run the user cares about.
+      // Requiring report.json is exactly why an older completed run looked "latest".
+      unsigned long long m = PathMtime(dir);
+      m = std::max(m, PathMtime(json));
+      m = std::max(m, PathMtime(dir / L"events.jsonl"));
+      m = std::max(m, PathMtime(dir / L"screenshots"));
+      if (m == 0) {
         continue;
       }
-      ULARGE_INTEGER t{};
-      t.LowPart = fad.ftLastWriteTime.dwLowDateTime;
-      t.HighPart = fad.ftLastWriteTime.dwHighDateTime;
-      if (t.QuadPart >= bestMtime) {
-        bestMtime = t.QuadPart;
+      if (m > bestMtime) { // strict > for a deterministic winner
+        bestMtime = m;
         best.dir = dir;
-        best.json = json;
+        best.json = json; // may not exist on an in-flight / stopped boot
       }
     }
   }
@@ -827,14 +843,18 @@ void WebViewHost::RegisterHandlers() {
       const AppConfig c = LoadConfig(DefaultConfigPath());
       std::error_code ec;
       const NewestRun nr = FindNewestRun(c.workspaceRoot);
-      if (nr.json.empty()) {
+      if (nr.dir.empty()) {
         WebViewHost::Emit(h, "dashboard.data", R"({"hasRun":false})");
         CoUninitialize();
         return;
       }
       const fs::path bestDir = nr.dir;
       const fs::path bestJson = nr.json;
-      const AnalysisReport r = LoadReportBestEffort(bestJson);
+      // A stopped/in-flight "Boot VM (live)" run has no report.json yet; show it
+      // anyway (it's the newest run) rather than falling back to an older one.
+      const bool hasReport = fs::exists(bestJson, ec);
+      const AnalysisReport r =
+          hasReport ? LoadReportBestEffort(bestJson) : AnalysisReport{};
       const std::string dirName = Narrow(bestDir.filename().wstring().c_str());
 
       // Frames: prefer guest-*.png (real VM framebuffer) over diagnostics.
@@ -897,13 +917,31 @@ void WebViewHost::RegisterHandlers() {
       }
       evArr += "]";
 
+      // A plain "Boot VM (live)" healthcheck runs the bundled AntiMal.Tests.exe as
+      // a dummy sample (it is never executed). Surfacing the static scan of OUR
+      // test binary as "Scanner: malicious (100)" is meaningless noise, so a
+      // boot/healthcheck run is labelled as such and its scanner verdict is hidden.
+      const std::string sampleFile =
+          Narrow(r.samplePath.filename().wstring().c_str());
+      const bool bootRun = !hasReport || sampleFile == "AntiMal.Tests.exe";
+      const fs::path whenPath =
+          (hasReport ? bestJson
+                     : (fs::exists(bestDir / L"events.jsonl", ec)
+                            ? bestDir / L"events.jsonl"
+                            : bestDir));
+
       JsonObjectBuilder lr;
       lr.AddString("runId", r.runId.empty() ? dirName : r.runId);
-      lr.AddString("file", Narrow(r.samplePath.filename().wstring().c_str()));
-      lr.AddString("verdict", ToString(r.sandboxVerdict));
-      lr.AddNumber("score", r.scannerVerdict.score);
-      lr.AddString("scannerVerdict", ToString(r.scannerVerdict.verdict));
-      lr.AddString("when", FormatFileTime(bestJson));
+      lr.AddString("kind", bootRun ? "boot" : "analysis");
+      lr.AddString("file", bootRun ? std::string() : sampleFile);
+      lr.AddString("verdict",
+                   bootRun ? std::string("boot session")
+                           : ToString(r.sandboxVerdict));
+      if (!bootRun) {
+        lr.AddNumber("score", r.scannerVerdict.score);
+        lr.AddString("scannerVerdict", ToString(r.scannerVerdict.verdict));
+      }
+      lr.AddString("when", FormatFileTime(whenPath));
       lr.AddString("runDir", Narrow(bestDir.wstring().c_str()));
       lr.AddString("frame", latestFrame);
 

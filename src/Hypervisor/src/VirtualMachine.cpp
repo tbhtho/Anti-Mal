@@ -1394,6 +1394,15 @@ VmRunSummary VirtualMachine::RunLoop(
   auto lastPacedCom2 = runStarted;        // throttle paced host->guest delivery
   // Live framebuffer mirror -> named shm (production <canvas> display path).
   auto lastFramePublish = runStarted;
+  // Geometry debounce: the guest's post-login modesets are a multi-register
+  // sequence (ENABLE 1->0->1, XRES then YRES then BPP written separately), so the
+  // 30Hz publisher can sample a half-applied tuple. Publishing those transient
+  // geometries is what makes the desktop flash desktop->grey->black. We only
+  // publish a NEW (w,h) once it has been observed stable on two consecutive
+  // ticks; until then we keep republishing the last good geometry.
+  uint32_t lastPubW = 0, lastPubH = 0; // last geometry actually published
+  uint32_t pendW = 0, pendH = 0;       // candidate geometry awaiting confirmation
+  int pendCount = 0;
   std::unique_ptr<LiveFrameShmPublisher> framePub;
   if (!liveFrameShmName_.empty()) {
     framePub = std::make_unique<LiveFrameShmPublisher>(liveFrameShmName_);
@@ -2699,11 +2708,43 @@ VmRunSummary VirtualMachine::RunLoop(
     // display (the UI maps the section read-only and blits it -- no PNG/disk).
     if (framePub && now - lastFramePublish >= std::chrono::milliseconds{33}) {
       lastFramePublish = now;
-      if (vbe_.Enabled()) {
-        framePub->Publish(vbe_.FramebufferHost(),
-                          static_cast<uint32_t>(vbe_.Width()),
-                          static_cast<uint32_t>(vbe_.Height()),
-                          static_cast<uint32_t>(vbe_.Bpp()));
+      // Atomic snapshot of the VBE registers (one read each), then validate as a
+      // consistent tuple before trusting the geometry.
+      const bool en = vbe_.Enabled();
+      const uint32_t w = static_cast<uint32_t>(vbe_.Width());
+      const uint32_t h = static_cast<uint32_t>(vbe_.Height());
+      const uint32_t bpp = static_cast<uint32_t>(vbe_.Bpp());
+      const uint64_t fbBytes = vbe_.FramebufferBytes();
+      const bool consistent = en && bpp == 32 && w >= 64 && h >= 64 &&
+                              w <= 8192 && h <= 8192 &&
+                              static_cast<uint64_t>(w) * h * 4ull <= fbBytes;
+      if (consistent) {
+        if (w == lastPubW && h == lastPubH) {
+          // Steady state: publish the current frame at the established geometry.
+          framePub->Publish(vbe_.FramebufferHost(), w, h, bpp);
+        } else {
+          // Geometry changed: require the SAME new (w,h) twice before adopting it,
+          // so a half-applied modeset tuple never reaches the UI.
+          if (w == pendW && h == pendH) {
+            if (++pendCount >= 2) {
+              lastPubW = w; lastPubH = h; pendCount = 0;
+              framePub->Publish(vbe_.FramebufferHost(), w, h, bpp);
+            } else if (lastPubW != 0) {
+              // Keep showing the last good geometry while confirming the new one.
+              framePub->Publish(vbe_.FramebufferHost(), lastPubW, lastPubH, bpp);
+            }
+          } else {
+            pendW = w; pendH = h; pendCount = 1;
+            if (lastPubW != 0) {
+              framePub->Publish(vbe_.FramebufferHost(), lastPubW, lastPubH, bpp);
+            }
+          }
+        }
+      } else if (lastPubW != 0 && bpp == 32 &&
+                 static_cast<uint64_t>(lastPubW) * lastPubH * 4ull <= fbBytes) {
+        // Transient ENABLE=0 / inconsistent tuple (a modeset blip): hold the last
+        // good frame instead of dropping out, which is what caused the black flash.
+        framePub->Publish(vbe_.FramebufferHost(), lastPubW, lastPubH, bpp);
       }
     }
     // Live interactive input: poll the input file (~every 100ms) for bytes the
