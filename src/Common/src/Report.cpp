@@ -3,6 +3,7 @@
 #include "antimal/FileUtil.h"
 #include "antimal/Json.h"
 
+#include <functional>
 #include <map>
 #include <regex>
 #include <set>
@@ -805,6 +806,283 @@ std::string EmitProcessTreeHtml(const ProcessForest &forest) {
   return out.str();
 }
 
+// ----- Analyst-grade grouped sections (Any.Run-style) ------------------
+//
+// These render ABOVE the full event timeline. Each emitter is self-contained
+// and renders nothing (returns "did it draw anything?") when it has no rows, so
+// the caller can skip the surrounding section card. Every untrusted string runs
+// through HtmlEscape, matching the rest of this renderer.
+
+constexpr int kProcessTreeMaxDepth = 64; // cycle/abuse guard for BuildProcessTree
+
+// Truncate a command line for the visible cell; the full value goes in title=.
+std::string TruncateForCell(const std::string &text, size_t max = 120) {
+  if (text.size() <= max) return text;
+  return text.substr(0, max) + "…";
+}
+
+// Look up a detail key, returning "" when absent.
+std::string Detail(const EventRecord &e, const char *key) {
+  const auto it = e.details.find(key);
+  return it == e.details.end() ? std::string() : it->second;
+}
+
+bool ActionIs(const EventRecord &e, const char *suffix) {
+  return e.action == suffix || e.action.find(suffix) != std::string::npos;
+}
+
+} // namespace
+
+std::vector<ProcessTreeNode> BuildProcessTree(
+    const std::vector<EventRecord> &events) {
+  // 1) Collapse process.start events into per-PID node records. A PID may
+  // appear more than once (e.g. start then later detail) -- first start wins for
+  // identity, but we still let a later record fill an empty field.
+  std::map<uint32_t, ProcessTreeNode> nodes;
+  std::map<uint32_t, std::vector<uint32_t>> children; // parent -> child pids (ordered by map insert below)
+  for (const auto &e : events) {
+    const bool isStart = e.category == "process" && ActionIs(e, "process.start");
+    if (!isStart) continue;
+    auto &node = nodes[e.processId];
+    node.processId = e.processId;
+    if (node.parentProcessId == 0 && e.parentProcessId != 0) {
+      node.parentProcessId = e.parentProcessId;
+    }
+    if (node.imagePath.empty() && !e.imagePath.empty()) node.imagePath = e.imagePath;
+    if (node.commandLine.empty() && !e.commandLine.empty()) {
+      node.commandLine = e.commandLine;
+    }
+    if (node.integrityLevel.empty() && !e.integrityLevel.empty()) {
+      node.integrityLevel = e.integrityLevel;
+    }
+    if (node.userName.empty() && !e.userName.empty()) node.userName = e.userName;
+    // A start event can already carry an exit code detail (e.g. short-lived
+    // processes summarized in one record).
+    if (!node.exited) {
+      const auto exit = Detail(e, "exitCode");
+      if (!exit.empty()) {
+        node.exitCode = exit;
+        node.exited = true;
+      }
+    }
+  }
+  if (nodes.empty()) return {};
+
+  // 2) Fold in exit codes from process.stop events.
+  for (const auto &e : events) {
+    const bool isStop = e.category == "process" && ActionIs(e, "process.stop");
+    if (!isStop) continue;
+    const auto it = nodes.find(e.processId);
+    if (it == nodes.end()) continue;
+    it->second.exited = true;
+    auto exit = Detail(e, "exitCode");
+    if (exit.empty()) exit = Detail(e, "exit");
+    if (!exit.empty()) it->second.exitCode = exit;
+  }
+
+  // 3) Wire parent->children. A node whose parent isn't a known process becomes
+  // a root. std::map keeps both the node set and each child list in ascending
+  // PID order, giving a deterministic traversal.
+  std::vector<uint32_t> roots;
+  for (auto &[pid, node] : nodes) {
+    if (node.parentProcessId != 0 && nodes.count(node.parentProcessId) &&
+        node.parentProcessId != pid) {
+      children[node.parentProcessId].push_back(pid);
+    } else {
+      roots.push_back(pid);
+    }
+  }
+
+  // 4) Depth-first flatten with a visited set (cycle guard) + a hard depth cap.
+  // A pid reachable via a cycle is only emitted once; the cap bounds runaway
+  // chains. Both guards guarantee termination on adversarial telemetry.
+  std::vector<ProcessTreeNode> out;
+  std::set<uint32_t> visited;
+  std::function<void(uint32_t, int)> walk = [&](uint32_t pid, int depth) {
+    if (depth > kProcessTreeMaxDepth) return;
+    if (!visited.insert(pid).second) return; // already emitted -> break cycle
+    auto it = nodes.find(pid);
+    if (it == nodes.end()) return;
+    ProcessTreeNode node = it->second;
+    node.depth = depth;
+    out.push_back(node);
+    const auto kids = children.find(pid);
+    if (kids != children.end()) {
+      for (uint32_t child : kids->second) walk(child, depth + 1);
+    }
+  };
+  for (uint32_t pid : roots) walk(pid, 0);
+  // Safety net: any node not reached from a root (only possible if every path
+  // into it was a pure cycle) is emitted as a depth-0 orphan so it never
+  // silently vanishes from the report.
+  for (auto &[pid, node] : nodes) {
+    if (!visited.count(pid)) {
+      ProcessTreeNode orphan = node;
+      orphan.depth = 0;
+      visited.insert(pid);
+      out.push_back(orphan);
+    }
+  }
+  return out;
+}
+
+namespace {
+
+// Returns true if it rendered any rows.
+bool EmitProcessTreeSection(std::ostringstream &html,
+                            const std::vector<EventRecord> &events) {
+  const auto tree = BuildProcessTree(events);
+  if (tree.empty()) return false;
+  html << "<ul class=\"proc-exec-tree\">";
+  for (const auto &node : tree) {
+    const int indent = node.depth * 18; // px per nesting level
+    html << "<li class=\"proc-exec\" style=\"margin-left:" << indent
+         << "px\" data-pid=\"" << node.processId << "\">";
+    html << "<span class=\"pid\">" << node.processId << "</span>";
+    html << "<span class=\"name\">"
+         << HtmlEscape(node.imagePath.empty()
+                           ? ("pid " + std::to_string(node.processId))
+                           : node.imagePath)
+         << "</span>";
+    if (node.exited) {
+      html << "<span class=\"chip exit\">exit "
+           << HtmlEscape(node.exitCode.empty() ? "?" : node.exitCode)
+           << "</span>";
+    }
+    if (!node.integrityLevel.empty()) {
+      html << "<span class=\"chip integ\">" << HtmlEscape(node.integrityLevel)
+           << "</span>";
+    }
+    if (!node.userName.empty()) {
+      html << "<span class=\"who mono\">" << HtmlEscape(node.userName)
+           << "</span>";
+    }
+    if (!node.commandLine.empty()) {
+      html << "<div class=\"cmd mono\" title=\"" << HtmlEscape(node.commandLine)
+           << "\">" << HtmlEscape(TruncateForCell(node.commandLine))
+           << "</div>";
+    }
+    html << "</li>";
+  }
+  html << "</ul>";
+  return true;
+}
+
+bool EmitPersistenceSection(std::ostringstream &html,
+                            const std::vector<EventRecord> &events) {
+  bool any = false;
+  std::ostringstream rows;
+  for (const auto &e : events) {
+    const bool isRegistry =
+        e.category == "registry" || e.action.find("registry") != std::string::npos;
+    if (e.mitre.empty() || !isRegistry) continue;
+    any = true;
+    rows << "<tr><td class=\"mono\">" << HtmlEscape(e.mitre)
+         << "</td><td class=\"mono\" title=\"" << HtmlEscape(e.target) << "\">"
+         << HtmlEscape(TruncateForCell(e.target)) << "</td><td class=\"mono\">"
+         << HtmlEscape(Detail(e, "data")) << "</td></tr>";
+  }
+  if (!any) return false;
+  html << "<table><thead><tr><th>Technique</th><th>Key / Value</th>"
+          "<th>Data</th></tr></thead><tbody>"
+       << rows.str() << "</tbody></table>";
+  return true;
+}
+
+bool EmitDroppedFilesSection(std::ostringstream &html,
+                             const std::vector<EventRecord> &events) {
+  bool any = false;
+  std::ostringstream rows;
+  for (const auto &e : events) {
+    const bool isDrop = e.category == "file" &&
+                        (ActionIs(e, "file.create") || ActionIs(e, "file.modify"));
+    if (!isDrop) continue;
+    any = true;
+    const std::string fileType = Detail(e, "fileType");
+    const std::string sha256 = Detail(e, "sha256");
+    std::string shaCell;
+    if (!sha256.empty()) {
+      const std::string shaShort =
+          sha256.size() > 16 ? sha256.substr(0, 16) + "…" : sha256;
+      shaCell = "<span title=\"" + HtmlEscape(sha256) + "\">" +
+                HtmlEscape(shaShort) + "</span>";
+    } else {
+      const std::string skipped = Detail(e, "hashSkipped");
+      shaCell = HtmlEscape(skipped.empty() ? "" : ("(skipped: " + skipped + ")"));
+    }
+    rows << "<tr><td class=\"mono\" title=\"" << HtmlEscape(e.fullImagePath)
+         << "\">" << HtmlEscape(TruncateForCell(e.target))
+         << "</td><td class=\"mono\">" << HtmlEscape(fileType)
+         << "</td><td class=\"mono\">" << HtmlEscape(Detail(e, "size"))
+         << "</td><td class=\"mono\">" << shaCell << "</td></tr>";
+  }
+  if (!any) return false;
+  html << "<table><thead><tr><th>Path</th><th>Type</th><th>Size</th>"
+          "<th>SHA-256</th></tr></thead><tbody>"
+       << rows.str() << "</tbody></table>";
+  return true;
+}
+
+bool EmitNetworkSection(std::ostringstream &html,
+                        const std::vector<EventRecord> &events) {
+  bool any = false;
+  std::ostringstream rows;
+  for (const auto &e : events) {
+    const bool isNet = e.category == "network" &&
+                       (ActionIs(e, "network.connect") || ActionIs(e, "network.close"));
+    if (!isNet) continue;
+    any = true;
+    const std::string proc =
+        (e.imagePath.empty() ? std::string("pid") : e.imagePath) + " (" +
+        std::to_string(e.processId) + ")";
+    std::string state = Detail(e, "state");
+    if (state.empty()) state = e.action;
+    rows << "<tr><td class=\"mono\">" << HtmlEscape(proc)
+         << "</td><td class=\"mono\">" << HtmlEscape(e.target)
+         << "</td><td class=\"mono\">" << HtmlEscape(state) << "</td></tr>";
+  }
+  if (!any) return false;
+  html << "<table><thead><tr><th>Process</th><th>Remote</th>"
+          "<th>State</th></tr></thead><tbody>"
+       << rows.str() << "</tbody></table>";
+  return true;
+}
+
+bool EmitCrashesSection(std::ostringstream &html,
+                        const std::vector<EventRecord> &events) {
+  bool any = false;
+  std::ostringstream rows;
+  for (const auto &e : events) {
+    if (!ActionIs(e, "process.crash")) continue;
+    any = true;
+    std::string exception = Detail(e, "exceptionCode");
+    if (exception.empty()) exception = Detail(e, "exitCode");
+    rows << "<tr><td class=\"mono\">"
+         << HtmlEscape(e.imagePath.empty() ? e.target : e.imagePath)
+         << "</td><td class=\"mono\">" << HtmlEscape(Detail(e, "module"))
+         << "</td><td class=\"mono\">" << HtmlEscape(exception)
+         << "</td><td class=\"mono\">" << HtmlEscape(Detail(e, "offset"))
+         << "</td></tr>";
+  }
+  if (!any) return false;
+  html << "<table><thead><tr><th>App</th><th>Module</th><th>Exception</th>"
+          "<th>Offset</th></tr></thead><tbody>"
+       << rows.str() << "</tbody></table>";
+  return true;
+}
+
+bool EmitMitreChips(std::ostringstream &html,
+                    const std::vector<std::string> &techniques) {
+  if (techniques.empty()) return false;
+  html << "<div class=\"mitre-chips\">";
+  for (const auto &t : techniques) {
+    if (t.empty()) continue;
+    html << "<span class=\"tag capability\">" << HtmlEscape(t) << "</span>";
+  }
+  html << "</div>";
+  return true;
+}
+
 const char *kStylesheet = R"CSS(
 :root{
   --bg:#0f1620; --panel:#151e2a; --panel2:#1a2433; --border:#27344a;
@@ -902,6 +1180,20 @@ code,.mono{font-family:Consolas,Cascadia Code,monospace;font-size:12px;
 #screenshot-hero{width:100%;max-height:380px;object-fit:contain;
                  background:#000;border:1px solid var(--border);border-radius:6px}
 .empty{color:var(--muted);font-style:italic;font-size:13px}
+.section-card{background:var(--panel2);border:1px solid var(--border);
+              border-radius:8px;padding:12px 14px;margin:0 0 14px}
+.section-card h2{margin:0 0 10px}
+.proc-exec-tree{list-style:none;padding:0;margin:0}
+.proc-exec{padding:6px 8px;border-left:2px solid var(--border);
+           border-radius:0 6px 6px 0;margin:3px 0;background:rgba(58,162,255,.04)}
+.proc-exec .pid{font-family:Consolas,monospace;color:var(--muted);
+                margin-right:8px}
+.proc-exec .name{font-weight:600}
+.proc-exec .who{color:var(--muted);margin-left:8px}
+.proc-exec .cmd{color:#9ccfff;margin-top:3px;word-break:break-all}
+.chip.exit{background:#3f2330;color:#ffd6df}
+.chip.integ{background:#243245;color:#cfe1f6}
+.mitre-chips{display:flex;gap:6px;flex-wrap:wrap}
 )CSS";
 
 const char *kJs = R"JS(
@@ -1534,12 +1826,58 @@ std::string BuildHtmlReportWithFrames(const AnalysisReport &report,
     html << "</tbody></table></section>";
   }
 
-  // Center column: screenshots + events + findings
+  // Center column: screenshots + analyst-grade grouped sections + full timeline
   html << "<section class=\"panel\">";
   html << "<h2>Run timeline</h2>";
   EmitFilmstrip(html, displayFrames);
 
-  html << "<h2 style=\"margin-top:16px\">Events</h2>";
+  // Analyst-grade grouped sections (Any.Run-style). Each renders ABOVE the full
+  // event timeline and only when it has rows -- a helper buffers each into its
+  // own ostringstream and we drop the section card when nothing was drawn.
+  {
+    std::ostringstream body;
+    if (EmitProcessTreeSection(body, report.events)) {
+      html << "<div class=\"section-card\"><h2>Process Tree</h2>" << body.str()
+           << "</div>";
+    }
+  }
+  {
+    std::ostringstream body;
+    if (EmitPersistenceSection(body, report.events)) {
+      html << "<div class=\"section-card\"><h2>Persistence</h2>" << body.str()
+           << "</div>";
+    }
+  }
+  {
+    std::ostringstream body;
+    if (EmitDroppedFilesSection(body, report.events)) {
+      html << "<div class=\"section-card\"><h2>Dropped Files</h2>" << body.str()
+           << "</div>";
+    }
+  }
+  {
+    std::ostringstream body;
+    if (EmitNetworkSection(body, report.events)) {
+      html << "<div class=\"section-card\"><h2>Network</h2>" << body.str()
+           << "</div>";
+    }
+  }
+  {
+    std::ostringstream body;
+    if (EmitCrashesSection(body, report.events)) {
+      html << "<div class=\"section-card\"><h2>Crashes</h2>" << body.str()
+           << "</div>";
+    }
+  }
+  {
+    std::ostringstream body;
+    if (EmitMitreChips(body, report.mitreTechniques)) {
+      html << "<div class=\"section-card\"><h2>MITRE ATT&amp;CK</h2>"
+           << body.str() << "</div>";
+    }
+  }
+
+  html << "<h2 style=\"margin-top:16px\">Full Event Timeline</h2>";
   EmitEventTable(html, report.events);
 
   if (!scan.findings.empty()) {

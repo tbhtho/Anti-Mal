@@ -4664,6 +4664,143 @@ void TestBehaviorScoreVerdict() {
   }
 }
 
+void TestReportSections() {
+  using antimal::AnalysisReport;
+  using antimal::BuildProcessTree;
+  using antimal::EventRecord;
+  using antimal::ProcessTreeNode;
+
+  // Synthetic detonation: parent process, a child under it, a MITRE-tagged
+  // persistence registry write, a dropped PE, a network connect, and a crash.
+  AnalysisReport report;
+  report.runId = "sections-test";
+
+  EventRecord parent;
+  parent.category = "process";
+  parent.action = "process.start";
+  parent.processId = 100;
+  parent.parentProcessId = 4; // not in the set -> root
+  parent.imagePath = "sample.exe";
+  parent.commandLine = "sample.exe --run";
+  parent.integrityLevel = "Medium";
+  parent.userName = "VM\\analyst";
+
+  EventRecord child;
+  child.category = "process";
+  child.action = "process.start";
+  child.processId = 200;
+  child.parentProcessId = 100;
+  child.imagePath = "child.exe";
+  child.commandLine = "child.exe /c <script>alert(1)</script>"; // XSS probe
+  child.integrityLevel = "High";
+  child.userName = "VM\\analyst";
+
+  EventRecord persist;
+  persist.category = "registry";
+  persist.action = "registry.setvalue";
+  persist.target =
+      "HKLM\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Run\\evil";
+  persist.mitre = "T1547.001";
+  persist.details["data"] = "C:\\Temp\\payload.exe";
+
+  EventRecord drop;
+  drop.category = "file";
+  drop.action = "file.create";
+  drop.target = "C:\\Users\\me\\AppData\\Local\\Temp\\payload.exe";
+  drop.details["fileType"] = "pe";
+  drop.details["sha256"] =
+      "1111111111111111111111111111111111111111111111111111111111111111";
+
+  EventRecord net;
+  net.category = "network";
+  net.action = "network.connect";
+  net.processId = 200;
+  net.imagePath = "child.exe";
+  net.target = "203.0.113.7:443";
+  net.details["state"] = "ESTABLISHED";
+
+  EventRecord crash;
+  crash.category = "crash";
+  crash.action = "process.crash";
+  crash.imagePath = "child.exe";
+  crash.details["module"] = "ntdll.dll";
+  crash.details["exceptionCode"] = "0xC0000409";
+  crash.details["offset"] = "0x1234";
+
+  report.events = {parent, child, persist, drop, net, crash};
+  report.mitreTechniques = {"T1055", "T1547.001"};
+
+  // ----- Pure tree builder: orphan/root + nesting depth -----
+  const std::vector<ProcessTreeNode> tree = BuildProcessTree(report.events);
+  Expect(tree.size() == 2, "report sections: tree has two process nodes");
+  const ProcessTreeNode *root = nullptr;
+  const ProcessTreeNode *kid = nullptr;
+  for (const auto &n : tree) {
+    if (n.processId == 100) root = &n;
+    if (n.processId == 200) kid = &n;
+  }
+  Expect(root && root->depth == 0,
+         "report sections: pid100 (parent not in set) is a depth-0 root");
+  Expect(kid && kid->depth == 1,
+         "report sections: pid200 nests at depth 1 under its parent");
+  Expect(kid && kid->integrityLevel == "High",
+         "report sections: child integrity captured from start event");
+
+  // BuildProcessTree must terminate on a pure cycle (100->200->100) without
+  // recursing unboundedly, and still emit both nodes exactly once.
+  {
+    EventRecord a = parent;
+    a.parentProcessId = 200; // 100's parent is 200 ...
+    EventRecord b = child;   // ... and 200's parent is 100 -> cycle
+    const auto cyclic = BuildProcessTree({a, b});
+    Expect(cyclic.size() == 2,
+           "report sections: cyclic parent links emit each node once");
+  }
+
+  // ----- HTML rendering: section headers + nesting + escaping -----
+  const std::string html = antimal::BuildHtmlReportWithFrames(report, {});
+  Expect(html.find("Process Tree") != std::string::npos,
+         "report sections: Process Tree header present");
+  Expect(html.find("Persistence") != std::string::npos,
+         "report sections: Persistence header present");
+  Expect(html.find("Dropped Files") != std::string::npos,
+         "report sections: Dropped Files header present");
+  Expect(html.find("Network") != std::string::npos,
+         "report sections: Network header present");
+  Expect(html.find("Crashes") != std::string::npos,
+         "report sections: Crashes header present");
+  Expect(html.find("Full Event Timeline") != std::string::npos,
+         "report sections: full event timeline retained at the bottom");
+  Expect(html.find("T1547.001") != std::string::npos,
+         "report sections: persistence MITRE technique rendered");
+  Expect(html.find(
+             "1111111111111111") != std::string::npos,
+         "report sections: dropped-file sha256 rendered (short form)");
+  Expect(html.find(">pe<") != std::string::npos,
+         "report sections: dropped-file type 'pe' rendered");
+  Expect(html.find("0xC0000409") != std::string::npos,
+         "report sections: crash exception code rendered");
+  Expect(html.find("ntdll.dll") != std::string::npos,
+         "report sections: crash module rendered");
+
+  // Child nests under the parent: the parent row must appear before the child
+  // row, and the child row carries a positive left margin (depth indent).
+  const auto parentPos = html.find("data-pid=\"100\"");
+  const auto childPos = html.find("data-pid=\"200\"");
+  Expect(parentPos != std::string::npos && childPos != std::string::npos &&
+             parentPos < childPos,
+         "report sections: parent process row precedes its child");
+  const auto childIndent = html.find("margin-left:18px", parentPos);
+  Expect(childIndent != std::string::npos,
+         "report sections: child rendered with depth-1 indentation");
+
+  // HtmlEscape applied: the raw <script> in the child cmdline must NOT survive.
+  Expect(html.find("<script>alert(1)</script>") == std::string::npos,
+         "report sections: raw <script> in cmdline is escaped, not emitted");
+  Expect(html.find("&lt;script&gt;alert(1)&lt;/script&gt;") != std::string::npos,
+         "report sections: cmdline angle brackets are HTML-escaped");
+}
+
 void TestPacketInspector() {
   // Frame builders. IPv4 total-length is left 0 (the parser clamps to the
   // captured length), so we only need structurally valid headers + payload.
@@ -5862,6 +5999,7 @@ int main() {
     TestFileSystemTelemetry();
     TestDroppedFileEnrichment();
     TestBehaviorScoreVerdict();
+    TestReportSections();
     TestPacketInspector();
     TestE1000Device();
     TestNicPciConfig();

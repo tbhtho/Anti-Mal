@@ -2,11 +2,40 @@
 
 #include "antimal/Types.h"
 
+#include <cstdint>
 #include <filesystem>
 #include <string>
 #include <vector>
 
 namespace antimal {
+
+// One process in the analyst-grade process tree. `depth` is the nesting level
+// (roots = 0); the renderer indents by it. The display fields are denormalized
+// from the start event (+ the matching stop event for exitCode) so the HTML
+// emitter is a dumb projection of this struct.
+struct ProcessTreeNode {
+  uint32_t processId = 0;
+  uint32_t parentProcessId = 0;
+  int depth = 0;
+  std::string imagePath;       // base image name
+  std::string commandLine;     // full command line (may carry a truncation marker)
+  std::string integrityLevel;  // "Low" | "Medium" | "High" | "System" | ...
+  std::string userName;        // "DOMAIN\\user"
+  std::string exitCode;        // hex exit code if the process exited; "" otherwise
+  bool exited = false;
+};
+
+// Pure: build an ordered, depth-annotated process tree from `process.start`
+// events (PID -> children via processId/parentProcessId), then flatten it
+// depth-first into the order the report renders. Robust to real-world telemetry:
+// missing parents and PIDs whose parent isn't a known process are treated as
+// roots; cycles are broken by a visited set and a hard depth cap, so the
+// function always terminates and never recurses unboundedly. Output order is
+// deterministic (roots and children are visited in ascending PID order).
+// `exitCode`/`exited` are filled from the matching `process.stop` event (or a
+// start event's `exitCode` detail) when present. Returns an empty vector when
+// there are no process.start events.
+std::vector<ProcessTreeNode> BuildProcessTree(const std::vector<EventRecord> &events);
 
 std::string HtmlEscape(std::string_view text);
 std::string BuildHtmlReport(const AnalysisReport &report);
