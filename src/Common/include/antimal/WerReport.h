@@ -81,6 +81,13 @@ inline bool ParseSigKey(const std::string &key, long &index, bool &isName) {
   if (pos == numStart || pos >= lower.size() || lower[pos] != ']') {
     return false;
   }
+  // Real WER Sig indices are < 100; cap the digit run so a pathological
+  // "Sig[99999999999999999]" can't throw std::out_of_range out of std::stol and
+  // unwind out of the SYSTEM agent's telemetry loop (this parses semi-untrusted
+  // on-disk .wer content). >9 digits is never a legitimate index.
+  if (pos - numStart > 9) {
+    return false;
+  }
   index = std::stol(lower.substr(numStart, pos - numStart));
   ++pos; // skip ']'
   if (pos >= lower.size() || lower[pos] != '.') {

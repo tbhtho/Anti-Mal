@@ -5631,6 +5631,15 @@ void TestWerReportParser() {
       antimal::ParseWerReport("Version=1\r\nEventType=APPCRASH\r\nConsent=1\r\n");
   Expect(!headerOnly.valid,
          "WER: header-only (no app name / exception code) is not valid");
+  // An absurd Sig index must NOT throw std::out_of_range out of the SYSTEM
+  // agent's telemetry loop (semi-untrusted on-disk content) -- the digit-run
+  // cap rejects it; the valid Sig[0] alongside still parses.
+  const antimal::WerCrashInfo bigIdx = antimal::ParseWerReport(
+      "Sig[99999999999999999999].Name=Application Name\r\n"
+      "Sig[99999999999999999999].Value=evil.exe\r\n"
+      "Sig[0].Name=Application Name\r\nSig[0].Value=ShellHost.exe\r\n");
+  Expect(bigIdx.valid && bigIdx.appName == "ShellHost.exe",
+         "WER: absurd Sig index is rejected without throwing; valid pairs survive");
 }
 
 int main() {

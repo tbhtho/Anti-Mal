@@ -705,7 +705,14 @@ void ScanWerRoot(HANDLE com2, const std::wstring &werRoot,
         continue; // not written yet / unreadable; retry on a later tick
       }
       // Mark seen only once we have content to parse, so a report dir created
-      // before its Report.wer is flushed gets revisited.
+      // before its Report.wer is flushed gets revisited. Bound the set on a
+      // very long service run (WER queues rarely hold more than a handful):
+      // past an absurd count, reset it -- at worst a few already-seen crashes
+      // re-emit once, vs unbounded growth.
+      constexpr size_t kMaxSeenWerReports = 4096;
+      if (seen.size() >= kMaxSeenWerReports) {
+        seen.clear();
+      }
       seen.insert(reportPath);
       const antimal::WerCrashInfo crash = antimal::ParseWerReport(text);
       if (!crash.valid) {
@@ -1018,17 +1025,30 @@ int RunHostChannelLoop(std::string reason, bool serviceMode) {
           const uint32_t pid = entry.first;
           auto known = knownProcs.find(pid);
           if (known != knownProcs.end()) {
-            // Carry forward the detail captured when we first saw this PID.
             const antimal::ProcessInfo &prevInfo = known->second;
-            entry.second.fullImagePath = prevInfo.fullImagePath;
-            entry.second.commandLine = prevInfo.commandLine;
-            entry.second.integrityLevel = prevInfo.integrityLevel;
-            entry.second.userName = prevInfo.userName;
-            entry.second.userSid = prevInfo.userSid;
-            entry.second.startTimeUtc = prevInfo.startTimeUtc;
-            entry.second.sessionId = prevInfo.sessionId;
-            entry.second.hasSessionId = prevInfo.hasSessionId;
-            continue;
+            // PID-reuse guard: if the (cheap, snapshot-provided) base image name
+            // or parent PID differ, this PID now hosts a DIFFERENT process. Don't
+            // inherit the old process's path/cmdline/user, and drop its stale
+            // query handle (whose exit code belongs to the OLD process) -- fall
+            // through and re-enrich as fresh. Without this, a reused PID reported
+            // the prior process's metadata and exit code.
+            if (prevInfo.image == entry.second.image &&
+                prevInfo.parentPid == entry.second.parentPid) {
+              entry.second.fullImagePath = prevInfo.fullImagePath;
+              entry.second.commandLine = prevInfo.commandLine;
+              entry.second.integrityLevel = prevInfo.integrityLevel;
+              entry.second.userName = prevInfo.userName;
+              entry.second.userSid = prevInfo.userSid;
+              entry.second.startTimeUtc = prevInfo.startTimeUtc;
+              entry.second.sessionId = prevInfo.sessionId;
+              entry.second.hasSessionId = prevInfo.hasSessionId;
+              continue;
+            }
+            auto stale = procHandles.find(pid);
+            if (stale != procHandles.end()) {
+              CloseHandle(stale->second);
+              procHandles.erase(stale);
+            }
           }
           HANDLE h = EnrichProcessInfo(pid, entry.second);
           if (h) {

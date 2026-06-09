@@ -24,9 +24,13 @@ std::optional<std::vector<uint8_t>> ReadFileHeadShared(const std::wstring &wideP
                                                        uint64_t cap,
                                                        bool *truncated) {
   if (truncated) *truncated = false;
+  // FILE_FLAG_OPEN_REPARSE_POINT: defense-in-depth so even if a reparse point
+  // slipped past the snapshot's symlink skip, we open the link itself rather
+  // than following it to an attacker-chosen target. Ignored for normal files.
   HANDLE h = CreateFileW(widePath.c_str(), GENERIC_READ,
                          FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
-                         nullptr, OPEN_EXISTING, FILE_FLAG_SEQUENTIAL_SCAN,
+                         nullptr, OPEN_EXISTING,
+                         FILE_FLAG_SEQUENTIAL_SCAN | FILE_FLAG_OPEN_REPARSE_POINT,
                          nullptr);
   if (h == INVALID_HANDLE_VALUE) {
     return std::nullopt;
@@ -129,6 +133,16 @@ FileSnapshot CaptureFileSnapshot(const std::vector<std::filesystem::path> &dirs,
         continue;
       }
       std::error_code fec;
+      // Skip symlinks/junctions: the watched dirs are sample-writable, so a
+      // dropped "file" could be a reparse point to e.g. \System32\config\SAM.
+      // is_symlink uses symlink_status (does NOT follow), and is_regular_file
+      // DOES follow -- so without this a SYSTEM agent would read+hash+ship the
+      // target. The recursive iterator already doesn't follow directory symlinks
+      // (follow_directory_symlink is off).
+      if (entry.is_symlink(fec)) {
+        fec.clear();
+        continue;
+      }
       if (!entry.is_regular_file(fec)) {
         continue;
       }
