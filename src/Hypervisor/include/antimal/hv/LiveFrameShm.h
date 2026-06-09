@@ -146,4 +146,40 @@ inline bool LiveFrameIsBlank(const uint8_t *px, uint32_t width, uint32_t height,
   return (hi - lo) < 14; // tight spread => uniform/cleared frame
 }
 
+// Decides whether a (possibly near-uniform) live frame should be published.
+//
+// Skipping near-uniform frames hides the 1-2 transient mid-repaint "clear"
+// frames that caused the desktop<->grey flash. But skipping them UNCONDITIONALLY
+// freezes the live view forever on any genuinely low-variance screen (a flat
+// desktop, a logon screen, a crashed-shell desktop whose only detail is a small
+// dialog the sparse blank-grid misses): frameSeq stops advancing, the host pump
+// has nothing new to post, the canvas holds its last frame, and the FPS readout
+// reads 0 -- the "it looks like a screenshot" bug.
+//
+// Fix: only skip a *bounded run* of consecutive near-uniform frames. A real
+// repaint lands within a frame or two, so the cap still swallows the flash; but a
+// persistently uniform screen is published after the cap so the view can never
+// freeze. Pure + deterministic -> unit-tested without a boot.
+struct LiveFramePublishGate {
+  static constexpr uint32_t kMaxConsecutiveBlankSkips = 8; // ~0.25s at 30Hz
+
+  // isBlank = LiveFrameIsBlank() for the current frame. Returns true to publish.
+  bool ShouldPublish(bool isBlank) {
+    if (!isBlank) {
+      consecutiveBlanks_ = 0;
+      return true; // real content -> always publish, reset the run
+    }
+    if (consecutiveBlanks_ < kMaxConsecutiveBlankSkips) {
+      ++consecutiveBlanks_;
+      return false; // transient clear -> swallow (no flash)
+    }
+    return true; // genuinely uniform screen -> show it, never freeze
+  }
+
+  uint32_t ConsecutiveBlanks() const noexcept { return consecutiveBlanks_; }
+
+private:
+  uint32_t consecutiveBlanks_ = 0;
+};
+
 } // namespace antimal::hv

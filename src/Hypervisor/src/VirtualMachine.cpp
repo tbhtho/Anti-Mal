@@ -1403,6 +1403,9 @@ VmRunSummary VirtualMachine::RunLoop(
   uint32_t lastPubW = 0, lastPubH = 0; // last geometry actually published
   uint32_t pendW = 0, pendH = 0;       // candidate geometry awaiting confirmation
   int pendCount = 0;
+  // Bounds the consecutive near-uniform frames we swallow, so the live view can
+  // never freeze on a low-variance/crashed-shell desktop (the fps=0 "screenshot").
+  LiveFramePublishGate frameGate;
   std::unique_ptr<LiveFrameShmPublisher> framePub;
   if (!liveFrameShmName_.empty()) {
     framePub = std::make_unique<LiveFrameShmPublisher>(liveFrameShmName_);
@@ -2735,9 +2738,11 @@ VmRunSummary VirtualMachine::RunLoop(
             off + static_cast<uint64_t>(ph - 1) * stride + bpr;
         const uint8_t *src = (last <= fbBytes) ? fbBase + off : fbBase;
         const uint32_t srcStride = (last <= fbBytes) ? stride : bpr;
-        // Skip near-uniform mid-clear frames -> the desktop never flashes to
-        // blank; the UI holds the last complete frame (seqlock not bumped).
-        if (LiveFrameIsBlank(src, pw, ph, srcStride)) {
+        // Swallow only a BOUNDED run of near-uniform mid-clear frames so the
+        // desktop never flashes to blank -- but a persistently uniform screen is
+        // still published (after the cap) so the live view can't freeze forever
+        // (the fps=0 "screenshot" bug). See LiveFramePublishGate.
+        if (!frameGate.ShouldPublish(LiveFrameIsBlank(src, pw, ph, srcStride))) {
           return;
         }
         framePub->Publish(src, pw, ph, bpp, srcStride);

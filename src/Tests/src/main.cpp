@@ -713,6 +713,48 @@ void TestLiveFrameShmContract() {
   CloseHandle(rh);
 }
 
+// The live-display anti-freeze gate: a transient run of near-uniform frames (a
+// mid-repaint clear) is swallowed so the desktop never flashes to grey, but a
+// PERSISTENTLY uniform screen is still published once the cap is hit, so the live
+// view can never freeze forever on a low-variance / crashed-shell desktop (the
+// fps=0 "it looks like a screenshot" bug). Pure decision logic -> no boot needed.
+void TestLiveFramePublishGate() {
+  using antimal::hv::LiveFramePublishGate;
+  const uint32_t cap = LiveFramePublishGate::kMaxConsecutiveBlankSkips;
+  Expect(cap >= 1, "blank-skip cap is at least one frame");
+
+  // Real content always publishes and holds the blank run at zero.
+  {
+    LiveFramePublishGate g;
+    for (int i = 0; i < 5; ++i) {
+      Expect(g.ShouldPublish(false), "non-blank frame always publishes");
+    }
+    Expect(g.ConsecutiveBlanks() == 0, "non-blank keeps the blank run at zero");
+  }
+
+  // A short burst of blanks (the flash window) is swallowed; the very next blank
+  // PAST the cap is published so the view cannot freeze.
+  {
+    LiveFramePublishGate g;
+    for (uint32_t i = 0; i < cap; ++i) {
+      Expect(!g.ShouldPublish(true), "transient blank within the cap is skipped");
+    }
+    Expect(g.ShouldPublish(true), "blank past the cap is published (no freeze)");
+    Expect(g.ShouldPublish(true), "a persistently uniform screen keeps publishing");
+  }
+
+  // A real repaint resets the run, so the next clear is swallowed again.
+  {
+    LiveFramePublishGate g;
+    for (uint32_t i = 0; i < cap; ++i) {
+      g.ShouldPublish(true); // exhaust the cap
+    }
+    Expect(g.ShouldPublish(false), "real content publishes and resets the run");
+    Expect(!g.ShouldPublish(true),
+           "after a reset the next transient blank is skipped again");
+  }
+}
+
 // Locks the host->guest live-input wire format (the framed 'K'/'M' keyboard +
 // mouse protocol the UI appends to _live-input.bin and the VM run loop tails).
 // The subtle, easy-to-break parts are split records across polls and resync on
@@ -5141,6 +5183,7 @@ int main() {
     TestPs2QueuedInput();
     TestLiveInputProtocol();
     TestLiveFrameShmContract();
+    TestLiveFramePublishGate();
     TestTpm2CrbDevice();
     TestAcpiTables();
     TestPcIoPmSleepByteWrites();
