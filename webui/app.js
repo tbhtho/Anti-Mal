@@ -53,6 +53,7 @@
   // same relative deltas we feed the guest and draw a synthetic pointer on the
   // canvas (an aiming aid — it can drift slightly from the guest's own ballistics).
   var liveCursor = { x: 0, y: 0, valid: false };
+  var curFrameW = 0, curFrameH = 0, liveRaf = 0; // render loop decoupled from publish rate
   var liveFrameBuffer = null;    // host-shared ArrayBuffer of live RGBA pixels
   var usingSharedFrames = false; // true once the canvas path is live (no <img>)
   var liveFrameCount = 0, liveFps = 0, liveFpsTimer = null; // canvas fps readout
@@ -524,6 +525,8 @@
     if (livePollTimer) { clearInterval(livePollTimer); livePollTimer = null; }
     if (liveMouseTimer) { clearInterval(liveMouseTimer); liveMouseTimer = null; }
     if (liveFpsTimer) { clearInterval(liveFpsTimer); liveFpsTimer = null; }
+    if (liveRaf) { cancelAnimationFrame(liveRaf); liveRaf = 0; }
+    curFrameW = 0; curFrameH = 0;
     liveMouse = { btn: 0, dx: 0, dy: 0 };
     usingSharedFrames = false; // next boot re-establishes the shared canvas path
     liveFrameCount = 0; liveFps = 0;
@@ -572,26 +575,44 @@
     }
     return cv;
   }
+  // A new published frame just arrived: remember its geometry and count it for the
+  // FPS readout. The actual drawing is done by the render loop (decoupled from the
+  // publish rate) so the cursor stays smooth even when the guest content is frozen.
   function onVmFrame(w, h) {
     if (!liveFrameBuffer || !w || !h) return;
-    var need = w * h * 4;
-    if (liveFrameBuffer.byteLength < need) return;
-    var cv = ensureLiveCanvas(); if (!cv) return;
-    if (cv.width !== w) cv.width = w;
-    if (cv.height !== h) cv.height = h;
-    var ctx = cv.getContext('2d'); if (!ctx) return;
-    try {
-      ctx.putImageData(new ImageData(new Uint8ClampedArray(liveFrameBuffer, 0, need), w, h), 0, 0);
-    } catch (x) { return; }
-    // putImageData overwrites the whole canvas, so the synthetic pointer is
-    // redrawn on top each frame with no erase bookkeeping. Only while captured.
-    if (liveCursor.valid && document.pointerLockElement &&
-        document.pointerLockElement.id === 'live-frame') {
-      drawLiveCursor(ctx, liveCursor.x, liveCursor.y);
-    }
+    if (liveFrameBuffer.byteLength < w * h * 4) return;
+    curFrameW = w; curFrameH = h;
     usingSharedFrames = true;
     liveFrameCount++;
     if (liveSession === 'boot') { liveSession = 'running'; setVmState('running'); }
+    if (!liveRaf) liveRaf = requestAnimationFrame(renderLoop);
+  }
+  // ~60fps redraw of the LATEST shared frame + the synthetic cursor. Runs
+  // independently of how often the guest produces frames, so moving the mouse is
+  // always responsive (the host updates the shared buffer in place; we just keep
+  // blitting it). The cursor moving over a held-still desktop is what makes the VM
+  // feel alive instead of frozen when the guest is busy.
+  function renderLoop() {
+    liveRaf = 0;
+    var box = $('#live-frame');
+    if (!box || !livePollTimer || !usingSharedFrames || !liveFrameBuffer || !curFrameW) return;
+    var need = curFrameW * curFrameH * 4;
+    if (liveFrameBuffer.byteLength >= need) {
+      var cv = ensureLiveCanvas();
+      if (cv) {
+        if (cv.width !== curFrameW) cv.width = curFrameW;
+        if (cv.height !== curFrameH) cv.height = curFrameH;
+        var ctx = cv.getContext('2d');
+        if (ctx) {
+          try { ctx.putImageData(new ImageData(new Uint8ClampedArray(liveFrameBuffer, 0, need), curFrameW, curFrameH), 0, 0); } catch (e) { }
+          if (liveCursor.valid && document.pointerLockElement &&
+              document.pointerLockElement.id === 'live-frame') {
+            drawLiveCursor(ctx, liveCursor.x, liveCursor.y);
+          }
+        }
+      }
+    }
+    liveRaf = requestAnimationFrame(renderLoop);
   }
   // A crisp white arrow with a dark outline so it reads on any background.
   function drawLiveCursor(ctx, x, y) {
