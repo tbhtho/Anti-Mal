@@ -11,6 +11,7 @@
 #include "antimal/ProcessTelemetry.h"
 #include "antimal/Report.h"
 #include "antimal/Screenshot.h"
+#include "antimal/WerReport.h"
 
 #include <Windows.h>
 #include <UserEnv.h>   // CreateEnvironmentBlock (visible-session launch)
@@ -21,11 +22,13 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cstdint>
 #include <exception>
 #include <filesystem>
 #include <iostream>
 #include <iterator>
 #include <optional>
+#include <set>
 #include <string>
 #include <string_view>
 #include <thread>
@@ -610,6 +613,148 @@ void SetHighPerformancePowerPlan() {
   }
 }
 
+// ---------------------------------------------------------------------------
+// In-guest WER (Windows Error Reporting) crash decoder.
+//
+// When a process crashes, WER writes a Report.wer (UTF-16LE, INI-like
+// key=value) under the WER ReportQueue/ReportArchive trees. The agent runs as
+// LocalSystem, so it can read both the machine-wide ProgramData location and
+// every per-user profile. We enumerate those Report.wer files, parse out the
+// faulting module + exception code + offset, and stream a "crash" event over
+// COM2 -- so a diagnostic detonation surfaces the EXACT fault behind a process
+// crash (e.g. ShellHost.exe STATUS_STACK_BUFFER_OVERRUN 0xC0000409) instead of
+// just an exit code. ParseWerReport is pure; the OS-specific work here is only
+// directory enumeration + the UTF-16LE -> UTF-8 file read.
+//
+// Bounded: at most kWerMaxDirsPerTick report dirs are inspected per tick and at
+// most kWerMaxReportBytes are read per file, so the scan stays cheap. Each
+// Report.wer is emitted once via a caller-owned seen-set keyed on full path.
+// ---------------------------------------------------------------------------
+
+constexpr size_t kWerMaxDirsPerTick = 64;
+constexpr DWORD kWerMaxReportBytes = 64u * 1024u;
+
+// Reads up to kWerMaxReportBytes of a UTF-16LE Report.wer and returns it as
+// UTF-8. WER files start with a UTF-16LE BOM (0xFF 0xFE); we skip it if present.
+std::string ReadWerFileUtf8(const std::wstring &path) {
+  HANDLE h = CreateFileW(path.c_str(), GENERIC_READ,
+                         FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr,
+                         OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+  if (h == INVALID_HANDLE_VALUE) {
+    return {};
+  }
+  std::vector<unsigned char> raw;
+  raw.resize(kWerMaxReportBytes);
+  DWORD read = 0;
+  const BOOL ok = ReadFile(h, raw.data(), kWerMaxReportBytes, &read, nullptr);
+  CloseHandle(h);
+  if (!ok || read < 2) {
+    return {};
+  }
+  raw.resize(read);
+  size_t offset = 0;
+  // Skip a UTF-16LE byte-order mark if present.
+  if (raw.size() >= 2 && raw[0] == 0xFF && raw[1] == 0xFE) {
+    offset = 2;
+  }
+  // Drop a trailing odd byte so the wchar_t reinterpret stays in bounds.
+  const size_t wideBytes = (raw.size() - offset) & ~static_cast<size_t>(1);
+  if (wideBytes == 0) {
+    return {};
+  }
+  const auto *wide = reinterpret_cast<const wchar_t *>(raw.data() + offset);
+  return NarrowUtf8(wide, static_cast<int>(wideBytes / sizeof(wchar_t)));
+}
+
+// Enumerates Report.wer files under one WER root (which contains ReportQueue\
+// and ReportArchive\, each holding per-crash subdirectories). For every
+// not-yet-seen Report.wer found (bounded by `budget`), parses it and -- when
+// valid -- emits a process.crash event over COM2. `budget` is decremented per
+// report directory inspected so the per-tick cap spans all roots.
+void ScanWerRoot(HANDLE com2, const std::wstring &werRoot,
+                 std::set<std::wstring> &seen, size_t &budget) {
+  for (const wchar_t *bucket : {L"ReportQueue", L"ReportArchive"}) {
+    if (budget == 0) {
+      return;
+    }
+    const std::wstring bucketDir = werRoot + L"\\" + bucket;
+    const std::wstring pattern = bucketDir + L"\\*";
+    WIN32_FIND_DATAW fd{};
+    HANDLE find = FindFirstFileW(pattern.c_str(), &fd);
+    if (find == INVALID_HANDLE_VALUE) {
+      continue;
+    }
+    do {
+      if (!(fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)) {
+        continue;
+      }
+      if (wcscmp(fd.cFileName, L".") == 0 || wcscmp(fd.cFileName, L"..") == 0) {
+        continue;
+      }
+      if (budget == 0) {
+        break;
+      }
+      --budget;
+      const std::wstring reportPath =
+          bucketDir + L"\\" + fd.cFileName + L"\\Report.wer";
+      if (seen.count(reportPath)) {
+        continue;
+      }
+      const std::string text = ReadWerFileUtf8(reportPath);
+      if (text.empty()) {
+        continue; // not written yet / unreadable; retry on a later tick
+      }
+      // Mark seen only once we have content to parse, so a report dir created
+      // before its Report.wer is flushed gets revisited.
+      seen.insert(reportPath);
+      const antimal::WerCrashInfo crash = antimal::ParseWerReport(text);
+      if (!crash.valid) {
+        continue;
+      }
+      antimal::EventRecord ev = MakeAgentEvent("process.crash", crash.appName);
+      ev.category = "crash";
+      ev.imagePath = crash.appName;
+      ev.details["module"] = crash.faultModule;
+      ev.details["moduleVersion"] = crash.faultModuleVersion;
+      ev.details["exceptionCode"] = crash.exceptionCode;
+      ev.details["exceptionOffset"] = crash.exceptionOffset;
+      ev.details["eventType"] = crash.eventType;
+      (void)SendAgentEvent(com2, ev);
+    } while (FindNextFileW(find, &fd));
+    FindClose(find);
+  }
+}
+
+// One WER scan pass: the machine-wide ProgramData root plus every per-user
+// profile's WER root. Bounded by kWerMaxDirsPerTick across all roots.
+void ScanForWerCrashes(HANDLE com2, std::set<std::wstring> &seen) {
+  size_t budget = kWerMaxDirsPerTick;
+  ScanWerRoot(com2,
+              L"C:\\ProgramData\\Microsoft\\Windows\\WER", seen, budget);
+
+  // Per-user: C:\Users\*\AppData\Local\Microsoft\Windows\WER.
+  WIN32_FIND_DATAW fd{};
+  HANDLE find = FindFirstFileW(L"C:\\Users\\*", &fd);
+  if (find == INVALID_HANDLE_VALUE) {
+    return;
+  }
+  do {
+    if (budget == 0) {
+      break;
+    }
+    if (!(fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)) {
+      continue;
+    }
+    if (wcscmp(fd.cFileName, L".") == 0 || wcscmp(fd.cFileName, L"..") == 0) {
+      continue;
+    }
+    const std::wstring userWer = std::wstring(L"C:\\Users\\") + fd.cFileName +
+                                 L"\\AppData\\Local\\Microsoft\\Windows\\WER";
+    ScanWerRoot(com2, userWer, seen, budget);
+  } while (FindNextFileW(find, &fd));
+  FindClose(find);
+}
+
 int RunHostChannelLoop(std::string reason, bool serviceMode) {
   static std::atomic_bool powerPlanSet{false};
   if (!powerPlanSet.exchange(true)) {
@@ -656,6 +801,9 @@ int RunHostChannelLoop(std::string reason, bool serviceMode) {
   bool regBaselineSent = false;
   antimal::FileSnapshot knownFiles;
   bool fileBaselineSent = false;
+  // Each Report.wer is decoded + emitted once; keyed on its full path so a
+  // crash surfaces as a single process.crash event across ticks.
+  std::set<std::wstring> seenWerReports;
   const std::vector<std::filesystem::path> watchedDirs =
       antimal::DefaultWatchedDirs();
   // Authorized-detonation state: an execute JobStart opens a transfer, the
@@ -975,6 +1123,14 @@ int RunHostChannelLoop(std::string reason, bool serviceMode) {
           }
         }
       }
+    }
+
+    // WER crash decoder: enumerate Report.wer files (machine-wide + per-user)
+    // and stream a process.crash event for each new fault, decoding the exact
+    // faulting module + exception code + offset behind a process crash. Polled
+    // on the process cadence (~2s); bounded per tick + de-duped by full path.
+    if (tick % kProcessPollEveryTicks == 0) {
+      ScanForWerCrashes(com2, seenWerReports);
     }
 
     ++tick;

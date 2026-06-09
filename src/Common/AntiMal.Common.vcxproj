@@ -61,6 +61,7 @@
     <ClInclude Include="include\antimal\Subprocess.h" />
     <ClInclude Include="include\antimal\Tagger.h" />
     <ClInclude Include="include\antimal\Types.h" />
+    <ClInclude Include="include\antimal\WerReport.h" />
   </ItemGroup>
   <ItemGroup>
     <ClCompile Include="src\BridgeRouter.cpp" />

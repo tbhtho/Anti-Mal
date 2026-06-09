@@ -7442,11 +7442,19 @@ bool PatchOverlayDesktopStability(hv::IBlockDevice &disk,
           if (k && UpsertHiveDword(hive, *k, name, val)) ++softSet;
         };
         // Windows Error Reporting OFF -> stops the WerFault/wermgr storm.
-        dword({"Microsoft", "Windows", "Windows Error Reporting"}, "Disabled", 1);
-        dword({"Microsoft", "Windows", "Windows Error Reporting"}, "DontShowUI", 1);
-        dword({"Microsoft", "Windows", "Windows Error Reporting"}, "LoggingDisabled", 1);
-        dword({"Policies", "Microsoft", "Windows", "Windows Error Reporting"}, "Disabled", 1);
-        dword({"Policies", "Microsoft", "Windows", "Windows Error Reporting"}, "DontShowUI", 1);
+        // DIAGNOSTIC MODE: when ANTIMAL_PROBE_KEEP_WER=1, SKIP these WER-
+        // disabling writes so WerFault runs and a Report.wer is written for any
+        // crash -- letting the in-guest agent decode the exact fault (faulting
+        // module + exception code + offset) and stream it as a process.crash
+        // event. The cost is some reintroduced WerFault churn; that is the
+        // price of capturing the fault. Default (flag unset) = WER stays off.
+        if (!EnvFlagEnabled("ANTIMAL_PROBE_KEEP_WER")) {
+          dword({"Microsoft", "Windows", "Windows Error Reporting"}, "Disabled", 1);
+          dword({"Microsoft", "Windows", "Windows Error Reporting"}, "DontShowUI", 1);
+          dword({"Microsoft", "Windows", "Windows Error Reporting"}, "LoggingDisabled", 1);
+          dword({"Policies", "Microsoft", "Windows", "Windows Error Reporting"}, "Disabled", 1);
+          dword({"Policies", "Microsoft", "Windows", "Windows Error Reporting"}, "DontShowUI", 1);
+        }
         // Defender real-time scanning OFF -> heavy first-boot CPU/IO removed.
         dword({"Policies", "Microsoft", "Windows Defender"}, "DisableAntiSpyware", 1);
         dword({"Policies", "Microsoft", "Windows Defender", "Real-Time Protection"}, "DisableRealtimeMonitoring", 1);
@@ -7493,7 +7501,11 @@ bool PatchOverlayDesktopStability(hv::IBlockDevice &disk,
         ctrlDword({*cs, "Control", "GraphicsDrivers"}, "TdrLevel", 0);
         ctrlDword({*cs, "Control", "GraphicsDrivers"}, "HwSchMode", 1);
         // Disable the heaviest background services that starve the single vCPU.
-        svcOff("WerSvc");                         // WER second-stage host
+        // DIAGNOSTIC MODE: ANTIMAL_PROBE_KEEP_WER=1 keeps WerSvc enabled so the
+        // WER second stage runs and writes Report.wer for the agent to decode.
+        if (!EnvFlagEnabled("ANTIMAL_PROBE_KEEP_WER")) {
+          svcOff("WerSvc");                       // WER second-stage host
+        }
         svcOff("clr_optimization_v4.0.30319_64"); // .NET NGEN (mscorsvw storm)
         svcOff("clr_optimization_v4.0.30319_32");
         svcOff("WinDefend"); svcOff("WdNisSvc"); svcOff("Sense"); // Defender

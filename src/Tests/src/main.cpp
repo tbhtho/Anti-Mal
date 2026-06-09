@@ -24,6 +24,7 @@
 #include "antimal/Strings.h"
 #include "antimal/Subprocess.h"
 #include "antimal/Tagger.h"
+#include "antimal/WerReport.h"
 #include "antimal/hv/AcpiTables.h"
 #include "antimal/hv/BlockDevice.h"
 #include "antimal/hv/BochsVbe.h"
@@ -5470,6 +5471,74 @@ void TestTpmIdentityIsScrubbed() {
   Expect(decode(kIdentityWords[3]) == "HTPH", "TPM identity: vendor word 3 == HTPH");
 }
 
+// WER (.wer) crash decoder: a diagnostic detonation reads the WER Report.wer a
+// crashing process leaves behind and turns it into a process.crash event with
+// the EXACT fault (faulting module + offset + exception code). This asserts the
+// pure parser at the heart of that path: the Sig[N].Name/Value pairs must be
+// matched by index N (not by adjacency or order), and the well-known names must
+// map onto the structured fields.
+void TestWerReportParser() {
+  // Realistic synthetic .wer for an APPCRASH of ShellHost.exe with exception
+  // code c0000409 (STATUS_STACK_BUFFER_OVERRUN). The Sig pairs are deliberately
+  // in NON-sequential order AND the Name/Value lines are interleaved out of
+  // order, so a correct parser must pair them by the index N, not by position.
+  const std::string wer =
+      "Version=1\r\n"
+      "EventType=APPCRASH\r\n"
+      "Consent=1\r\n"
+      "Sig[3].Value=ntdll.dll\r\n"          // value before its name
+      "Sig[0].Name=Application Name\r\n"
+      "Sig[6].Name=Exception Code\r\n"
+      "Sig[3].Name=Fault Module Name\r\n"
+      "Sig[7].Value=000000000004ab12\r\n"   // offset value before its name
+      "Sig[0].Value=ShellHost.exe\r\n"
+      "Sig[6].Value=c0000409\r\n"
+      "Sig[4].Name=Fault Module Version\r\n"
+      "Sig[7].Name=Exception Offset\r\n"
+      "Sig[4].Value=10.0.26200.1\r\n"
+      "DynamicSig[1].Name=OS Version\r\n"
+      "DynamicSig[1].Value=10.0.26200.2.0.0.256.48\r\n";
+
+  const antimal::WerCrashInfo info = antimal::ParseWerReport(wer);
+  Expect(info.valid, "WER: realistic crash report is valid");
+  Expect(info.appName == "ShellHost.exe", "WER: application name extracted");
+  Expect(info.eventType == "APPCRASH", "WER: top-level EventType extracted");
+  Expect(info.exceptionCode.find("c0000409") != std::string::npos,
+         "WER: exception code contains c0000409");
+  Expect(info.faultModule == "ntdll.dll",
+         "WER: fault module paired by index N (not adjacency)");
+  Expect(info.faultModuleVersion == "10.0.26200.1",
+         "WER: fault module version extracted");
+  Expect(info.exceptionOffset == "000000000004ab12",
+         "WER: exception offset paired by index N across interleaving");
+
+  // Index-pairing proof: a minimal case where pairing by adjacency would mis-
+  // assign. Name and Value for each index are separated by an unrelated line,
+  // and the two records' lines are interleaved. Correct pairing keys on N only.
+  const std::string interleaved =
+      "Sig[0].Name=Application Name\r\n"
+      "Sig[1].Name=Fault Module Name\r\n"
+      "Sig[0].Value=victim.exe\r\n"
+      "Sig[1].Value=evil.dll\r\n";
+  const antimal::WerCrashInfo paired = antimal::ParseWerReport(interleaved);
+  Expect(paired.valid, "WER: interleaved pairs still valid");
+  Expect(paired.appName == "victim.exe",
+         "WER: interleaved Sig[0] -> victim.exe");
+  Expect(paired.faultModule == "evil.dll",
+         "WER: interleaved Sig[1] -> evil.dll (matched by index)");
+
+  // Malformed / empty inputs are not crash reports -> valid==false.
+  const antimal::WerCrashInfo empty = antimal::ParseWerReport("");
+  Expect(!empty.valid, "WER: empty input is not valid");
+  const antimal::WerCrashInfo junk = antimal::ParseWerReport(
+      "this is not a wer file\r\nno key value pairs here\r\n");
+  Expect(!junk.valid, "WER: malformed input is not valid");
+  const antimal::WerCrashInfo headerOnly =
+      antimal::ParseWerReport("Version=1\r\nEventType=APPCRASH\r\nConsent=1\r\n");
+  Expect(!headerOnly.valid,
+         "WER: header-only (no app name / exception code) is not valid");
+}
+
 int main() {
   try {
     // Must run before anything else touches the guest clock: GuestRtcNowEpoch()
@@ -5537,6 +5606,7 @@ int main() {
     TestSubprocessEcho();
     TestSubprocessToolMissing();
     TestEventJournalRoundtrip();
+    TestWerReportParser();
     TestKdSerialDebuggerPackets();
     TestKdSerialDebuggerStatePackets();
     TestKdSerialDebuggerCom1Integration();
