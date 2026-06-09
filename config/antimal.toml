@@ -29,6 +29,14 @@ dynamic_execution_enabled = false
 collect_screenshots = true
 screenshot_interval_ms = 2000
 
+# Virtual guest clock base, as a unix epoch (seconds). 0 = auto: the VM captures
+# host time once at boot (so TLS/cert validation works) and then advances the
+# guest clock on its own crystal, never re-reading the host wall-clock — so
+# reports don't leak your real date. Set a non-zero epoch to pin the guest's
+# start date (e.g. to trip date-gated "logic bomb" malware). The live control
+# path is the ANTIMAL_GUEST_EPOCH env var; this is the persisted default for it.
+vm_guest_clock_epoch = 0
+
 # Live-VM hands-free login: password | autologon (no password) | manual.
 # "manual" = you drive the login yourself in the live console (click the password
 # box, type the password, press Enter). The account password is below.

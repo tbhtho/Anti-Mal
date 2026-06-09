@@ -11,10 +11,19 @@
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <ctime>
 #include <string>
 #include <vector>
 
 namespace antimal::hv {
+
+// Current VIRTUAL guest clock as a unix epoch (seconds). Decoupled from the
+// live host wall-clock: a base epoch is captured exactly once (from the
+// ANTIMAL_GUEST_EPOCH env var if set+valid, else a one-time host-time sample)
+// and advanced monotonically with steady_clock. The guest RTC (CMOS reads in
+// PcIoDevices) is fed from this, so detonation reports never leak the analyst's
+// live date and date-triggered samples can be pinned to a chosen day.
+std::time_t GuestRtcNowEpoch();
 
 struct PcIoMemoryLayout {
   // Bytes of usable RAM below 4 GiB. Default is intentionally small (128 MiB)

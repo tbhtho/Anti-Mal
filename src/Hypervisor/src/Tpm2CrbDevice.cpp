@@ -241,11 +241,15 @@ std::vector<uint8_t> BuildTpmPropertyCapability(uint32_t property,
       {0x00000102, 0x00000138},
       {0x00000103, 1},
       {0x00000104, 2026},
-      {0x00000105, 0x414D414C}, // TPM_PT_MANUFACTURER: "AMAL"
-      {0x00000106, 0x416E7469}, // "Anti"
-      {0x00000107, 0x4D616C20}, // "Mal "
-      {0x00000108, 0x54504D32}, // "TPM2"
-      {0x00000109, 0x53747562}, // "Stub"
+      // Anti-evasion: report a realistic discrete-TPM identity that matches our
+      // SMBIOS (Dell business desktop). STMicroelectronics ("STM ") is the TPM
+      // vendor on Dell OptiPlex boards; ST33 is a real ST TPM family. None of
+      // these four-byte words decode to sandbox-identifying ASCII.
+      {0x00000105, 0x53544D20}, // TPM_PT_MANUFACTURER: "STM " (STMicroelectronics)
+      {0x00000106, 0x53544D20}, // VENDOR_STRING_1: "STM "
+      {0x00000107, 0x53543333}, // VENDOR_STRING_2: "ST33"
+      {0x00000108, 0x48545048}, // VENDOR_STRING_3: "HTPH"
+      {0x00000109, 0x322E3200}, // VENDOR_STRING_4: "2.2\0"
       {0x0000010A, 0},
       {0x0000010B, 1},
       {0x0000010C, 0},

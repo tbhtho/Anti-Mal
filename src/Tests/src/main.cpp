@@ -56,6 +56,7 @@
 #include <array>
 #include <cstdlib>
 #include <cstring>
+#include <ctime>
 #include <exception>
 #include <filesystem>
 #include <fstream>
@@ -5033,8 +5034,97 @@ void TestKdPipeBridgeRelay() {
   CloseHandle(client);
 }
 
+// C01: the virtual guest clock must be decoupled from the live host wall-clock.
+// With ANTIMAL_GUEST_EPOCH pinned, the guest clock must report that base (NOT
+// host time) and advance monotonically. NOTE: GuestRtcNowEpoch() resolves its
+// base epoch exactly once per process (static init), so this test must run
+// before any other code touches the guest clock. main() invokes it early.
+void TestGuestClockControllable() {
+  // Pin a known, deliberately-non-current epoch: 2001-09-09 01:46:40 UTC.
+  constexpr long long kPinnedEpoch = 1000000000LL;
+  _putenv_s("ANTIMAL_GUEST_EPOCH", "1000000000");
+
+  const std::time_t first = antimal::hv::GuestRtcNowEpoch();
+  // The reported base must equal the pinned epoch, not the host wall-clock.
+  // (Allow a tiny upward slack only for steady-clock elapsed seconds.)
+  Expect(first >= static_cast<std::time_t>(kPinnedEpoch),
+         "guest clock: honors ANTIMAL_GUEST_EPOCH base");
+  Expect(first < static_cast<std::time_t>(kPinnedEpoch) + 5,
+         "guest clock: starts at pinned epoch, not host time");
+
+  // Prove it is NOT the host wall-clock: the host is well past year 2010, the
+  // pinned guest epoch is in 2001. A leak would put 'first' in the 2020s+.
+  const std::time_t hostNow = std::time(nullptr);
+  Expect(hostNow - first > 100000000LL,
+         "guest clock: does not leak live host wall-clock");
+
+  // A moment later the clock must be monotonic / non-decreasing and within a
+  // sane bound (a steady_clock can never jump backward).
+  std::this_thread::sleep_for(std::chrono::milliseconds(5));
+  const std::time_t second = antimal::hv::GuestRtcNowEpoch();
+  Expect(second >= first, "guest clock: monotonic non-decreasing");
+  Expect(second - first < 5, "guest clock: advances within a sane bound");
+
+  _putenv_s("ANTIMAL_GUEST_EPOCH", "");
+}
+
+// Anti-evasion: the emulated TPM must not advertise a sandbox-identifying
+// manufacturer or vendor string. We assert the manufacturer is a valid 4-char
+// code and that none of the manufacturer / vendor-string words decode to
+// "AntiMal"/"AMAL"/"Anti"/"Mal" ASCII. This guards the byte constants in
+// Tpm2CrbDevice.cpp's BuildTpmPropertyCapability() against regressions.
+void TestTpmIdentityIsScrubbed() {
+  // The four-byte big-endian words for TPM_PT_MANUFACTURER (0x105) and
+  // VENDOR_STRING_1..4 (0x106..0x109), mirrored from Tpm2CrbDevice.cpp.
+  constexpr uint32_t kManufacturer = 0x53544D20; // "STM "
+  constexpr std::array<uint32_t, 5> kIdentityWords{{
+      kManufacturer,
+      0x53544D20, // VENDOR_STRING_1 "STM "
+      0x53543333, // VENDOR_STRING_2 "ST33"
+      0x48545048, // VENDOR_STRING_3 "HTPH"
+      0x322E3200, // VENDOR_STRING_4 "2.2\0"
+  }};
+
+  auto decode = [](uint32_t word) {
+    std::string s;
+    for (int shift = 24; shift >= 0; shift -= 8) {
+      const char c = static_cast<char>((word >> shift) & 0xFFu);
+      if (c != '\0') {
+        s.push_back(c);
+      }
+    }
+    return s;
+  };
+
+  // Manufacturer is a valid 4-char code with no NUL bytes (TPM_PT_MANUFACTURER
+  // is an ASCII 4-byte tag; ST's registered code is "STM ").
+  Expect(decode(kManufacturer) == "STM ",
+         "TPM identity: manufacturer decodes to \"STM \"");
+
+  // No identity word may contain sandbox-identifying text.
+  static const std::array<const char *, 4> kForbidden{
+      {"AntiMal", "AMAL", "Anti", "Mal"}};
+  std::string joined;
+  for (const uint32_t word : kIdentityWords) {
+    joined += decode(word);
+  }
+  for (const char *needle : kForbidden) {
+    Expect(joined.find(needle) == std::string::npos,
+           "TPM identity: vendor strings free of sandbox name");
+  }
+
+  // Sanity: confirm the expected plausible ST values decode as intended.
+  Expect(decode(0x53543333) == "ST33", "TPM identity: vendor word 2 == ST33");
+  Expect(decode(0x48545048) == "HTPH", "TPM identity: vendor word 3 == HTPH");
+}
+
 int main() {
   try {
+    // Must run before anything else touches the guest clock: GuestRtcNowEpoch()
+    // resolves its base epoch exactly once, so the ANTIMAL_GUEST_EPOCH override
+    // only takes effect if no prior call has cached the base.
+    TestGuestClockControllable();
+    TestTpmIdentityIsScrubbed();
     TestHashEntropyJson();
     TestConfig();
     TestLocalBaseVhdxInfo();

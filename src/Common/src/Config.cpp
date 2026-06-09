@@ -71,6 +71,8 @@ void ApplyConfigValue(AppConfig &config, std::string key, std::string value) {
     config.collectScreenshots = ParseBool(value);
   } else if (key == "dynamic_execution_enabled") {
     config.dynamicExecutionEnabled = ParseBool(value);
+  } else if (key == "vm_guest_clock_epoch") {
+    config.vmGuestClockEpoch = static_cast<int64_t>(std::stoll(value));
   } else if (key == "vm_login_mode") {
     config.vmLoginMode = value;
   } else if (key == "vm_login_password") {
@@ -144,6 +146,10 @@ std::string SerializeConfig(const AppConfig &config) {
   out << "dynamic_execution_enabled = " << boolStr(config.dynamicExecutionEnabled) << "\n";
   out << "collect_screenshots = " << boolStr(config.collectScreenshots) << "\n";
   out << "screenshot_interval_ms = " << config.screenshotIntervalMs << "\n";
+  out << "\n# Virtual guest clock base (unix epoch seconds). 0 = auto (captured once\n";
+  out << "# at boot, then advances on its own crystal; never tracks host time).\n";
+  out << "# Set a non-zero epoch to pin the guest start date for date-gated malware.\n";
+  out << "vm_guest_clock_epoch = " << config.vmGuestClockEpoch << "\n";
   out << "\n# Live-VM hands-free login: password | autologon (no password) | manual.\n";
   out << "vm_login_mode = \"" << config.vmLoginMode << "\"\n";
   out << "vm_login_password = \"" << config.vmLoginPassword << "\"\n";

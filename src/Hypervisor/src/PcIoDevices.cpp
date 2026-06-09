@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cstdlib>
 #include <ctime>
 #include <iterator>
 #include <string_view>
@@ -54,21 +55,72 @@ constexpr uint16_t kFwCfgAcpiRsdp = kFwCfgFileFirst + 3;
 constexpr uint16_t kFwCfgSmbiosTables = kFwCfgFileFirst + 4;
 constexpr uint16_t kFwCfgSmbiosAnchor = kFwCfgFileFirst + 5;
 
-// Returns a wallclock-derived std::tm whose value is guaranteed STABLE
-// across consecutive calls within the same wall-clock second. Each call
-// only recomputes the std::tm when std::time(nullptr) has actually
-// advanced. This is the contract real RTC silicon offers via the UIP bit:
-// within a single non-update window, every register read returns the
-// same value. OVMF's PcRtcDxe `GetTime` and bootmgr's polling loops rely
-// on that contract — without it we observed bootmgr spinning at ~14 kHz
-// re-reading the date/time fields when sub-microsecond reads
-// occasionally bridged a wall-second boundary and returned mismatched
-// seconds across an atomic read sequence.
+// Returns the current GUEST epoch (unix seconds), decoupled from the live host
+// wall-clock. A real RTC ticks forward on its own crystal; we model the same.
+//
+// Anti-analysis rationale: if the guest RTC simply mirrored the host's live
+// wall-clock, every detonation report would leak the analyst's real date, and
+// date-triggered ("logic bomb") malware could never be tested against a chosen
+// date. So we capture a base epoch exactly ONCE at first use and thereafter
+// advance it with a monotonic steady_clock, never re-reading host wall-clock.
+//
+// Base-epoch resolution order, evaluated once:
+//   1. env var ANTIMAL_GUEST_EPOCH (unix seconds, decimal) — the live control
+//      path the orchestrator/CLI can set per run (e.g. to pin a logic-bomb
+//      trigger date).
+//   2. captured-once host time at init — a sane real-ish clock so TLS/cert
+//      validation inside the guest still works. This is read a SINGLE time;
+//      it is NOT re-read per access, so the guest clock can never track the
+//      host's live wall-clock back to the analyst.
+//
+// The anchor is a steady_clock sample taken alongside the base epoch; from then
+// on guest_now = base_epoch + (steady_clock::now() - anchor). steady_clock is
+// monotonic, so the guest clock is guaranteed non-decreasing.
+std::time_t GuestEpochBase() {
+  // Resolve the base epoch exactly once for the process lifetime.
+  static const std::time_t base = [] {
+    if (const char *raw = std::getenv("ANTIMAL_GUEST_EPOCH");
+        raw != nullptr && raw[0] != '\0') {
+      char *end = nullptr;
+      const long long parsed = std::strtoll(raw, &end, 10);
+      // Accept only a fully-consumed, non-negative decimal value.
+      if (end != nullptr && *end == '\0' && parsed >= 0) {
+        return static_cast<std::time_t>(parsed);
+      }
+    }
+    // Fallback: capture host wall-clock ONCE so certificate/TLS validation in
+    // the guest sees a realistic year. Never read again after this.
+    return std::time(nullptr);
+  }();
+  return base;
+}
+
+// Current virtual guest epoch (unix seconds): base captured once + monotonic
+// elapsed steady time. Decoupled from the live host wall-clock.
+std::time_t GuestNowEpoch() {
+  static const std::chrono::steady_clock::time_point anchor =
+      std::chrono::steady_clock::now();
+  const std::time_t base = GuestEpochBase();
+  const auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(
+                           std::chrono::steady_clock::now() - anchor)
+                           .count();
+  return base + static_cast<std::time_t>(elapsed);
+}
+
+// Returns a guest-clock-derived std::tm whose value is guaranteed STABLE
+// across consecutive calls within the same guest second. Each call only
+// recomputes the std::tm when the guest epoch has actually advanced. This is
+// the contract real RTC silicon offers via the UIP bit: within a single
+// non-update window, every register read returns the same value. OVMF's
+// PcRtcDxe `GetTime` and bootmgr's polling loops rely on that contract —
+// without it we observed bootmgr spinning at ~14 kHz re-reading the date/time
+// fields when sub-microsecond reads occasionally bridged a second boundary and
+// returned mismatched seconds across an atomic read sequence.
 std::tm UtcNowStable() {
   static thread_local std::time_t cachedSecond = 0;
   static thread_local std::tm cachedTm{};
   static thread_local bool cacheValid = false;
-  const std::time_t now = std::time(nullptr);
+  const std::time_t now = GuestNowEpoch();
   if (!cacheValid || cachedSecond != now) {
     gmtime_s(&cachedTm, &now);
     cachedSecond = now;
@@ -378,6 +430,8 @@ uint8_t Bcd(uint8_t value) {
 }
 
 } // namespace
+
+std::time_t GuestRtcNowEpoch() { return GuestNowEpoch(); }
 
 PcIoDevices::PcIoDevices() : acpi_(BuildPcAcpiTables()) {
   BuildPcSmbiosTables(&smbiosTables_, &smbiosAnchor_);

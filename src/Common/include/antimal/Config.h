@@ -34,6 +34,14 @@ struct AppConfig {
   bool collectScreenshots = true;
   bool dynamicExecutionEnabled = false;
 
+  // Virtual guest-clock base, as a unix epoch (seconds). 0 = auto (the VM
+  // captures host time once at boot so TLS/cert validation works, then advances
+  // it on its own crystal — never re-reading host wall-clock). A non-zero value
+  // pins the guest's start date, e.g. to trigger date-gated "logic bomb"
+  // malware. The live control path is the ANTIMAL_GUEST_EPOCH env var, which the
+  // orchestrator sets per run; this field is the persisted source for it.
+  int64_t vmGuestClockEpoch = 0;
+
   // Live-VM ("Boot VM (live)") hands-free login. The seed snapshot lands on the
   // Win11 lock/login screen; this controls how the desktop is reached:
   //   "password"  — auto-type vmLoginPassword (proven to reach the desktop)
