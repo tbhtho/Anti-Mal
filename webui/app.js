@@ -261,9 +261,7 @@
         '</div><div class="k">Workspace</div><div class="v mono">' + esc(c.workspaceRoot || '—') + '</div><div class="k">Provider</div><div class="v">' + esc(c.vmProvider || '—') + '</div></div>' +
         lbl('Network mode') + '<select id="cfg-net" style="' + inp + '">' + ['disabled', 'hostonly', 'nat'].map(function (o) { return '<option value="' + o + '"' + (net === o ? ' selected' : '') + '>' + o + '</option>'; }).join('') + '</select>' +
         lbl('VM timeout (sec)') + '<input id="cfg-timeout" type="number" min="10" value="' + (c.defaultTimeoutSec != null ? c.defaultTimeoutSec : 180) + '" style="' + inp + '">' +
-        lbl('Live frame interval (ms)') + '<input id="cfg-shot" type="number" min="100" value="' + (c.screenshotIntervalMs != null ? c.screenshotIntervalMs : 2000) + '" style="' + inp + '">' +
-        lbl('Boot VM (live) login') + '<select id="cfg-login" style="' + inp + '">' + [['password', 'Auto-type password → desktop'], ['autologon', 'No password (autologon)'], ['manual', 'Manual (type in console)']].map(function (o) { return '<option value="' + o[0] + '"' + ((c.vmLoginMode || 'password') === o[0] ? ' selected' : '') + '>' + esc(o[1]) + '</option>'; }).join('') + '</select>' +
-        lbl('Login password' + (c.vmLoginPasswordSet ? ' (currently set)' : '')) + '<input id="cfg-loginpw" type="password" autocomplete="off" placeholder="' + (c.vmLoginPasswordSet ? '•••••• (blank = keep)' : 'AntiMal!23') + '" style="' + inp + '">';
+        lbl('Live frame interval (ms)') + '<input id="cfg-shot" type="number" min="100" value="' + (c.screenshotIntervalMs != null ? c.screenshotIntervalMs : 2000) + '" style="' + inp + '">';
       var scanSec = chk('cfg-yara', 'YARA', c.enrichYara) + chk('cfg-capa', 'capa', c.enrichCapa) + chk('cfg-die', 'Detect It Easy', c.enrichDie) + chk('cfg-tagger', 'Tagger', c.enrichTagger);
       var intelSec = chk('cfg-intel', 'Enable network lookups (off by default)', c.intelEnabled) + chk('cfg-mb', 'MalwareBazaar', c.intelMalwareBazaar) +
         lbl('VirusTotal API key' + (c.virusTotalKeySet ? ' (currently set)' : '')) + '<input id="cfg-vt" type="password" autocomplete="off" placeholder="' + (c.virusTotalKeySet ? '•••••• (blank = keep)' : 'not set') + '" style="' + inp + '">';
@@ -279,12 +277,9 @@
           defaultTimeoutSec: parseInt($('#cfg-timeout').value, 10) || 180,
           screenshotIntervalMs: parseInt($('#cfg-shot').value, 10) || 2000,
           enrichYara: $('#cfg-yara').checked, enrichCapa: $('#cfg-capa').checked, enrichDie: $('#cfg-die').checked, enrichTagger: $('#cfg-tagger').checked,
-          intelEnabled: $('#cfg-intel').checked, intelMalwareBazaar: $('#cfg-mb').checked, dynamicExecutionEnabled: $('#cfg-dyn').checked,
-          vmLoginMode: ($('#cfg-login') && $('#cfg-login').value) || 'password'
+          intelEnabled: $('#cfg-intel').checked, intelMalwareBazaar: $('#cfg-mb').checked, dynamicExecutionEnabled: $('#cfg-dyn').checked
         };
         if (vt) payload.virusTotalApiKey = vt; // blank = keep existing key
-        var lpw = ($('#cfg-loginpw') && $('#cfg-loginpw').value) || '';
-        if (lpw) payload.vmLoginPassword = lpw; // blank = keep existing password
         send('config.set', payload).then(function (rr) {
           var ok = rr && rr.ok && rr.result && rr.result.ok;
           var st = $('#cfg-save-status'); if (st) { st.textContent = ok ? '✓ saved to antimal.toml' : '✗ ' + String((rr && rr.result && rr.result.error) || 'save failed'); st.style.color = ok ? '#7ee2a8' : '#ff9b9b'; }

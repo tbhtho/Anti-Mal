@@ -4539,6 +4539,8 @@ bool PatchOverlaySystemBootStorage(hv::IBlockDevice &disk,
                                    BootOverlayPatchResult *result);
 bool PatchOverlayAutologon(hv::IBlockDevice &disk,
                            BootOverlayPatchResult *result);
+bool PatchOverlayBlankAntimalPassword(hv::IBlockDevice &disk,
+                                      BootOverlayPatchResult *result);
 // Arms the THIRD key of the detonation gate (the guest-side authorization) by
 // adding ANTIMAL_GUEST_ALLOW_EXECUTION=1 to the AntiMalGuestAgent service's own
 // per-service Environment value in the overlay's SYSTEM hive. The SCM merges that
@@ -6290,6 +6292,12 @@ BootOverlayPatchResult ApplyEphemeralBootOverlay(hv::IBlockDevice &disk) {
   if (EnvFlagEnabled("ANTIMAL_PROBE_OOBE_AUTOLOGON")) {
     PatchOverlayAutologon(disk, &result);
   }
+  // Opt-in: make the `antimal` account passwordless in this disposable overlay
+  // (blank its SAM hash + disable the baked autologon) so the live VM reaches the
+  // desktop with no password -- a single Enter at the login screen logs in.
+  if (EnvFlagEnabled("ANTIMAL_PROBE_OOBE_NOPASSWORD")) {
+    PatchOverlayBlankAntimalPassword(disk, &result);
+  }
   // Opt-in third detonation key: arm the guest-side execution authorization in
   // THIS run's disposable overlay only (the promoted snapshot stays gated). With
   // this and both host keys set, an authorized execute job is honored in-guest.
@@ -7209,6 +7217,163 @@ bool PatchOverlayAutologon(hv::IBlockDevice &disk,
                             " SOFTWARE=" + (soft ? "ok" : "no"));
   }
   return sys || sam || soft;
+}
+
+// Make the seeded `antimal` account PASSWORDLESS in the disposable overlay only
+// (never the base). Win11 25H2 ignores plaintext autologon, so the reliable path
+// to a no-password desktop is to actually BLANK the account: zero the LM+NT hash
+// LENGTH fields in the user's SAM `V` value (the chntpw technique — Windows then
+// treats the account as empty-password with no decryption), set ACB_PWNOTREQ, and
+// disable the baked AutoAdminLogon (its stale non-empty DefaultPassword would
+// otherwise trigger a "password incorrect" auto-attempt). The login then lands on
+// a passwordless prompt that a single Enter clears. All edits are in-place /
+// same-size (the NTFS writer cannot grow files). Opt-in via
+// ANTIMAL_PROBE_OOBE_NOPASSWORD. Heavily diagnosed so the first run pins the V
+// layout if an offset is off. Returns true if the SAM blank applied.
+bool PatchOverlayBlankAntimalPassword(hv::IBlockDevice &disk,
+                                      BootOverlayPatchResult *result) {
+  const auto parts = ReadGptPartitionsLite(disk);
+  const auto windows =
+      std::find_if(parts.begin(), parts.end(), [](const GptPartitionLite &p) {
+        return IsWindowsBasicDataGuid(p.typeGuid);
+      });
+  if (windows == parts.end()) {
+    if (result) result->notes.push_back("nopassword: Windows partition not found");
+    return false;
+  }
+  NtfsBootFileLocator ntfs(disk, windows->firstLba);
+  if (!ntfs.Init()) {
+    if (result) result->notes.push_back("nopassword: Windows NTFS unreadable");
+    return false;
+  }
+  auto findPath = [](MutableHiveView &hive,
+                     std::initializer_list<std::string> components)
+      -> std::optional<uint32_t> {
+    auto cur = hive.RootIndex();
+    for (const auto &c : components) {
+      if (!cur) return std::nullopt;
+      cur = hive.FindSubkey(*cur, c);
+    }
+    return cur;
+  };
+  auto patchHive = [&](const char *path, auto &&fn) -> bool {
+    const auto entry = ntfs.FindPath(path);
+    if (!entry) {
+      if (result) result->notes.push_back(std::string("nopassword: missing ") + path);
+      return false;
+    }
+    auto bytes = ntfs.ReadFile(*entry, 256u * 1024u * 1024u);
+    MutableHiveView hive(bytes);
+    if (!hive.IsValid() || !fn(hive)) {
+      if (result) result->notes.push_back(std::string("nopassword: no change ") + path);
+      return false;
+    }
+    RefreshRegistryHiveHeader(bytes);
+    if (!ntfs.WriteFileSameSize(*entry, bytes)) {
+      if (result) result->notes.push_back(std::string("nopassword: write failed ") + path);
+      return false;
+    }
+    return true;
+  };
+  auto le32 = [](const std::vector<uint8_t> &v, size_t o) -> uint32_t {
+    if (o + 4 > v.size()) return 0;
+    return static_cast<uint32_t>(v[o]) |
+           (static_cast<uint32_t>(v[o + 1]) << 8) |
+           (static_cast<uint32_t>(v[o + 2]) << 16) |
+           (static_cast<uint32_t>(v[o + 3]) << 24);
+  };
+
+  std::string diag;
+  const bool sam = patchHive(
+      "Windows\\System32\\config\\SAM", [&](MutableHiveView &hive) {
+        auto users = findPath(hive, {"SAM", "Domains", "Account", "Users"});
+        if (!users) users = findPath(hive, {"Domains", "Account", "Users"});
+        if (!users) { diag = "nopassword: Users key not found"; return false; }
+        // Find antimal by scanning RID-named children and matching the username
+        // embedded in each V (robust against a non-1000 RID).
+        std::optional<uint32_t> target;
+        std::string foundRid;
+        for (const auto &name : hive.ChildKeyNames(*users)) {
+          if (name == "Names" || name.size() != 8) continue; // RID keys are 8 hex
+          auto child = hive.FindSubkey(*users, name);
+          if (!child) continue;
+          const auto vl = hive.FindValue(*child, "V");
+          if (!vl) continue;
+          const auto v = hive.ValueBytes(*vl);
+          const uint32_t uo = le32(v, 0x0c), ul = le32(v, 0x10);
+          std::string uname;
+          if (static_cast<size_t>(0xCC) + uo + ul <= v.size()) {
+            for (uint32_t i = 0; i + 1 < ul; i += 2) {
+              const unsigned wc =
+                  v[0xCC + uo + i] |
+                  (static_cast<unsigned>(v[0xCC + uo + i + 1]) << 8);
+              uname += static_cast<char>(
+                  wc < 128 ? std::tolower(static_cast<int>(wc)) : '?');
+            }
+          }
+          if (uname == "antimal") { target = child; foundRid = name; break; }
+        }
+        if (!target) { diag = "nopassword: antimal account not found"; return false; }
+        const auto vl = hive.FindValue(*target, "V");
+        if (!vl) { diag = "nopassword: V missing rid=" + foundRid; return false; }
+        auto v = hive.ValueBytes(*vl);
+        if (v.size() < 0xb0) {
+          diag = "nopassword: V too short " + std::to_string(v.size());
+          return false;
+        }
+        // Canonical SAM-V layout (creddump/chntpw): LM len @0xA0, NT len @0xAC.
+        const uint32_t lmLen = le32(v, 0xa0), ntLen = le32(v, 0xac);
+        diag = "nopassword: rid=" + foundRid + " Vlen=" + std::to_string(v.size()) +
+               " lmLen=" + std::to_string(lmLen) + " ntLen=" + std::to_string(ntLen);
+        auto ok = [](uint32_t n) {
+          return n == 0 || n == 0x14 || n == 0x18 || n == 0x38;
+        };
+        if (!ok(lmLen) || !ok(ntLen)) {
+          diag += " (REFUSED: implausible hash lengths -- offsets unverified)";
+          return false;
+        }
+        for (int i = 0; i < 4; ++i) { v[0xa0 + i] = 0; v[0xac + i] = 0; } // blank
+        if (!hive.UpsertBinaryValueSameSize(*target, "V", vl->type, v)) {
+          diag += " (V write failed)"; return false;
+        }
+        // ACB_PWNOTREQ(0x20) + ensure enabled (clear ACB_DISABLED 0x01) in F[0x38].
+        const auto fl = hive.FindValue(*target, "F");
+        if (fl) {
+          auto f = hive.ValueBytes(*fl);
+          if (f.size() > 0x38) {
+            f[0x38] = static_cast<uint8_t>((f[0x38] & ~0x01u) | 0x20u);
+            hive.UpsertBinaryValueSameSize(*target, "F", fl->type, f);
+          }
+        }
+        diag += " (BLANKED)";
+        return true;
+      });
+  if (result && !diag.empty()) result->notes.push_back(diag);
+
+  // Disable the baked AutoAdminLogon so its stale DefaultPassword can't trigger a
+  // wrong-password auto-attempt against the now-blank account. Same-size flip of
+  // the REG_SZ "1" -> "0" (can't empty DefaultPassword: same-size writer only).
+  const bool soft = patchHive(
+      "Windows\\System32\\config\\SOFTWARE", [&](MutableHiveView &hive) {
+        const auto winlogon = findPath(
+            hive, {"Microsoft", "Windows NT", "CurrentVersion", "Winlogon"});
+        if (!winlogon) return false;
+        const auto al = hive.FindValue(*winlogon, "AutoAdminLogon");
+        if (!al) return false; // nothing to disable
+        auto b = hive.ValueBytes(*al);
+        if (b.empty()) return false;
+        b[0] = 0x30; // '0'
+        for (size_t i = 1; i < b.size(); ++i) b[i] = 0;
+        return hive.UpsertBinaryValueSameSize(*winlogon, "AutoAdminLogon",
+                                              al->type, b);
+      });
+
+  if (result) {
+    result->notes.push_back(std::string("nopassword overlay patch: SAM=") +
+                            (sam ? "ok" : "no") + " autologon-off=" +
+                            (soft ? "ok" : "no"));
+  }
+  return sam;
 }
 
 bool DeployExecAgentToOpenOverlay(hv::IBlockDevice &disk,
@@ -10527,6 +10692,22 @@ DetonationResult InHouseOrchestrator::PrepareAndRun(
                    keys[k]});
             }
           }
+        }
+      }
+      // ANTIMAL_PROBE_OOBE_NOPASSWORD: the account was blanked offline, so login
+      // is just "dismiss the lock screen, submit the empty password" -- two Enters
+      // ~700ms apart, fired across a wide window so one pair lands once the sign-in
+      // field is focused. No password is ever typed. Extra firings on the desktop
+      // are inert.
+      if (EnvFlagEnabled("ANTIMAL_PROBE_OOBE_NOPASSWORD")) {
+        using namespace std::chrono;
+        const std::vector<uint8_t> enter = {0x1C, 0x9C};
+        for (int off : {30, 50, 70, 90, 110, 140, 170, 200, 240}) {
+          request.keyboardBursts.push_back(
+              {milliseconds{static_cast<int64_t>(off) * 1000}, enter}); // dismiss
+          request.keyboardBursts.push_back(
+              {milliseconds{static_cast<int64_t>(off) * 1000 + 700},
+               enter}); // submit empty password
         }
       }
       // ANTIMAL_PROBE_BYPASS_DRIVER_SIG: at this delay (seconds), the host
