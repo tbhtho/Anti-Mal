@@ -4283,6 +4283,114 @@ void TestRegistryTelemetry() {
          "registry: removed value -> registry.delete");
 }
 
+// T72: the persistence diff tags each event with the MITRE ATT&CK technique of
+// the location that fired, and never mis-tags a non-persistence write. Pure:
+// synthetic before/after snapshots, no real registry touched.
+void TestRegistryPersistenceMitreTagging() {
+  // A new Run value -> persistence event tagged T1547.001.
+  {
+    antimal::RegistrySnapshot prev, cur;
+    cur["HKLM\\...\\Run\\evil"] = "C:\\Users\\x\\evil.exe";
+    auto d = antimal::DiffRegistrySnapshots(prev, cur, false, 64, 64);
+    Expect(d.size() == 1 && d[0].action == "registry.set" &&
+               d[0].mitre == "T1547.001",
+           "registry: new Run value tagged T1547.001");
+  }
+  // A Services ImagePath change -> T1543.003.
+  {
+    antimal::RegistrySnapshot prev, cur;
+    prev["HKLM\\...\\Services\\beep\\ImagePath"] =
+        "C:\\Windows\\System32\\drivers\\beep.sys";
+    cur["HKLM\\...\\Services\\beep\\ImagePath"] = "C:\\Users\\x\\rogue.sys";
+    auto d = antimal::DiffRegistrySnapshots(prev, cur, false, 64, 64);
+    Expect(d.size() == 1 && d[0].mitre == "T1543.003",
+           "registry: Services ImagePath change tagged T1543.003");
+  }
+  // An IFEO Debugger value -> T1546.012.
+  {
+    antimal::RegistrySnapshot prev, cur;
+    cur["HKLM\\...\\IFEO\\sethc.exe\\Debugger"] = "C:\\Windows\\System32\\cmd.exe";
+    auto d = antimal::DiffRegistrySnapshots(prev, cur, false, 64, 64);
+    Expect(d.size() == 1 && d[0].mitre == "T1546.012",
+           "registry: IFEO Debugger value tagged T1546.012");
+  }
+  // A COM InprocServer32 default-value change -> T1546.015.
+  {
+    antimal::RegistrySnapshot prev, cur;
+    prev["HKCU\\...\\COM\\{42aedc87}\\InprocServer32"] =
+        "C:\\Windows\\System32\\shell32.dll";
+    cur["HKCU\\...\\COM\\{42aedc87}\\InprocServer32"] = "C:\\Users\\x\\hijack.dll";
+    auto d = antimal::DiffRegistrySnapshots(prev, cur, false, 64, 64);
+    Expect(d.size() == 1 && d[0].mitre == "T1546.015",
+           "registry: COM InprocServer32 change tagged T1546.015");
+  }
+  // A benign NON-persistence key change is NOT mis-tagged (mitre stays "").
+  {
+    antimal::RegistrySnapshot prev, cur;
+    prev["HKCU\\...\\Some\\Unrelated\\Setting"] = "old";
+    cur["HKCU\\...\\Some\\Unrelated\\Setting"] = "new";
+    auto d = antimal::DiffRegistrySnapshots(prev, cur, false, 64, 64);
+    Expect(d.size() == 1 && d[0].mitre.empty(),
+           "registry: non-persistence write is not MITRE-tagged");
+  }
+  // Prefix boundary: "...\\Run" must not swallow "...\\RunServices" — each
+  // resolves to its own (here-identical T1547.001) entry, and a bare prefix
+  // with no separator after it does not falsely match a longer sibling.
+  {
+    Expect(antimal::PersistenceMitreForKey("HKLM\\...\\RunServices\\x") ==
+               "T1547.001",
+           "registry: RunServices resolves on its own prefix");
+    Expect(antimal::PersistenceMitreForKey("HKLM\\...\\Runaway\\x").empty(),
+           "registry: 'Runaway' does not match the 'Run' prefix");
+  }
+}
+
+// T72: the watched-location -> MITRE mapping table is correct and exhaustive for
+// the documented persistence families. Drives PersistenceMitreForKey through one
+// representative key per location.
+void TestRegistryPersistenceLocationTable() {
+  struct Case {
+    const char *key;
+    const char *expected;
+  };
+  const Case cases[] = {
+      {"HKLM\\...\\Run\\a", "T1547.001"},
+      {"HKLM\\...\\RunOnce\\a", "T1547.001"},
+      {"HKLM\\...\\RunServices\\a", "T1547.001"},
+      {"HKLM\\...\\RunServicesOnce\\a", "T1547.001"},
+      {"HKCU\\...\\Run\\a", "T1547.001"},
+      {"HKCU\\...\\RunOnce\\a", "T1547.001"},
+      {"HKCU\\...\\RunServices\\a", "T1547.001"},
+      {"HKCU\\...\\RunServicesOnce\\a", "T1547.001"},
+      {"HKLM\\...\\Winlogon\\Shell", "T1547.004"},
+      {"HKCU\\...\\Winlogon\\Userinit", "T1547.004"},
+      {"HKLM\\...\\Services\\svc\\Start", "T1543.003"},
+      {"HKLM\\...\\IFEO\\img.exe\\Debugger", "T1546.012"},
+      {"HKLM\\...\\AppInit\\AppInit_DLLs", "T1546.010"},
+      {"HKLM\\...\\AppInit\\LoadAppInit_DLLs", "T1546.010"},
+      {"HKLM\\...\\ActiveSetup\\{c}\\StubPath", "T1547.014"},
+      {"HKCU\\...\\ActiveSetup\\{c}\\StubPath", "T1547.014"},
+      {"HKLM\\...\\ShellFolders\\Startup", "T1547.001"},
+      {"HKCU\\...\\ShellFolders\\Common Startup", "T1547.001"},
+      {"HKLM\\...\\StartupApproved\\a", "T1547.001"},
+      {"HKCU\\...\\StartupApproved\\a", "T1547.001"},
+      {"HKLM\\...\\COM\\{c}\\InprocServer32", "T1546.015"},
+      {"HKCU\\...\\COM\\{c}\\LocalServer32", "T1546.015"},
+  };
+  for (const auto &c : cases) {
+    Expect(antimal::PersistenceMitreForKey(c.key) == c.expected,
+           "registry table: watched location maps to its expected MITRE id");
+  }
+  // Every entry in the published table has a non-empty technique id.
+  bool allTagged = true;
+  for (const auto &loc : antimal::PersistenceLocations()) {
+    if (!loc.mitre || !*loc.mitre) {
+      allTagged = false;
+    }
+  }
+  Expect(allTagged, "registry table: every watched location has a MITRE id");
+}
+
 void TestFileSystemTelemetry() {
   antimal::FileSnapshot prev, cur;
   prev["C:\\Temp\\a.txt"] = antimal::FileMeta{10, 100};
@@ -5438,6 +5546,8 @@ int main() {
     TestDetonationProtocol();
     TestNetworkTelemetry();
     TestRegistryTelemetry();
+    TestRegistryPersistenceMitreTagging();
+    TestRegistryPersistenceLocationTable();
     TestFileSystemTelemetry();
     TestPacketInspector();
     TestE1000Device();
