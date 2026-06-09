@@ -1,4 +1,5 @@
 #include <stdexcept>
+#include "antimal/BehaviorScore.h"
 #include "antimal/BridgeRouter.h"
 #include "antimal/BrowserImpact.h"
 #include "antimal/Config.h"
@@ -4526,6 +4527,143 @@ void TestDroppedFileEnrichment() {
          "drop enrich: report JSON write->load preserves sha256+type");
 }
 
+void TestBehaviorScoreVerdict() {
+  using antimal::AnalysisReport;
+  using antimal::BehaviorScore;
+  using antimal::DynamicRunSummary;
+  using antimal::EventRecord;
+  using antimal::ScoreSandboxBehavior;
+  using antimal::Verdict;
+
+  auto rationaleHas = [](const std::vector<std::string> &lines,
+                         const char *needle) {
+    for (const auto &l : lines) {
+      std::string low = l;
+      for (char &c : low) c = static_cast<char>(std::tolower((unsigned char)c));
+      if (low.find(needle) != std::string::npos) {
+        return true;
+      }
+    }
+    return false;
+  };
+  auto procStart = [](uint32_t pid, const char *image) {
+    EventRecord e;
+    e.category = "process";
+    e.action = "process.start";
+    e.processId = pid;
+    e.imagePath = image;
+    return e;
+  };
+
+  // (a) Benign run that merely hit its time budget: a couple of process starts,
+  // no persistence / drops / network. Must be Clean (NOT Malicious on the basis
+  // of the timeout), and the rationale must say the timeout is not malicious.
+  {
+    DynamicRunSummary s;
+    s.sampleExecuted = true;
+    s.timedOut = true;
+    s.completed = true;
+    std::vector<EventRecord> events = {procStart(1000, "sample.exe"),
+                                       procStart(1004, "conhost.exe")};
+    const BehaviorScore bs = ScoreSandboxBehavior(s, events);
+    Expect(bs.verdict == Verdict::Clean,
+           "behavior: benign timed-out run -> Clean (not Malicious)");
+    Expect(rationaleHas(bs.rationale, "timeout") ||
+               rationaleHas(bs.rationale, "time budget"),
+           "behavior: timeout FP killed -- rationale explains timeout != malicious");
+    Expect(bs.score < 20, "behavior: benign run scores below suspicious threshold");
+  }
+
+  // (b) Malware-like run: persistence (MITRE-tagged registry-run write) + a
+  // dropped PE + an external (public) network connection + a High-integrity
+  // child spawned from a Medium parent. Must be Malicious, and the rationale
+  // must enumerate those four specific signals.
+  {
+    DynamicRunSummary s;
+    s.sampleExecuted = true;
+    s.timedOut = true; // even with a timeout, behavior decides the verdict
+
+    EventRecord persist;
+    persist.category = "registry";
+    persist.action = "registry.setvalue";
+    persist.target =
+        "HKLM\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Run\\evil";
+    persist.mitre = "T1547.001";
+
+    EventRecord drop;
+    drop.category = "file";
+    drop.action = "file.create";
+    drop.target = "C:\\Users\\me\\AppData\\Local\\Temp\\payload.exe";
+    drop.details["fileType"] = "pe";
+
+    EventRecord net;
+    net.category = "network";
+    net.action = "network.connect";
+    net.target = "203.0.113.7:443"; // public (TEST-NET-3, treated as external)
+
+    EventRecord child;
+    child.category = "process";
+    child.action = "process.start";
+    child.processId = 2000;
+    child.imagePath = "elevated.exe";
+    child.integrityLevel = "High";
+    child.details["parentIntegrityLevel"] = "Medium";
+
+    std::vector<EventRecord> events = {procStart(1000, "sample.exe"), persist,
+                                       drop, net, child};
+    const BehaviorScore bs = ScoreSandboxBehavior(s, events);
+    Expect(bs.verdict == Verdict::Malicious,
+           "behavior: persistence+drop+egress+privesc -> Malicious");
+    Expect(rationaleHas(bs.rationale, "persistence"),
+           "behavior: rationale names persistence");
+    Expect(rationaleHas(bs.rationale, "executable") ||
+               rationaleHas(bs.rationale, "payload"),
+           "behavior: rationale names the dropped payload");
+    Expect(rationaleHas(bs.rationale, "egress") ||
+               rationaleHas(bs.rationale, "external endpoint"),
+           "behavior: rationale names external network egress");
+    Expect(rationaleHas(bs.rationale, "escalation") ||
+               rationaleHas(bs.rationale, "high/system"),
+           "behavior: rationale names privilege escalation");
+    Expect(bs.score >= 60, "behavior: malware-like run clears Malicious threshold");
+  }
+
+  // (c) Nothing executed (gated / healthcheck run) -> Unknown, never Error.
+  {
+    DynamicRunSummary s;
+    s.sampleExecuted = false;
+    const BehaviorScore bs = ScoreSandboxBehavior(s, {});
+    Expect(bs.verdict == Verdict::Unknown,
+           "behavior: not-executed -> Unknown");
+    Expect(bs.verdict != Verdict::Error,
+           "behavior: scorer never returns Error");
+    Expect(!bs.rationale.empty(),
+           "behavior: not-executed still carries a rationale line");
+  }
+
+  // (d) Report-JSON round-trip preserves verdictRationale + verdictScore.
+  {
+    AnalysisReport report;
+    report.runId = "behavior-roundtrip";
+    report.sandboxVerdict = Verdict::Malicious;
+    report.verdictScore = 123;
+    report.verdictRationale = {"Persistence established (+35).",
+                               "Outbound network egress (+20)."};
+    const auto dir = TempRoot();
+    const auto reportPath = dir / "behavior-report.json";
+    antimal::WriteReportJson(reportPath, report);
+    const AnalysisReport loaded = antimal::LoadReportBestEffort(reportPath);
+    Expect(loaded.verdictScore == 123,
+           "behavior: report JSON round-trips verdictScore");
+    Expect(loaded.verdictRationale.size() == 2 &&
+               loaded.verdictRationale[0] == report.verdictRationale[0] &&
+               loaded.verdictRationale[1] == report.verdictRationale[1],
+           "behavior: report JSON round-trips verdictRationale");
+    Expect(loaded.sandboxVerdict == Verdict::Malicious,
+           "behavior: report JSON round-trips sandboxVerdict");
+  }
+}
+
 void TestPacketInspector() {
   // Frame builders. IPv4 total-length is left 0 (the parser clamps to the
   // captured length), so we only need structurally valid headers + payload.
@@ -5723,6 +5861,7 @@ int main() {
     TestRegistryPersistenceLocationTable();
     TestFileSystemTelemetry();
     TestDroppedFileEnrichment();
+    TestBehaviorScoreVerdict();
     TestPacketInspector();
     TestE1000Device();
     TestNicPciConfig();

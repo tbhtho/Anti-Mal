@@ -317,6 +317,11 @@ struct AnalysisReport {
   std::filesystem::path samplePath;
   ScanResult scannerVerdict;
   Verdict sandboxVerdict = Verdict::Clean;
+  // Explainable behavioral verdict (T07): the score that produced
+  // sandboxVerdict and the per-signal "why" lines behind it. Empty for staged /
+  // pre-T07 reports; round-trips through the report JSON.
+  int verdictScore = 0;
+  std::vector<std::string> verdictRationale;
   DynamicRunSummary dynamicSummary;
   std::vector<EventRecord> events;
   std::vector<std::string> mitreTechniques;

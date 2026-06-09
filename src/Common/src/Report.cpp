@@ -712,6 +712,8 @@ AnalysisReport ParseReportJson(const std::string &text,
   report.samplePath = Utf8ToWide(StringValue(Member(root, "samplePath")));
   report.scannerVerdict = ParseScan(Member(root, "scannerVerdict"));
   report.sandboxVerdict = ParseVerdictValue(Member(root, "sandboxVerdict"));
+  report.verdictScore = IntValue(Member(root, "verdictScore"), 0);
+  report.verdictRationale = StringArrayValue(Member(root, "verdictRationale"));
   report.dynamicSummary = ParseDynamicSummary(Member(root, "dynamicSummary"));
   report.events = ParseEvents(Member(root, "events"));
   report.mitreTechniques = StringArrayValue(Member(root, "mitreTechniques"));
@@ -860,6 +862,8 @@ th{color:var(--muted);font-weight:600;font-size:11px;text-transform:uppercase;
 tr:hover td{background:rgba(58,162,255,.06)}
 .kv{display:grid;grid-template-columns:90px 1fr;gap:6px 12px;font-size:13px}
 .kv .k{color:var(--muted)}
+ul.why{margin:2px 0;padding-left:16px;font-size:12px;color:var(--muted)}
+ul.why li{margin:2px 0}
 code,.mono{font-family:Consolas,Cascadia Code,monospace;font-size:12px;
             color:#9ccfff}
 .proc-tree{list-style:none;padding-left:0;margin:0}
@@ -1193,7 +1197,20 @@ std::string BuildHtmlReportWithFrames(const AnalysisReport &report,
        << "</div>";
   html << "<div class=\"k\">sandbox</div><div><span class=\"badge "
        << HtmlEscape(ToString(report.sandboxVerdict)) << "\">"
-       << HtmlEscape(ToString(report.sandboxVerdict)) << "</span></div>";
+       << HtmlEscape(ToString(report.sandboxVerdict)) << "</span>";
+  if (report.verdictScore != 0 || !report.verdictRationale.empty()) {
+    html << " score " << report.verdictScore;
+  }
+  html << "</div>";
+  // T07: explainable verdict -- the per-signal "why this verdict" list directly
+  // under the sandbox badge so the conclusion is never an unexplained label.
+  if (!report.verdictRationale.empty()) {
+    html << "<div class=\"k\">why this verdict</div><div><ul class=\"why\">";
+    for (const auto &line : report.verdictRationale) {
+      html << "<li>" << HtmlEscape(line) << "</li>";
+    }
+    html << "</ul></div>";
+  }
   if (!report.dynamicSummary.status.empty() || report.dynamicSummary.started) {
     html << "<div class=\"k\">VM</div><div>"
          << HtmlEscape(report.dynamicSummary.status.empty()

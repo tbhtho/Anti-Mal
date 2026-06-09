@@ -1,5 +1,6 @@
 #include "antimal/HyperVOrchestrator.h"
 
+#include "antimal/BehaviorScore.h"
 #include "antimal/DetonationProtocol.h"
 #include "antimal/EventJournal.h"
 #include "antimal/PacketInspector.h"
@@ -8331,75 +8332,35 @@ void AppendJournalEvent(const std::filesystem::path &journalPath,
   }
 }
 
-// Map a completed in-house run to a sandbox verdict from what the guest actually
-// did. A VM/host failure is Error; a run where the sample never executed (gated
-// or healthcheck) is Unknown (NOT Error -- that was the long-standing bug where
-// every run badged "error"); an executed sample is scored from its observed
-// behavior. A calibrated model is the T07 follow-up; this is a conservative
-// first-order heuristic over the captured EventRecords.
+// Map a completed in-house run to an explainable behavioral verdict (T07).
+//
+// An actual run failure (VM crash, boot failure) is Error and is handled here
+// up front -- that is a host-side outcome, not guest behavior, so the scorer
+// never sees it. Everything else delegates to the pure, unit-tested
+// ScoreSandboxBehavior(), which weights real telemetry signals (persistence,
+// payload drops, external egress, privilege escalation, suspicious command
+// lines, crashes), emits a per-signal rationale, and -- critically -- treats a
+// plain timeout as a non-malicious signal so a benign sample that idled to its
+// time budget scores Clean instead of the old "ran to timeout => Malicious" FP.
+BehaviorScore DeriveSandboxScore(const DynamicRunSummary &s,
+                                 const std::vector<EventRecord> &events) {
+  if (s.crashed) {
+    BehaviorScore err;
+    err.verdict = Verdict::Error;
+    err.score = 0;
+    err.rationale.push_back(
+        "The run itself failed (VM crash / boot failure) before behavior could "
+        "be scored.");
+    return err;
+  }
+  return ScoreSandboxBehavior(s, events);
+}
+
+// Backward-compatible verdict-only entry point (call sites that only need the
+// enum). The rich path uses DeriveSandboxScore to also capture rationale+score.
 Verdict DeriveSandboxVerdict(const DynamicRunSummary &s,
                              const std::vector<EventRecord> &events) {
-  if (s.crashed) {
-    return Verdict::Error;
-  }
-  if (!s.sampleExecuted) {
-    return Verdict::Unknown;
-  }
-  auto lower = [](std::string v) {
-    for (char &c : v) {
-      c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
-    }
-    return v;
-  };
-  auto has = [](const std::string &h, const char *n) {
-    return h.find(n) != std::string::npos;
-  };
-  auto endsWith = [](const std::string &h, const char *suf) {
-    const size_t n = std::strlen(suf);
-    return h.size() >= n && h.compare(h.size() - n, n, suf) == 0;
-  };
-  // External = anything not obviously loopback/local (conservative: a private-LAN
-  // contact still counts as noteworthy egress for triage purposes).
-  auto externalEndpoint = [&](const std::string &t) {
-    return !t.empty() && !has(t, "127.0.0.1") && !has(t, "::1") &&
-           !has(t, "localhost");
-  };
-  int persistence = 0, injection = 0, extNet = 0, exeDrops = 0, mitre = 0;
-  for (const auto &e : events) {
-    const std::string cat = lower(e.category);
-    const std::string act = lower(e.action);
-    const std::string tgtL = lower(e.target);
-    if (cat == "registry" &&
-        (has(tgtL, "\\run") || has(tgtL, "winlogon") || has(tgtL, "services\\") ||
-         has(tgtL, "currentversion\\run"))) {
-      ++persistence;
-    }
-    if (cat == "process" &&
-        (has(act, "inject") || has(act, "remote") || has(act, "hollow"))) {
-      ++injection;
-    }
-    if (cat == "network" &&
-        (has(act, "connect") || has(act, "connection") || has(act, "dns")) &&
-        externalEndpoint(e.target)) {
-      ++extNet;
-    }
-    if (cat == "file" && has(act, "create") &&
-        (endsWith(tgtL, ".exe") || endsWith(tgtL, ".dll") ||
-         endsWith(tgtL, ".scr") || endsWith(tgtL, ".sys"))) {
-      ++exeDrops;
-    }
-    if (!e.mitre.empty()) {
-      ++mitre;
-    }
-  }
-  const int total = persistence + injection + extNet + exeDrops;
-  if ((injection > 0 && extNet > 0) || total >= 4 || mitre >= 3) {
-    return Verdict::Malicious;
-  }
-  if (total >= 1 || mitre >= 1) {
-    return Verdict::Suspicious;
-  }
-  return Verdict::Clean; // executed and exited with no noteworthy behavior
+  return DeriveSandboxScore(s, events).verdict;
 }
 
 void WriteErrorReport(const std::filesystem::path &reportPath,
@@ -8409,12 +8370,14 @@ void WriteErrorReport(const std::filesystem::path &reportPath,
                       const std::vector<EventRecord> &events = {},
                       const DynamicRunSummary &dynamicSummary = {},
                       const std::vector<std::filesystem::path> &artifacts = {},
-                      Verdict sandboxVerdict = Verdict::Error) {
+                      const BehaviorScore &behaviorScore = {}) {
   AnalysisReport report;
   report.runId = runId;
   report.samplePath = samplePath;
   report.scannerVerdict = ScanFile(samplePath);
-  report.sandboxVerdict = sandboxVerdict;
+  report.sandboxVerdict = behaviorScore.verdict;
+  report.verdictScore = behaviorScore.score;
+  report.verdictRationale = behaviorScore.rationale;
   report.dynamicSummary = dynamicSummary;
   report.events = events;
   // T24/T25: surface what the run actually observed. mitreTechniques unions the
@@ -10686,8 +10649,18 @@ DetonationResult InHouseOrchestrator::PrepareAndRun(
                                         {{"reason", "preflight"}}),
                        &events);
     result.dynamicSummary.eventsCaptured = static_cast<uint32_t>(events.size());
-    WriteErrorReport(result.reportPath, result.runId, samplePath, result.errors,
-                     events, result.dynamicSummary);
+    {
+      // Preflight blocked the run: this is a host-side run failure, not guest
+      // behavior -> Error verdict with a one-line rationale.
+      BehaviorScore blocked;
+      blocked.verdict = Verdict::Error;
+      blocked.rationale.push_back(
+          "Run was blocked at preflight; the VM never ran, so no behavior was "
+          "scored.");
+      WriteErrorReport(result.reportPath, result.runId, samplePath,
+                       result.errors, events, result.dynamicSummary, {},
+                       blocked);
+    }
     return result;
   }
 
@@ -12210,11 +12183,14 @@ DetonationResult InHouseOrchestrator::PrepareAndRun(
     result.dynamicSummary.artifactsCaptured =
         static_cast<uint32_t>(returnedArtifacts.size());
     WriteTextFile(vmSummaryPath, ToJson(result.dynamicSummary));
-    // Verdict from what the guest actually did (crash -> Error, executed ->
-    // scored behavior, never-ran -> Unknown), not a blanket "error".
+    // Explainable verdict from what the guest actually did (crash -> Error,
+    // executed -> scored behavior, never-ran -> Unknown), not a blanket "error".
+    // The score + per-signal rationale ride into the report alongside it.
+    const BehaviorScore behaviorScore =
+        DeriveSandboxScore(result.dynamicSummary, events);
     WriteErrorReport(result.reportPath, result.runId, samplePath, result.errors,
                      events, result.dynamicSummary, returnedArtifacts,
-                     DeriveSandboxVerdict(result.dynamicSummary, events));
+                     behaviorScore);
   } else {
     result.status = "staged";
     result.dynamicSummary.status = "staged";

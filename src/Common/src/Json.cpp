@@ -583,6 +583,8 @@ std::string ToJson(const AnalysisReport &report) {
   obj.AddString("samplePath", PathToUtf8(report.samplePath));
   obj.AddRaw("scannerVerdict", ToJson(report.scannerVerdict));
   obj.AddString("sandboxVerdict", ToString(report.sandboxVerdict));
+  obj.AddNumber("verdictScore", report.verdictScore);
+  obj.AddRaw("verdictRationale", JsonStringArray(report.verdictRationale));
   obj.AddRaw("dynamicSummary", ToJson(report.dynamicSummary));
   obj.AddRaw("events", events.str());
   obj.AddRaw("mitreTechniques", JsonStringArray(report.mitreTechniques));
