@@ -33,8 +33,16 @@ struct EventRecord {
   std::string action;
   uint32_t processId = 0;
   uint32_t parentProcessId = 0;
-  std::string imagePath;
+  std::string imagePath; // base image name for the process panel header
   std::string target;
+  // Deep process detail (Any.Run-class). Empty when not captured / not a
+  // process event. The prominent fields are first-class so consumers (report,
+  // UI) don't have to dig through `details`; lower-frequency attributes
+  // (SID, session id, start time, exit code) live in `details`.
+  std::string fullImagePath;  // full on-disk path of the process image
+  std::string commandLine;    // process command line (may carry a truncation marker)
+  std::string integrityLevel; // "Low" | "Medium" | "High" | "System" | ...
+  std::string userName;       // "DOMAIN\\user" the process runs as
   std::map<std::string, std::string> details;
   std::string mitre;
 };

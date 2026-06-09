@@ -368,6 +368,78 @@ void TestProcessTelemetryDiff() {
   Expect(starts == 3, "proc telemetry: delta start cap honored");
 }
 
+// Deep process telemetry (T11): the enriched ProcessInfo fields must flow
+// through the (pure) diff into the EventRecord -- first-class fields directly,
+// lower-frequency attributes (SID, session, start time, exit code) via details.
+void TestProcessTelemetryDeepFields() {
+  using antimal::ProcessInfo;
+  using antimal::ProcessSnapshot;
+
+  ProcessInfo rich;
+  rich.parentPid = 200;
+  rich.image = "malware.exe";
+  rich.fullImagePath = "C:\\Users\\bob\\AppData\\Local\\Temp\\malware.exe";
+  rich.commandLine = "\"malware.exe\" /silent --inject explorer.exe";
+  rich.integrityLevel = "High";
+  rich.userName = "WIN11\\analyst";
+  rich.userSid = "S-1-5-21-1-2-3-1001";
+  rich.startTimeUtc = "2026-06-09T10:11:12Z";
+  rich.sessionId = 1;
+  rich.hasSessionId = true;
+
+  ProcessSnapshot prev;
+  prev[4] = ProcessInfo{0, "System"};
+  ProcessSnapshot cur = prev;
+  cur[300] = rich;
+
+  auto delta = antimal::DiffProcessSnapshots(prev, cur, false, 64, 64);
+  const antimal::EventRecord *start = nullptr;
+  for (const auto &ev : delta) {
+    if (ev.action == "process.start" && ev.processId == 300) {
+      start = &ev;
+    }
+  }
+  Expect(start != nullptr, "proc deep: process.start emitted for enriched pid");
+  if (start) {
+    Expect(start->fullImagePath == rich.fullImagePath,
+           "proc deep: full image path carried");
+    Expect(start->commandLine == rich.commandLine,
+           "proc deep: command line carried");
+    Expect(start->integrityLevel == "High", "proc deep: integrity carried");
+    Expect(start->userName == "WIN11\\analyst", "proc deep: user carried");
+    Expect(start->target == rich.fullImagePath,
+           "proc deep: target prefers full path");
+    Expect(start->details.at("sid") == rich.userSid, "proc deep: sid in details");
+    Expect(start->details.at("sessionId") == "1",
+           "proc deep: session id in details");
+    Expect(start->details.at("startTime") == rich.startTimeUtc,
+           "proc deep: start time in details");
+    Expect(start->details.count("exitCode") == 0,
+           "proc deep: no exit code on a start event");
+  }
+
+  // Exit-code path: a tracked process that vanishes carries its captured exit
+  // code (rendered in hex) on the process.stop event. 0xC0000409 is the
+  // ShellHost STATUS_STACK_BUFFER_OVERRUN crash this surfaces as telemetry.
+  ProcessSnapshot prevWithCode = cur;
+  prevWithCode[300].exitCode = 0xC0000409u;
+  prevWithCode[300].hasExitCode = true;
+  ProcessSnapshot afterExit = prev; // pid 300 gone
+  auto stopDelta =
+      antimal::DiffProcessSnapshots(prevWithCode, afterExit, false, 64, 64);
+  const antimal::EventRecord *stop = nullptr;
+  for (const auto &ev : stopDelta) {
+    if (ev.action == "process.stop" && ev.processId == 300) {
+      stop = &ev;
+    }
+  }
+  Expect(stop != nullptr, "proc deep: process.stop emitted on exit");
+  if (stop) {
+    Expect(stop->details.at("exitCode") == "0xC0000409",
+           "proc deep: crash exit code rendered in hex on stop event");
+  }
+}
+
 void TestCom2UartFrames() {
   antimal::hv::SerialConsole com2(antimal::hv::SerialConsole::kCom2Base);
   com2.OnWrite(antimal::hv::SerialConsole::kCom2Base + 1, 0x01, 1);
@@ -3668,6 +3740,10 @@ void TestEventJournalRoundtrip() {
     ev.processId = 4321;
     ev.parentProcessId = 100;
     ev.imagePath = "C:\\Windows\\evil.exe";
+    ev.fullImagePath = "C:\\Windows\\System32\\evil.exe";
+    ev.commandLine = "\"evil.exe\" --payload C:\\Users\\bob\\stage.bin";
+    ev.integrityLevel = "System";
+    ev.userName = "NT AUTHORITY\\SYSTEM";
     ev.target = "C:\\Users\\bob\\stage.bin";
     ev.details["size"] = "12345";
     ev.details["quoted"] = "C:\\Temp\\\"payload\"\\stage.bin";
@@ -3692,6 +3768,15 @@ void TestEventJournalRoundtrip() {
   Expect(all[0].details["size"] == "12345", "journal: details map preserved");
   Expect(all[0].details["quoted"] == "C:\\Temp\\\"payload\"\\stage.bin",
          "journal: escaped detail preserved");
+  Expect(all[0].fullImagePath == "C:\\Windows\\System32\\evil.exe",
+         "journal: full image path round-trips");
+  Expect(all[0].commandLine ==
+             "\"evil.exe\" --payload C:\\Users\\bob\\stage.bin",
+         "journal: command line round-trips");
+  Expect(all[0].integrityLevel == "System",
+         "journal: integrity level round-trips");
+  Expect(all[0].userName == "NT AUTHORITY\\SYSTEM",
+         "journal: user name round-trips");
   Expect(all[1].target == "evil.example.com:443", "journal: target preserved");
 
   const std::string richLine = R"JSON({"timestampUtc":"2026-05-23T20:00:00Z","source":"Host","category":"vm","action":"boot.status","processId":0,"parentProcessId":0,"imagePath":"","target":"C:\\AntiMalRuns\\run\\vm-diagnostics.txt","details":{"message":"DriverSiPolicy.p7b, active CI policy data, bootres.dll","nested":"{\"status\":\"0xc0000225\",\"items\":[\"a\",\"b\"]}","note":"line\nquote\"slash\\"},"mitre":""})JSON";
@@ -5294,6 +5379,7 @@ int main() {
     TestJobMediaBlockDevice();
     TestHostSerialChannelFrames();
     TestProcessTelemetryDiff();
+    TestProcessTelemetryDeepFields();
     TestCom2UartFrames();
     TestSerialThreInterruptIsEdgeTriggered();
     TestSerialRxFifoResetPreservesBacklog();

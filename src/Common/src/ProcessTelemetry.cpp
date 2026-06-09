@@ -2,6 +2,8 @@
 
 #include "antimal/FileUtil.h" // UtcNowIso8601
 
+#include <cstdio> // _snprintf_s (hex exit-code formatting)
+
 #ifdef _WIN32
 #include <Windows.h>
 #include <tlhelp32.h>
@@ -21,9 +23,33 @@ EventRecord MakeProcessEvent(const std::string &action, uint32_t pid,
   ev.processId = pid;
   ev.parentProcessId = info.parentPid;
   ev.imagePath = info.image;
-  ev.target = info.image;
+  // Target shows the full path when we have it (more useful in the UI), else
+  // the base name.
+  ev.target = info.fullImagePath.empty() ? info.image : info.fullImagePath;
+  ev.fullImagePath = info.fullImagePath;
+  ev.commandLine = info.commandLine;
+  ev.integrityLevel = info.integrityLevel;
+  ev.userName = info.userName;
   ev.details["pid"] = std::to_string(pid);
   ev.details["ppid"] = std::to_string(info.parentPid);
+  // Lower-frequency attributes ride in the details map (round-trips through
+  // both serializers without per-field plumbing). Only set keys we captured.
+  if (!info.userSid.empty()) {
+    ev.details["sid"] = info.userSid;
+  }
+  if (info.hasSessionId) {
+    ev.details["sessionId"] = std::to_string(info.sessionId);
+  }
+  if (!info.startTimeUtc.empty()) {
+    ev.details["startTime"] = info.startTimeUtc;
+  }
+  // Exit code is the high-value signal — render in hex so crash codes like
+  // 0xC0000409 (STATUS_STACK_BUFFER_OVERRUN) are immediately recognizable.
+  if (info.hasExitCode) {
+    char hex[16];
+    _snprintf_s(hex, sizeof(hex), _TRUNCATE, "0x%08X", info.exitCode);
+    ev.details["exitCode"] = hex;
+  }
   return ev;
 }
 

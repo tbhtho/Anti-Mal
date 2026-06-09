@@ -24,6 +24,22 @@ namespace antimal {
 struct ProcessInfo {
   uint32_t parentPid = 0;
   std::string image; // base image name, e.g. "explorer.exe"
+
+  // Deep telemetry, captured in-guest by the GuestAgent (see its OS-capture
+  // path). All optional: DiffProcessSnapshots stays pure and simply copies
+  // whatever the caller filled in. Empty/zero means "not captured" (e.g. a
+  // protected process the agent couldn't open, or a host unit test that only
+  // exercises the diff).
+  std::string fullImagePath;   // full on-disk path, e.g. "C:\\Windows\\explorer.exe"
+  std::string commandLine;     // process command line (truncated with a marker if long)
+  std::string integrityLevel;  // "Low" | "Medium" | "High" | "System" | "Untrusted"
+  std::string userName;        // "DOMAIN\\user" of the process token
+  std::string userSid;         // SID string, e.g. "S-1-5-18"
+  std::string startTimeUtc;    // ISO-8601 UTC process creation time
+  uint32_t sessionId = 0;      // Windows session id
+  bool hasSessionId = false;   // distinguishes "session 0" from "not captured"
+  uint32_t exitCode = 0;       // captured at process exit (GetExitCodeProcess)
+  bool hasExitCode = false;    // true only on a process.stop where we read the code
 };
 
 // pid -> info. std::map keeps the diff output ordered (stable) so tests and the

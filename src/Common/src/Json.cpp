@@ -533,6 +533,10 @@ static std::string EventToJson(const EventRecord &event) {
   obj.AddNumber("processId", event.processId);
   obj.AddNumber("parentProcessId", event.parentProcessId);
   obj.AddString("imagePath", event.imagePath);
+  obj.AddString("fullImagePath", event.fullImagePath);
+  obj.AddString("commandLine", event.commandLine);
+  obj.AddString("integrityLevel", event.integrityLevel);
+  obj.AddString("userName", event.userName);
   obj.AddString("target", event.target);
   obj.AddRaw("details", details.str());
   obj.AddString("mitre", event.mitre);

@@ -911,7 +911,14 @@ void WebViewHost::RegisterHandlers() {
         eo.AddString("action", ev.action);
         eo.AddNumber("pid", ev.processId);
         eo.AddString("image", ev.imagePath);
+        eo.AddString("fullImagePath", ev.fullImagePath);
+        eo.AddString("commandLine", ev.commandLine);
+        eo.AddString("integrity", ev.integrityLevel);
+        eo.AddString("user", ev.userName);
         eo.AddString("target", ev.target);
+        if (const auto it = ev.details.find("exitCode"); it != ev.details.end()) {
+          eo.AddString("exitCode", it->second);
+        }
         eo.AddString("mitre", ev.mitre);
         evArr += eo.Finish();
       }
@@ -1117,7 +1124,14 @@ void WebViewHost::RegisterHandlers() {
           eo.AddString("action", ev.action);
           eo.AddNumber("pid", ev.processId);
           eo.AddString("image", ev.imagePath);
+          eo.AddString("fullImagePath", ev.fullImagePath);
+          eo.AddString("commandLine", ev.commandLine);
+          eo.AddString("integrity", ev.integrityLevel);
+          eo.AddString("user", ev.userName);
           eo.AddString("target", ev.target);
+          if (const auto it = ev.details.find("exitCode"); it != ev.details.end()) {
+            eo.AddString("exitCode", it->second);
+          }
           eo.AddString("mitre", ev.mitre);
           WebViewHost::Emit(h, "telemetry", eo.Finish());
           if (++streamed >= kMaxEvents) {

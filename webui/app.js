@@ -362,10 +362,12 @@
     var rows = events.slice().reverse().map(function (e) {
       var when = String(e.time || '').replace('T', ' ').replace('Z', '');
       var mit = e.mitre ? '<span class="tag">' + esc(e.mitre) + '</span>' : '';
+      var cmd = e.commandLine || (e.exitCode ? ('exit ' + e.exitCode) : '');
+      var img = shortPath(e.fullImagePath || e.image);
       return '<tr><td class="mono">' + esc(when) + '</td><td><span class="tag">' + esc(e.category || '?') + '</span></td><td>' + esc(e.action || '') +
-        '</td><td class="mono">' + esc(e.pid | 0) + '</td><td class="mono">' + esc(shortPath(e.image)) + '</td><td class="mono">' + esc(e.target || '') + '</td><td>' + mit + '</td></tr>';
+        '</td><td class="mono">' + esc(e.pid | 0) + '</td><td class="mono" title="' + esc(e.fullImagePath || '') + '">' + esc(img) + '</td><td class="mono">' + esc(e.user || '') + '</td><td class="mono">' + esc(e.integrity || '') + '</td><td class="mono" title="' + esc(e.commandLine || '') + '">' + esc(cmd) + '</td><td class="mono">' + esc(e.target || '') + '</td><td>' + mit + '</td></tr>';
     }).join('');
-    box.innerHTML = '<table class="grid"><thead><tr><th>Time</th><th>Category</th><th>Action</th><th>PID</th><th>Image</th><th>Target</th><th>MITRE</th></tr></thead><tbody>' + rows + '</tbody></table>';
+    box.innerHTML = '<table class="grid"><thead><tr><th>Time</th><th>Category</th><th>Action</th><th>PID</th><th>Image</th><th>User</th><th>Integ.</th><th>Cmd / Exit</th><th>Target</th><th>MITRE</th></tr></thead><tbody>' + rows + '</tbody></table>';
   }
   function onDashboardData(d) {
     if (!d || !d.hasRun) {
@@ -410,13 +412,15 @@
     var box = $('#vm-events') || $('#dash-events'); if (!box) return;
     var tbody = box.querySelector('tbody');
     if (!tbody) {
-      box.innerHTML = '<table class="grid"><thead><tr><th>Time</th><th>Category</th><th>Action</th><th>PID</th><th>Image</th><th>Target</th><th>MITRE</th></tr></thead><tbody></tbody></table>';
+      box.innerHTML = '<table class="grid"><thead><tr><th>Time</th><th>Category</th><th>Action</th><th>PID</th><th>Image</th><th>User</th><th>Integ.</th><th>Cmd / Exit</th><th>Target</th><th>MITRE</th></tr></thead><tbody></tbody></table>';
       tbody = box.querySelector('tbody');
     }
     var when = String(d.time || '').replace('T', ' ').replace('Z', '');
+    var cmd = d.commandLine || (d.exitCode ? ('exit ' + d.exitCode) : '');
+    var img = shortPath(d.fullImagePath || d.image);
     var tr = document.createElement('tr');
     tr.innerHTML = '<td class="mono">' + esc(when) + '</td><td><span class="tag">' + esc(cat) + '</span></td><td>' + esc(act) +
-      '</td><td class="mono">' + esc(d.pid | 0) + '</td><td class="mono">' + esc(shortPath(d.image)) + '</td><td class="mono">' + esc(tgt) +
+      '</td><td class="mono">' + esc(d.pid | 0) + '</td><td class="mono" title="' + esc(d.fullImagePath || '') + '">' + esc(img) + '</td><td class="mono">' + esc(d.user || '') + '</td><td class="mono">' + esc(d.integrity || '') + '</td><td class="mono" title="' + esc(d.commandLine || '') + '">' + esc(cmd) + '</td><td class="mono">' + esc(tgt) +
       '</td><td>' + (d.mitre ? '<span class="tag">' + esc(d.mitre) + '</span>' : '') + '</td>';
     tbody.insertBefore(tr, tbody.firstChild);
   }

@@ -390,6 +390,10 @@ std::vector<EventRecord> ParseEvents(const JsonValue *value) {
     event.parentProcessId =
         static_cast<uint32_t>(IntValue(Member(item, "parentProcessId")));
     event.imagePath = StringValue(Member(item, "imagePath"));
+    event.fullImagePath = StringValue(Member(item, "fullImagePath"));
+    event.commandLine = StringValue(Member(item, "commandLine"));
+    event.integrityLevel = StringValue(Member(item, "integrityLevel"));
+    event.userName = StringValue(Member(item, "userName"));
     event.target = StringValue(Member(item, "target"));
     event.mitre = StringValue(Member(item, "mitre"));
     if (const auto *details = Member(item, "details");
@@ -980,10 +984,21 @@ void EmitEventTable(std::ostringstream &html,
   html << "<input id=\"event-search\" placeholder=\"Search events (path, action, target)\">";
   html << "<span id=\"filter-status\" class=\"mono\" style=\"color:var(--muted)\">all events</span>";
   html << "</div>";
-  html << "<table><thead><tr><th>Time</th><th>PID</th><th>Source</th><th>Category</th><th>Action</th><th>Target</th><th>MITRE</th></tr></thead>";
+  html << "<table><thead><tr><th>Time</th><th>PID</th><th>Source</th><th>Category</th><th>Action</th><th>Target</th><th>User</th><th>Integ.</th><th>Cmd / Exit</th><th>MITRE</th></tr></thead>";
   html << "<tbody id=\"event-tbody\">";
   for (const auto &e : events) {
-    const std::string search = e.imagePath + " " + e.action + " " + e.target;
+    // Prefer the command line; fall back to the exit code (rendered in hex by
+    // the collector) so a crashing process shows e.g. 0xC0000409 here.
+    std::string cmdOrExit = e.commandLine;
+    if (cmdOrExit.empty()) {
+      const auto it = e.details.find("exitCode");
+      if (it != e.details.end()) {
+        cmdOrExit = "exit " + it->second;
+      }
+    }
+    const std::string search = e.imagePath + " " + e.fullImagePath + " " +
+                               e.action + " " + e.target + " " + e.commandLine +
+                               " " + e.userName;
     html << "<tr data-pid=\"" << e.processId << "\" data-search=\""
          << HtmlEscape(search) << "\">"
          << "<td class=\"mono\">" << HtmlEscape(e.timestampUtc) << "</td>"
@@ -992,7 +1007,12 @@ void EmitEventTable(std::ostringstream &html,
          << "<td><span class=\"chip cat-" << HtmlEscape(e.category) << "\">"
          << HtmlEscape(e.category) << "</span></td>"
          << "<td>" << HtmlEscape(e.action) << "</td>"
-         << "<td class=\"mono\">" << HtmlEscape(e.target) << "</td>"
+         << "<td class=\"mono\" title=\"" << HtmlEscape(e.fullImagePath)
+         << "\">" << HtmlEscape(e.target) << "</td>"
+         << "<td class=\"mono\">" << HtmlEscape(e.userName) << "</td>"
+         << "<td class=\"mono\">" << HtmlEscape(e.integrityLevel) << "</td>"
+         << "<td class=\"mono\" title=\"" << HtmlEscape(e.commandLine) << "\">"
+         << HtmlEscape(cmdOrExit) << "</td>"
          << "<td class=\"mono\">" << HtmlEscape(e.mitre) << "</td></tr>";
   }
   html << "</tbody></table>";

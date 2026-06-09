@@ -15,6 +15,8 @@
 #include <Windows.h>
 #include <UserEnv.h>   // CreateEnvironmentBlock (visible-session launch)
 #include <WtsApi32.h>  // WTSQueryUserToken (active console session token)
+#include <sddl.h>      // ConvertSidToStringSidW (process-token SID string)
+#include <winternl.h>  // NTSTATUS / UNICODE_STRING for the ntdll command-line query
 
 #include <algorithm>
 #include <atomic>
@@ -62,6 +64,212 @@ void BootLog(const std::string &line) {
     WriteFile(h, "\r\n", 2, &w, nullptr);
     CloseHandle(h);
   }
+}
+
+// ---------------------------------------------------------------------------
+// Deep process telemetry (backlog T11).
+//
+// Enriches each tracked guest process with the detail an Any.Run-class report
+// expects: full image path, command line, integrity level, token user/SID,
+// session id, start time, and -- the high-value one -- the exit code, captured
+// at the moment a tracked process exits (so a crash code like 0xC0000409,
+// STATUS_STACK_BUFFER_OVERRUN, surfaces as telemetry instead of a guess).
+//
+// The agent runs as LocalSystem, so enabling SeDebugPrivilege lets it open
+// cross-session processes with PROCESS_QUERY_LIMITED_INFORMATION. The pure diff
+// (DiffProcessSnapshots) consumes whatever we fill in here -- it never calls an
+// OS API itself, so it stays host-unit-testable.
+// ---------------------------------------------------------------------------
+
+void EnableDebugPrivilege() {
+  HANDLE token = nullptr;
+  if (!OpenProcessToken(GetCurrentProcess(),
+                        TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY, &token)) {
+    return;
+  }
+  LUID luid{};
+  if (LookupPrivilegeValueW(nullptr, SE_DEBUG_NAME, &luid)) {
+    TOKEN_PRIVILEGES tp{};
+    tp.PrivilegeCount = 1;
+    tp.Privileges[0].Luid = luid;
+    tp.Privileges[0].Attributes = SE_PRIVILEGE_ENABLED;
+    (void)AdjustTokenPrivileges(token, FALSE, &tp, sizeof(tp), nullptr, nullptr);
+  }
+  CloseHandle(token);
+}
+
+std::string NarrowUtf8(const wchar_t *wide, int wideLen = -1) {
+  if (!wide || !*wide) {
+    return {};
+  }
+  const int n =
+      WideCharToMultiByte(CP_UTF8, 0, wide, wideLen, nullptr, 0, nullptr, nullptr);
+  if (n <= 0) {
+    return {};
+  }
+  std::string out(static_cast<size_t>(n), '\0');
+  WideCharToMultiByte(CP_UTF8, 0, wide, wideLen, out.data(), n, nullptr, nullptr);
+  // For a NUL-terminated source the count includes the terminator; trim it.
+  if (wideLen == -1 && !out.empty() && out.back() == '\0') {
+    out.pop_back();
+  }
+  return out;
+}
+
+// FILETIME (100ns ticks since 1601) -> "YYYY-MM-DDTHH:MM:SSZ".
+std::string FileTimeToIso8601Utc(const FILETIME &ft) {
+  if (ft.dwLowDateTime == 0 && ft.dwHighDateTime == 0) {
+    return {};
+  }
+  SYSTEMTIME st{};
+  if (!FileTimeToSystemTime(&ft, &st)) {
+    return {};
+  }
+  char buf[32];
+  _snprintf_s(buf, sizeof(buf), _TRUNCATE, "%04u-%02u-%02uT%02u:%02u:%02uZ",
+              st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond);
+  return std::string(buf);
+}
+
+std::string IntegrityLevelString(HANDLE token) {
+  DWORD size = 0;
+  GetTokenInformation(token, TokenIntegrityLevel, nullptr, 0, &size);
+  if (size == 0) {
+    return {};
+  }
+  std::vector<unsigned char> buf(size);
+  if (!GetTokenInformation(token, TokenIntegrityLevel, buf.data(), size,
+                           &size)) {
+    return {};
+  }
+  auto *til = reinterpret_cast<TOKEN_MANDATORY_LABEL *>(buf.data());
+  const DWORD subCount = *GetSidSubAuthorityCount(til->Label.Sid);
+  if (subCount == 0) {
+    return {};
+  }
+  const DWORD rid = *GetSidSubAuthority(til->Label.Sid, subCount - 1);
+  if (rid < SECURITY_MANDATORY_LOW_RID) {
+    return "Untrusted";
+  }
+  if (rid < SECURITY_MANDATORY_MEDIUM_RID) {
+    return "Low";
+  }
+  if (rid < SECURITY_MANDATORY_HIGH_RID) {
+    return "Medium";
+  }
+  if (rid < SECURITY_MANDATORY_SYSTEM_RID) {
+    return "High";
+  }
+  return "System";
+}
+
+void FillTokenIdentity(HANDLE process, antimal::ProcessInfo &info) {
+  HANDLE token = nullptr;
+  if (!OpenProcessToken(process, TOKEN_QUERY, &token)) {
+    return;
+  }
+  info.integrityLevel = IntegrityLevelString(token);
+
+  DWORD size = 0;
+  GetTokenInformation(token, TokenUser, nullptr, 0, &size);
+  if (size > 0) {
+    std::vector<unsigned char> buf(size);
+    if (GetTokenInformation(token, TokenUser, buf.data(), size, &size)) {
+      auto *tu = reinterpret_cast<TOKEN_USER *>(buf.data());
+      LPWSTR sidStr = nullptr;
+      if (ConvertSidToStringSidW(tu->User.Sid, &sidStr)) {
+        info.userSid = NarrowUtf8(sidStr);
+        LocalFree(sidStr);
+      }
+      wchar_t name[256];
+      wchar_t domain[256];
+      DWORD nameLen = 256;
+      DWORD domainLen = 256;
+      SID_NAME_USE use{};
+      if (LookupAccountSidW(nullptr, tu->User.Sid, name, &nameLen, domain,
+                            &domainLen, &use)) {
+        std::string domainUtf8 = NarrowUtf8(domain);
+        std::string nameUtf8 = NarrowUtf8(name);
+        info.userName =
+            domainUtf8.empty() ? nameUtf8 : (domainUtf8 + "\\" + nameUtf8);
+      }
+    }
+  }
+  CloseHandle(token);
+}
+
+// ProcessCommandLineInformation == 60 (Win8.1+; supported on Win11). The query
+// returns a UNICODE_STRING followed inline by the command-line buffer.
+constexpr int kProcessCommandLineInformation = 60;
+constexpr size_t kCommandLineCap = 4096;
+
+std::string QueryCommandLine(HANDLE process) {
+  using NtQip_t = LONG(NTAPI *)(HANDLE, int, PVOID, ULONG, PULONG);
+  static NtQip_t ntqip = []() -> NtQip_t {
+    HMODULE nt = GetModuleHandleW(L"ntdll.dll");
+    return nt ? reinterpret_cast<NtQip_t>(
+                    GetProcAddress(nt, "NtQueryInformationProcess"))
+              : nullptr;
+  }();
+  if (!ntqip) {
+    return {};
+  }
+  ULONG needed = 0;
+  // First call sizes the buffer (STATUS_INFO_LENGTH_MISMATCH expected).
+  ntqip(process, kProcessCommandLineInformation, nullptr, 0, &needed);
+  if (needed == 0 || needed > (1u << 20)) {
+    return {};
+  }
+  std::vector<unsigned char> buf(needed);
+  const LONG status = ntqip(process, kProcessCommandLineInformation, buf.data(),
+                            needed, &needed);
+  if (status < 0) {
+    return {};
+  }
+  auto *us = reinterpret_cast<UNICODE_STRING *>(buf.data());
+  if (!us->Buffer || us->Length == 0) {
+    return {};
+  }
+  std::string cmd =
+      NarrowUtf8(us->Buffer, static_cast<int>(us->Length / sizeof(wchar_t)));
+  if (cmd.size() > kCommandLineCap) {
+    cmd.resize(kCommandLineCap);
+    cmd += "...(truncated)";
+  }
+  return cmd;
+}
+
+// Opens `pid` and enriches `info` (full path, command line, integrity, user,
+// SID, session, start time). On success the returned handle is kept by the
+// caller (in the per-PID handle map) so the exit code can be read later; the
+// caller owns closing it. Returns nullptr if the process can't be opened.
+HANDLE EnrichProcessInfo(uint32_t pid, antimal::ProcessInfo &info) {
+  if (pid == 0) {
+    return nullptr;
+  }
+  HANDLE process =
+      OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+  if (!process) {
+    return nullptr;
+  }
+  wchar_t path[MAX_PATH * 2];
+  DWORD pathLen = static_cast<DWORD>(std::size(path));
+  if (QueryFullProcessImageNameW(process, 0, path, &pathLen)) {
+    info.fullImagePath = NarrowUtf8(path, static_cast<int>(pathLen));
+  }
+  info.commandLine = QueryCommandLine(process);
+  FillTokenIdentity(process, info);
+
+  DWORD session = 0;
+  if (ProcessIdToSessionId(pid, &session)) {
+    info.sessionId = session;
+    info.hasSessionId = true;
+  }
+  FILETIME creation{}, exitT{}, kernelT{}, userT{};
+  if (GetProcessTimes(process, &creation, &exitT, &kernelT, &userT)) {
+    info.startTimeUtc = FileTimeToIso8601Utc(creation);
+  }
+  return process;
 }
 
 // Emits a placeholder journal line so the host UI has something to render
@@ -436,6 +644,12 @@ int RunHostChannelLoop(std::string reason, bool serviceMode) {
   // process panel shows what is already running.
   antimal::ProcessSnapshot knownProcs;
   bool processBaselineSent = false;
+  // Per-PID query handle (PROCESS_QUERY_LIMITED_INFORMATION) held for every
+  // tracked process so its exit code can be read at the moment it exits (T11).
+  // SeDebugPrivilege (enabled below) lets the LocalSystem agent open
+  // cross-session processes.
+  std::map<uint32_t, HANDLE> procHandles;
+  EnableDebugPrivilege();
   antimal::TcpSnapshot knownConns;
   bool netBaselineSent = false;
   antimal::RegistrySnapshot knownReg;
@@ -643,6 +857,52 @@ int RunHostChannelLoop(std::string reason, bool serviceMode) {
     if (tick % kProcessPollEveryTicks == 0) {
       auto current = antimal::CaptureProcessSnapshot();
       if (!current.empty() || processBaselineSent) {
+        // Enrich every process in the fresh snapshot with deep detail (full
+        // path, command line, integrity, user/SID, session, start time) and
+        // keep an open query handle so its exit code can be read later. New
+        // PIDs get opened+enriched; PIDs we already track inherit their cached
+        // enrichment (it doesn't change over a process's lifetime).
+        for (auto &entry : current) {
+          const uint32_t pid = entry.first;
+          auto known = knownProcs.find(pid);
+          if (known != knownProcs.end()) {
+            // Carry forward the detail captured when we first saw this PID.
+            const antimal::ProcessInfo &prevInfo = known->second;
+            entry.second.fullImagePath = prevInfo.fullImagePath;
+            entry.second.commandLine = prevInfo.commandLine;
+            entry.second.integrityLevel = prevInfo.integrityLevel;
+            entry.second.userName = prevInfo.userName;
+            entry.second.userSid = prevInfo.userSid;
+            entry.second.startTimeUtc = prevInfo.startTimeUtc;
+            entry.second.sessionId = prevInfo.sessionId;
+            entry.second.hasSessionId = prevInfo.hasSessionId;
+            continue;
+          }
+          HANDLE h = EnrichProcessInfo(pid, entry.second);
+          if (h) {
+            procHandles[pid] = h;
+          }
+        }
+        // For PIDs that vanished, read their exit code (the high-value T11
+        // signal -- captures crash codes like 0xC0000409) into the cached
+        // `knownProcs` entry that DiffProcessSnapshots reports as process.stop,
+        // then release the held handle.
+        for (auto &entry : knownProcs) {
+          if (current.find(entry.first) != current.end()) {
+            continue; // still alive
+          }
+          auto hit = procHandles.find(entry.first);
+          if (hit != procHandles.end()) {
+            DWORD code = 0;
+            if (GetExitCodeProcess(hit->second, &code) &&
+                code != STILL_ACTIVE) {
+              entry.second.exitCode = code;
+              entry.second.hasExitCode = true;
+            }
+            CloseHandle(hit->second);
+            procHandles.erase(hit);
+          }
+        }
         auto procEvents = antimal::DiffProcessSnapshots(
             knownProcs, current, !processBaselineSent, kProcessBaselineCap,
             kProcessDeltaCap);
@@ -721,6 +981,9 @@ int RunHostChannelLoop(std::string reason, bool serviceMode) {
     std::this_thread::sleep_for(std::chrono::seconds(1));
   }
 
+  for (auto &h : procHandles) {
+    CloseHandle(h.second);
+  }
   CloseHandle(com2);
   return 0;
 }

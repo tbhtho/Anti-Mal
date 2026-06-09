@@ -416,6 +416,10 @@ std::string SerializeEventJsonLine(const EventRecord &event) {
   obj.AddNumber("processId", event.processId);
   obj.AddNumber("parentProcessId", event.parentProcessId);
   obj.AddString("imagePath", event.imagePath);
+  obj.AddString("fullImagePath", event.fullImagePath);
+  obj.AddString("commandLine", event.commandLine);
+  obj.AddString("integrityLevel", event.integrityLevel);
+  obj.AddString("userName", event.userName);
   obj.AddString("target", event.target);
   obj.AddRaw("details", details.str());
   obj.AddString("mitre", event.mitre);
@@ -431,6 +435,10 @@ EventRecord ParseEventJsonLine(const std::string &line) {
   event.processId = NumberMember(line, "processId");
   event.parentProcessId = NumberMember(line, "parentProcessId");
   event.imagePath = StringMember(line, "imagePath");
+  event.fullImagePath = StringMember(line, "fullImagePath");
+  event.commandLine = StringMember(line, "commandLine");
+  event.integrityLevel = StringMember(line, "integrityLevel");
+  event.userName = StringMember(line, "userName");
   event.target = StringMember(line, "target");
   event.details = DetailsMember(line);
   event.mitre = StringMember(line, "mitre");
