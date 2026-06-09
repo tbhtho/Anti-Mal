@@ -756,6 +756,15 @@
             liveCursor.x = cv ? cv.width / 2 : 0; liveCursor.y = cv ? cv.height / 2 : 0; liveCursor.valid = !!cv;
           } else { if (f) f.style.outline = 'none'; liveCursor.valid = false; releaseHeldKeys(); } // never leave a key stuck
         });
+        // While driving the VM, the scroll wheel must NOT scroll the host page.
+        // passive:false so preventDefault actually takes effect. (Delivering the
+        // wheel to the guest needs PS/2 IntelliMouse 4-byte packets -- not yet
+        // implemented; for now we just stop the leak.)
+        document.addEventListener('wheel', function (e) {
+          if (!livePollTimer || !vmCaptured()) return;
+          e.preventDefault();
+          e.stopPropagation();
+        }, { passive: false });
         // Relative motion (movementX/Y) keeps coming under pointer lock even past
         // the window edge -- exactly what a guest mouse expects.
         document.addEventListener('mousemove', function (e) {
