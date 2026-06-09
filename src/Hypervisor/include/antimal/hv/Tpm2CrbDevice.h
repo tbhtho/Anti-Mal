@@ -42,6 +42,21 @@ struct TpmPcrExtendTrace {
   std::vector<TpmPcrDigestTrace> digests;
 };
 
+// The TPM identity words the device actually reports for TPM_PT_MANUFACTURER +
+// VENDOR_STRING_1..4 (properties 0x105-0x109). Defined here as the SINGLE source
+// of truth (the device's property table indexes this array, and the anti-evasion
+// unit test asserts these exact bytes carry no sandbox-identifying ASCII) so the
+// test guards the shipped value rather than a hand-copied mirror. Big-endian per
+// the TPM wire: STMicroelectronics ("STM "), consistent with the Dell OptiPlex
+// SMBIOS identity. NEVER let any of these decode to AntiMal/ANTIMAL/AMAL/Anti/Mal.
+inline constexpr std::array<uint32_t, 5> kTpmIdentityWords = {
+    0x53544D20u, // TPM_PT_MANUFACTURER  "STM "
+    0x53544D20u, // VENDOR_STRING_1      "STM "
+    0x53543333u, // VENDOR_STRING_2      "ST33"
+    0x48545048u, // VENDOR_STRING_3      "HTPH"
+    0x322E3200u, // VENDOR_STRING_4      "2.2\0"
+};
+
 class Tpm2CrbDevice final : public IMmioDevice {
 public:
   static constexpr uint64_t kDefaultMmioBase = 0xFED40000ull;

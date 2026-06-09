@@ -10441,6 +10441,9 @@ DetonationResult InHouseOrchestrator::PrepareAndRun(
       (result.runDir / L"run.lock").c_str(), GENERIC_WRITE, 0 /*exclusive*/,
       nullptr, CREATE_ALWAYS,
       FILE_ATTRIBUTE_NORMAL | FILE_FLAG_DELETE_ON_CLOSE, nullptr);
+  // Capture the failure reason NOW, before any intervening call clobbers it.
+  const unsigned long runLockError =
+      (runLock.handle == INVALID_HANDLE_VALUE) ? ::GetLastError() : 0ul;
 
   std::vector<EventRecord> events;
   std::vector<std::filesystem::path> returnedArtifacts;
@@ -10449,6 +10452,22 @@ DetonationResult InHouseOrchestrator::PrepareAndRun(
                                       {{"runId", result.runId},
                                        {"networkMode", ToString(networkMode)}}),
                      &events);
+  if (runLock.handle == INVALID_HANDLE_VALUE) {
+    // T08: we could not hold an exclusive run.lock (transient AV/indexer handle,
+    // ACL, etc.). The run still proceeds, but a concurrent detonation's
+    // overlay-GC can no longer see us as live and could reclaim this run's
+    // overlay mid-run. Record WHY so an unexpectedly-deleted overlay is
+    // explainable rather than a silent reopening of the very data-loss window
+    // the lock closes.
+    const std::string detail =
+        "run.lock unacquired (err=" + std::to_string(runLockError) +
+        "); concurrent overlay-GC protection degraded for this run";
+    AppendJournalEvent(result.journalPath,
+                       MakeSandboxEvent("run.lock.degraded", samplePath,
+                                        {{"runId", result.runId},
+                                         {"detail", detail}}),
+                       &events);
+  }
 
   const auto stagedSample = result.runDir / "in" / samplePath.filename();
   std::error_code ec;

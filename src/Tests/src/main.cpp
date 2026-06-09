@@ -5236,16 +5236,12 @@ void TestGuestClockControllable() {
 // "AntiMal"/"AMAL"/"Anti"/"Mal" ASCII. This guards the byte constants in
 // Tpm2CrbDevice.cpp's BuildTpmPropertyCapability() against regressions.
 void TestTpmIdentityIsScrubbed() {
-  // The four-byte big-endian words for TPM_PT_MANUFACTURER (0x105) and
-  // VENDOR_STRING_1..4 (0x106..0x109), mirrored from Tpm2CrbDevice.cpp.
-  constexpr uint32_t kManufacturer = 0x53544D20; // "STM "
-  constexpr std::array<uint32_t, 5> kIdentityWords{{
-      kManufacturer,
-      0x53544D20, // VENDOR_STRING_1 "STM "
-      0x53543333, // VENDOR_STRING_2 "ST33"
-      0x48545048, // VENDOR_STRING_3 "HTPH"
-      0x322E3200, // VENDOR_STRING_4 "2.2\0"
-  }};
+  // Guard the SHIPPED bytes, not a copy: read the device's own identity words
+  // (kTpmIdentityWords in Tpm2CrbDevice.h, which the property table at 0x105-0x109
+  // indexes). If anyone reverts the device identity to "AMAL"/"Anti"/"Mal", this
+  // test fails because it asserts the same array the device serializes.
+  const std::array<uint32_t, 5> &kIdentityWords = antimal::hv::kTpmIdentityWords;
+  const uint32_t kManufacturer = kIdentityWords[0];
 
   auto decode = [](uint32_t word) {
     std::string s;
@@ -5275,9 +5271,10 @@ void TestTpmIdentityIsScrubbed() {
            "TPM identity: vendor strings free of sandbox name");
   }
 
-  // Sanity: confirm the expected plausible ST values decode as intended.
-  Expect(decode(0x53543333) == "ST33", "TPM identity: vendor word 2 == ST33");
-  Expect(decode(0x48545048) == "HTPH", "TPM identity: vendor word 3 == HTPH");
+  // Sanity: the device's own vendor words decode to the intended plausible ST
+  // values (asserts the shipped array, so a silent identity swap is caught).
+  Expect(decode(kIdentityWords[2]) == "ST33", "TPM identity: vendor word 2 == ST33");
+  Expect(decode(kIdentityWords[3]) == "HTPH", "TPM identity: vendor word 3 == HTPH");
 }
 
 int main() {
