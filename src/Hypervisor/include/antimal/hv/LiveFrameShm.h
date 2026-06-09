@@ -81,8 +81,11 @@ public:
 
   bool Valid() const noexcept { return view_ != nullptr; }
 
+  // srcStride = bytes between source rows (0 = tightly packed width*4). A wider
+  // stride lets the caller copy just the visible width out of a larger virtual
+  // surface (panning / double-buffering) without the off-screen padding.
   void Publish(const uint8_t *pixels, uint32_t width, uint32_t height,
-               uint32_t bpp) {
+               uint32_t bpp, uint32_t srcStride = 0) {
     if (!view_ || !pixels || bpp != 32 || width == 0 || height == 0) {
       return;
     }
@@ -90,8 +93,17 @@ public:
     if (bytes > kMaxPixelBytes) {
       return;
     }
+    const uint32_t rowBytes = width * 4u;
+    const uint32_t stride = srcStride ? srcStride : rowBytes;
     auto *h = reinterpret_cast<Header *>(view_);
-    std::memcpy(view_ + kHeaderBytes, pixels, static_cast<size_t>(bytes));
+    if (stride == rowBytes) {
+      std::memcpy(view_ + kHeaderBytes, pixels, static_cast<size_t>(bytes));
+    } else {
+      for (uint32_t y = 0; y < height; ++y) {
+        std::memcpy(view_ + kHeaderBytes + static_cast<size_t>(y) * rowBytes,
+                    pixels + static_cast<size_t>(y) * stride, rowBytes);
+      }
+    }
     h->width = width;
     h->height = height;
     h->bpp = bpp;
@@ -105,5 +117,33 @@ private:
   HANDLE handle_ = nullptr;
   uint8_t *view_ = nullptr;
 };
+
+// True if a BGRX frame region is near-uniform (e.g. the guest cleared the
+// framebuffer mid-repaint and hasn't redrawn yet). Windows' basic display path
+// clears to a flat dark color then repaints the desktop, so a ~30 Hz capture
+// catches the cleared state half the time -- the desktop<->blank flash. Callers
+// skip publishing/saving these so only complete frames are shown. Samples a
+// sparse grid (cheap); a real desktop has wide luma spread, a cleared frame ~0.
+inline bool LiveFrameIsBlank(const uint8_t *px, uint32_t width, uint32_t height,
+                             uint32_t stride) {
+  if (!px || width < 8 || height < 8) {
+    return false;
+  }
+  const uint32_t steps = 12; // 12x12 = 144 samples across the frame
+  uint8_t lo = 255, hi = 0;
+  for (uint32_t gy = 0; gy < steps; ++gy) {
+    const uint32_t y = (height - 1) * gy / (steps - 1);
+    const uint8_t *row = px + static_cast<size_t>(y) * stride;
+    for (uint32_t gx = 0; gx < steps; ++gx) {
+      const uint32_t x = (width - 1) * gx / (steps - 1);
+      const uint8_t *p = row + static_cast<size_t>(x) * 4;
+      const uint8_t v = static_cast<uint8_t>(
+          (static_cast<int>(p[0]) + p[1] + p[2]) / 3); // BGRX -> avg luma
+      if (v < lo) lo = v;
+      if (v > hi) hi = v;
+    }
+  }
+  return (hi - lo) < 14; // tight spread => uniform/cleared frame
+}
 
 } // namespace antimal::hv

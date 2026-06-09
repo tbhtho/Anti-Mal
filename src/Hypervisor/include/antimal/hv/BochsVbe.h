@@ -70,6 +70,14 @@ public:
   bool Enabled() const noexcept {
     return (regs_[DispiIndexEnable] & 0x01u) != 0;
   }
+  // Panning / double-buffering: the guest scrolls the visible window inside a
+  // larger virtual surface by writing X/Y_OFFSET (and a wider VIRT_WIDTH). Windows'
+  // basic display path page-flips the desktop by toggling Y_OFFSET between a front
+  // and back buffer, so a capture that ignores these reads the WRONG buffer half
+  // the time (the desktop<->black flash). Readers must honor them.
+  uint16_t XOffset() const noexcept { return regs_[DispiIndexXOffset]; }
+  uint16_t YOffset() const noexcept { return regs_[DispiIndexYOffset]; }
+  uint16_t VirtWidth() const noexcept { return regs_[DispiIndexVirtWidth]; }
 
   const uint8_t *FramebufferHost() const noexcept { return framebufferHost_; }
   uint8_t *FramebufferHost() noexcept { return framebufferHost_; }

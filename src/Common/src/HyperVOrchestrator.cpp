@@ -11,6 +11,7 @@
 #include "antimal/Screenshot.h"
 #include "antimal/hv/BlockDevice.h"
 #include "antimal/hv/HostSerialChannel.h"
+#include "antimal/hv/LiveFrameShm.h"
 #include "antimal/hv/VirtualMachine.h"
 #include "antimal/hv/WhpHost.h"
 
@@ -11080,7 +11081,11 @@ DetonationResult InHouseOrchestrator::PrepareAndRun(
               if (needed <= snap.framebufferBytes &&
                   FramebufferHasVisiblePixels(
                       snap.framebufferHost, snap.framebufferWidth,
-                      snap.framebufferHeight, snap.framebufferBpp / 8)) {
+                      snap.framebufferHeight, snap.framebufferBpp / 8) &&
+                  !hv::LiveFrameIsBlank(snap.framebufferHost,
+                                        snap.framebufferWidth,
+                                        snap.framebufferHeight,
+                                        snap.framebufferWidth * 4u)) {
                 char gpuName[64];
                 _snprintf_s(gpuName, sizeof(gpuName), _TRUNCATE,
                             "guest-%06u.png", frameIdx);
@@ -11113,7 +11118,11 @@ DetonationResult InHouseOrchestrator::PrepareAndRun(
               if (lneeded <= snap.framebufferBytes &&
                   FramebufferHasVisiblePixels(
                       snap.framebufferHost, snap.framebufferWidth,
-                      snap.framebufferHeight, snap.framebufferBpp / 8)) {
+                      snap.framebufferHeight, snap.framebufferBpp / 8) &&
+                  !hv::LiveFrameIsBlank(snap.framebufferHost,
+                                        snap.framebufferWidth,
+                                        snap.framebufferHeight,
+                                        snap.framebufferWidth * 4u)) {
                 const auto livePath = screenshotsDirCopy / L"live.png";
                 const auto liveTmp = screenshotsDirCopy / L"live.png.tmp";
                 try {

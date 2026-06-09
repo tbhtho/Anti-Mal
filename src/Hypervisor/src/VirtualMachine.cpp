@@ -2715,28 +2715,55 @@ VmRunSummary VirtualMachine::RunLoop(
       const uint32_t h = static_cast<uint32_t>(vbe_.Height());
       const uint32_t bpp = static_cast<uint32_t>(vbe_.Bpp());
       const uint64_t fbBytes = vbe_.FramebufferBytes();
+      const uint32_t bytespp = bpp ? bpp / 8u : 4u;
+      uint8_t *const fbBase = vbe_.FramebufferHost();
+      // Publish from the VISIBLE scanline start, honoring the guest's panning /
+      // double-buffer offsets (Y_OFFSET/X_OFFSET over a VIRT_WIDTH-wide surface).
+      // Windows page-flips the desktop by toggling Y_OFFSET between a front and
+      // back buffer; capturing the fixed base instead read the blank back buffer
+      // half the time -- the desktop<->black flash. Falls back to the base if the
+      // computed window would run past the framebuffer.
+      auto publishGeom = [&](uint32_t pw, uint32_t ph) {
+        if (!fbBase) return;
+        const uint32_t bpr = pw * bytespp;
+        const uint32_t stride = vbe_.VirtWidth()
+                                    ? vbe_.VirtWidth() * bytespp
+                                    : bpr;
+        const uint64_t off = static_cast<uint64_t>(vbe_.YOffset()) * stride +
+                             static_cast<uint64_t>(vbe_.XOffset()) * bytespp;
+        const uint64_t last =
+            off + static_cast<uint64_t>(ph - 1) * stride + bpr;
+        const uint8_t *src = (last <= fbBytes) ? fbBase + off : fbBase;
+        const uint32_t srcStride = (last <= fbBytes) ? stride : bpr;
+        // Skip near-uniform mid-clear frames -> the desktop never flashes to
+        // blank; the UI holds the last complete frame (seqlock not bumped).
+        if (LiveFrameIsBlank(src, pw, ph, srcStride)) {
+          return;
+        }
+        framePub->Publish(src, pw, ph, bpp, srcStride);
+      };
       const bool consistent = en && bpp == 32 && w >= 64 && h >= 64 &&
                               w <= 8192 && h <= 8192 &&
                               static_cast<uint64_t>(w) * h * 4ull <= fbBytes;
       if (consistent) {
         if (w == lastPubW && h == lastPubH) {
           // Steady state: publish the current frame at the established geometry.
-          framePub->Publish(vbe_.FramebufferHost(), w, h, bpp);
+          publishGeom(w, h);
         } else {
           // Geometry changed: require the SAME new (w,h) twice before adopting it,
           // so a half-applied modeset tuple never reaches the UI.
           if (w == pendW && h == pendH) {
             if (++pendCount >= 2) {
               lastPubW = w; lastPubH = h; pendCount = 0;
-              framePub->Publish(vbe_.FramebufferHost(), w, h, bpp);
+              publishGeom(w, h);
             } else if (lastPubW != 0) {
               // Keep showing the last good geometry while confirming the new one.
-              framePub->Publish(vbe_.FramebufferHost(), lastPubW, lastPubH, bpp);
+              publishGeom(lastPubW, lastPubH);
             }
           } else {
             pendW = w; pendH = h; pendCount = 1;
             if (lastPubW != 0) {
-              framePub->Publish(vbe_.FramebufferHost(), lastPubW, lastPubH, bpp);
+              publishGeom(lastPubW, lastPubH);
             }
           }
         }
@@ -2744,7 +2771,7 @@ VmRunSummary VirtualMachine::RunLoop(
                  static_cast<uint64_t>(lastPubW) * lastPubH * 4ull <= fbBytes) {
         // Transient ENABLE=0 / inconsistent tuple (a modeset blip): hold the last
         // good frame instead of dropping out, which is what caused the black flash.
-        framePub->Publish(vbe_.FramebufferHost(), lastPubW, lastPubH, bpp);
+        publishGeom(lastPubW, lastPubH);
       }
     }
     // Live interactive input: poll the input file (~every 100ms) for bytes the
@@ -2854,7 +2881,26 @@ VmRunSummary VirtualMachine::RunLoop(
       snapshot.framebufferWidth = vbe_.Width();
       snapshot.framebufferHeight = vbe_.Height();
       snapshot.framebufferBpp = vbe_.Bpp();
-      snapshot.framebufferHost = vbe_.FramebufferHost();
+      // Point the PNG snapshot at the VISIBLE scanline start too (same double-
+      // buffer Y_OFFSET fix as the live-canvas publisher), so the saved filmstrip
+      // doesn't alternate desktop/blank. Only when the visible rows are tightly
+      // packed (the common front/back flip); the PNG encoder has no stride.
+      {
+        const uint32_t fbpp = vbe_.Bpp() ? vbe_.Bpp() / 8u : 4u;
+        const uint32_t fw = vbe_.Width();
+        uint8_t *const base = vbe_.FramebufferHost();
+        if (base && vbe_.XOffset() == 0 &&
+            (vbe_.VirtWidth() == 0 || vbe_.VirtWidth() == fw)) {
+          const uint64_t off =
+              static_cast<uint64_t>(vbe_.YOffset()) * fw * fbpp;
+          const uint64_t need =
+              off + static_cast<uint64_t>(vbe_.Height()) * fw * fbpp;
+          snapshot.framebufferHost =
+              (need <= vbe_.FramebufferBytes()) ? base + off : base;
+        } else {
+          snapshot.framebufferHost = base;
+        }
+      }
       snapshot.framebufferBytes = vbe_.FramebufferBytes();
       if (auto *vgaText = HostPointerForGpa(0xB8000ull, 4000)) {
         bool anyNonZero = false;

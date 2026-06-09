@@ -120,7 +120,8 @@ html, body {
 
 /* run preview */
 .preview-wrap { display: grid; grid-template-columns: 1.4fr 1fr; gap: 16px; }
-.screenframe { background: #000; border: 1px solid var(--border2); border-radius: var(--radius-sm); aspect-ratio: 16/10;
+.screenframe { background: #000; border: 1px solid var(--border2); border-radius: var(--radius-sm); aspect-ratio: 16/9;
+  max-height: 62vh; margin: 12px auto 0; max-width: 100%;
   display: flex; align-items: center; justify-content: center; color: var(--muted); font-size: 12px; overflow: hidden; }
 .screenframe img, .screenframe canvas { width: 100%; height: 100%; object-fit: contain; display: block; }
 /* Fullscreen VM: fill the whole display, keep the guest aspect via contain. */
