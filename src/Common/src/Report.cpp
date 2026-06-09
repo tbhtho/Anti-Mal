@@ -984,7 +984,7 @@ void EmitEventTable(std::ostringstream &html,
   html << "<input id=\"event-search\" placeholder=\"Search events (path, action, target)\">";
   html << "<span id=\"filter-status\" class=\"mono\" style=\"color:var(--muted)\">all events</span>";
   html << "</div>";
-  html << "<table><thead><tr><th>Time</th><th>PID</th><th>Source</th><th>Category</th><th>Action</th><th>Target</th><th>User</th><th>Integ.</th><th>Cmd / Exit</th><th>MITRE</th></tr></thead>";
+  html << "<table><thead><tr><th>Time</th><th>PID</th><th>Source</th><th>Category</th><th>Action</th><th>Target</th><th>Type</th><th>SHA-256</th><th>User</th><th>Integ.</th><th>Cmd / Exit</th><th>MITRE</th></tr></thead>";
   html << "<tbody id=\"event-tbody\">";
   for (const auto &e : events) {
     // Prefer the command line; fall back to the exit code (rendered in hex by
@@ -996,9 +996,28 @@ void EmitEventTable(std::ostringstream &html,
         cmdOrExit = "exit " + it->second;
       }
     }
+    // Dropped-file enrichment: the in-guest collector tags file.create /
+    // file.modify events with the file's magic-byte type + sha256 (or a skip
+    // marker when it couldn't read/hash the file). Show the type, and a short
+    // sha256 with the full hash in a tooltip.
+    std::string fileType;
+    if (const auto it = e.details.find("fileType"); it != e.details.end()) {
+      fileType = it->second;
+    }
+    std::string sha256;
+    if (const auto it = e.details.find("sha256"); it != e.details.end()) {
+      sha256 = it->second;
+    }
+    std::string shaShort = sha256.size() > 16 ? sha256.substr(0, 16) + "…"
+                                              : sha256;
+    if (sha256.empty()) {
+      if (const auto it = e.details.find("hashSkipped"); it != e.details.end()) {
+        shaShort = "(" + it->second + ")";  // size | locked | rate
+      }
+    }
     const std::string search = e.imagePath + " " + e.fullImagePath + " " +
                                e.action + " " + e.target + " " + e.commandLine +
-                               " " + e.userName;
+                               " " + e.userName + " " + fileType + " " + sha256;
     html << "<tr data-pid=\"" << e.processId << "\" data-search=\""
          << HtmlEscape(search) << "\">"
          << "<td class=\"mono\">" << HtmlEscape(e.timestampUtc) << "</td>"
@@ -1009,6 +1028,9 @@ void EmitEventTable(std::ostringstream &html,
          << "<td>" << HtmlEscape(e.action) << "</td>"
          << "<td class=\"mono\" title=\"" << HtmlEscape(e.fullImagePath)
          << "\">" << HtmlEscape(e.target) << "</td>"
+         << "<td class=\"mono\">" << HtmlEscape(fileType) << "</td>"
+         << "<td class=\"mono\" title=\"" << HtmlEscape(sha256) << "\">"
+         << HtmlEscape(shaShort) << "</td>"
          << "<td class=\"mono\">" << HtmlEscape(e.userName) << "</td>"
          << "<td class=\"mono\">" << HtmlEscape(e.integrityLevel) << "</td>"
          << "<td class=\"mono\" title=\"" << HtmlEscape(e.commandLine) << "\">"

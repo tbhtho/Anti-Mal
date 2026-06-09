@@ -4432,6 +4432,100 @@ void TestFileSystemTelemetry() {
          "file: baseline is capped");
 }
 
+// Dropped-file enrichment (backlog T51-lite): the in-guest collector tags a
+// file.create with the dropped file's magic-byte type + sha256, so the report
+// can say WHAT a sample dropped. Covers the pure classifier, the on-disk
+// enrichment (incl. locked / oversize markers), and that the fields survive the
+// EventJournal serialize->parse and the report-JSON write->load round-trips.
+void TestDroppedFileEnrichment() {
+  using antimal::ClassifyDroppedFileBytes;
+  auto b = [](std::initializer_list<int> v) {
+    std::vector<uint8_t> out;
+    for (int x : v) out.push_back(static_cast<uint8_t>(x));
+    return out;
+  };
+  // Classifier reuses the static IdentifyFileType labels exactly.
+  Expect(ClassifyDroppedFileBytes(b({'M', 'Z', 0x90, 0x00})) == "pe",
+         "drop classify: MZ -> pe");
+  Expect(ClassifyDroppedFileBytes(b({'#', '!', '/', 'b', 'i', 'n', '/', 's',
+                                     'h'})) == "script",
+         "drop classify: #! -> script");
+  Expect(ClassifyDroppedFileBytes(b({'P', 'K', 0x03, 0x04})) == "zip",
+         "drop classify: PK -> zip");
+  Expect(ClassifyDroppedFileBytes(b({0x12, 0x34, 0x56})) == "data",
+         "drop classify: unknown bytes -> data");
+  Expect(ClassifyDroppedFileBytes({}) == "empty",
+         "drop classify: empty -> empty");
+
+  // On-disk enrichment of a real dropped file: write a tiny PE-magic file and
+  // confirm the agent helper fills sha256 + fileType matching a direct hash.
+  const auto dir = TempRoot();
+  const auto pePath = dir / "dropped.exe";
+  const std::vector<uint8_t> peBytes = {'M', 'Z', 0x90, 0x00, 0x03, 0x00, 'X'};
+  {
+    std::ofstream f(pePath, std::ios::binary);
+    f.write(reinterpret_cast<const char *>(peBytes.data()),
+            static_cast<std::streamsize>(peBytes.size()));
+  }
+  antimal::EventRecord ev;
+  ev.source = "GuestAgent";
+  ev.category = "file";
+  ev.action = "file.create";
+  ev.target = antimal::PathToUtf8(pePath);
+  ev.details["size"] = std::to_string(peBytes.size());
+  antimal::EnrichDroppedFileEvent(ev);
+  Expect(ev.details["fileType"] == "pe", "drop enrich: PE file -> fileType pe");
+  Expect(ev.details["sha256"] == antimal::Sha256Hex(peBytes),
+         "drop enrich: sha256 matches direct hash");
+  Expect(ev.details.find("hashSkipped") == ev.details.end(),
+         "drop enrich: readable file is not marked skipped");
+
+  // Oversize drop: never read, marked size-skipped with an explicit type.
+  antimal::EventRecord big;
+  big.action = "file.create";
+  big.target = antimal::PathToUtf8(pePath);
+  big.details["size"] = std::to_string(antimal::kMaxHashBytes + 1);
+  antimal::EnrichDroppedFileEvent(big);
+  Expect(big.details["hashSkipped"] == "size" &&
+             big.details["fileType"] == "(large, unhashed)" &&
+             big.details.find("sha256") == big.details.end(),
+         "drop enrich: oversize -> size-skipped, no hash");
+
+  // Unreadable drop (the file does not exist): marked locked, never hashed,
+  // never throws.
+  antimal::EventRecord missing;
+  missing.action = "file.create";
+  missing.target = antimal::PathToUtf8(dir / "does-not-exist.bin");
+  missing.details["size"] = "10";
+  antimal::EnrichDroppedFileEvent(missing);
+  Expect(missing.details["hashSkipped"] == "locked" &&
+             missing.details.find("sha256") == missing.details.end(),
+         "drop enrich: unreadable -> locked, no hash");
+
+  // EventJournal round-trip: an enriched file.create survives serialize->parse
+  // with its sha256 + fileType intact.
+  const std::string line = antimal::SerializeEventJsonLine(ev);
+  const antimal::EventRecord parsed = antimal::ParseEventJsonLine(line);
+  Expect(parsed.action == "file.create" &&
+             parsed.details.at("sha256") == ev.details.at("sha256") &&
+             parsed.details.at("fileType") == "pe",
+         "drop enrich: journal serialize->parse preserves sha256+type");
+
+  // Report-JSON round-trip (the EventToJson path): write a report carrying the
+  // enriched event, load it back, confirm the detail fields survive.
+  antimal::AnalysisReport report;
+  report.runId = "drop-enrich-test";
+  report.events.push_back(ev);
+  const auto reportPath = dir / "report.json";
+  antimal::WriteReportJson(reportPath, report);
+  const antimal::AnalysisReport loaded =
+      antimal::LoadReportBestEffort(reportPath);
+  Expect(loaded.events.size() == 1 &&
+             loaded.events[0].details.at("sha256") == ev.details.at("sha256") &&
+             loaded.events[0].details.at("fileType") == "pe",
+         "drop enrich: report JSON write->load preserves sha256+type");
+}
+
 void TestPacketInspector() {
   // Frame builders. IPv4 total-length is left 0 (the parser clamps to the
   // captured length), so we only need structurally valid headers + payload.
@@ -5619,6 +5713,7 @@ int main() {
     TestRegistryPersistenceMitreTagging();
     TestRegistryPersistenceLocationTable();
     TestFileSystemTelemetry();
+    TestDroppedFileEnrichment();
     TestPacketInspector();
     TestE1000Device();
     TestNicPciConfig();

@@ -1,12 +1,68 @@
 #include "antimal/FileSystemTelemetry.h"
 
-#include "antimal/FileUtil.h"  // UtcNowIso8601, PathToUtf8
+#include "antimal/Crypto.h"    // Sha256Hex
+#include "antimal/FileUtil.h"  // UtcNowIso8601, PathToUtf8, Utf8ToWide
+#include "antimal/Scanner.h"   // IdentifyFileType (magic-byte type label)
 
 #include <Windows.h>
+
+#include <algorithm>
+#include <cstdlib>
+#include <optional>
 
 namespace antimal {
 
 namespace {
+
+// Reads up to `cap` bytes of a file with a tolerant share mode so a drop that is
+// still open for writing (the common case mid-detonation) can still be read.
+// `truncated` is set when the file was larger than `cap` and the read stopped at
+// the cap. Returns std::nullopt only when the file could not be opened at all
+// (locked with no shared read, deleted, ACL) -- the caller treats that as
+// "locked", never as an error.
+std::optional<std::vector<uint8_t>> ReadFileHeadShared(const std::wstring &widePath,
+                                                       uint64_t cap,
+                                                       bool *truncated) {
+  if (truncated) *truncated = false;
+  HANDLE h = CreateFileW(widePath.c_str(), GENERIC_READ,
+                         FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                         nullptr, OPEN_EXISTING, FILE_FLAG_SEQUENTIAL_SCAN,
+                         nullptr);
+  if (h == INVALID_HANDLE_VALUE) {
+    return std::nullopt;
+  }
+  std::vector<uint8_t> bytes;
+  bytes.reserve(static_cast<size_t>(std::min<uint64_t>(cap, 1u << 20)));
+  uint8_t buf[64 * 1024];
+  uint64_t total = 0;
+  for (;;) {
+    const uint64_t remaining = cap - total;
+    if (remaining == 0) {
+      // Hit the cap. Peek one more byte to learn whether the file is bigger.
+      DWORD probe = 0;
+      uint8_t one = 0;
+      if (ReadFile(h, &one, 1, &probe, nullptr) && probe == 1 && truncated) {
+        *truncated = true;
+      }
+      break;
+    }
+    const DWORD want =
+        static_cast<DWORD>(std::min<uint64_t>(remaining, sizeof(buf)));
+    DWORD got = 0;
+    if (!ReadFile(h, buf, want, &got, nullptr)) {
+      CloseHandle(h);
+      return std::nullopt;  // read fault after open -> treat as unreadable
+    }
+    if (got == 0) {
+      break;  // EOF
+    }
+    bytes.insert(bytes.end(), buf, buf + got);
+    total += got;
+  }
+  CloseHandle(h);
+  return bytes;
+}
+
 
 EventRecord MakeFileEvent(const std::string &path, const FileMeta &meta,
                           std::string action) {
@@ -122,6 +178,54 @@ std::vector<EventRecord> DiffFileSnapshots(const FileSnapshot &prev,
     }
   }
   return out;
+}
+
+std::string ClassifyDroppedFileBytes(const std::vector<uint8_t> &head) {
+  if (head.empty()) {
+    return "empty";
+  }
+  std::string type = IdentifyFileType(head);
+  // IdentifyFileType returns "" for bytes that match no known signature; surface
+  // that as "data" so the report cell is never blank for a file that exists.
+  return type.empty() ? "data" : type;
+}
+
+void EnrichDroppedFileEvent(EventRecord &event) {
+  if (event.target.empty()) {
+    return;
+  }
+  // Parse the size the diff already recorded; it lets us skip the read entirely
+  // for an oversize drop (mark + move on) without opening the file.
+  uint64_t size = 0;
+  if (const auto it = event.details.find("size"); it != event.details.end()) {
+    size = std::strtoull(it->second.c_str(), nullptr, 10);
+  }
+  if (size > kMaxHashBytes) {
+    event.details["hashSkipped"] = "size";
+    event.details["fileType"] = "(large, unhashed)";
+    return;
+  }
+
+  const std::wstring widePath = Utf8ToWide(event.target);
+  bool truncated = false;
+  const auto head =
+      ReadFileHeadShared(widePath, kMaxHashBytes, &truncated);
+  if (!head) {
+    // Locked / deleted / ACL-denied -- emit the event anyway with a marker so
+    // the operator sees the drop happened even though we couldn't read it.
+    event.details["hashSkipped"] = "locked";
+    return;
+  }
+  if (truncated) {
+    // The recorded size lied (file grew past the cap between snapshot + read).
+    event.details["hashSkipped"] = "size";
+    event.details["fileType"] = "(large, unhashed)";
+    return;
+  }
+  // Type from the (already-read) bytes, then the full-content sha256. Reusing the
+  // static pipeline's magic-byte detector keeps the labels consistent end-to-end.
+  event.details["fileType"] = ClassifyDroppedFileBytes(*head);
+  event.details["sha256"] = Sha256Hex(*head);
 }
 
 }  // namespace antimal

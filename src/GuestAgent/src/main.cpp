@@ -837,6 +837,10 @@ int RunHostChannelLoop(std::string reason, bool serviceMode) {
   constexpr uint32_t kFilePollEveryTicks = 5;    // file walk is heavier
   constexpr size_t kProcessBaselineCap = 64;
   constexpr size_t kProcessDeltaCap = 64;
+  // Cap on dropped files hashed per file-poll tick. A burst of drops beyond this
+  // is still reported (with details["hashSkipped"]="rate"); the hashing just
+  // defers, so a flood can't stall the collector on a single vCPU.
+  constexpr size_t kFileEnrichPerTick = 64;
   uint32_t tick = 0;
   // Base budget: a service run lingers all day; a bare console run exits after
   // ~2 min. But once a sample is STAGED, a console run must outlast the deferred
@@ -1108,6 +1112,15 @@ int RunHostChannelLoop(std::string reason, bool serviceMode) {
     // Filesystem telemetry: snapshot the drop directories and stream
     // file.create / file.modify / file.delete deltas. Polled less often than the
     // others because the directory walk is heavier.
+    //
+    // For a newly-seen file (file.create / file.modify) the agent reads the file
+    // in-guest and enriches the event with its sha256 + magic-byte file type --
+    // the high-signal "WHAT did it drop" detail (e.g. "dropped a PE"). Bounded so
+    // a burst of drops can't stall the ~2s collector on a single vCPU: at most
+    // kFileEnrichPerTick files are hashed per tick (the rest carry
+    // details["hashSkipped"]="rate"), each capped at kMaxHashBytes; a locked file
+    // is reported WITHOUT a hash. The pure diff above stays untouched -- all of
+    // the disk I/O / hashing happens here.
     if (tick % kFilePollEveryTicks == 0) {
       auto files = antimal::CaptureFileSnapshot(watchedDirs);
       if (!files.empty() || fileBaselineSent) {
@@ -1116,7 +1129,16 @@ int RunHostChannelLoop(std::string reason, bool serviceMode) {
             kProcessDeltaCap);
         fileBaselineSent = true;
         knownFiles = std::move(files);
-        for (const auto &ev : fileEvents) {
+        size_t enriched = 0;
+        for (auto &ev : fileEvents) {
+          if (ev.action == "file.create" || ev.action == "file.modify") {
+            if (enriched < kFileEnrichPerTick) {
+              antimal::EnrichDroppedFileEvent(ev);
+              ++enriched;
+            } else {
+              ev.details["hashSkipped"] = "rate";  // per-tick cap hit
+            }
+          }
           if (!SendAgentEvent(com2, ev)) {
             CloseHandle(com2);
             return 1;

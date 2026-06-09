@@ -919,6 +919,18 @@ void WebViewHost::RegisterHandlers() {
         if (const auto it = ev.details.find("exitCode"); it != ev.details.end()) {
           eo.AddString("exitCode", it->second);
         }
+        // Dropped-file enrichment: surface the magic-byte type + sha256 (or the
+        // skip marker) so the event feed can show WHAT a sample dropped.
+        if (const auto it = ev.details.find("fileType"); it != ev.details.end()) {
+          eo.AddString("fileType", it->second);
+        }
+        if (const auto it = ev.details.find("sha256"); it != ev.details.end()) {
+          eo.AddString("sha256", it->second);
+        }
+        if (const auto it = ev.details.find("hashSkipped");
+            it != ev.details.end()) {
+          eo.AddString("hashSkipped", it->second);
+        }
         eo.AddString("mitre", ev.mitre);
         evArr += eo.Finish();
       }
@@ -1131,6 +1143,19 @@ void WebViewHost::RegisterHandlers() {
           eo.AddString("target", ev.target);
           if (const auto it = ev.details.find("exitCode"); it != ev.details.end()) {
             eo.AddString("exitCode", it->second);
+          }
+          // Dropped-file enrichment: magic-byte type + sha256 (or skip marker).
+          if (const auto it = ev.details.find("fileType");
+              it != ev.details.end()) {
+            eo.AddString("fileType", it->second);
+          }
+          if (const auto it = ev.details.find("sha256");
+              it != ev.details.end()) {
+            eo.AddString("sha256", it->second);
+          }
+          if (const auto it = ev.details.find("hashSkipped");
+              it != ev.details.end()) {
+            eo.AddString("hashSkipped", it->second);
           }
           eo.AddString("mitre", ev.mitre);
           WebViewHost::Emit(h, "telemetry", eo.Finish());

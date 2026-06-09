@@ -356,6 +356,20 @@
     if (!state.scans.length) { box.innerHTML = '<p class="page-sub" style="margin:0">No scans this session. Use Scan File to analyze a sample.</p>'; return; }
     box.innerHTML = '<table class="grid"><thead><tr><th>Score</th><th>Verdict</th><th>Tags</th><th>Path</th><th>SHA-256</th></tr></thead><tbody>' + state.scans.map(scanRow).join('') + '</tbody></table>';
   }
+  // Renders the dropped-file enrichment cell: the magic-byte type plus a short
+  // sha256 (full hash in the tooltip), or the skip marker the agent set when it
+  // couldn't read/hash the drop. Empty for non-file events.
+  function dropCell(e) {
+    var type = e.fileType || '';
+    var sha = e.sha256 || '';
+    var skip = e.hashSkipped || '';
+    if (!type && !sha && !skip) return '<td></td>';
+    var label = '';
+    if (type) label += '<span class="tag">' + esc(type) + '</span> ';
+    if (sha) label += '<span class="mono" title="' + esc(sha) + '">' + esc(sha.slice(0, 16)) + '…</span>';
+    else if (skip) label += '<span class="mono" title="hash skipped: ' + esc(skip) + '">(' + esc(skip) + ')</span>';
+    return '<td>' + label + '</td>';
+  }
   function renderEventFeed(events) {
     var box = $('#dash-events'); if (!box) return;
     if (!events || !events.length) { box.innerHTML = '<p class="page-sub" style="margin:0">No events recorded for this run.</p>'; return; }
@@ -365,9 +379,9 @@
       var cmd = e.commandLine || (e.exitCode ? ('exit ' + e.exitCode) : '');
       var img = shortPath(e.fullImagePath || e.image);
       return '<tr><td class="mono">' + esc(when) + '</td><td><span class="tag">' + esc(e.category || '?') + '</span></td><td>' + esc(e.action || '') +
-        '</td><td class="mono">' + esc(e.pid | 0) + '</td><td class="mono" title="' + esc(e.fullImagePath || '') + '">' + esc(img) + '</td><td class="mono">' + esc(e.user || '') + '</td><td class="mono">' + esc(e.integrity || '') + '</td><td class="mono" title="' + esc(e.commandLine || '') + '">' + esc(cmd) + '</td><td class="mono">' + esc(e.target || '') + '</td><td>' + mit + '</td></tr>';
+        '</td><td class="mono">' + esc(e.pid | 0) + '</td><td class="mono" title="' + esc(e.fullImagePath || '') + '">' + esc(img) + '</td><td class="mono">' + esc(e.user || '') + '</td><td class="mono">' + esc(e.integrity || '') + '</td><td class="mono" title="' + esc(e.commandLine || '') + '">' + esc(cmd) + '</td><td class="mono">' + esc(e.target || '') + '</td>' + dropCell(e) + '<td>' + mit + '</td></tr>';
     }).join('');
-    box.innerHTML = '<table class="grid"><thead><tr><th>Time</th><th>Category</th><th>Action</th><th>PID</th><th>Image</th><th>User</th><th>Integ.</th><th>Cmd / Exit</th><th>Target</th><th>MITRE</th></tr></thead><tbody>' + rows + '</tbody></table>';
+    box.innerHTML = '<table class="grid"><thead><tr><th>Time</th><th>Category</th><th>Action</th><th>PID</th><th>Image</th><th>User</th><th>Integ.</th><th>Cmd / Exit</th><th>Target</th><th>Drop (type · sha256)</th><th>MITRE</th></tr></thead><tbody>' + rows + '</tbody></table>';
   }
   function onDashboardData(d) {
     if (!d || !d.hasRun) {
@@ -412,7 +426,7 @@
     var box = $('#vm-events') || $('#dash-events'); if (!box) return;
     var tbody = box.querySelector('tbody');
     if (!tbody) {
-      box.innerHTML = '<table class="grid"><thead><tr><th>Time</th><th>Category</th><th>Action</th><th>PID</th><th>Image</th><th>User</th><th>Integ.</th><th>Cmd / Exit</th><th>Target</th><th>MITRE</th></tr></thead><tbody></tbody></table>';
+      box.innerHTML = '<table class="grid"><thead><tr><th>Time</th><th>Category</th><th>Action</th><th>PID</th><th>Image</th><th>User</th><th>Integ.</th><th>Cmd / Exit</th><th>Target</th><th>Drop (type · sha256)</th><th>MITRE</th></tr></thead><tbody></tbody></table>';
       tbody = box.querySelector('tbody');
     }
     var when = String(d.time || '').replace('T', ' ').replace('Z', '');
@@ -421,7 +435,7 @@
     var tr = document.createElement('tr');
     tr.innerHTML = '<td class="mono">' + esc(when) + '</td><td><span class="tag">' + esc(cat) + '</span></td><td>' + esc(act) +
       '</td><td class="mono">' + esc(d.pid | 0) + '</td><td class="mono" title="' + esc(d.fullImagePath || '') + '">' + esc(img) + '</td><td class="mono">' + esc(d.user || '') + '</td><td class="mono">' + esc(d.integrity || '') + '</td><td class="mono" title="' + esc(d.commandLine || '') + '">' + esc(cmd) + '</td><td class="mono">' + esc(tgt) +
-      '</td><td>' + (d.mitre ? '<span class="tag">' + esc(d.mitre) + '</span>' : '') + '</td>';
+      '</td>' + dropCell(d) + '<td>' + (d.mitre ? '<span class="tag">' + esc(d.mitre) + '</span>' : '') + '</td>';
     tbody.insertBefore(tr, tbody.firstChild);
   }
   function onRunStatus(d) {
