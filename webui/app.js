@@ -630,13 +630,22 @@
     ctx.stroke();
     ctx.restore();
   }
-  // Clean FPS readout while a live session runs. No "fallback" label clutter.
+  // Honest liveness readout while a live session runs. fps counts frames the VM
+  // process actually published this second; 0 now means the publisher isn't
+  // advancing frameSeq (the VM process stalled/exited) -- NOT the old blank-skip
+  // freeze, which is fixed host-side (LiveFramePublishGate). Surfacing "stalled"
+  // vs a real fps is exactly what the "live vm fps = 0" confusion needed.
   function updateDisplayMode() {
     var el = $('#vm-display-mode'); if (!el) return;
     if (!livePollTimer || !usingSharedFrames) { el.textContent = ''; return; }
     liveFps = liveFrameCount; liveFrameCount = 0;
-    el.textContent = liveFps + ' FPS';
-    el.style.color = '#7ee2a8';
+    if (liveFps > 0) {
+      el.textContent = '● live · ' + liveFps + ' fps';
+      el.style.color = '#7ee2a8';
+    } else {
+      el.textContent = '○ stalled · 0 fps';
+      el.style.color = '#d9a441';
+    }
   }
   function startLivePoll() {
     stopLivePoll();
