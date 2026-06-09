@@ -210,7 +210,26 @@ CpuidExitResult Vcpu::EmulateCpuidExit() {
       // never advertise a feature this hypervisor cannot faithfully emulate.
       rcx &= ~(1u << 7);  // CET_SS  (shadow stack)
       rdx &= ~(1u << 20); // CET_IBT (indirect branch tracking)
+      // Hide the Hybrid bit (EDX[15]). The host is a hybrid part (Raptor Lake:
+      // P+E cores) but we present a single uniform vCPU with the hypervisor bit
+      // cleared, so a guest that sees Hybrid enables Thread-Director / Hardware-
+      // Feedback / HWP paths and then reads native CPU-management MSRs
+      // (IA32_HW_FEEDBACK_PTR/CONFIG 0x17D0/0x17D1, HWP 0x770-0x774) that WHP does
+      // not model -> they #GP into the guest and perturb scheduler/power state.
+      // Same discipline as masking x2APIC / TSC-deadline / CET / leaf-6 above:
+      // never advertise a feature this hypervisor cannot faithfully back. Leaf
+      // 0x1A (hybrid core-type enumeration) is zeroed below for the same reason.
+      rdx &= ~(1u << 15); // Hybrid
     }
+    break;
+  case 0x0000001Au:
+    // Hybrid core-type enumeration. With the Hybrid bit hidden (leaf 7 EDX[15]
+    // above) this must report "not hybrid" so the guest never enumerates P/E core
+    // types it would then try to manage via unmodeled MSRs.
+    rax = 0;
+    rbx = 0;
+    rcx = 0;
+    rdx = 0;
     break;
   case 0x00000004u:
     // Deterministic cache parameters report cores-per-package in EAX[31:26].

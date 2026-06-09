@@ -1266,6 +1266,10 @@ void WebViewHost::RegisterHandlers() {
       // straight to the desktop with nothing typed. Password protection is a
       // later feature; there is intentionally no password to enter today.
       SetEnvironmentVariableW(L"ANTIMAL_PROBE_OOBE_NOPASSWORD", L"1");
+      // Interactive "use the VM" boot: quiet the shell crash-storm + free the
+      // single vCPU (disable WER/NGEN/Defender/Edge churn + force software
+      // graphics in this disposable overlay) so the desktop is actually usable.
+      SetEnvironmentVariableW(L"ANTIMAL_PROBE_DESKTOP_STABILITY", L"1");
       SetEnvironmentVariableW(L"ANTIMAL_PROBE_LOGIN_PASSWORD", nullptr);
       SetEnvironmentVariableW(L"ANTIMAL_PROBE_OOBE_AUTOLOGON", nullptr);
       SetEnvironmentVariableW(L"ANTIMAL_PROBE_PRESS_ENTER_SEC", nullptr);

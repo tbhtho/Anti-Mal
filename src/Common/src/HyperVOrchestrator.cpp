@@ -4542,6 +4542,8 @@ bool PatchOverlayAutologon(hv::IBlockDevice &disk,
                            BootOverlayPatchResult *result);
 bool PatchOverlayBlankAntimalPassword(hv::IBlockDevice &disk,
                                       BootOverlayPatchResult *result);
+bool PatchOverlayDesktopStability(hv::IBlockDevice &disk,
+                                  BootOverlayPatchResult *result);
 // Arms the THIRD key of the detonation gate (the guest-side authorization) by
 // adding ANTIMAL_GUEST_ALLOW_EXECUTION=1 to the AntiMalGuestAgent service's own
 // per-service Environment value in the overlay's SYSTEM hive. The SCM merges that
@@ -6299,6 +6301,12 @@ BootOverlayPatchResult ApplyEphemeralBootOverlay(hv::IBlockDevice &disk) {
   if (EnvFlagEnabled("ANTIMAL_PROBE_OOBE_NOPASSWORD")) {
     PatchOverlayBlankAntimalPassword(disk, &result);
   }
+  // Opt-in: quiet the shell crash-storm + free the single vCPU so the desktop is
+  // actually usable interactively (disable WER/NGEN/Defender/Edge/Search churn +
+  // force software graphics in THIS disposable overlay). Off for stealth runs.
+  if (EnvFlagEnabled("ANTIMAL_PROBE_DESKTOP_STABILITY")) {
+    PatchOverlayDesktopStability(disk, &result);
+  }
   // Opt-in third detonation key: arm the guest-side execution authorization in
   // THIS run's disposable overlay only (the promoted snapshot stays gated). With
   // this and both host keys set, an authorized execute job is honored in-guest.
@@ -7375,6 +7383,133 @@ bool PatchOverlayBlankAntimalPassword(hv::IBlockDevice &disk,
                             (soft ? "ok" : "no"));
   }
   return sam;
+}
+
+// Make the disposable overlay's desktop stable enough to actually USE. On this
+// minimal VMM the Win11 shell (explorer) crash-loops -- a never-booted-before
+// image runs heavy first-logon provisioning + Defender + NGEN + Edge churn on a
+// single emulated vCPU, and WER + AutoRestartShell amplify each shell crash into
+// a CPU-starving storm (telemetry: explorer/WerFault ~8-16x/min, never subsides).
+// This quiets the storm + frees the vCPU by disabling, OFFLINE in the overlay
+// ONLY: Windows Error Reporting, .NET NGEN, Defender real-time scanning,
+// Edge/OneDrive/telemetry/Search/SysMain background work, and hardware-graphics
+// paths the software framebuffer can't service. ANTI-EVASION: several of these
+// are sandbox tells -- fine for an interactive "usable desktop" boot (overlay is
+// disposable), but it is opt-in (ANTIMAL_PROBE_DESKTOP_STABILITY) and must NOT be
+// applied on a stealth detonation profile.
+bool PatchOverlayDesktopStability(hv::IBlockDevice &disk,
+                                  BootOverlayPatchResult *result) {
+  const auto parts = ReadGptPartitionsLite(disk);
+  const auto windows =
+      std::find_if(parts.begin(), parts.end(), [](const GptPartitionLite &p) {
+        return IsWindowsBasicDataGuid(p.typeGuid);
+      });
+  if (windows == parts.end()) {
+    if (result) result->notes.push_back("stability: Windows partition not found");
+    return false;
+  }
+  NtfsBootFileLocator ntfs(disk, windows->firstLba);
+  if (!ntfs.Init()) {
+    if (result) result->notes.push_back("stability: Windows NTFS unreadable");
+    return false;
+  }
+  auto patchHive = [&](const char *path, auto &&fn) -> bool {
+    const auto entry = ntfs.FindPath(path);
+    if (!entry) {
+      if (result) result->notes.push_back(std::string("stability: missing ") + path);
+      return false;
+    }
+    auto bytes = ntfs.ReadFile(*entry, 256u * 1024u * 1024u);
+    MutableHiveView hive(bytes);
+    if (!hive.IsValid() || !fn(hive)) {
+      if (result) result->notes.push_back(std::string("stability: no change ") + path);
+      return false;
+    }
+    RefreshRegistryHiveHeader(bytes);
+    if (!ntfs.WriteFileSameSize(*entry, bytes)) {
+      if (result) result->notes.push_back(std::string("stability: write failed ") + path);
+      return false;
+    }
+    return true;
+  };
+
+  int softSet = 0;
+  const bool soft = patchHive(
+      "Windows\\System32\\config\\SOFTWARE", [&](MutableHiveView &hive) {
+        auto dword = [&](std::initializer_list<std::string> path,
+                         const std::string &name, uint32_t val) {
+          const auto k = EnsureHivePath(hive, path);
+          if (k && UpsertHiveDword(hive, *k, name, val)) ++softSet;
+        };
+        // Windows Error Reporting OFF -> stops the WerFault/wermgr storm.
+        dword({"Microsoft", "Windows", "Windows Error Reporting"}, "Disabled", 1);
+        dword({"Microsoft", "Windows", "Windows Error Reporting"}, "DontShowUI", 1);
+        dword({"Microsoft", "Windows", "Windows Error Reporting"}, "LoggingDisabled", 1);
+        dword({"Policies", "Microsoft", "Windows", "Windows Error Reporting"}, "Disabled", 1);
+        dword({"Policies", "Microsoft", "Windows", "Windows Error Reporting"}, "DontShowUI", 1);
+        // Defender real-time scanning OFF -> heavy first-boot CPU/IO removed.
+        dword({"Policies", "Microsoft", "Windows Defender"}, "DisableAntiSpyware", 1);
+        dword({"Policies", "Microsoft", "Windows Defender", "Real-Time Protection"}, "DisableRealtimeMonitoring", 1);
+        dword({"Policies", "Microsoft", "Windows Defender", "Real-Time Protection"}, "DisableBehaviorMonitoring", 1);
+        dword({"Policies", "Microsoft", "Windows Defender", "Real-Time Protection"}, "DisableOnAccessProtection", 1);
+        dword({"Microsoft", "Windows Defender", "Features"}, "TamperProtection", 0);
+        // Force software graphics (no GPU/D3D path for the shell to fault on).
+        dword({"Microsoft", "Avalon.Graphics"}, "DisableHWAcceleration", 1);
+        // SmartScreen OFF -> no reputation network stalls during shell init.
+        dword({"Policies", "Microsoft", "Windows", "System"}, "EnableSmartScreen", 0);
+        // Edge update / startup-boost / OneDrive sync churn OFF.
+        dword({"Policies", "Microsoft", "EdgeUpdate"}, "UpdateDefault", 0);
+        dword({"Policies", "Microsoft", "EdgeUpdate"}, "AutoUpdateCheckPeriodMinutes", 0);
+        dword({"Policies", "Microsoft", "Edge"}, "StartupBoostEnabled", 0);
+        dword({"Policies", "Microsoft", "Edge"}, "BackgroundModeEnabled", 0);
+        dword({"Policies", "Microsoft", "Windows", "OneDrive"}, "DisableFileSyncNGSC", 1);
+        // Telemetry + Start-menu content-delivery pulls OFF.
+        dword({"Policies", "Microsoft", "Windows", "DataCollection"}, "AllowTelemetry", 0);
+        dword({"Microsoft", "Windows", "CurrentVersion", "ContentDeliveryManager"}, "ContentDeliveryAllowed", 0);
+        dword({"Microsoft", "Windows", "CurrentVersion", "ContentDeliveryManager"}, "SilentInstalledAppsEnabled", 0);
+        dword({"Microsoft", "Windows", "CurrentVersion", "ContentDeliveryManager"}, "PreInstalledAppsEnabled", 0);
+        dword({"Microsoft", "Windows", "CurrentVersion", "ContentDeliveryManager"}, "OemPreInstalledAppsEnabled", 0);
+        // Skip the slow first-logon animation phase.
+        dword({"Microsoft", "Windows NT", "CurrentVersion", "Winlogon"}, "EnableFirstLogonAnimation", 0);
+        return softSet > 0;
+      });
+  if (result) result->notes.push_back("stability SOFTWARE values set: " + std::to_string(softSet));
+
+  int sysSet = 0;
+  const bool sys = patchHive(
+      "Windows\\System32\\config\\SYSTEM", [&](MutableHiveView &hive) {
+        const auto cs = SelectOfflineControlSet(hive);
+        if (!cs) return false;
+        auto ctrlDword = [&](std::initializer_list<std::string> path,
+                             const std::string &name, uint32_t val) {
+          const auto k = EnsureHivePath(hive, path);
+          if (k && UpsertHiveDword(hive, *k, name, val)) ++sysSet;
+        };
+        auto svcOff = [&](const std::string &svc) {
+          const auto k = EnsureHivePath(hive, {*cs, "Services", svc});
+          if (k && UpsertHiveDword(hive, *k, "Start", 4)) ++sysSet; // 4 = disabled
+        };
+        // Graphics: disable TDR reset + HW scheduling for the software framebuffer.
+        ctrlDword({*cs, "Control", "GraphicsDrivers"}, "TdrLevel", 0);
+        ctrlDword({*cs, "Control", "GraphicsDrivers"}, "HwSchMode", 1);
+        // Disable the heaviest background services that starve the single vCPU.
+        svcOff("WerSvc");                         // WER second-stage host
+        svcOff("clr_optimization_v4.0.30319_64"); // .NET NGEN (mscorsvw storm)
+        svcOff("clr_optimization_v4.0.30319_32");
+        svcOff("WinDefend"); svcOff("WdNisSvc"); svcOff("Sense"); // Defender
+        svcOff("DiagTrack"); svcOff("dmwappushservice");          // telemetry
+        svcOff("WSearch");                         // search-index crawl
+        svcOff("SysMain");                         // superfetch prefetch
+        svcOff("diagnosticshub.standardcollector.service");
+        return sysSet > 0;
+      });
+  if (result) result->notes.push_back("stability SYSTEM values set: " + std::to_string(sysSet));
+
+  if (result) {
+    result->notes.push_back(std::string("desktop-stability overlay patch: SOFTWARE=") +
+                            (soft ? "ok" : "no") + " SYSTEM=" + (sys ? "ok" : "no"));
+  }
+  return soft || sys;
 }
 
 bool DeployExecAgentToOpenOverlay(hv::IBlockDevice &disk,
