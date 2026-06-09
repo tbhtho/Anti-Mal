@@ -103,6 +103,14 @@ VhdxRawConversionResult ConvertVhdxToRaw(const std::filesystem::path &vhdxPath,
                                          const std::filesystem::path &rawPath,
                                          bool force);
 
+// True when `runDir` holds a live, exclusively-held run.lock (a detonation is
+// in progress in some process). Probes by trying to open run.lock with no share
+// access: ERROR_SHARING_VIOLATION means another process holds it (live), a
+// successful open means a stale/unheld lock, and "not found"/other errors mean
+// no reclaimable lock. The overlay-GC sweep skips dirs that are live-locked so a
+// concurrent run can never delete a still-running sibling's disposable overlay.
+bool RunDirIsLiveLocked(const std::filesystem::path &runDir);
+
 // Offline deploy of the execute-capable GuestAgent into a COW overlay (the
 // disposable run overlay or a saved desktop snapshot), WITHOUT touching the
 // base VHDX. The in-house NTFS writer is same-size-only and the /MT agent is

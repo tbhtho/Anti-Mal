@@ -755,6 +755,126 @@ void TestLiveFramePublishGate() {
   }
 }
 
+// T08: the per-run lock that stops a concurrent detonation's overlay-GC sweep
+// from deleting a still-RUNNING sibling run's disposable overlay. Locks the OS
+// semantics RunDirIsLiveLocked relies on: an exclusively-held run.lock probes
+// as live; once released it probes as reclaimable; a dir with no lock is not
+// live. Exercises the real function (no boot needed).
+void TestRunDirLiveLock() {
+  const auto root = TempRoot();
+  const auto held = root / "held-run";
+  const auto unlocked = root / "no-lock-run";
+  antimal::EnsureDirectory(held);
+  antimal::EnsureDirectory(unlocked);
+
+  // A dir with no run.lock at all is never "live".
+  Expect(!antimal::RunDirIsLiveLocked(unlocked),
+         "run dir without run.lock probes as not-live");
+
+  // Hold the lock with the EXACT flags the orchestrator uses for a live run.
+  HANDLE lock = ::CreateFileW(
+      (held / L"run.lock").c_str(), GENERIC_WRITE, 0 /*exclusive*/, nullptr,
+      CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL | FILE_FLAG_DELETE_ON_CLOSE, nullptr);
+  Expect(lock != INVALID_HANDLE_VALUE, "acquired the live run.lock");
+  Expect(antimal::RunDirIsLiveLocked(held),
+         "exclusively-held run.lock probes as LIVE");
+
+  // Releasing it (DELETE_ON_CLOSE) removes the file -> reclaimable.
+  ::CloseHandle(lock);
+  Expect(!antimal::RunDirIsLiveLocked(held),
+         "released run.lock probes as not-live (reclaimable)");
+
+  std::error_code ec;
+  std::filesystem::remove_all(root, ec);
+}
+
+// T24/T25: the pure aggregation helpers that populate report.mitreTechniques
+// (dynamic EventRecord.mitre unioned with static capa technique IDs, distinct +
+// sorted, nothing fabricated) and report.networkDomains (by-name endpoints
+// only; IP:port telemetry yields none). Locks "honest, no invention".
+void TestAggregateMitreAndDomains() {
+  std::vector<antimal::EventRecord> events;
+  {
+    antimal::EventRecord e;
+    e.category = "process";
+    e.mitre = "T1055";
+    events.push_back(e);
+  }
+  {
+    antimal::EventRecord e;
+    e.category = "registry";
+    e.mitre = "T1547"; // distinct
+    events.push_back(e);
+  }
+  {
+    antimal::EventRecord e;
+    e.category = "file";
+    e.mitre = "T1055"; // duplicate -> collapses
+    events.push_back(e);
+  }
+  {
+    antimal::EventRecord e; // empty mitre -> ignored
+    e.category = "file";
+    events.push_back(e);
+  }
+  // Network events: an IP:port target (TCP-table telemetry) must NOT become a
+  // domain; a DNS query name and an HTTP Host header MUST.
+  {
+    antimal::EventRecord e;
+    e.category = "network";
+    e.action = "network.connect";
+    e.target = "93.184.216.34:443"; // bare IP:port -> rejected
+    events.push_back(e);
+  }
+  {
+    antimal::EventRecord e;
+    e.category = "network";
+    e.action = "network.dns";
+    e.target = "evil.example.com"; // DNS name -> kept
+    events.push_back(e);
+  }
+  {
+    antimal::EventRecord e;
+    e.category = "network";
+    e.action = "network.http";
+    e.target = "1.2.3.4/login"; // path target -> rejected
+    e.details["host"] = "cdn.example.org"; // Host header -> kept
+    events.push_back(e);
+  }
+
+  antimal::ScanResult scan;
+  {
+    antimal::ScanCapaCapability cap;
+    cap.name = "create process";
+    cap.mitreTechniques = {"T1106", "T1055"}; // T1055 overlaps the dynamic side
+    scan.capaCapabilities.push_back(cap);
+  }
+
+  const auto techniques = antimal::AggregateMitreTechniques(events, scan);
+  // Distinct + sorted: T1055, T1106, T1547 (T1055 collapsed across sources).
+  Expect(techniques.size() == 3, "three distinct MITRE techniques");
+  Expect(techniques[0] == "T1055" && techniques[1] == "T1106" &&
+             techniques[2] == "T1547",
+         "MITRE techniques are distinct, sorted, and union dynamic+capa");
+
+  const auto domains = antimal::AggregateNetworkDomains(events);
+  Expect(domains.size() == 2, "two by-name domains (IP/IP:port rejected)");
+  Expect(domains[0] == "cdn.example.org" && domains[1] == "evil.example.com",
+         "domains are the DNS query + HTTP host, sorted, no IPs");
+
+  // No by-name endpoints -> empty (the honest IP-only-telemetry reality).
+  std::vector<antimal::EventRecord> ipOnly;
+  {
+    antimal::EventRecord e;
+    e.category = "network";
+    e.action = "network.connect";
+    e.target = "10.0.0.5:8080";
+    ipOnly.push_back(e);
+  }
+  Expect(antimal::AggregateNetworkDomains(ipOnly).empty(),
+         "IP:port-only telemetry yields no domains (empty pending DNS)");
+}
+
 // Locks the host->guest live-input wire format (the framed 'K'/'M' keyboard +
 // mouse protocol the UI appends to _live-input.bin and the VM run loop tails).
 // The subtle, easy-to-break parts are split records across polls and resync on
@@ -5184,6 +5304,8 @@ int main() {
     TestLiveInputProtocol();
     TestLiveFrameShmContract();
     TestLiveFramePublishGate();
+    TestRunDirLiveLock();
+    TestAggregateMitreAndDomains();
     TestTpm2CrbDevice();
     TestAcpiTables();
     TestPcIoPmSleepByteWrites();

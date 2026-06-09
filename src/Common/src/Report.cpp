@@ -1600,6 +1600,63 @@ void WriteReportHtml(const std::filesystem::path &path, const AnalysisReport &re
   WriteTextFile(path, BuildHtmlReportWithFrames(report, frames));
 }
 
+std::vector<std::string> AggregateMitreTechniques(
+    const std::vector<EventRecord> &events, const ScanResult &scan) {
+  std::set<std::string> techniques; // std::set keeps them distinct + sorted
+  for (const auto &e : events) {
+    if (!e.mitre.empty()) {
+      techniques.insert(e.mitre);
+    }
+  }
+  // Union in the static capa-derived technique IDs (capa maps each capability to
+  // zero or more ATT&CK technique strings). These corroborate / fill in for the
+  // dynamic side without fabricating anything.
+  for (const auto &cap : scan.capaCapabilities) {
+    for (const auto &t : cap.mitreTechniques) {
+      if (!t.empty()) {
+        techniques.insert(t);
+      }
+    }
+  }
+  return std::vector<std::string>(techniques.begin(), techniques.end());
+}
+
+std::vector<std::string> AggregateNetworkDomains(
+    const std::vector<EventRecord> &events) {
+  // A by-name endpoint only: a string with at least one dot and no ':' (which
+  // would mark it as an IP:port target) and no '/'. This deliberately rejects
+  // the IP:port targets the in-guest TCP-table telemetry emits, so domains stay
+  // empty until DNS/SNI capture lands rather than turning IPs into "domains".
+  auto looksLikeHostname = [](const std::string &s) {
+    if (s.empty() || s.size() > 253) return false;
+    if (s.find(':') != std::string::npos || s.find('/') != std::string::npos) {
+      return false;
+    }
+    if (s.find('.') == std::string::npos) return false;
+    bool allDigitsOrDots = true;
+    for (char c : s) {
+      const unsigned char u = static_cast<unsigned char>(c);
+      if (!(std::isalnum(u) || c == '.' || c == '-' || c == '_')) return false;
+      if (!(c == '.' || std::isdigit(u))) allDigitsOrDots = false;
+    }
+    return !allDigitsOrDots; // reject a bare dotted-quad IP (e.g. "1.2.3.4")
+  };
+  std::set<std::string> domains; // distinct + sorted
+  for (const auto &e : events) {
+    if (e.category != "network") continue;
+    // DNS query name: PacketInspector puts the queried hostname in target.
+    if (e.action == "network.dns" && looksLikeHostname(e.target)) {
+      domains.insert(e.target);
+    }
+    // HTTP Host header: PacketInspector records it in details["host"].
+    const auto it = e.details.find("host");
+    if (it != e.details.end() && looksLikeHostname(it->second)) {
+      domains.insert(it->second);
+    }
+  }
+  return std::vector<std::string>(domains.begin(), domains.end());
+}
+
 std::vector<std::string> ExtractNetworkDomainsFromReportText(std::string_view jsonText) {
   std::vector<std::string> domains;
   const std::string text(jsonText);

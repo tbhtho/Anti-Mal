@@ -8405,6 +8405,12 @@ void WriteErrorReport(const std::filesystem::path &reportPath,
   report.sandboxVerdict = sandboxVerdict;
   report.dynamicSummary = dynamicSummary;
   report.events = events;
+  // T24/T25: surface what the run actually observed. mitreTechniques unions the
+  // dynamic EventRecord.mitre values with the static capa-derived technique IDs;
+  // networkDomains aggregates by-name endpoints (DNS/HTTP host) — IP-only TCP
+  // telemetry yields none, so this stays empty pending DNS capture (by design).
+  report.mitreTechniques = AggregateMitreTechniques(events, report.scannerVerdict);
+  report.networkDomains = AggregateNetworkDomains(events);
   report.artifacts = artifacts;
   report.errors = errors;
   WriteTextFile(reportPath, ToJson(report));
@@ -10001,6 +10007,23 @@ std::string FormatVmDiagnostics(const hv::VmRunSummary &vm) {
 
 } // namespace
 
+bool RunDirIsLiveLocked(const std::filesystem::path &runDir) {
+  // Probe the per-run lock with NO share access. A live detonation holds this
+  // handle (GENERIC_WRITE, share=0, DELETE_ON_CLOSE), so our open collides:
+  //   - ERROR_SHARING_VIOLATION -> another process holds it: the run is LIVE.
+  //   - opened OK               -> nobody holds it: a stale/unheld lock.
+  //   - not found / other error -> no reclaimable lock at all.
+  const std::filesystem::path lockPath = runDir / L"run.lock";
+  HANDLE h = ::CreateFileW(lockPath.c_str(), GENERIC_READ, 0 /*no sharing*/,
+                           nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL,
+                           nullptr);
+  if (h == INVALID_HANDLE_VALUE) {
+    return ::GetLastError() == ERROR_SHARING_VIOLATION;
+  }
+  ::CloseHandle(h);
+  return false;
+}
+
 AgentOverlayDeployResult DeployExecuteAgentIntoOverlay(
     const std::filesystem::path &baseVhdxPath,
     const std::filesystem::path &overlayPath,
@@ -10337,6 +10360,10 @@ DetonationResult InHouseOrchestrator::PrepareAndRun(
         if (name.empty() || name[0] == L'_') continue; // _base, _intel_cache
         if (entry.path().filename() == std::filesystem::path(result.runId))
           continue; // never the run being created
+        // T08: never reclaim a still-RUNNING sibling's overlay. A live
+        // detonation (this or another process) holds an exclusive run.lock in
+        // its run dir; deleting its overlay mid-run corrupts the live VM disk.
+        if (RunDirIsLiveLocked(entry.path())) continue;
         for (const wchar_t *ov :
              {L"overlay.cow", L"overlay.raw", L"overlay.vhdx"}) {
           std::error_code rec;
@@ -10395,6 +10422,25 @@ DetonationResult InHouseOrchestrator::PrepareAndRun(
   EnsureDirectory(result.runDir / "disk");
   EnsureDirectory(result.screenshotsDir);
   EnsureDirectory(result.artifactsDir);
+
+  // T08: hold an exclusive run.lock for this run's entire lifetime, created
+  // NOW (before any overlay exists) so the invariant "any dir that owns an
+  // overlay holds a live lock" is always true. A concurrent detonation's
+  // overlay-GC sweep probes this lock (RunDirIsLiveLocked) and skips us while
+  // we run. CREATE_ALWAYS + share=0 makes the open exclusive;
+  // FILE_FLAG_DELETE_ON_CLOSE self-heals on crash and leaves no stale file.
+  struct RunLockGuard {
+    HANDLE handle = INVALID_HANDLE_VALUE;
+    ~RunLockGuard() {
+      if (handle != INVALID_HANDLE_VALUE) {
+        ::CloseHandle(handle); // DELETE_ON_CLOSE removes run.lock
+      }
+    }
+  } runLock;
+  runLock.handle = ::CreateFileW(
+      (result.runDir / L"run.lock").c_str(), GENERIC_WRITE, 0 /*exclusive*/,
+      nullptr, CREATE_ALWAYS,
+      FILE_ATTRIBUTE_NORMAL | FILE_FLAG_DELETE_ON_CLOSE, nullptr);
 
   std::vector<EventRecord> events;
   std::vector<std::filesystem::path> returnedArtifacts;
@@ -10716,19 +10762,47 @@ DetonationResult InHouseOrchestrator::PrepareAndRun(
           }
         }
       }
-      // ANTIMAL_PROBE_LOGIN_PASSWORD=<password>: after the lock screen is
-      // dismissed (PRESS_ENTER above), type this password + Enter at several
+      // Resolve the login behavior. A caller-supplied env override always wins
+      // (the App's vm.boot path sets these); only when NEITHER login env var is
+      // present do we derive from config (vm_login_mode / vm_login_password),
+      // so the HostCli detonate path honors the configured login instead of
+      // silently dropping it. "password" -> type the configured password;
+      // "autologon" -> the blank/no-password Enter-Enter path; "manual"/empty
+      // -> no injected keystrokes (a human logs in).
+      std::string effectiveLoginPwd;
+      bool effectiveNoPassword = EnvFlagEnabled("ANTIMAL_PROBE_OOBE_NOPASSWORD");
+      {
+        char pwdEnv[128]{};
+        size_t pwdEnvNeeded = 0;
+        const bool loginPwdEnvSet =
+            getenv_s(&pwdEnvNeeded, pwdEnv, sizeof(pwdEnv),
+                     "ANTIMAL_PROBE_LOGIN_PASSWORD") == 0 &&
+            pwdEnvNeeded > 1 && pwdEnv[0] != '\0';
+        if (loginPwdEnvSet) {
+          effectiveLoginPwd.assign(pwdEnv);
+        }
+        // Only fall back to config when no login env override is present at all.
+        if (!loginPwdEnvSet && !effectiveNoPassword) {
+          const std::string mode = ToLowerAscii(config_.vmLoginMode);
+          if (mode == "password") {
+            effectiveLoginPwd = config_.vmLoginPassword;
+          } else if (mode == "autologon") {
+            effectiveNoPassword = true;
+          }
+          // "manual" / empty -> leave both unset (login stays manual).
+        }
+      }
+      // ANTIMAL_PROBE_LOGIN_PASSWORD / config "password": after the lock screen
+      // is dismissed (PRESS_ENTER above), type this password + Enter at several
       // offsets so it lands once the Win11 login password field is focused.
       // Win11 25H2 ignores plaintext autologon (the lock screen intercepts; the
       // LSA secret is required), so injected-input login is the proven path to
       // the desktop on a seeded fast-boot. Extra firings on an already
       // logged-in desktop are inert. Does NOT authorize sample execution.
       {
-        char pwd[128]{};
-        size_t pwdNeeded = 0;
-        if (getenv_s(&pwdNeeded, pwd, sizeof(pwd),
-                     "ANTIMAL_PROBE_LOGIN_PASSWORD") == 0 &&
-            pwdNeeded > 1 && pwd[0] != '\0') {
+        const std::string &pwd = effectiveLoginPwd;
+        const size_t pwdNeeded = pwd.size() + 1; // mirror the old getenv_s len
+        if (!pwd.empty()) {
           using namespace std::chrono;
           // Map an ASCII char to a Set-1 make scancode (US layout), reporting
           // whether Left-Shift must wrap it (uppercase + shifted symbols).
@@ -10830,12 +10904,13 @@ DetonationResult InHouseOrchestrator::PrepareAndRun(
           }
         }
       }
-      // ANTIMAL_PROBE_OOBE_NOPASSWORD: the account was blanked offline, so login
-      // is just "dismiss the lock screen, submit the empty password" -- two Enters
-      // ~700ms apart, fired across a wide window so one pair lands once the sign-in
-      // field is focused. No password is ever typed. Extra firings on the desktop
-      // are inert.
-      if (EnvFlagEnabled("ANTIMAL_PROBE_OOBE_NOPASSWORD")) {
+      // ANTIMAL_PROBE_OOBE_NOPASSWORD (or config vm_login_mode = "autologon"):
+      // the account was blanked offline, so login is just "dismiss the lock
+      // screen, submit the empty password" -- two Enters ~700ms apart, fired
+      // across a wide window so one pair lands once the sign-in field is
+      // focused. No password is ever typed. Extra firings on the desktop are
+      // inert.
+      if (effectiveNoPassword) {
         using namespace std::chrono;
         const std::vector<uint8_t> enter = {0x1C, 0x9C};
         for (int off : {30, 50, 70, 90, 110, 140, 170, 200, 240}) {
