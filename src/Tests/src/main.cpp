@@ -9,6 +9,7 @@
 #include "antimal/ExternalTools.h"
 #include "antimal/FileSystemTelemetry.h"
 #include "antimal/FileUtil.h"
+#include "antimal/ImageLoadTelemetry.h"
 #include "antimal/Http.h"
 #include "antimal/HyperVOrchestrator.h"
 #include "antimal/IntelLookup.h"
@@ -4433,6 +4434,131 @@ void TestFileSystemTelemetry() {
          "file: baseline is capped");
 }
 
+// Image/DLL-load telemetry (injection / side-loading detection). Covers the pure
+// diff (load / unload / baseline), the suspicious-path classifier + its MITRE
+// tag, that a suspicious load feeds the behavior scorer toward Malicious with a
+// rationale naming the module, and that the report renders a "Module Loads"
+// section highlighting the side-loaded DLL.
+void TestImageLoadTelemetry() {
+  using antimal::DiffModuleSnapshots;
+  using antimal::IsSuspiciousModulePath;
+  using antimal::LoadedModule;
+  using antimal::ProcessModuleSnapshot;
+
+  // ----- (a) Diff: a module new to a pid -> image.load; removed -> unload -----
+  ProcessModuleSnapshot prev, cur;
+  prev[1000] = {LoadedModule{"C:\\Windows\\System32\\ntdll.dll", 0x7FF000000000ull}};
+  cur[1000] = {LoadedModule{"C:\\Windows\\System32\\ntdll.dll", 0x7FF000000000ull},
+               LoadedModule{"C:\\Windows\\System32\\kernel32.dll", 0x7FF000100000ull}};
+
+  auto loads = DiffModuleSnapshots(prev, cur, false, 64, 64);
+  Expect(loads.size() == 1 && loads[0].action == "image.load" &&
+             loads[0].category == "image" && loads[0].processId == 1000 &&
+             loads[0].target == "C:\\Windows\\System32\\kernel32.dll" &&
+             loads[0].details["base"] == "0x00007FF000100000",
+         "image: new module in a pid -> image.load with hex base");
+
+  auto unloads = DiffModuleSnapshots(cur, prev, false, 64, 64);
+  Expect(unloads.size() == 1 && unloads[0].action == "image.unload" &&
+             unloads[0].target == "C:\\Windows\\System32\\kernel32.dll",
+         "image: removed module -> image.unload");
+
+  // Baseline emits image.observed across all pids, capped.
+  auto base = DiffModuleSnapshots({}, cur, true, 1, 64);
+  Expect(base.size() == 1 && base[0].action == "image.observed" &&
+             base[0].details["truncated"] == "true",
+         "image: baseline is capped and marks truncation honestly");
+
+  // System-DLL loads are NEVER flagged, so a fresh kernel32 load is not suspicious.
+  Expect(loads[0].mitre.empty() &&
+             loads[0].details.find("suspicion") == loads[0].details.end(),
+         "image: System32 load carries no suspicion tag");
+
+  // ----- (b) Suspicious-path classifier -----
+  Expect(IsSuspiciousModulePath(
+             "C:\\Users\\x\\AppData\\Local\\Temp\\evil.dll", ""),
+         "image suspicion: AppData\\Local\\Temp DLL -> suspicious");
+  Expect(!IsSuspiciousModulePath("C:\\Windows\\System32\\ntdll.dll", ""),
+         "image suspicion: System32 DLL -> NOT suspicious");
+  Expect(!IsSuspiciousModulePath("C:\\Program Files\\App\\app.dll", ""),
+         "image suspicion: Program Files DLL -> NOT suspicious");
+  Expect(!IsSuspiciousModulePath("C:\\Windows\\WinSxS\\amd64_x\\comctl32.dll", ""),
+         "image suspicion: WinSxS DLL -> NOT suspicious");
+  // Application-directory side-loading: a DLL next to a dropped sample in a
+  // writable, non-system folder.
+  Expect(IsSuspiciousModulePath(
+             "C:\\Users\\me\\Downloads\\sneaky.dll",
+             "C:\\Users\\me\\Downloads\\sample.exe"),
+         "image suspicion: DLL beside dropped sample in Downloads -> suspicious");
+  // Extended-length prefix + forward slashes must still resolve to System32.
+  Expect(!IsSuspiciousModulePath("\\\\?\\C:/Windows/System32/ole32.dll", ""),
+         "image suspicion: \\\\?\\ + slashes still resolve System32 -> NOT suspicious");
+
+  // A suspicious load is tagged with the side-loading techniques + suspicion.
+  ProcessModuleSnapshot susPrev, susCur;
+  susPrev[2000] = {LoadedModule{"C:\\Windows\\System32\\ntdll.dll", 0x1000}};
+  susCur[2000] = {LoadedModule{"C:\\Windows\\System32\\ntdll.dll", 0x1000},
+                  LoadedModule{"C:\\Users\\v\\AppData\\Local\\Temp\\inject.dll",
+                               0x4000}};
+  auto susLoads = DiffModuleSnapshots(susPrev, susCur, false, 64, 64);
+  Expect(susLoads.size() == 1 &&
+             susLoads[0].target ==
+                 "C:\\Users\\v\\AppData\\Local\\Temp\\inject.dll" &&
+             susLoads[0].details["suspicion"] == "dll-from-writable-path" &&
+             susLoads[0].mitre.find("T1574") != std::string::npos,
+         "image: temp-path DLL load tagged suspicious with T1574 technique");
+
+  // ----- (c) A suspicious image.load drives the behavior scorer -----
+  {
+    antimal::DynamicRunSummary s;
+    s.sampleExecuted = true;
+    antimal::EventRecord proc;
+    proc.category = "process";
+    proc.action = "process.start";
+    proc.processId = 2000;
+    proc.imagePath = "trusted.exe";
+    std::vector<antimal::EventRecord> events = {proc, susLoads[0]};
+    const antimal::BehaviorScore bs =
+        antimal::ScoreSandboxBehavior(s, events);
+    Expect(bs.verdict == antimal::Verdict::Suspicious ||
+               bs.verdict == antimal::Verdict::Malicious,
+           "image: a suspicious load pushes the verdict to Suspicious/Malicious");
+    bool named = false;
+    for (const auto &line : bs.rationale) {
+      if (line.find("side-loading") != std::string::npos &&
+          line.find("inject.dll") != std::string::npos) {
+        named = true;
+      }
+    }
+    Expect(named,
+           "image: scorer rationale names the side-loaded module (inject.dll)");
+  }
+
+  // ----- (d) Report renders a "Module Loads" section with the suspicious DLL --
+  {
+    antimal::AnalysisReport report;
+    report.runId = "image-section-test";
+    antimal::EventRecord normalLoad;
+    normalLoad.category = "image";
+    normalLoad.action = "image.load";
+    normalLoad.processId = 2000;
+    normalLoad.imagePath = "trusted.exe";
+    normalLoad.target = "C:\\Windows\\System32\\kernel32.dll";
+    report.events = {susLoads[0], normalLoad};
+    const std::string html = antimal::BuildHtmlReportWithFrames(report, {});
+    Expect(html.find("Module Loads") != std::string::npos,
+           "image report: Module Loads section header present");
+    Expect(html.find("Side-loaded / hijacked modules") != std::string::npos,
+           "image report: suspicious sub-section present");
+    Expect(html.find("inject.dll") != std::string::npos,
+           "image report: side-loaded module path rendered");
+    Expect(html.find("T1574.001/T1574.002") != std::string::npos,
+           "image report: side-loading technique rendered");
+    Expect(html.find("kernel32.dll") != std::string::npos,
+           "image report: normal module load also listed");
+  }
+}
+
 // Dropped-file enrichment (backlog T51-lite): the in-guest collector tags a
 // file.create with the dropped file's magic-byte type + sha256, so the report
 // can say WHAT a sample dropped. Covers the pure classifier, the on-disk
@@ -5997,6 +6123,7 @@ int main() {
     TestRegistryPersistenceMitreTagging();
     TestRegistryPersistenceLocationTable();
     TestFileSystemTelemetry();
+    TestImageLoadTelemetry();
     TestDroppedFileEnrichment();
     TestBehaviorScoreVerdict();
     TestReportSections();

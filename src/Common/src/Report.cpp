@@ -1071,6 +1071,66 @@ bool EmitCrashesSection(std::ostringstream &html,
   return true;
 }
 
+// Module Loads (image/DLL-load telemetry). Suspicious side-loaded /
+// search-order-hijacked DLLs (details["suspicion"] set / MITRE-tagged) are
+// listed FIRST and highlighted; a bounded tail of normal loads follows so the
+// section stays readable on a process that pulls in hundreds of system DLLs.
+bool EmitModuleLoadsSection(std::ostringstream &html,
+                            const std::vector<EventRecord> &events) {
+  constexpr size_t kNormalLoadCap = 64;
+  std::ostringstream suspRows;
+  std::ostringstream normalRows;
+  size_t suspCount = 0;
+  size_t normalShown = 0;
+  size_t normalTotal = 0;
+  for (const auto &e : events) {
+    if (e.category != "image" || !ActionIs(e, "image.load")) continue;
+    const bool suspicious =
+        !e.mitre.empty() || !Detail(e, "suspicion").empty();
+    const std::string loader =
+        (e.imagePath.empty() ? std::string("pid") : e.imagePath) + " (" +
+        std::to_string(e.processId) + ")";
+    if (suspicious) {
+      ++suspCount;
+      suspRows << "<tr class=\"bad\"><td class=\"mono\">"
+               << HtmlEscape(e.mitre.empty() ? "(hijack)" : e.mitre)
+               << "</td><td class=\"mono\" title=\"" << HtmlEscape(e.target)
+               << "\">" << HtmlEscape(TruncateForCell(e.target))
+               << "</td><td class=\"mono\">" << HtmlEscape(loader)
+               << "</td></tr>";
+    } else {
+      ++normalTotal;
+      if (normalShown < kNormalLoadCap) {
+        ++normalShown;
+        normalRows << "<tr><td class=\"mono\" title=\"" << HtmlEscape(e.target)
+                   << "\">" << HtmlEscape(TruncateForCell(e.target))
+                   << "</td><td class=\"mono\">" << HtmlEscape(loader)
+                   << "</td></tr>";
+      }
+    }
+  }
+  if (suspCount == 0 && normalTotal == 0) return false;
+
+  if (suspCount > 0) {
+    html << "<h3 class=\"bad\">Side-loaded / hijacked modules (" << suspCount
+         << ")</h3>";
+    html << "<table><thead><tr><th>Technique</th><th>Module</th>"
+            "<th>Loaded by</th></tr></thead><tbody>"
+         << suspRows.str() << "</tbody></table>";
+  }
+  if (normalTotal > 0) {
+    html << "<h3>Other module loads (" << normalTotal << ")</h3>";
+    html << "<table><thead><tr><th>Module</th><th>Loaded by</th></tr></thead>"
+            "<tbody>"
+         << normalRows.str() << "</tbody></table>";
+    if (normalTotal > normalShown) {
+      html << "<div class=\"muted\">… " << (normalTotal - normalShown)
+           << " more normal load(s) not shown.</div>";
+    }
+  }
+  return true;
+}
+
 bool EmitMitreChips(std::ostringstream &html,
                     const std::vector<std::string> &techniques) {
   if (techniques.empty()) return false;
@@ -1194,6 +1254,9 @@ code,.mono{font-family:Consolas,Cascadia Code,monospace;font-size:12px;
 .chip.exit{background:#3f2330;color:#ffd6df}
 .chip.integ{background:#243245;color:#cfe1f6}
 .mitre-chips{display:flex;gap:6px;flex-wrap:wrap}
+h3.bad{color:var(--bad);margin:10px 0 6px}
+tr.bad td{background:rgba(240,75,94,.10);color:#ffd0d6}
+.muted{color:var(--muted);font-size:12px;margin-top:4px}
 )CSS";
 
 const char *kJs = R"JS(
@@ -1866,6 +1929,13 @@ std::string BuildHtmlReportWithFrames(const AnalysisReport &report,
     std::ostringstream body;
     if (EmitCrashesSection(body, report.events)) {
       html << "<div class=\"section-card\"><h2>Crashes</h2>" << body.str()
+           << "</div>";
+    }
+  }
+  {
+    std::ostringstream body;
+    if (EmitModuleLoadsSection(body, report.events)) {
+      html << "<div class=\"section-card\"><h2>Module Loads</h2>" << body.str()
            << "</div>";
     }
   }

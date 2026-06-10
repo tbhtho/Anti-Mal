@@ -5,6 +5,7 @@
 #include "antimal/FileSystemTelemetry.h"
 #include "antimal/GuestMonitor.h"
 #include "antimal/HostChannel.h"
+#include "antimal/ImageLoadTelemetry.h"
 #include "antimal/NetworkTelemetry.h"
 #include "antimal/RegistryTelemetry.h"
 #include "antimal/Json.h"
@@ -14,6 +15,7 @@
 #include "antimal/WerReport.h"
 
 #include <Windows.h>
+#include <tlhelp32.h>  // CreateToolhelp32Snapshot (per-process module enumeration)
 #include <UserEnv.h>   // CreateEnvironmentBlock (visible-session launch)
 #include <WtsApi32.h>  // WTSQueryUserToken (active console session token)
 #include <sddl.h>      // ConvertSidToStringSidW (process-token SID string)
@@ -762,6 +764,67 @@ void ScanForWerCrashes(HANDLE com2, std::set<std::wstring> &seen) {
   FindClose(find);
 }
 
+// ---------------------------------------------------------------------------
+// Image / DLL-load telemetry capture.
+//
+// Builds a per-process module snapshot by enumerating each live process's loaded
+// modules via a per-PID Toolhelp32 module snapshot. This is HEAVIER than the
+// process-table poll (one snapshot handle per process), so the caller runs it on
+// its own slower cadence, and we BOUND it hard so a single vCPU can't stall:
+//   * at most kModuleMaxPidsPerPass processes are scanned per pass;
+//   * at most kModuleMaxModulesPerProc modules are recorded per process.
+// Truncation is marked on the snapshot side via the diff's per-batch caps; here
+// we simply stop at the per-process module cap (the common process has well
+// under 256 modules, so this almost never trips). pid 0 (System Idle) and pid 4
+// (System) are skipped -- they have no user-mode module list. A snapshot failure
+// on a protected/exited process (access denied) is tolerated per-pid: that pid
+// contributes no modules and the pass continues.
+// ---------------------------------------------------------------------------
+
+constexpr size_t kModuleMaxPidsPerPass = 128;
+constexpr size_t kModuleMaxModulesPerProc = 256;
+
+antimal::ProcessModuleSnapshot BuildModuleSnapshot(
+    const std::vector<uint32_t> &pids) {
+  antimal::ProcessModuleSnapshot snap;
+  size_t scanned = 0;
+  for (uint32_t pid : pids) {
+    if (scanned >= kModuleMaxPidsPerPass) {
+      break;
+    }
+    if (pid == 0 || pid == 4) {
+      continue;  // System Idle / System -- no user-mode module list
+    }
+    HANDLE modSnap = CreateToolhelp32Snapshot(
+        TH32CS_SNAPMODULE | TH32CS_SNAPMODULE32, pid);
+    if (modSnap == INVALID_HANDLE_VALUE) {
+      continue;  // access denied on a protected/exited process -- tolerate it
+    }
+    ++scanned;
+    MODULEENTRY32W me{};
+    me.dwSize = sizeof(me);
+    std::vector<antimal::LoadedModule> mods;
+    if (Module32FirstW(modSnap, &me)) {
+      do {
+        if (mods.size() >= kModuleMaxModulesPerProc) {
+          break;  // per-process cap (honestly bounded; rarely hit)
+        }
+        antimal::LoadedModule m;
+        m.path = NarrowUtf8(me.szExePath);
+        m.base = reinterpret_cast<uint64_t>(me.modBaseAddr);
+        if (!m.path.empty()) {
+          mods.push_back(std::move(m));
+        }
+      } while (Module32NextW(modSnap, &me));
+    }
+    CloseHandle(modSnap);
+    if (!mods.empty()) {
+      snap[pid] = std::move(mods);
+    }
+  }
+  return snap;
+}
+
 int RunHostChannelLoop(std::string reason, bool serviceMode) {
   static std::atomic_bool powerPlanSet{false};
   if (!powerPlanSet.exchange(true)) {
@@ -808,6 +871,12 @@ int RunHostChannelLoop(std::string reason, bool serviceMode) {
   bool regBaselineSent = false;
   antimal::FileSnapshot knownFiles;
   bool fileBaselineSent = false;
+  // Image/DLL-load telemetry: a per-process module map, diffed into
+  // image.load/unload (suspicious side-loads/hijacks tagged with MITRE). Heavier
+  // than the others (one Toolhelp snapshot per process), so polled on its own
+  // slower cadence (kModulePollEveryTicks) and bounded in BuildModuleSnapshot.
+  antimal::ProcessModuleSnapshot knownModules;
+  bool moduleBaselineSent = false;
   // Each Report.wer is decoded + emitted once; keyed on its full path so a
   // crash surfaces as a single process.crash event across ticks.
   std::set<std::wstring> seenWerReports;
@@ -842,6 +911,7 @@ int RunHostChannelLoop(std::string reason, bool serviceMode) {
   constexpr int kLaunchWaitSec = 600;
   constexpr uint32_t kProcessPollEveryTicks = 2; // ~2s between snapshots
   constexpr uint32_t kFilePollEveryTicks = 5;    // file walk is heavier
+  constexpr uint32_t kModulePollEveryTicks = 6;  // per-process module walk is heaviest
   constexpr size_t kProcessBaselineCap = 64;
   constexpr size_t kProcessDeltaCap = 64;
   // Cap on dropped files hashed per file-poll tick. A burst of drops beyond this
@@ -1159,6 +1229,36 @@ int RunHostChannelLoop(std::string reason, bool serviceMode) {
               ev.details["hashSkipped"] = "rate";  // per-tick cap hit
             }
           }
+          if (!SendAgentEvent(com2, ev)) {
+            CloseHandle(com2);
+            return 1;
+          }
+        }
+      }
+    }
+
+    // Image/DLL-load telemetry: snapshot each live process's loaded modules and
+    // stream image.load / image.unload deltas -- the high-signal "what DLLs got
+    // pulled in, and were any side-loaded / search-order-hijacked from a
+    // writable, non-system path?" (DiffModuleSnapshots tags those with MITRE +
+    // details["suspicion"]). Polled on the slowest cadence because the per-process
+    // module walk is the heaviest collector; PIDs come from the freshest process
+    // snapshot (knownProcs), and BuildModuleSnapshot bounds PIDs + modules so a
+    // module flood can't stall the single vCPU.
+    if (tick % kModulePollEveryTicks == 0) {
+      std::vector<uint32_t> livePids;
+      livePids.reserve(knownProcs.size());
+      for (const auto &entry : knownProcs) {
+        livePids.push_back(entry.first);
+      }
+      auto modules = BuildModuleSnapshot(livePids);
+      if (!modules.empty() || moduleBaselineSent) {
+        auto modEvents = antimal::DiffModuleSnapshots(
+            knownModules, modules, !moduleBaselineSent, kProcessBaselineCap,
+            kProcessDeltaCap);
+        moduleBaselineSent = true;
+        knownModules = std::move(modules);
+        for (const auto &ev : modEvents) {
           if (!SendAgentEvent(com2, ev)) {
             CloseHandle(com2);
             return 1;

@@ -46,6 +46,7 @@
     <ClInclude Include="include\antimal\HostChannel.h" />
     <ClInclude Include="include\antimal\Http.h" />
     <ClInclude Include="include\antimal\HyperVOrchestrator.h" />
+    <ClInclude Include="include\antimal\ImageLoadTelemetry.h" />
     <ClInclude Include="include\antimal\IntelLookup.h" />
     <ClInclude Include="include\antimal\Json.h" />
     <ClInclude Include="include\antimal\JsonValue.h" />
@@ -76,6 +77,7 @@
     <ClCompile Include="src\GuestMonitor.cpp" />
     <ClCompile Include="src\Http.cpp" />
     <ClCompile Include="src\HyperVOrchestrator.cpp" />
+    <ClCompile Include="src\ImageLoadTelemetry.cpp" />
     <ClCompile Include="src\IntelLookup.cpp" />
     <ClCompile Include="src\Json.cpp" />
     <ClCompile Include="src\JsonValue.cpp" />

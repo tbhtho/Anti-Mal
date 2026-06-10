@@ -171,6 +171,8 @@ const char *SuspiciousCommandLineLabel(const std::string &cmdRaw) {
 //   persistence (per event, MITRE-confirmed)        +35
 //   dropped executable / script (per event)         +30
 //   privilege escalation (child elevated vs parent) +35
+//   DLL side-load / search-order hijack (first)     +25
+//   DLL side-load / search-order hijack (each more)  +8 (capped)
 //   external network egress (first endpoint)        +20
 //   external network egress (each extra endpoint)    +8 (capped)
 //   suspicious command line (per distinct technique) +15
@@ -205,6 +207,7 @@ BehaviorScore ScoreSandboxBehavior(const DynamicRunSummary &summary,
   std::set<std::string> suspiciousCmds; // distinct technique labels
   std::set<std::string> persistenceTargets;
   std::set<std::string> dropTargets;
+  std::set<std::string> suspiciousModules; // distinct side-loaded/hijacked DLLs
 
   for (const auto &e : events) {
     const std::string cat = Lower(e.category);
@@ -296,14 +299,28 @@ BehaviorScore ScoreSandboxBehavior(const DynamicRunSummary &summary,
       }
     }
 
+    // --- Side-loaded / search-order-hijacked DLL: an image.load the telemetry
+    // flagged as loaded from a writable, non-system path (details["suspicion"]
+    // set, MITRE-tagged). De-duped by module path so a repeated load of the same
+    // hijacked DLL counts once.
+    if (cat == "image" && Has(act, "load")) {
+      const std::string *susp = Detail(e, "suspicion");
+      if ((susp && !susp->empty()) || !e.mitre.empty()) {
+        suspiciousModules.insert(tgtL.empty() ? act : tgtL);
+      }
+    }
+
     // --- Any other MITRE-tagged behavior we did not already count above.
-    if (!e.mitre.empty() && cat != "registry") {
+    // Registry persistence and suspicious image loads are scored explicitly, so
+    // exclude both categories here to avoid double-counting.
+    if (!e.mitre.empty() && cat != "registry" && cat != "image") {
       ++otherMitre;
     }
   }
 
   const int extNet = static_cast<int>(externalEndpoints.size());
   const int suspCmd = static_cast<int>(suspiciousCmds.size());
+  const int suspMod = static_cast<int>(suspiciousModules.size());
 
   // ---- Accumulate score + rationale, strongest signals first. ----
   if (persistence > 0) {
@@ -328,6 +345,26 @@ BehaviorScore ScoreSandboxBehavior(const DynamicRunSummary &summary,
         "Privilege escalation: " + std::to_string(privEsc) +
         " High/System-integrity child spawned from a Medium/Low parent (+" +
         std::to_string(w) + ").");
+  }
+  if (suspMod > 0) {
+    // First side-loaded/hijacked DLL is moderate; each additional one adds less,
+    // capped so a process loading many DLLs from one writable dir can't run away
+    // with the score. Names the offending module(s) for the analyst.
+    const int w = 25 + std::min(suspMod - 1, 5) * 8;
+    out.score += w;
+    std::string joined;
+    int shown = 0;
+    for (const auto &m : suspiciousModules) {
+      if (shown++ >= 3) {
+        joined += ", ...";
+        break;
+      }
+      joined += (joined.empty() ? "" : ", ") + m;
+    }
+    out.rationale.push_back(
+        "DLL side-loading / search-order hijack: " + std::to_string(suspMod) +
+        " module(s) loaded from a writable, non-system path (" + joined +
+        ") (+" + std::to_string(w) + ").");
   }
   if (extNet > 0) {
     // First external endpoint is moderate; each additional one adds less,
@@ -382,7 +419,7 @@ BehaviorScore ScoreSandboxBehavior(const DynamicRunSummary &summary,
   }
 
   const bool richBehavior = persistence || exeDrops || privEsc || extNet ||
-                            suspCmd || dataDrops || otherMitre;
+                            suspCmd || suspMod || dataDrops || otherMitre;
 
   // ---- Map score -> verdict. ----
   // >= 60  : two strong signals, or one strong + corroboration -> Malicious
