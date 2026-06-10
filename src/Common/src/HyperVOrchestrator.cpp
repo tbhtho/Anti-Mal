@@ -4546,6 +4546,8 @@ bool PatchOverlayBlankAntimalPassword(hv::IBlockDevice &disk,
                                       BootOverlayPatchResult *result);
 bool PatchOverlayDesktopStability(hv::IBlockDevice &disk,
                                   BootOverlayPatchResult *result);
+bool MaybeCompleteOobeInOverlay(hv::IBlockDevice &disk,
+                                BootOverlayPatchResult *result);
 // Arms the THIRD key of the detonation gate (the guest-side authorization) by
 // adding ANTIMAL_GUEST_ALLOW_EXECUTION=1 to the AntiMalGuestAgent service's own
 // per-service Environment value in the overlay's SYSTEM hive. The SCM merges that
@@ -6309,6 +6311,19 @@ BootOverlayPatchResult ApplyEphemeralBootOverlay(hv::IBlockDevice &disk) {
   if (EnvFlagEnabled("ANTIMAL_PROBE_DESKTOP_STABILITY")) {
     PatchOverlayDesktopStability(disk, &result);
   }
+  // Opt-in CANDIDATE (default-OFF, A/B-test only): mark Windows OOBE/setup
+  // COMPLETE in THIS disposable overlay so the boot stops re-running the
+  // mid-first-logon OOBE/setup that the seed snapshot was captured in the middle
+  // of. The documented root cause of the unusable desktop is that every seed-boot
+  // re-runs OOBE/setup, so per-user modern-shell AppX provisioning never
+  // completes and explorer/ShellHost crash-loop. Flipping the standard Windows
+  // "setup is done" flags is a REASONED candidate to let a clean first
+  // INTERACTIVE logon (and its AppX provisioning) proceed. This is unverified --
+  // the user must boot-test it. Overlay-only, never the base. When the flag is
+  // unset this is a no-op and the boot is byte-identical to today's.
+  if (EnvFlagEnabled("ANTIMAL_PROBE_COMPLETE_OOBE")) {
+    MaybeCompleteOobeInOverlay(disk, &result);
+  }
   // Opt-in third detonation key: arm the guest-side execution authorization in
   // THIS run's disposable overlay only (the promoted snapshot stays gated). With
   // this and both host keys set, an authorized execute job is honored in-guest.
@@ -7524,6 +7539,167 @@ bool PatchOverlayDesktopStability(hv::IBlockDevice &disk,
                             (soft ? "ok" : "no") + " SYSTEM=" + (sys ? "ok" : "no"));
   }
   return soft || sys;
+}
+
+// CANDIDATE (default-OFF, opt-in via ANTIMAL_PROBE_COMPLETE_OOBE): mark Windows
+// OOBE/setup COMPLETE in THIS disposable overlay only.
+//
+// Documented root cause (do not re-derive): the seed snapshot was captured
+// MID-first-logon, so every seed-boot RE-RUNS OOBE/setup (defaultuser0,
+// FirstLogonAnim / OOBEFodSetup / setup.exe / runonce re-run and never finish).
+// Because OOBE never completes, per-user modern-shell AppX provisioning
+// (RuntimeBroker / StartMenuExperienceHost / SearchHost) never happens and
+// explorer/ShellHost crash-loop (STACK_BUFFER_OVERRUN 0xC0000409) -> the desktop
+// renders but is non-interactive. Hypothesis this patch TESTS: if we flip the
+// standard Windows "setup is done" flags in the overlay, the boot stops
+// re-running OOBE and proceeds to a clean first INTERACTIVE logon, letting the
+// normal per-user AppX provisioning complete and the shell initialize.
+//
+// This is an UNVERIFIED candidate for the user to A/B boot-test, NOT a proven
+// fix. Overlay-only (never the base). Reuses the SAME offline-hive write
+// mechanism PatchOverlayDesktopStability uses (NtfsBootFileLocator + the
+// same-size MutableHiveView writer + RefreshRegistryHiveHeader +
+// WriteFileSameSize). The in-house writer is SAME-SIZE-ONLY (it cannot create
+// keys/values or grow a value), so we only touch DWORD values that ALREADY
+// EXIST, replacing 4 bytes with 4 bytes (always same-size). Absent values are
+// SKIPPED with a breadcrumb -- never created. When ANTIMAL_PROBE_COMPLETE_OOBE
+// is unset this function is never called, so the default boot is unaffected.
+bool MaybeCompleteOobeInOverlay(hv::IBlockDevice &disk,
+                                BootOverlayPatchResult *result) {
+  const auto parts = ReadGptPartitionsLite(disk);
+  const auto windows =
+      std::find_if(parts.begin(), parts.end(), [](const GptPartitionLite &p) {
+        return IsWindowsBasicDataGuid(p.typeGuid);
+      });
+  if (windows == parts.end()) {
+    if (result) result->notes.push_back("complete-oobe: Windows partition not found");
+    return false;
+  }
+  NtfsBootFileLocator ntfs(disk, windows->firstLba);
+  if (!ntfs.Init()) {
+    if (result) result->notes.push_back("complete-oobe: Windows NTFS unreadable");
+    return false;
+  }
+  // Same open/edit/refresh/write-same-size envelope PatchOverlayDesktopStability
+  // uses, so this rides the identical offline-hive write mechanism.
+  auto patchHive = [&](const char *path, auto &&fn) -> bool {
+    const auto entry = ntfs.FindPath(path);
+    if (!entry) {
+      if (result) result->notes.push_back(std::string("complete-oobe: missing ") + path);
+      return false;
+    }
+    auto bytes = ntfs.ReadFile(*entry, 256u * 1024u * 1024u);
+    MutableHiveView hive(bytes);
+    if (!hive.IsValid() || !fn(hive)) {
+      if (result) result->notes.push_back(std::string("complete-oobe: no change ") + path);
+      return false;
+    }
+    RefreshRegistryHiveHeader(bytes);
+    if (!ntfs.WriteFileSameSize(*entry, bytes)) {
+      if (result) result->notes.push_back(std::string("complete-oobe: write failed ") + path);
+      return false;
+    }
+    return true;
+  };
+
+  int applied = 0;
+  int skippedAbsent = 0;
+  int skippedSize = 0;
+  // SAME-SIZE-ONLY, PRE-EXISTENCE-GATED DWORD write. We deliberately do NOT use
+  // the create-capable UpsertHiveDword here: per this overlay-writer's
+  // same-size-only constraint we only overwrite a value that ALREADY EXISTS and
+  // is a 4-byte DWORD (4 -> 4 bytes is always same-size). Absent values are
+  // recorded and skipped -- never created. Returns true iff a write happened.
+  auto sameSizeDword = [&](MutableHiveView &hive, uint32_t key,
+                           const std::string &name, uint32_t val,
+                           const char *label) -> bool {
+    const auto loc = hive.FindValue(key, name);
+    if (!loc) {
+      ++skippedAbsent;
+      if (result)
+        result->notes.push_back(std::string("complete-oobe: skipped-absent ") +
+                                label);
+      return false;
+    }
+    if (loc->dataLength != 4) {
+      ++skippedSize;
+      if (result)
+        result->notes.push_back(std::string("complete-oobe: skipped (not a "
+                                            "4-byte DWORD, len=") +
+                                std::to_string(loc->dataLength) + ") " + label);
+      return false;
+    }
+    // 4-byte -> 4-byte: UpsertBinaryValueSameSize overwrites in place (the value
+    // exists and is the same length), so the hive file size never changes.
+    if (hive.UpsertBinaryValueSameSize(key, name, REG_DWORD,
+                                       HiveDwordBytes(val))) {
+      ++applied;
+      if (result)
+        result->notes.push_back(std::string("complete-oobe: applied ") + label +
+                                " = " + std::to_string(val));
+      return true;
+    }
+    if (result)
+      result->notes.push_back(std::string("complete-oobe: write skipped ") +
+                              label);
+    return false;
+  };
+
+  // SYSTEM\Setup lives at the hive ROOT (HKLM\SYSTEM\Setup), NOT under a control
+  // set -- this matches the existing autologon overlay patch, which resolves the
+  // Setup key the same way. These are the standard "OOBE/setup is finished"
+  // flags; clearing them stops the boot from re-entering the setup pass.
+  const bool sys = patchHive(
+      "Windows\\System32\\config\\SYSTEM", [&](MutableHiveView &hive) {
+        const auto root = hive.RootIndex();
+        if (!root) return false;
+        const auto setup = hive.FindSubkey(*root, "Setup");
+        if (!setup) {
+          if (result)
+            result->notes.push_back("complete-oobe: SYSTEM\\Setup key absent");
+          return false;
+        }
+        bool any = false;
+        // SetupType = 0 (SETUPTYPE_NOREBOOT) -> setup complete, no setup.exe pass.
+        any = sameSizeDword(hive, *setup, "SetupType", 0, "SYSTEM\\Setup\\SetupType") || any;
+        // The remaining three are "if present" -- skipped cleanly when absent.
+        any = sameSizeDword(hive, *setup, "SystemSetupInProgress", 0,
+                            "SYSTEM\\Setup\\SystemSetupInProgress") || any;
+        any = sameSizeDword(hive, *setup, "OOBEInProgress", 0,
+                            "SYSTEM\\Setup\\OOBEInProgress") || any;
+        any = sameSizeDword(hive, *setup, "FactoryPreInstallInProgress", 0,
+                            "SYSTEM\\Setup\\FactoryPreInstallInProgress") || any;
+        return any;
+      });
+
+  // SOFTWARE\...\Policies\System\EnableFirstLogonAnimation = 0 -> skip the
+  // first-logon animation that re-runs in the mid-OOBE snapshot. "If present"
+  // only -- never created.
+  const bool soft = patchHive(
+      "Windows\\System32\\config\\SOFTWARE", [&](MutableHiveView &hive) {
+        const auto policiesSystem = FindHivePath(
+            hive, {"Microsoft", "Windows", "CurrentVersion", "Policies",
+                   "System"});
+        if (!policiesSystem) {
+          if (result)
+            result->notes.push_back(
+                "complete-oobe: SOFTWARE Policies\\System key absent");
+          return false;
+        }
+        return sameSizeDword(
+            hive, *policiesSystem, "EnableFirstLogonAnimation", 0,
+            "SOFTWARE\\...\\Policies\\System\\EnableFirstLogonAnimation");
+      });
+
+  if (result) {
+    result->notes.push_back(
+        std::string("complete-oobe overlay patch (CANDIDATE, A/B test): SYSTEM=") +
+        (sys ? "ok" : "no") + " SOFTWARE=" + (soft ? "ok" : "no") +
+        " applied=" + std::to_string(applied) + " skipped-absent=" +
+        std::to_string(skippedAbsent) + " skipped-size=" +
+        std::to_string(skippedSize));
+  }
+  return sys || soft;
 }
 
 bool DeployExecAgentToOpenOverlay(hv::IBlockDevice &disk,
