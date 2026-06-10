@@ -64,9 +64,14 @@ bool IsSuspiciousModulePath(const std::string &modulePath,
 // details["suspicion"]="dll-from-writable-path" so the scorer + report can
 // highlight it without re-deriving the classification.
 //
-// Truncation is honest: when the baseline / delta cap is hit, the LAST emitted
-// event of that batch carries details["truncated"]="true" so a flood is visibly
-// bounded rather than silently dropped.
+// Truncation is honest at the DIFF level: when the baseline / delta cap is hit,
+// the LAST emitted event of that batch carries details["truncated"]="true" so a
+// flood is visibly bounded rather than silently dropped.
+// CAVEAT: the GuestAgent's per-process module enumeration is separately bounded
+// (kModuleMaxModulesPerProc) and that cap is NOT marked here -- a process with
+// more loaded modules than the cap has its tail silently omitted from `cur`. The
+// cap is set well above a normal process's module count, so this is a rare,
+// best-effort edge, not a per-load guarantee.
 std::vector<EventRecord> DiffModuleSnapshots(const ProcessModuleSnapshot &prev,
                                              const ProcessModuleSnapshot &cur,
                                              bool emitBaseline,

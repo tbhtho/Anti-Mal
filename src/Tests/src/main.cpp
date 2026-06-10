@@ -4788,6 +4788,87 @@ void TestBehaviorScoreVerdict() {
     Expect(loaded.sandboxVerdict == Verdict::Malicious,
            "behavior: report JSON round-trips sandboxVerdict");
   }
+
+  // (e) The WER decoder emits crashes as category="crash" (action
+  // "process.crash"); the scorer must count those (it previously matched
+  // category=="process" only, so real crashes were silently dropped).
+  {
+    DynamicRunSummary s;
+    s.sampleExecuted = true;
+    EventRecord crash;
+    crash.category = "crash";
+    crash.action = "process.crash";
+    crash.imagePath = "ShellHost.exe";
+    crash.details["exceptionCode"] = "0xc0000409";
+    std::vector<EventRecord> events = {procStart(1000, "sample.exe"), crash};
+    const BehaviorScore bs = ScoreSandboxBehavior(s, events);
+    Expect(rationaleHas(bs.rationale, "crash"),
+           "behavior: a category=crash event contributes (signal not dead)");
+  }
+
+  // (f) Privilege escalation resolved from the LIVE event stream -- the parent's
+  // integrity comes from the parent's own process.start event, with NO
+  // details["parentIntegrityLevel"] (which production telemetry never sets).
+  {
+    DynamicRunSummary s;
+    s.sampleExecuted = true;
+    EventRecord parent;
+    parent.category = "process";
+    parent.action = "process.start";
+    parent.processId = 500;
+    parent.imagePath = "sample.exe";
+    parent.integrityLevel = "Medium";
+    EventRecord child;
+    child.category = "process";
+    child.action = "process.start";
+    child.processId = 600;
+    child.parentProcessId = 500;
+    child.imagePath = "elevated.exe";
+    child.integrityLevel = "System"; // no parentIntegrityLevel detail on purpose
+    std::vector<EventRecord> events = {parent, child};
+    const BehaviorScore bs = ScoreSandboxBehavior(s, events);
+    Expect(rationaleHas(bs.rationale, "escalation"),
+           "behavior: privesc derived from the parent's observed integrity (live)");
+    Expect(bs.verdict == Verdict::Suspicious,
+           "behavior: a lone privesc (+35) lands Suspicious");
+  }
+
+  // (g) Signed-installer FP mitigation: drop(+30)+run-key(+35)+external(+20)=85.
+  // Unsigned -> Malicious; a present Authenticode signature raises the Malicious
+  // bar (90) so the SAME behavior caps at Suspicious -- not a clean-list (the raw
+  // score is unchanged), with the dampener explained in the rationale.
+  {
+    DynamicRunSummary s;
+    s.sampleExecuted = true;
+    EventRecord persist;
+    persist.category = "registry";
+    persist.action = "registry.setvalue";
+    persist.target =
+        "HKLM\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Run\\app";
+    persist.mitre = "T1547.001";
+    EventRecord drop;
+    drop.category = "file";
+    drop.action = "file.create";
+    drop.target = "C:\\Program Files\\App\\app.exe";
+    drop.details["fileType"] = "pe";
+    EventRecord net;
+    net.category = "network";
+    net.action = "network.connect";
+    net.target = "203.0.113.20:443";
+    std::vector<EventRecord> events = {procStart(1000, "installer.exe"), persist,
+                                       drop, net};
+    const BehaviorScore unsignedBs = ScoreSandboxBehavior(s, events, false);
+    Expect(unsignedBs.verdict == Verdict::Malicious,
+           "behavior: unsigned installer-like behavior -> Malicious");
+    const BehaviorScore signedBs = ScoreSandboxBehavior(s, events, true);
+    Expect(signedBs.verdict == Verdict::Suspicious,
+           "behavior: a present signature caps the same behavior at Suspicious");
+    Expect(rationaleHas(signedBs.rationale, "signed") ||
+               rationaleHas(signedBs.rationale, "signature"),
+           "behavior: signed dampener explained in the rationale");
+    Expect(signedBs.score == unsignedBs.score,
+           "behavior: signing changes the threshold, not the raw score");
+  }
 }
 
 void TestReportSections() {

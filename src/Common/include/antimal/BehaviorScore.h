@@ -34,9 +34,14 @@ struct BehaviorScore {
 //     sample that idled until timeout scores Clean, and the rationale says so
 //     explicitly -- this kills the classic "ran to timeout => Malicious" FP.
 //   * The verdict is driven by observed behavior (persistence, drops, egress,
-//     privilege escalation, suspicious command lines, crashes), each of which
-//     adds weight AND a rationale line.
+//     privilege escalation, side-loaded DLLs, suspicious command lines, crashes),
+//     each of which adds weight AND a rationale line.
+//   * `sampleSigned` (the static Authenticode-present flag) raises the Malicious
+//     threshold -- a present signature is weak evidence of benignity but reduces
+//     confidence in a Malicious call, mitigating the benign signed-installer FP.
+//     It is NOT a clean-list (signed malware still scores its behavior).
 BehaviorScore ScoreSandboxBehavior(const DynamicRunSummary &summary,
-                                   const std::vector<EventRecord> &events);
+                                   const std::vector<EventRecord> &events,
+                                   bool sampleSigned = false);
 
 } // namespace antimal

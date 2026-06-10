@@ -7,6 +7,7 @@
 #include "antimal/FileUtil.h"
 #include "antimal/HostChannel.h"
 #include "antimal/Json.h"
+#include "antimal/PeParser.h" // HasAuthenticodeSignature (signed-installer FP guard)
 #include "antimal/Report.h"
 #include "antimal/Scanner.h"
 #include "antimal/Screenshot.h"
@@ -8343,7 +8344,8 @@ void AppendJournalEvent(const std::filesystem::path &journalPath,
 // plain timeout as a non-malicious signal so a benign sample that idled to its
 // time budget scores Clean instead of the old "ran to timeout => Malicious" FP.
 BehaviorScore DeriveSandboxScore(const DynamicRunSummary &s,
-                                 const std::vector<EventRecord> &events) {
+                                 const std::vector<EventRecord> &events,
+                                 bool sampleSigned) {
   if (s.crashed) {
     BehaviorScore err;
     err.verdict = Verdict::Error;
@@ -8353,14 +8355,15 @@ BehaviorScore DeriveSandboxScore(const DynamicRunSummary &s,
         "be scored.");
     return err;
   }
-  return ScoreSandboxBehavior(s, events);
+  return ScoreSandboxBehavior(s, events, sampleSigned);
 }
 
 // Backward-compatible verdict-only entry point (call sites that only need the
 // enum). The rich path uses DeriveSandboxScore to also capture rationale+score.
 Verdict DeriveSandboxVerdict(const DynamicRunSummary &s,
-                             const std::vector<EventRecord> &events) {
-  return DeriveSandboxScore(s, events).verdict;
+                             const std::vector<EventRecord> &events,
+                             bool sampleSigned) {
+  return DeriveSandboxScore(s, events, sampleSigned).verdict;
 }
 
 void WriteErrorReport(const std::filesystem::path &reportPath,
@@ -12186,8 +12189,12 @@ DetonationResult InHouseOrchestrator::PrepareAndRun(
     // Explainable verdict from what the guest actually did (crash -> Error,
     // executed -> scored behavior, never-ran -> Unknown), not a blanket "error".
     // The score + per-signal rationale ride into the report alongside it.
+    // A present Authenticode signature (cheap WinVerifyTrust check) raises the
+    // Malicious bar in the scorer -- the main mitigation for the benign signed-
+    // installer false positive. Not a clean-list; signed malware still scores.
+    const bool sampleSigned = HasAuthenticodeSignature(samplePath);
     const BehaviorScore behaviorScore =
-        DeriveSandboxScore(result.dynamicSummary, events);
+        DeriveSandboxScore(result.dynamicSummary, events, sampleSigned);
     WriteErrorReport(result.reportPath, result.runId, samplePath, result.errors,
                      events, result.dynamicSummary, returnedArtifacts,
                      behaviorScore);

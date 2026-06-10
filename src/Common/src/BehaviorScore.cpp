@@ -2,7 +2,9 @@
 
 #include <algorithm>
 #include <cctype>
+#include <cstdlib> // std::atoi
 #include <cstring>
+#include <map>
 #include <set>
 #include <string>
 
@@ -182,7 +184,8 @@ const char *SuspiciousCommandLineLabel(const std::string &cmdRaw) {
 //   other MITRE-tagged behavior (per event)          +6 (capped)
 //   rich executed behavior present                   +5 (context, not a tell)
 BehaviorScore ScoreSandboxBehavior(const DynamicRunSummary &summary,
-                                   const std::vector<EventRecord> &events) {
+                                   const std::vector<EventRecord> &events,
+                                   bool sampleSigned) {
   BehaviorScore out;
 
   // Nothing ran (gated/healthcheck) or no telemetry at all -> inconclusive.
@@ -208,6 +211,19 @@ BehaviorScore ScoreSandboxBehavior(const DynamicRunSummary &summary,
   std::set<std::string> persistenceTargets;
   std::set<std::string> dropTargets;
   std::set<std::string> suspiciousModules; // distinct side-loaded/hijacked DLLs
+
+  // First pass: map each PID to the integrity level the telemetry observed for
+  // it, so the privilege-escalation check can resolve a child's PARENT integrity
+  // from the actual event stream (parents may appear before or after children).
+  // This makes the privEsc signal live on real runs -- previously it depended on
+  // a details["parentIntegrityLevel"] field that production telemetry never set.
+  std::map<uint32_t, int> pidIntegrity;
+  for (const auto &e : events) {
+    if (Lower(e.category) == "process" && e.processId != 0 &&
+        !e.integrityLevel.empty()) {
+      pidIntegrity[e.processId] = IntegrityRank(e.integrityLevel);
+    }
+  }
 
   for (const auto &e : events) {
     const std::string cat = Lower(e.category);
@@ -272,8 +288,15 @@ BehaviorScore ScoreSandboxBehavior(const DynamicRunSummary &summary,
     if (cat == "process" &&
         (Has(act, "start") || Has(act, "create") || Has(act, "spawn"))) {
       const int childRank = IntegrityRank(e.integrityLevel);
-      const std::string *parentLvl = Detail(e, "parentIntegrityLevel");
-      const int parentRank = parentLvl ? IntegrityRank(*parentLvl) : 0;
+      // Parent integrity: prefer the live event stream (the parent PID's own
+      // observed level), fall back to an explicit details field if present.
+      int parentRank = 0;
+      if (const auto it = pidIntegrity.find(e.parentProcessId);
+          it != pidIntegrity.end()) {
+        parentRank = it->second;
+      } else if (const std::string *parentLvl = Detail(e, "parentIntegrityLevel")) {
+        parentRank = IntegrityRank(*parentLvl);
+      }
       if (childRank >= 3 /* High or System */ && parentRank >= 1 &&
           parentRank <= 2 /* Low or Medium */) {
         ++privEsc;
@@ -287,7 +310,9 @@ BehaviorScore ScoreSandboxBehavior(const DynamicRunSummary &summary,
 
     // --- Crashes. A non-sample crash is weak (could be instability); the
     // sample crashing itself is noted modestly (could be a packer/exploit).
-    if (cat == "process" && Has(act, "crash")) {
+    // The WER decoder emits these with category="crash"; the process collector
+    // can also surface "process.crash" under category="process" -- accept both.
+    if ((cat == "process" || cat == "crash") && Has(act, "crash")) {
       const std::string *isSample = Detail(e, "isSample");
       const bool sampleSelf =
           (isSample && (*isSample == "true" || *isSample == "1")) ||
@@ -425,12 +450,33 @@ BehaviorScore ScoreSandboxBehavior(const DynamicRunSummary &summary,
   // >= 60  : two strong signals, or one strong + corroboration -> Malicious
   // >= 20  : at least one noteworthy signal                    -> Suspicious
   // else   : executed cleanly                                  -> Clean
-  if (out.score >= 60) {
+  //
+  // Signed-installer FP mitigation: a present Authenticode signature is weak
+  // evidence of benignity (malware is often signed with stolen/abused certs),
+  // but it materially raises the Malicious bar. Without this, a legitimately
+  // signed installer (drops its own EXE +30, writes a Run key +35, license/
+  // update check +20 = 85) reads Malicious. Raising the bar to 90 caps that
+  // common benign class at Suspicious while egregious behavior (>=90) still
+  // reads Malicious even when signed.
+  const int maliciousThreshold = sampleSigned ? 90 : 60;
+  if (out.score >= maliciousThreshold) {
     out.verdict = Verdict::Malicious;
   } else if (out.score >= 20) {
     out.verdict = Verdict::Suspicious;
   } else {
     out.verdict = Verdict::Clean;
+  }
+  if (sampleSigned && out.score >= 60 && out.verdict != Verdict::Malicious) {
+    out.rationale.push_back(
+        "Sample is Authenticode-signed: the Malicious threshold was raised to " +
+        std::to_string(maliciousThreshold) + " (behavior scored " +
+        std::to_string(out.score) +
+        "), capping the verdict at Suspicious -- a present signature is not "
+        "proof of benignity, but reduces confidence in a Malicious call.");
+  } else if (sampleSigned && richBehavior) {
+    out.rationale.push_back(
+        "Sample is Authenticode-signed (factored into the verdict; a present "
+        "signature is not proof of benignity).");
   }
 
   // ---- Timeout false-positive guard. ----
@@ -452,7 +498,9 @@ BehaviorScore ScoreSandboxBehavior(const DynamicRunSummary &summary,
 
   if (out.verdict == Verdict::Clean && out.rationale.empty()) {
     out.rationale.push_back(
-        "Sample executed and exited with no noteworthy behavior observed.");
+        "No malicious behavior observed in the detonation window. Note: Clean "
+        "reflects what was seen during this run, not a proof of benignity "
+        "(low-and-slow or environment-gated malware may stay dormant).");
   } else if (out.verdict == Verdict::Clean && richBehavior) {
     // Defensive: should not happen (rich behavior => score >= 20), but keep the
     // rationale honest if weights are retuned below threshold.

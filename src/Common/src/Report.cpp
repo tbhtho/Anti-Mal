@@ -1010,7 +1010,7 @@ bool EmitDroppedFilesSection(std::ostringstream &html,
       const std::string skipped = Detail(e, "hashSkipped");
       shaCell = HtmlEscape(skipped.empty() ? "" : ("(skipped: " + skipped + ")"));
     }
-    rows << "<tr><td class=\"mono\" title=\"" << HtmlEscape(e.fullImagePath)
+    rows << "<tr><td class=\"mono\" title=\"" << HtmlEscape(e.target)
          << "\">" << HtmlEscape(TruncateForCell(e.target))
          << "</td><td class=\"mono\">" << HtmlEscape(fileType)
          << "</td><td class=\"mono\">" << HtmlEscape(Detail(e, "size"))
@@ -1029,7 +1029,9 @@ bool EmitNetworkSection(std::ostringstream &html,
   std::ostringstream rows;
   for (const auto &e : events) {
     const bool isNet = e.category == "network" &&
-                       (ActionIs(e, "network.connect") || ActionIs(e, "network.close"));
+                       (ActionIs(e, "network.connect") ||
+                        ActionIs(e, "network.connection") ||
+                        ActionIs(e, "network.close"));
     if (!isNet) continue;
     any = true;
     const std::string proc =
