@@ -13,6 +13,7 @@
 #include "antimal/Http.h"
 #include "antimal/HyperVOrchestrator.h"
 #include "antimal/IntelLookup.h"
+#include "antimal/IocExport.h"
 #include "antimal/Json.h"
 #include "antimal/JsonValue.h"
 #include "antimal/NetworkTelemetry.h"
@@ -65,6 +66,7 @@
 #include <fstream>
 #include <iostream>
 #include <map>
+#include <sstream>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -948,6 +950,232 @@ void TestAggregateMitreAndDomains() {
   }
   Expect(antimal::AggregateNetworkDomains(ipOnly).empty(),
          "IP:port-only telemetry yields no domains (empty pending DNS)");
+}
+
+// T79: machine-readable IOC export (STIX 2.1 / MISP / CSV). Verifies indicator
+// gathering, that every value survives into each format, that STIX+MISP are
+// well-formed JSON (round-trip-parsed), that CSV obeys RFC-4180 quoting, that an
+// empty report still yields valid framing, and that a hostile value (embedded
+// quote/comma/angle-brackets) is escaped rather than breaking the format.
+void TestIocExport() {
+  // Helper: does `haystack` contain `needle`?
+  auto contains = [](const std::string &haystack, const std::string &needle) {
+    return haystack.find(needle) != std::string::npos;
+  };
+
+  antimal::AnalysisReport report;
+  report.runId = "run-ioc-01";
+  report.scannerVerdict.sha256 =
+      "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+  report.scannerVerdict.md5 = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+  report.scannerVerdict.sha1 = "cccccccccccccccccccccccccccccccccccccccc";
+  report.scannerVerdict.iocs.urls.push_back("http://evil.example.com/payload");
+  report.scannerVerdict.iocs.mutexHints.push_back("Global\\EvilMutex");
+  report.mitreTechniques.push_back("T1547");
+  report.networkDomains.push_back("c2.example.net");
+
+  // Dropped file with a SHA-256.
+  {
+    antimal::EventRecord e;
+    e.category = "file";
+    e.action = "file.create";
+    e.target = "C:\\Temp\\dropped.bin";
+    e.details["sha256"] =
+        "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd";
+    report.events.push_back(e);
+  }
+  // Public network endpoint (kept) + private one (dropped).
+  {
+    antimal::EventRecord e;
+    e.category = "network";
+    e.action = "network.connect";
+    e.target = "203.0.113.7:443";
+    report.events.push_back(e);
+  }
+  {
+    antimal::EventRecord e;
+    e.category = "network";
+    e.action = "network.connect";
+    e.target = "10.0.0.5:445"; // RFC1918 -> excluded
+    report.events.push_back(e);
+  }
+  // Persistence registry event (MITRE-tagged).
+  {
+    antimal::EventRecord e;
+    e.category = "registry";
+    e.action = "registry.setvalue";
+    e.target =
+        "HKLM\\Software\\Microsoft\\Windows\\CurrentVersion\\Run\\Evil";
+    e.mitre = "T1547";
+    report.events.push_back(e);
+  }
+
+  // --- Gathered indicators ---
+  const auto indicators = antimal::CollectIndicators(report);
+  Expect(!indicators.empty(), "ioc: indicators gathered");
+  auto hasIoc = [&](const std::string &type, const std::string &value) {
+    for (const auto &i : indicators) {
+      if (i.type == type && i.value == value) return true;
+    }
+    return false;
+  };
+  Expect(hasIoc("sha256", report.scannerVerdict.sha256), "ioc: sample sha256");
+  Expect(hasIoc("md5", report.scannerVerdict.md5), "ioc: sample md5");
+  Expect(hasIoc("sha1", report.scannerVerdict.sha1), "ioc: sample sha1");
+  Expect(hasIoc(
+             "sha256",
+             "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"),
+         "ioc: dropped-file sha256");
+  Expect(hasIoc("domain", "c2.example.net"), "ioc: domain");
+  Expect(hasIoc("ipv4", "203.0.113.7"), "ioc: public ipv4 (port stripped)");
+  Expect(!hasIoc("ipv4", "10.0.0.5"), "ioc: private ipv4 excluded");
+  Expect(hasIoc("url", "http://evil.example.com/payload"), "ioc: url");
+  Expect(hasIoc("mutex", "Global\\EvilMutex"), "ioc: mutex");
+  Expect(hasIoc("regkey",
+                "HKLM\\Software\\Microsoft\\Windows\\CurrentVersion\\Run\\Evil"),
+         "ioc: persistence regkey");
+  Expect(hasIoc("mitre", "T1547"), "ioc: mitre technique");
+
+  // --- STIX: well-formed JSON + values present ---
+  const std::string stix = antimal::ExportIocsStix(report);
+  const auto stixParsed = antimal::ParseJson(stix);
+  Expect(stixParsed.has_value(), "ioc: STIX is well-formed JSON");
+  if (stixParsed) {
+    Expect(stixParsed->At("type").AsString() == "bundle",
+           "ioc: STIX bundle type");
+    Expect(stixParsed->At("objects").IsArray() &&
+               !stixParsed->At("objects").array.empty(),
+           "ioc: STIX has objects");
+    // A report SDO and at least one attack-pattern must be present.
+    bool sawReport = false, sawAttack = false, sawIndicator = false;
+    for (const auto &o : stixParsed->At("objects").array) {
+      const std::string t = o.At("type").AsString();
+      if (t == "report") sawReport = true;
+      if (t == "attack-pattern") sawAttack = true;
+      if (t == "indicator") sawIndicator = true;
+    }
+    Expect(sawReport && sawAttack && sawIndicator,
+           "ioc: STIX has report + attack-pattern + indicator SDOs");
+  }
+  Expect(contains(stix, report.scannerVerdict.sha256), "ioc: STIX has sha256");
+  Expect(contains(stix, "203.0.113.7"), "ioc: STIX has ipv4");
+  Expect(contains(stix, "c2.example.net"), "ioc: STIX has domain");
+  Expect(contains(stix, "T1547"), "ioc: STIX has mitre id");
+  Expect(contains(stix, "[file:hashes.'SHA-256' = '"), "ioc: STIX hash pattern");
+
+  // Determinism: re-export yields byte-identical output.
+  Expect(antimal::ExportIocsStix(report) == stix, "ioc: STIX is deterministic");
+
+  // --- MISP: well-formed JSON + values present ---
+  const std::string misp = antimal::ExportIocsMisp(report);
+  const auto mispParsed = antimal::ParseJson(misp);
+  Expect(mispParsed.has_value(), "ioc: MISP is well-formed JSON");
+  if (mispParsed) {
+    const auto &attrs = mispParsed->At("Event").At("Attribute");
+    Expect(attrs.IsArray() && !attrs.array.empty(),
+           "ioc: MISP has Attribute array");
+    bool sawSha256 = false, sawIpDst = false, sawRegkey = false;
+    for (const auto &a : attrs.array) {
+      const std::string t = a.At("type").AsString();
+      if (t == "sha256") sawSha256 = true;
+      if (t == "ip-dst") sawIpDst = true;
+      if (t == "regkey") sawRegkey = true;
+    }
+    Expect(sawSha256 && sawIpDst && sawRegkey,
+           "ioc: MISP attribute types present");
+    Expect(mispParsed->At("Event").At("Tag").IsArray(),
+           "ioc: MISP Tag array (mitre)");
+  }
+  Expect(contains(misp, "Global\\\\EvilMutex"),
+         "ioc: MISP mutex value (backslash JSON-escaped)");
+
+  // --- CSV: header + a row per indicator, RFC-4180 quoting ---
+  const std::string csv = antimal::ExportIocsCsv(report);
+  Expect(csv.rfind("type,value,context\r\n", 0) == 0, "ioc: CSV header first");
+  Expect(contains(csv, "203.0.113.7"), "ioc: CSV has ipv4");
+  Expect(contains(csv, report.scannerVerdict.sha256), "ioc: CSV has sha256");
+  // One data row per gathered indicator (+1 header row).
+  {
+    size_t rows = 0;
+    for (size_t i = 0; (i = csv.find("\r\n", i)) != std::string::npos;
+         i += 2) {
+      ++rows;
+    }
+    Expect(rows == indicators.size() + 1,
+           "ioc: CSV has header + one row per indicator");
+  }
+
+  // --- Empty report -> valid, well-formed but empty output ---
+  antimal::AnalysisReport empty;
+  const std::string emptyStix = antimal::ExportIocsStix(empty);
+  const std::string emptyMisp = antimal::ExportIocsMisp(empty);
+  const std::string emptyCsv = antimal::ExportIocsCsv(empty);
+  Expect(antimal::ParseJson(emptyStix).has_value(),
+         "ioc: empty STIX still valid JSON");
+  Expect(antimal::ParseJson(emptyMisp).has_value(),
+         "ioc: empty MISP still valid JSON");
+  Expect(emptyCsv == "type,value,context\r\n",
+         "ioc: empty CSV is just the header");
+  Expect(antimal::CollectIndicators(empty).empty(),
+         "ioc: empty report -> no indicators");
+
+  // --- Injection safety: a hostile value must be escaped, not break framing ---
+  antimal::AnalysisReport evil;
+  evil.runId = "run-evil";
+  // A domain crafted to break out of JSON strings and a URL with angle brackets,
+  // plus a CSV-hostile value carrying a comma + embedded quote.
+  evil.networkDomains.push_back("\",\"injected\":\"x");
+  evil.scannerVerdict.iocs.urls.push_back("http://evil/\"><script>alert(1)");
+  evil.scannerVerdict.iocs.mutexHints.push_back("a,b\"c");
+
+  const std::string evilStix = antimal::ExportIocsStix(evil);
+  const std::string evilMisp = antimal::ExportIocsMisp(evil);
+  Expect(antimal::ParseJson(evilStix).has_value(),
+         "ioc: hostile STIX still parses (escaped, not broken)");
+  Expect(antimal::ParseJson(evilMisp).has_value(),
+         "ioc: hostile MISP still parses (escaped, not broken)");
+  // The raw, unescaped injection must NOT appear verbatim in the JSON.
+  Expect(!contains(evilStix, "\"injected\":\"x"),
+         "ioc: STIX did not let the injected key escape the string");
+  Expect(!contains(evilMisp, "\"injected\":\"x"),
+         "ioc: MISP did not let the injected key escape the string");
+
+  // CSV: the comma+quote mutex must be wrapped in quotes with the internal quote
+  // doubled, and the field-count per row stays at 3 (no broken columns).
+  const std::string evilCsv = antimal::ExportIocsCsv(evil);
+  Expect(contains(evilCsv, "\"a,b\"\"c\""),
+         "ioc: CSV quotes a comma+quote value and doubles internal quotes");
+  {
+    // Every data row, after CSV-aware splitting, must have exactly 3 fields.
+    bool allThree = true;
+    std::istringstream lines(evilCsv);
+    std::string line;
+    bool firstLine = true;
+    while (std::getline(lines, line)) {
+      if (!line.empty() && line.back() == '\r') line.pop_back();
+      if (line.empty()) continue;
+      if (firstLine) { // header
+        firstLine = false;
+        continue;
+      }
+      int fields = 1;
+      bool inQuotes = false;
+      for (size_t i = 0; i < line.size(); ++i) {
+        const char c = line[i];
+        if (c == '"') {
+          if (inQuotes && i + 1 < line.size() && line[i + 1] == '"') {
+            ++i; // escaped quote
+          } else {
+            inQuotes = !inQuotes;
+          }
+        } else if (c == ',' && !inQuotes) {
+          ++fields;
+        }
+      }
+      if (fields != 3) allThree = false;
+    }
+    Expect(allThree, "ioc: every CSV data row has exactly 3 fields");
+  }
 }
 
 // Locks the host->guest live-input wire format (the framed 'K'/'M' keyboard +
@@ -6151,6 +6379,7 @@ int main() {
     TestLiveFramePublishGate();
     TestRunDirLiveLock();
     TestAggregateMitreAndDomains();
+    TestIocExport();
     TestTpm2CrbDevice();
     TestAcpiTables();
     TestPcIoPmSleepByteWrites();

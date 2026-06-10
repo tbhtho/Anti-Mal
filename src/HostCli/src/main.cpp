@@ -2,6 +2,7 @@
 #include "antimal/Config.h"
 #include "antimal/FileUtil.h"
 #include "antimal/HyperVOrchestrator.h"
+#include "antimal/IocExport.h"
 #include "antimal/Json.h"
 #include "antimal/Report.h"
 #include "antimal/Scanner.h"
@@ -158,7 +159,8 @@ void PrintUsage() {
       << "  antimal base inspect --vhdx <base.vhdx> [--overlay <overlay.cow>]\n"
       << "                       [--dump-bcd <out.bcd>] [--dump-system <out.hive>]\n"
       << "  antimal report <run-id-or-report.json> --html\n"
-      << "  antimal browser-impact <run-id-or-report.json> --decrypt-browser-secrets\n";
+      << "  antimal browser-impact <run-id-or-report.json> --decrypt-browser-secrets\n"
+      << "  antimal export <run-id-or-report.json> --format stix|misp|csv [--out <file>]\n";
 }
 
 antimal::ScannerOptions BuildScannerOptions(int argc, wchar_t **argv,
@@ -2841,6 +2843,41 @@ int CommandBrowserImpact(int argc, wchar_t **argv) {
   return 0;
 }
 
+int CommandExport(int argc, wchar_t **argv) {
+  if (argc < 3) {
+    PrintUsage();
+    return 2;
+  }
+  const auto format = OptionValue(argc, argv, "--format").value_or("stix");
+  std::string body;
+  if (format == "stix" || format == "misp" || format == "csv") {
+    const auto config = antimal::LoadConfig(antimal::DefaultConfigPath());
+    const auto reportPath =
+        ResolveReportPath(config, std::filesystem::path(argv[2]));
+    const auto report = antimal::LoadReportBestEffort(reportPath);
+    if (format == "stix") {
+      body = antimal::ExportIocsStix(report);
+    } else if (format == "misp") {
+      body = antimal::ExportIocsMisp(report);
+    } else {
+      body = antimal::ExportIocsCsv(report);
+    }
+  } else {
+    std::cerr << "Unknown --format '" << format
+              << "' (expected stix|misp|csv).\n";
+    return 2;
+  }
+
+  if (const auto outPath = OptionValue(argc, argv, "--out")) {
+    const std::filesystem::path out(antimal::Utf8ToWide(*outPath));
+    antimal::WriteTextFile(out, body);
+    std::cout << "Wrote " << *outPath << "\n";
+  } else {
+    std::cout << body << "\n";
+  }
+  return 0;
+}
+
 } // namespace
 
 int wmain(int argc, wchar_t **argv) {
@@ -2867,6 +2904,9 @@ int wmain(int argc, wchar_t **argv) {
     }
     if (command == "browser-impact") {
       return CommandBrowserImpact(argc, argv);
+    }
+    if (command == "export") {
+      return CommandExport(argc, argv);
     }
     PrintUsage();
     return 2;
