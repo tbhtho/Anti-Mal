@@ -71,6 +71,8 @@ void ApplyConfigValue(AppConfig &config, std::string key, std::string value) {
     config.collectScreenshots = ParseBool(value);
   } else if (key == "dynamic_execution_enabled") {
     config.dynamicExecutionEnabled = ParseBool(value);
+  } else if (key == "workspace_retention_runs") {
+    config.workspaceRetentionRuns = std::stoi(value);
   } else if (key == "vm_guest_clock_epoch") {
     config.vmGuestClockEpoch = static_cast<int64_t>(std::stoll(value));
   } else if (key == "vm_login_mode") {
@@ -146,6 +148,8 @@ std::string SerializeConfig(const AppConfig &config) {
   out << "dynamic_execution_enabled = " << boolStr(config.dynamicExecutionEnabled) << "\n";
   out << "collect_screenshots = " << boolStr(config.collectScreenshots) << "\n";
   out << "screenshot_interval_ms = " << config.screenshotIntervalMs << "\n";
+  out << "\n# Workspace retention: 0 = keep every run; N>0 keeps the N newest runs.\n";
+  out << "workspace_retention_runs = " << config.workspaceRetentionRuns << "\n";
   out << "\n# Virtual guest clock base (unix epoch seconds). 0 = auto (captured once\n";
   out << "# at boot, then advances on its own crystal; never tracks host time).\n";
   out << "# Set a non-zero epoch to pin the guest start date for date-gated malware.\n";

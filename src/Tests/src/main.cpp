@@ -3190,6 +3190,51 @@ void TestExternalToolParsers() {
   Expect(true, "malformed DIE JSON does not crash");
 }
 
+// T62: the workspace retention policy keeps the N most-recent non-system runs and
+// never reclaims a live one.
+void TestSelectRunsToReclaim() {
+  using antimal::SelectRunsToReclaim;
+  using antimal::WorkspaceRunInfo;
+  auto has = [](const std::vector<std::string> &v, const char *n) {
+    return std::find(v.begin(), v.end(), std::string(n)) != v.end();
+  };
+  // keepRecent == 0 -> unlimited, reclaim nothing.
+  {
+    std::vector<WorkspaceRunInfo> runs = {{"a", 100, false, false},
+                                          {"b", 200, false, false}};
+    Expect(SelectRunsToReclaim(runs, 0).empty(), "keepRecent=0 reclaims nothing");
+  }
+  // Keep the 2 newest of 4 -> reclaim the 2 oldest by mtime.
+  {
+    std::vector<WorkspaceRunInfo> runs = {{"old1", 100, false, false},
+                                          {"old2", 200, false, false},
+                                          {"new1", 300, false, false},
+                                          {"new2", 400, false, false}};
+    const auto r = SelectRunsToReclaim(runs, 2);
+    Expect(r.size() == 2, "reclaims runs beyond the keepRecent newest");
+    Expect(has(r, "old1") && has(r, "old2"), "reclaims the two OLDEST runs");
+  }
+  // A live old run is never reclaimed; a non-live overflow run is.
+  {
+    std::vector<WorkspaceRunInfo> runs = {{"liveold", 10, true, false},
+                                          {"n1", 300, false, false},
+                                          {"n2", 400, false, false}};
+    const auto r = SelectRunsToReclaim(runs, 1);
+    Expect(!has(r, "liveold"), "a live run is never reclaimed");
+    Expect(has(r, "n1"), "a non-live overflow run is reclaimed");
+  }
+  // System dirs are exempt and don't count toward the cap.
+  {
+    std::vector<WorkspaceRunInfo> runs = {{"_base", 500, false, true},
+                                          {"_intel_cache", 500, false, true},
+                                          {"r1", 100, false, false},
+                                          {"r2", 200, false, false}};
+    const auto r = SelectRunsToReclaim(runs, 2);
+    Expect(r.empty(), "system dirs do not count toward the cap");
+    Expect(!has(r, "_base"), "a system dir is never reclaimed");
+  }
+}
+
 // MD5 (triage hash) + the pefile-compatible imphash. MD5 is checked against the
 // canonical RFC-1321 test vectors; imphash canonicalization (lowercase, strip a
 // trailing .dll/.ocx/.sys, "ordN" ordinals, comma-join, then MD5) is checked by
@@ -6886,6 +6931,7 @@ int main() {
     TestPeDepthText();
     TestSubprocessOutputCap();
     TestExternalToolParsers();
+    TestSelectRunsToReclaim();
     TestMd5AndImphash();
     TestFileTypeId();
     TestImportCapabilities();

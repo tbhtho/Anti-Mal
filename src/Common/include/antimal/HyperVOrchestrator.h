@@ -111,6 +111,21 @@ VhdxRawConversionResult ConvertVhdxToRaw(const std::filesystem::path &vhdxPath,
 // concurrent run can never delete a still-running sibling's disposable overlay.
 bool RunDirIsLiveLocked(const std::filesystem::path &runDir);
 
+// A workspace run directory as seen by the retention sweep.
+struct WorkspaceRunInfo {
+  std::string name;          // run-dir name
+  long long lastWriteTicks;  // sortable mtime (larger = newer)
+  bool live = false;         // RunDirIsLiveLocked(runDir)
+  bool systemDir = false;    // name starts with '_' (e.g. _base, _intel_cache)
+};
+
+// Retention policy (pure, unit-tested): returns the names of run directories to
+// reclaim so that at most `keepRecent` of the most-recent non-system runs are
+// kept. A live run is NEVER reclaimed (even if old) and system dirs are exempt
+// and don't count toward the cap. keepRecent == 0 means unlimited (reclaim none).
+std::vector<std::string> SelectRunsToReclaim(std::vector<WorkspaceRunInfo> runs,
+                                             size_t keepRecent);
+
 // Offline deploy of the execute-capable GuestAgent into a COW overlay (the
 // disposable run overlay or a saved desktop snapshot), WITHOUT touching the
 // base VHDX. The in-house NTFS writer is same-size-only and the /MT agent is

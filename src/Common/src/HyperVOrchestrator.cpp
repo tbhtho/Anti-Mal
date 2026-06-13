@@ -10490,6 +10490,31 @@ HyperVPreflight InHouseOrchestrator::Preflight() const {
   return result;
 }
 
+std::vector<std::string> SelectRunsToReclaim(std::vector<WorkspaceRunInfo> runs,
+                                             size_t keepRecent) {
+  if (keepRecent == 0) {
+    return {};
+  }
+  std::vector<WorkspaceRunInfo> cand;
+  cand.reserve(runs.size());
+  for (auto &r : runs) {
+    if (!r.systemDir) {
+      cand.push_back(std::move(r));
+    }
+  }
+  std::sort(cand.begin(), cand.end(),
+            [](const WorkspaceRunInfo &a, const WorkspaceRunInfo &b) {
+              return a.lastWriteTicks > b.lastWriteTicks; // newest first
+            });
+  std::vector<std::string> reclaim;
+  for (size_t i = keepRecent; i < cand.size(); ++i) {
+    if (!cand[i].live) { // a live run is never reclaimed, even if old
+      reclaim.push_back(cand[i].name);
+    }
+  }
+  return reclaim;
+}
+
 DetonationResult InHouseOrchestrator::PrepareAndRun(
     const std::filesystem::path &samplePath, uint32_t timeoutSec,
     NetworkMode networkMode, bool executeVmCommands,
@@ -10523,6 +10548,37 @@ DetonationResult InHouseOrchestrator::PrepareAndRun(
           std::error_code rec;
           std::filesystem::remove(entry.path() / L"disk" / ov, rec);
         }
+      }
+    }
+  }
+  // T62: retention quota. When configured (>0), prune the OLDEST run directories
+  // entirely (artifacts and all) so at most N most-recent non-system, non-live
+  // runs survive. Default 0 = keep everything (historical behavior).
+  if (config_.workspaceRetentionRuns > 0) {
+    std::error_code wec;
+    if (std::filesystem::is_directory(config_.workspaceRoot, wec)) {
+      std::vector<WorkspaceRunInfo> runs;
+      for (const auto &entry :
+           std::filesystem::directory_iterator(config_.workspaceRoot, wec)) {
+        std::error_code dec;
+        if (!entry.is_directory(dec)) continue;
+        const std::wstring wname = entry.path().filename().wstring();
+        if (wname == std::filesystem::path(result.runId)) continue;
+        WorkspaceRunInfo info;
+        info.name = PathToUtf8(entry.path().filename());
+        info.systemDir = !wname.empty() && wname[0] == L'_';
+        info.live = RunDirIsLiveLocked(entry.path());
+        std::error_code tec;
+        const auto wt = std::filesystem::last_write_time(entry.path(), tec);
+        info.lastWriteTicks =
+            tec ? 0 : static_cast<long long>(wt.time_since_epoch().count());
+        runs.push_back(std::move(info));
+      }
+      for (const auto &name : SelectRunsToReclaim(
+               std::move(runs),
+               static_cast<size_t>(config_.workspaceRetentionRuns))) {
+        std::error_code rec;
+        std::filesystem::remove_all(config_.workspaceRoot / Utf8ToWide(name), rec);
       }
     }
   }
@@ -12380,6 +12436,21 @@ DetonationResult InHouseOrchestrator::PrepareAndRun(
     result.dynamicSummary.eventsCaptured = static_cast<uint32_t>(events.size());
     WriteStagedReport(result.reportPath, result.runId, samplePath, events,
                       result.dynamicSummary, returnedArtifacts);
+  }
+
+  // T62: end-of-run overlay reclamation. The existing start-of-run sweep already
+  // bounds overlay disk to ~1 run (it reclaims every PAST run's overlay), so this
+  // only matters when retention is enabled, where the operator has asked for
+  // aggressive reclamation: drop this run's ~3 GB disposable overlay immediately
+  // (the VM has stopped and the report is written; artifacts are kept). Default
+  // (retention 0) leaves the overlay in place -- the prior behavior. Opt out even
+  // under retention with ANTIMAL_KEEP_OVERLAYS=1.
+  if (config_.workspaceRetentionRuns > 0 &&
+      !EnvFlagEnabled("ANTIMAL_KEEP_OVERLAYS")) {
+    for (const wchar_t *ov : {L"overlay.cow", L"overlay.raw", L"overlay.vhdx"}) {
+      std::error_code rec;
+      std::filesystem::remove(result.runDir / L"disk" / ov, rec);
+    }
   }
 
   return result;

@@ -34,6 +34,12 @@ struct AppConfig {
   bool collectScreenshots = true;
   bool dynamicExecutionEnabled = false;
 
+  // Workspace retention. 0 = unlimited (keep every run's artifacts forever — the
+  // historical behavior). When > 0, the orchestrator prunes the OLDEST run
+  // directories at start-of-run so at most N most-recent non-live runs survive.
+  // The per-run ~3 GB disposable overlay is reclaimed end-of-run regardless.
+  int workspaceRetentionRuns = 0;
+
   // Virtual guest-clock base, as a unix epoch (seconds). 0 = auto (the VM
   // captures host time once at boot so TLS/cert validation works, then advances
   // it on its own crystal — never re-reading host wall-clock). A non-zero value
