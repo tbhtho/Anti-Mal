@@ -6339,20 +6339,37 @@ BootOverlayPatchResult ApplyEphemeralBootOverlay(hv::IBlockDevice &disk) {
   // built AntiMal.GuestAgent.exe. The snapshot already repoints the service at the
   // Segoe-emoji font slot, so re-clobbering it in the overlay shadows the baked
   // agent with the new one. Base VHDX untouched.
-  if (EnvFlagEnabled("ANTIMAL_DEPLOY_FRESH_AGENT")) {
-    result.notes.push_back(
-        "fresh-agent deploy enabled by ANTIMAL_DEPLOY_FRESH_AGENT");
+  // T09/T10: deploy the freshly-built GuestAgent into THIS run's disposable
+  // overlay BY DEFAULT, so the run streams the CURRENT build's rich telemetry
+  // (deep process detail, persistence, dropped files, DLL-load, WER) instead of
+  // whatever stale agent is baked into the seed snapshot. Overlay-only
+  // clobber+repoint -- the base VHDX is untouched. Opt out with
+  // ANTIMAL_NO_FRESH_AGENT=1. On any failure we LOG it and fall back to the
+  // snapshot's agent (result.freshAgentDeployed stays false -- honest, never a
+  // silent no-op). Was opt-in via ANTIMAL_DEPLOY_FRESH_AGENT, which left the
+  // 2026-06-09 telemetry depth dormant on Detonate (freshAgentDeployed:false).
+  if (!EnvFlagEnabled("ANTIMAL_NO_FRESH_AGENT")) {
+    std::filesystem::path agentPath;
     char buf[1024]{};
     size_t need = 0;
-    std::filesystem::path agentPath;
     if (getenv_s(&need, buf, sizeof(buf), "ANTIMAL_FRESH_AGENT_PATH") == 0 &&
         need > 1 && buf[0] != '\0') {
-      agentPath = std::filesystem::path(buf);
+      agentPath = std::filesystem::path(buf); // explicit override wins
+    } else {
+      // Default: the GuestAgent built next to the host executable.
+      std::vector<wchar_t> mod(MAX_PATH);
+      const DWORD n =
+          GetModuleFileNameW(nullptr, mod.data(), static_cast<DWORD>(mod.size()));
+      if (n > 0 && n < mod.size()) {
+        agentPath = std::filesystem::path(mod.data()).parent_path() /
+                    L"AntiMal.GuestAgent.exe";
+      }
     }
     std::error_code aec;
     if (agentPath.empty() || !std::filesystem::exists(agentPath, aec)) {
-      result.notes.push_back(
-          "fresh-agent deploy: ANTIMAL_FRESH_AGENT_PATH missing or not found");
+      result.notes.push_back("fresh-agent deploy: agent not found (" +
+                             PathToUtf8(agentPath) +
+                             "); using the snapshot's agent");
     } else {
       std::vector<uint8_t> agentBytes;
       try {
@@ -6360,12 +6377,18 @@ BootOverlayPatchResult ApplyEphemeralBootOverlay(hv::IBlockDevice &disk) {
       } catch (...) {
       }
       if (agentBytes.empty()) {
-        result.notes.push_back("fresh-agent deploy: could not read agent bytes");
+        result.notes.push_back(
+            "fresh-agent deploy: could not read agent bytes; using the "
+            "snapshot's agent");
       } else {
         result.freshAgentDeployed = DeployExecAgentToOpenOverlay(
             disk, agentBytes, "Windows\\Fonts\\seguiemj.ttf",
             "C:\\Windows\\Fonts\\seguiemj.ttf", "AntiMalGuestAgent",
             &result.notes);
+        result.notes.push_back(
+            result.freshAgentDeployed
+                ? "fresh-agent deploy: current build deployed (default-on)"
+                : "fresh-agent deploy: deploy failed; using the snapshot's agent");
       }
     }
   }
