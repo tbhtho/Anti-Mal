@@ -1304,6 +1304,64 @@ void TestPs2QueuedInput() {
          "PS/2 input: read diagnostics count port traffic");
 }
 
+// A real PS/2 mouse returns MULTI-byte replies to several AUX commands. The old
+// stub ACK-only reply truncated mouse RESET/GET-ID, so mouclass/i8042prt init
+// busy-polled 0x64 forever waiting for the missing bytes -- the cold-boot
+// "Getting devices ready" i8042 spin (ps2StatusReads went 192201 -> 24358 and
+// ps2MouseBytesQueued 1 -> 40 once the full responses were emulated; the boot
+// then advanced from "Getting devices ready" to "Starting services").
+void TestPs2MouseCommandSequence() {
+  using antimal::hv::Ps2Controller;
+  Ps2Controller ps2;
+  // Address a byte to the AUX/mouse device: controller cmd 0xD4, then the data.
+  auto sendMouse = [&](uint8_t b) {
+    ps2.OnWrite(0x64, 0xD4, 1);
+    ps2.OnWrite(0x60, b, 1);
+  };
+  auto readByte = [&]() -> uint8_t {
+    return static_cast<uint8_t>(ps2.OnRead(0x60, 1) & 0xFFu);
+  };
+
+  // RESET (0xFF): ACK + Basic-Assurance-Test pass + device ID (3 bytes).
+  sendMouse(0xFF);
+  Expect(readByte() == 0xFA, "PS/2 mouse: reset ACK");
+  Expect((ps2.OnRead(0x64, 1) & 0x20u) != 0,
+         "PS/2 mouse: reply carries the AUX status bit");
+  Expect(readByte() == 0xAA, "PS/2 mouse: reset BAT-pass");
+  Expect(readByte() == 0x00, "PS/2 mouse: reset device ID (standard mouse)");
+  Expect(!ps2.HasDataPending(), "PS/2 mouse: reset reply fully drained");
+
+  // GET DEVICE ID (0xF2): ACK + ID (2 bytes).
+  sendMouse(0xF2);
+  Expect(readByte() == 0xFA, "PS/2 mouse: get-ID ACK");
+  Expect(readByte() == 0x00, "PS/2 mouse: get-ID returns standard ID");
+
+  // SET SAMPLE RATE (0xF3) + SET RESOLUTION (0xE8) each take a parameter byte
+  // that arrives as a second AUX-addressed write; both halves ACK.
+  sendMouse(0xF3);
+  Expect(readByte() == 0xFA, "PS/2 mouse: set-sample-rate ACK");
+  sendMouse(100);
+  Expect(readByte() == 0xFA, "PS/2 mouse: sample-rate parameter ACK");
+  sendMouse(0xE8);
+  Expect(readByte() == 0xFA, "PS/2 mouse: set-resolution ACK");
+  sendMouse(0x03);
+  Expect(readByte() == 0xFA, "PS/2 mouse: resolution parameter ACK");
+
+  // ENABLE REPORTING (0xF4), then STATUS REQUEST (0xE9): ACK + 3 status bytes
+  // echoing the state we set above.
+  sendMouse(0xF4);
+  Expect(readByte() == 0xFA, "PS/2 mouse: enable-reporting ACK");
+  sendMouse(0xE9);
+  Expect(readByte() == 0xFA, "PS/2 mouse: status-request ACK");
+  Expect((readByte() & 0x20u) != 0, "PS/2 mouse: status reflects reporting on");
+  Expect(readByte() == 0x03, "PS/2 mouse: status echoes resolution");
+  Expect(readByte() == 100, "PS/2 mouse: status echoes sample rate");
+  Expect(!ps2.HasDataPending(), "PS/2 mouse: status reply fully drained");
+
+  Expect(ps2.MouseBytesQueued() >= 14,
+         "PS/2 mouse: full multi-byte init replies queued (no truncation)");
+}
+
 uint16_t ReadLe16(const std::vector<uint8_t> &data, size_t offset) {
   if (offset + 2 > data.size()) {
     return 0;
@@ -6989,6 +7047,7 @@ int main() {
     TestSerialThreInterruptIsEdgeTriggered();
     TestSerialRxFifoResetPreservesBacklog();
     TestPs2QueuedInput();
+    TestPs2MouseCommandSequence();
     TestLiveInputProtocol();
     TestLiveFrameShmContract();
     TestLiveFramePublishGate();

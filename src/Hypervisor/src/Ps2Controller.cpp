@@ -197,7 +197,7 @@ void Ps2Controller::HandleDataWrite(uint8_t value) {
   }
   if (expectingMouseCommandByte_) {
     expectingMouseCommandByte_ = false;
-    QueueMouseByte(kReplyAck);
+    ProcessMouseCommand(value);
     return;
   }
   if (pendingKeyboardCommand_ != 0) {
@@ -241,6 +241,86 @@ void Ps2Controller::HandleDataWrite(uint8_t value) {
     break;
   default:
     QueueKeyboardByte(kReplyAck);
+    break;
+  }
+}
+
+// A byte the guest addressed to the AUX (mouse) device via controller command
+// 0xD4. A real PS/2 mouse returns multi-byte responses to several of these; the
+// old stub's ACK-only reply truncated mouse RESET (0xFF -> ACK,BAT,ID) and
+// GET-ID (0xF2 -> ACK,ID), so mouclass/i8042prt would busy-poll 0x64 waiting for
+// the missing bytes during "Getting devices ready" -- the cold-boot wall. All
+// replies go to the mouse queue so they carry the AUX status bit on read.
+void Ps2Controller::ProcessMouseCommand(uint8_t value) {
+  // A parameter byte for a prior set-sample-rate (0xF3) / set-resolution (0xE8).
+  if (pendingMouseCommand_ != 0) {
+    const uint8_t cmd = pendingMouseCommand_;
+    pendingMouseCommand_ = 0;
+    if (cmd == 0xF3) {
+      mouseSampleRate_ = value;
+    } else if (cmd == 0xE8) {
+      mouseResolution_ = value;
+    }
+    QueueMouseByte(kReplyAck);
+    return;
+  }
+  switch (value) {
+  case 0xFF: // Reset: ACK + Basic Assurance Test pass + device ID (0x00 = std).
+    mouseDataReporting_ = false;
+    mouseScaling21_ = false;
+    mouseResolution_ = 0;
+    mouseSampleRate_ = 100;
+    QueueMouseByte(kReplyAck);
+    QueueMouseByte(0xAA);
+    QueueMouseByte(0x00);
+    break;
+  case 0xF2: // Get device ID: ACK + 0x00 (standard PS/2 mouse).
+    QueueMouseByte(kReplyAck);
+    QueueMouseByte(0x00);
+    break;
+  case 0xE9: // Status request: ACK + status byte + resolution + sample rate.
+    QueueMouseByte(kReplyAck);
+    QueueMouseByte(static_cast<uint8_t>((mouseDataReporting_ ? 0x20u : 0u) |
+                                        (mouseScaling21_ ? 0x10u : 0u)));
+    QueueMouseByte(mouseResolution_);
+    QueueMouseByte(mouseSampleRate_);
+    break;
+  case 0xEB: // Read data (poll): ACK + a 3-byte movement packet (no motion).
+    QueueMouseByte(kReplyAck);
+    QueueMouseByte(0x08); // bit3 always set, no buttons, no motion.
+    QueueMouseByte(0x00);
+    QueueMouseByte(0x00);
+    break;
+  case 0xF3: // Set sample rate -> ACK now; rate value arrives as next AUX byte.
+  case 0xE8: // Set resolution  -> ACK now; resolution arrives as next AUX byte.
+    pendingMouseCommand_ = value;
+    QueueMouseByte(kReplyAck);
+    break;
+  case 0xF4: // Enable data reporting.
+    mouseDataReporting_ = true;
+    QueueMouseByte(kReplyAck);
+    break;
+  case 0xF5: // Disable data reporting.
+    mouseDataReporting_ = false;
+    QueueMouseByte(kReplyAck);
+    break;
+  case 0xF6: // Set defaults.
+    mouseDataReporting_ = false;
+    mouseScaling21_ = false;
+    mouseResolution_ = 0;
+    mouseSampleRate_ = 100;
+    QueueMouseByte(kReplyAck);
+    break;
+  case 0xE7: // Set scaling 2:1.
+    mouseScaling21_ = true;
+    QueueMouseByte(kReplyAck);
+    break;
+  case 0xE6: // Set scaling 1:1.
+    mouseScaling21_ = false;
+    QueueMouseByte(kReplyAck);
+    break;
+  default: // Set-wrap (0xEE), reset-wrap (0xEC), and any other: bare ACK.
+    QueueMouseByte(kReplyAck);
     break;
   }
 }

@@ -63,6 +63,11 @@ private:
   void QueueMouseByte(uint8_t value);
   void HandleCommand(uint8_t command);
   void HandleDataWrite(uint8_t value);
+  // A byte addressed to the AUX (mouse) device (controller command 0xD4). A real
+  // PS/2 mouse returns multi-byte replies to several of these; emulate them so
+  // mouclass/i8042prt mouse init completes instead of busy-polling 0x64 for the
+  // missing bytes (the cold-boot "Getting devices ready" wall).
+  void ProcessMouseCommand(uint8_t value);
 
   std::deque<uint8_t> keyboardQueue_;
   std::deque<uint8_t> mouseQueue_;
@@ -75,6 +80,13 @@ private:
   bool expectingMouseOutByte_ = false;
   bool expectingMouseCommandByte_ = false;
   uint8_t pendingKeyboardCommand_ = 0;
+  // A mouse set-rate/set-resolution command (0xF3/0xE8) awaiting its parameter
+  // byte (which arrives as the next 0xD4-prefixed data write).
+  uint8_t pendingMouseCommand_ = 0;
+  uint8_t mouseResolution_ = 0;
+  uint8_t mouseSampleRate_ = 100;
+  bool mouseDataReporting_ = false;
+  bool mouseScaling21_ = false;
   bool keyboardPortEnabled_ = true;
   bool mousePortEnabled_ = true;
   bool keyboardScanningEnabled_ = true;
