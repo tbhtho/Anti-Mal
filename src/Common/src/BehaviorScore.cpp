@@ -225,7 +225,29 @@ BehaviorScore ScoreSandboxBehavior(const DynamicRunSummary &summary,
     }
   }
 
+  // The sandbox's own boot/login churns ~100+ autostart-registry keys, writes
+  // files, and crash-loops the shell BEFORE the sample ever runs -- that is
+  // baseline, not the sample's behavior. (registry/file deltas carry no PID, so a
+  // time gate is the available attribution.) Anchor on the moment the in-guest
+  // agent launched the staged sample (`process.create` / `sample.received`) and
+  // score ONLY events at/after it. ISO-8601 UTC timestamps compare
+  // lexicographically. When no anchor is found, the gate is a no-op (count all).
+  std::string sampleExecTime;
   for (const auto &e : events) {
+    const std::string a = Lower(e.action);
+    if ((a == "process.create" || Has(a, "sample.received")) &&
+        !e.timestampUtc.empty() &&
+        (sampleExecTime.empty() || e.timestampUtc < sampleExecTime)) {
+      sampleExecTime = e.timestampUtc;
+    }
+  }
+
+  for (const auto &e : events) {
+    // Skip the pre-execution boot/login baseline.
+    if (!sampleExecTime.empty() && !e.timestampUtc.empty() &&
+        e.timestampUtc < sampleExecTime) {
+      continue;
+    }
     const std::string cat = Lower(e.category);
     const std::string act = Lower(e.action);
     const std::string tgtL = Lower(e.target);
@@ -349,7 +371,10 @@ BehaviorScore ScoreSandboxBehavior(const DynamicRunSummary &summary,
 
   // ---- Accumulate score + rationale, strongest signals first. ----
   if (persistence > 0) {
-    const int w = 35 * persistence;
+    // Capped like every other signal so even a residual burst of autostart
+    // writes can't run away with the score (the first ~3 mechanisms is plenty
+    // to call persistence; real malware rarely needs more).
+    const int w = std::min(35 * persistence, 105);
     out.score += w;
     out.rationale.push_back(
         "Persistence established: " + std::to_string(persistence) +

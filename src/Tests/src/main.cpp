@@ -5392,6 +5392,56 @@ void TestDroppedFileEnrichment() {
          "drop enrich: report JSON write->load preserves sha256+type");
 }
 
+// The sandbox's own boot/login churns ~100+ autostart-registry keys BEFORE the
+// sample runs. Those are baseline, not the sample's behavior, and must not be
+// scored as the sample's persistence (the live benign-probe FP: 112 OS writes ->
+// +3920 -> "malicious"). The scorer anchors on the agent's sample-launch
+// (process.create) and only counts events at/after it.
+void TestBehaviorScoreExcludesBootBaseline() {
+  using antimal::DynamicRunSummary;
+  using antimal::EventRecord;
+  using antimal::ScoreSandboxBehavior;
+  using antimal::Verdict;
+  auto reg = [](const std::string &ts, const std::string &tgt) {
+    EventRecord e;
+    e.timestampUtc = ts;
+    e.category = "registry";
+    e.action = "registry.value";
+    e.target = tgt;
+    return e;
+  };
+  DynamicRunSummary s;
+  s.sampleExecuted = true;
+  s.completed = true;
+  std::vector<EventRecord> ev;
+  // 100 OS boot/login autostart-key writes BEFORE the sample executes.
+  for (int i = 0; i < 100; ++i) {
+    ev.push_back(reg("2026-01-01T00:00:00Z",
+                     "HKLM\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Run\\os" +
+                         std::to_string(i)));
+  }
+  // The in-guest agent launches the staged sample.
+  EventRecord launch;
+  launch.timestampUtc = "2026-01-01T00:10:00Z";
+  launch.category = "process";
+  launch.action = "process.create";
+  launch.target = "C:\\AntiMal\\run\\sample.exe";
+  ev.push_back(launch);
+  // The sample writes ONE persistence key AFTER it runs.
+  ev.push_back(reg("2026-01-01T00:10:05Z",
+                   "HKLM\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Run\\Evil"));
+
+  const auto bs = ScoreSandboxBehavior(s, ev, false);
+  bool one = false;
+  for (const auto &r : bs.rationale) {
+    if (r.find("Persistence established: 1 ") != std::string::npos) {
+      one = true;
+    }
+  }
+  Expect(one, "behavior: pre-execution boot persistence is excluded (counts 1, not 101)");
+  Expect(bs.score <= 105, "behavior: OS boot churn cannot inflate the verdict score");
+}
+
 void TestBehaviorScoreVerdict() {
   using antimal::AnalysisReport;
   using antimal::BehaviorScore;
@@ -6958,6 +7008,7 @@ int main() {
     TestImageLoadTelemetry();
     TestDroppedFileEnrichment();
     TestBehaviorScoreVerdict();
+    TestBehaviorScoreExcludesBootBaseline();
     TestReportSections();
     TestPacketInspector();
     TestE1000Device();
