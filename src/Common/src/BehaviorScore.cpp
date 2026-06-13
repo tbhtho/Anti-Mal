@@ -491,6 +491,27 @@ BehaviorScore ScoreSandboxBehavior(const DynamicRunSummary &summary,
   } else {
     out.verdict = Verdict::Clean;
   }
+
+  // Malicious requires a SAMPLE-ATTRIBUTABLE corroborating signal. Registry
+  // persistence, file drops, and non-sample crashes carry no PID (poll-diff
+  // telemetry) and are polluted by the sandbox's OWN boot/login/shell churn --
+  // they can make a clean boot look busy but must not ALONE produce a Malicious
+  // verdict (the benign-probe FP: 48 OS autostart writes + 12 shell crashes =>
+  // "malicious"). The stronger, rarer signals (a dropped executable, outbound
+  // egress, privilege escalation, a suspicious command line, DLL side-loading, or
+  // other MITRE-tagged behavior) are far more attributable to the sample; require
+  // at least one of them to call Malicious. Without one, cap at Suspicious.
+  const bool attributableMalice =
+      exeDrops || extNet || privEsc || suspCmd || suspMod || otherMitre;
+  if (out.verdict == Verdict::Malicious && !attributableMalice) {
+    out.verdict = Verdict::Suspicious;
+    out.rationale.push_back(
+        "Capped at Suspicious: the score is driven only by non-attributable "
+        "signals (registry persistence / file drops / host-process crashes) that "
+        "the sandbox's own boot and shell can produce; no sample-attributable "
+        "malice (dropped executable, network egress, privilege escalation, "
+        "suspicious command line, DLL side-loading) corroborated it.");
+  }
   if (sampleSigned && out.score >= 60 && out.verdict != Verdict::Malicious) {
     out.rationale.push_back(
         "Sample is Authenticode-signed: the Malicious threshold was raised to " +

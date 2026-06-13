@@ -5440,6 +5440,9 @@ void TestBehaviorScoreExcludesBootBaseline() {
   }
   Expect(one, "behavior: pre-execution boot persistence is excluded (counts 1, not 101)");
   Expect(bs.score <= 105, "behavior: OS boot churn cannot inflate the verdict score");
+  Expect(bs.verdict != Verdict::Malicious,
+         "behavior: a noise-only boot (persistence, no attributable malice) is "
+         "NOT Malicious");
 }
 
 void TestBehaviorScoreVerdict() {
