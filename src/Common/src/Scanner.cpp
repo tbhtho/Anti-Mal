@@ -451,6 +451,15 @@ ScanResult ScanFile(const std::filesystem::path &path,
     result.peSections = pe.sections;
     result.peOverlaySize = pe.overlaySize;
     result.peOverlayEntropy = pe.overlayEntropy;
+    result.isDll = pe.isDll;
+    result.isDotNet = pe.isDotNet;
+    result.dotNetRuntimeVersion = pe.dotNetRuntimeVersion;
+    result.exportName = pe.exportName;
+    result.peExports = pe.exports;
+    result.tlsCallbackCount = pe.tlsCallbackCount;
+    result.peVersionInfo = pe.versionInfo;
+    result.pdbPath = pe.pdbPath;
+    result.richHash = pe.richHash;
 
     if (result.entropy > 7.2) {
       AddFinding(result, "entropy.high", "File entropy is above packed/encrypted threshold", 25);
@@ -517,6 +526,66 @@ ScanResult ScanFile(const std::filesystem::path &path,
       // the verdict.
       for (const auto &cap : DetectImportCapabilities(result.imports)) {
         AddFinding(result, cap.ruleId, cap.message, cap.score);
+      }
+
+      // T47 depth findings.
+      if (pe.tlsCallbackCount > 0) {
+        // A single TLS callback is usually the benign MSVC CRT __dyn_tls_init;
+        // multiple callbacks are the stronger anti-analysis / early-exec tell.
+        AddFinding(result, "pe.tls_callbacks",
+                   "Has " + std::to_string(pe.tlsCallbackCount) +
+                       " TLS callback(s) that run before the entry point "
+                       "(anti-analysis / early-execution tell)",
+                   pe.tlsCallbackCount > 1 ? 20 : 5);
+      }
+      if (!pe.isDll && !pe.exports.empty()) {
+        AddFinding(result, "pe.exe_exports",
+                   "Executable (non-DLL) exports " +
+                       std::to_string(pe.exports.size()) +
+                       " function(s) -- unusual (reflective loader / DLL "
+                       "masquerade)",
+                   10);
+      }
+      if (pe.isDotNet) {
+        AddFinding(result, "pe.dotnet_managed",
+                   "Managed .NET assembly (CLR " + pe.dotNetRuntimeVersion + ")",
+                   0);
+      }
+      if (!pe.pdbPath.empty()) {
+        // Score 0: an embedded PDB path is forensic build metadata present in
+        // nearly all release binaries -- valuable intel, but not a malice signal,
+        // so it must not inflate the verdict (cf. pe.dotnet_managed).
+        AddFinding(result, "pe.debug_pdb_path",
+                   "Embedded debug PDB path: " + pe.pdbPath, 0);
+      }
+      // OriginalFilename stem != the on-disk stem is a rename/masquerade tell.
+      // Compare extension-insensitively: legit version resources routinely store
+      // the name without its extension (kernel32.dll -> "kernel32"), so a
+      // full-name compare would false-positive on clean files.
+      if (pe.versionInfo.present && !pe.versionInfo.originalFilename.empty()) {
+        auto stem = [](std::string s) {
+          const size_t slash = s.find_last_of("\\/");
+          if (slash != std::string::npos) {
+            s = s.substr(slash + 1);
+          }
+          const size_t dot = s.find_last_of('.');
+          if (dot != std::string::npos && dot != 0) {
+            s = s.substr(0, dot);
+          }
+          for (char &c : s) {
+            c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+          }
+          return s;
+        };
+        const std::string origStem = stem(pe.versionInfo.originalFilename);
+        if (!origStem.empty() && stem(PathToUtf8(path.filename())) != origStem) {
+          AddFinding(result, "filetype.versioninfo_mismatch",
+                     "On-disk name '" + PathToUtf8(path.filename()) +
+                         "' differs from the embedded OriginalFilename '" +
+                         pe.versionInfo.originalFilename +
+                         "' (possible rename/masquerade)",
+                     15);
+        }
       }
     }
 
@@ -615,6 +684,35 @@ std::string FormatScanText(const ScanResult &result) {
   }
   if (result.embeddedExecutables > 0) {
     out << "  embedded executables: " << result.embeddedExecutables << "\n";
+  }
+  if (result.isDotNet) {
+    out << "  .NET: yes (CLR " << result.dotNetRuntimeVersion << ")\n";
+  }
+  if (!result.peExports.empty()) {
+    out << "  exports: " << result.peExports.size();
+    if (!result.exportName.empty()) {
+      out << " (" << result.exportName << ")";
+    }
+    out << "\n";
+  }
+  if (result.tlsCallbackCount > 0) {
+    out << "  tls callbacks: " << result.tlsCallbackCount << "\n";
+  }
+  if (!result.pdbPath.empty()) {
+    out << "  pdb: " << result.pdbPath << "\n";
+  }
+  if (result.peVersionInfo.present) {
+    out << "  version: " << result.peVersionInfo.companyName;
+    if (!result.peVersionInfo.productName.empty()) {
+      out << " / " << result.peVersionInfo.productName;
+    }
+    if (!result.peVersionInfo.originalFilename.empty()) {
+      out << " (" << result.peVersionInfo.originalFilename << ")";
+    }
+    out << "\n";
+  }
+  if (!result.richHash.empty()) {
+    out << "  richhash: " << result.richHash << "\n";
   }
   for (const auto &finding : result.findings) {
     out << "  - [" << finding.ruleId << "] +" << finding.score << " "

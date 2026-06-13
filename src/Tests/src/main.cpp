@@ -2777,6 +2777,55 @@ static std::vector<uint8_t> BuildMinimalPe64(const std::vector<uint8_t> &section
   return buf;
 }
 
+// The PE32 (32-bit) sibling of BuildMinimalPe64 -- exercises the divergent
+// IMAGE_OPTIONAL_HEADER32 DataDirectory offset + the 4-byte TLS callback stride.
+static std::vector<uint8_t> BuildMinimalPe32(const std::vector<uint8_t> &sectionBytes,
+                                             int dirIndex, uint32_t dirRva,
+                                             uint32_t dirSize) {
+  const uint32_t kSectionRaw = 0x200;
+  uint32_t rawSize =
+      static_cast<uint32_t>(((sectionBytes.size() + 0x1FF) / 0x200) * 0x200);
+  if (rawSize == 0) {
+    rawSize = 0x200;
+  }
+  std::vector<uint8_t> buf(static_cast<size_t>(kSectionRaw) + rawSize, 0);
+
+  auto *dos = reinterpret_cast<IMAGE_DOS_HEADER *>(buf.data());
+  dos->e_magic = IMAGE_DOS_SIGNATURE;
+  dos->e_lfanew = 0x40;
+
+  auto *nt = reinterpret_cast<IMAGE_NT_HEADERS32 *>(buf.data() + 0x40);
+  nt->Signature = IMAGE_NT_SIGNATURE;
+  nt->FileHeader.Machine = IMAGE_FILE_MACHINE_I386;
+  nt->FileHeader.NumberOfSections = 1;
+  nt->FileHeader.SizeOfOptionalHeader = sizeof(IMAGE_OPTIONAL_HEADER32);
+  nt->FileHeader.Characteristics =
+      IMAGE_FILE_EXECUTABLE_IMAGE | IMAGE_FILE_32BIT_MACHINE;
+  nt->OptionalHeader.Magic = IMAGE_NT_OPTIONAL_HDR32_MAGIC;
+  nt->OptionalHeader.ImageBase = 0x00400000;
+  nt->OptionalHeader.SectionAlignment = 0x1000;
+  nt->OptionalHeader.FileAlignment = 0x200;
+  nt->OptionalHeader.Subsystem = IMAGE_SUBSYSTEM_WINDOWS_CUI;
+  nt->OptionalHeader.NumberOfRvaAndSizes = IMAGE_NUMBEROF_DIRECTORY_ENTRIES;
+  if (dirIndex >= 0 && dirIndex < IMAGE_NUMBEROF_DIRECTORY_ENTRIES) {
+    nt->OptionalHeader.DataDirectory[dirIndex].VirtualAddress = dirRva;
+    nt->OptionalHeader.DataDirectory[dirIndex].Size = dirSize;
+  }
+
+  auto *sec = IMAGE_FIRST_SECTION(nt);
+  std::memcpy(sec->Name, ".data", 5);
+  sec->Misc.VirtualSize = rawSize;
+  sec->VirtualAddress = 0x1000;
+  sec->SizeOfRawData = rawSize;
+  sec->PointerToRawData = kSectionRaw;
+  sec->Characteristics = IMAGE_SCN_MEM_READ | IMAGE_SCN_CNT_INITIALIZED_DATA;
+
+  if (!sectionBytes.empty()) {
+    std::memcpy(buf.data() + kSectionRaw, sectionBytes.data(), sectionBytes.size());
+  }
+  return buf;
+}
+
 // A native MSVC EXE: not a DLL, not managed, exports nothing, but carries a
 // linker-emitted Rich header (a deterministic toolchain fingerprint).
 void TestPeParserSelfExe() {
@@ -2862,6 +2911,213 @@ void TestPeParserSyntheticDirectories() {
     Expect(pe.debugEntryCount == 1, "one debug directory entry");
     Expect(pe.pdbPath == "C:\\proj\\sample.pdb", "CodeView PDB path extracted");
   }
+}
+
+// The magic-aware OptHeaderView + the 32-bit TLS stride: a PE32 (not PE32+) image
+// must enumerate its TLS callbacks through the IMAGE_OPTIONAL_HEADER32 path.
+void TestPeParserPe32() {
+  std::vector<uint8_t> sec(0x200, 0);
+  reinterpret_cast<IMAGE_TLS_DIRECTORY32 *>(sec.data())->AddressOfCallBacks =
+      0x00400000u + 0x1100u; // VA -> RVA 0x1100
+  auto *cbs = reinterpret_cast<uint32_t *>(sec.data() + 0x100);
+  cbs[0] = 0x00400000u + 0x2000u;
+  cbs[1] = 0x00400000u + 0x2000u;
+  cbs[2] = 0;
+  const auto pe = antimal::ParsePe(BuildMinimalPe32(
+      sec, IMAGE_DIRECTORY_ENTRY_TLS, 0x1000, sizeof(IMAGE_TLS_DIRECTORY32)));
+  Expect(pe.isPe, "minimal PE32 parses");
+  Expect(!pe.isDll, "PE32 EXE is not a DLL");
+  Expect(pe.tlsCallbackCount == 2,
+         "PE32 TLS callbacks counted via the 32-bit view + stride");
+}
+
+// Rich-header decode correctness: build a DOS stub with an XOR-encoded
+// DanS..Rich sequence and assert richHash equals an independently-computed MD5
+// of the decoded payload (the self-exe test only proves length + determinism).
+void TestParseRichHeaderSynthetic() {
+  const uint32_t key = 0x12345678u;
+  const uint32_t clear[] = {0x536E6144u /*DanS*/, 0u, 0u, 0u, 0x00010101u, 0x00000007u};
+  auto put32 = [](std::vector<uint8_t> &v, uint32_t x) {
+    v.push_back(static_cast<uint8_t>(x & 0xFF));
+    v.push_back(static_cast<uint8_t>((x >> 8) & 0xFF));
+    v.push_back(static_cast<uint8_t>((x >> 16) & 0xFF));
+    v.push_back(static_cast<uint8_t>((x >> 24) & 0xFF));
+  };
+  std::vector<uint8_t> clearBytes;
+  for (uint32_t d : clear) {
+    put32(clearBytes, d);
+  }
+  const std::string expected = antimal::Md5Hex(clearBytes);
+
+  auto buildWithStub = [&](const std::vector<uint8_t> &stub) {
+    const size_t ntOff = (0x40 + stub.size() + 7) & ~static_cast<size_t>(7);
+    std::vector<uint8_t> buf(ntOff + sizeof(IMAGE_NT_HEADERS64) + 0x40, 0);
+    auto *dos = reinterpret_cast<IMAGE_DOS_HEADER *>(buf.data());
+    dos->e_magic = IMAGE_DOS_SIGNATURE;
+    dos->e_lfanew = static_cast<LONG>(ntOff);
+    std::memcpy(buf.data() + 0x40, stub.data(), stub.size());
+    auto *nt = reinterpret_cast<IMAGE_NT_HEADERS64 *>(buf.data() + ntOff);
+    nt->Signature = IMAGE_NT_SIGNATURE;
+    nt->FileHeader.Machine = IMAGE_FILE_MACHINE_AMD64;
+    nt->FileHeader.SizeOfOptionalHeader = sizeof(IMAGE_OPTIONAL_HEADER64);
+    nt->OptionalHeader.Magic = IMAGE_NT_OPTIONAL_HDR64_MAGIC;
+    return buf;
+  };
+
+  std::vector<uint8_t> stub;
+  for (uint32_t d : clear) {
+    put32(stub, d ^ key); // XOR-encoded payload
+  }
+  put32(stub, 0x68636952u); // literal 'Rich' marker
+  put32(stub, key);
+  const auto pe = antimal::ParsePe(buildWithStub(stub));
+  Expect(pe.isPe, "synthetic Rich PE parses");
+  Expect(pe.hasRichHeader, "synthetic Rich header detected");
+  Expect(pe.richHash == expected, "richhash equals MD5 of the decoded payload");
+
+  std::vector<uint8_t> noRich;
+  for (int i = 0; i < 8; ++i) {
+    put32(noRich, 0xA1B2C3D4u + static_cast<uint32_t>(i));
+  }
+  const auto pe2 = antimal::ParsePe(buildWithStub(noRich));
+  Expect(!pe2.hasRichHeader, "no 'Rich' marker -> hasRichHeader false");
+  Expect(pe2.richHash.empty(), "no rich header -> empty richhash");
+}
+
+// ScanFile turns the parsed PE-depth signals into findings. Each crafted PE is
+// written to a temp file and scanned end-to-end.
+void TestPeDepthFindings() {
+  auto has = [](const std::vector<antimal::ScanFinding> &f, const char *id) {
+    for (const auto &x : f) {
+      if (x.ruleId == id) {
+        return true;
+      }
+    }
+    return false;
+  };
+  auto scanBytes = [](const std::wstring &name, const std::vector<uint8_t> &bytes) {
+    const auto p = std::filesystem::temp_directory_path() / name;
+    {
+      std::ofstream f(p, std::ios::binary | std::ios::trunc);
+      f.write(reinterpret_cast<const char *>(bytes.data()),
+              static_cast<std::streamsize>(bytes.size()));
+    }
+    const auto r = antimal::ScanFile(p);
+    std::error_code ec;
+    std::filesystem::remove(p, ec);
+    return r;
+  };
+
+  // TLS callbacks -> pe.tls_callbacks.
+  {
+    std::vector<uint8_t> sec(0x200, 0);
+    reinterpret_cast<IMAGE_TLS_DIRECTORY64 *>(sec.data())->AddressOfCallBacks =
+        0x140000000ull + 0x1100;
+    auto *cbs = reinterpret_cast<uint64_t *>(sec.data() + 0x100);
+    cbs[0] = 0x140000000ull + 0x2000;
+    cbs[1] = 0;
+    const auto r = scanBytes(L"antimal_t47_tls.exe",
+                             BuildMinimalPe64(sec, IMAGE_DIRECTORY_ENTRY_TLS,
+                                              0x1000, sizeof(IMAGE_TLS_DIRECTORY64)));
+    Expect(r.tlsCallbackCount == 1, "scan mirrors the TLS callback count");
+    Expect(has(r.findings, "pe.tls_callbacks"), "TLS callbacks -> finding");
+  }
+  // .NET managed -> pe.dotnet_managed.
+  {
+    std::vector<uint8_t> sec(0x40, 0);
+    *reinterpret_cast<uint32_t *>(sec.data() + 0) = 72;
+    *reinterpret_cast<uint16_t *>(sec.data() + 4) = 2;
+    *reinterpret_cast<uint16_t *>(sec.data() + 6) = 5;
+    const auto r =
+        scanBytes(L"antimal_t47_net.exe",
+                  BuildMinimalPe64(sec, IMAGE_DIRECTORY_ENTRY_COM_DESCRIPTOR,
+                                   0x1000, 72));
+    Expect(r.isDotNet, "scan mirrors the .NET flag");
+    Expect(has(r.findings, "pe.dotnet_managed"), ".NET assembly -> finding");
+  }
+  // CodeView PDB path -> pe.debug_pdb_path.
+  {
+    std::vector<uint8_t> sec(0x100, 0);
+    auto *dbg = reinterpret_cast<IMAGE_DEBUG_DIRECTORY *>(sec.data());
+    dbg->Type = IMAGE_DEBUG_TYPE_CODEVIEW;
+    dbg->PointerToRawData = 0x240;
+    const char *pdb = "C:\\build\\evil.pdb";
+    std::memcpy(sec.data() + 0x40, "RSDS", 4);
+    std::memcpy(sec.data() + 0x40 + 24, pdb, std::strlen(pdb) + 1);
+    dbg->SizeOfData = 24 + static_cast<DWORD>(std::strlen(pdb) + 1);
+    const auto r = scanBytes(L"antimal_t47_dbg.exe",
+                             BuildMinimalPe64(sec, IMAGE_DIRECTORY_ENTRY_DEBUG,
+                                              0x1000, sizeof(IMAGE_DEBUG_DIRECTORY)));
+    Expect(r.pdbPath == "C:\\build\\evil.pdb", "scan mirrors the PDB path");
+    Expect(has(r.findings, "pe.debug_pdb_path"), "PDB path -> finding");
+  }
+  // A non-DLL EXE that exports functions -> pe.exe_exports.
+  {
+    std::vector<uint8_t> sec(0x100, 0);
+    auto *ed = reinterpret_cast<IMAGE_EXPORT_DIRECTORY *>(sec.data());
+    ed->Name = 0x1040;
+    ed->Base = 1;
+    ed->NumberOfFunctions = 1;
+    ed->NumberOfNames = 1;
+    ed->AddressOfNames = 0x1060;
+    std::memcpy(sec.data() + 0x40, "evil.exe", 9);
+    *reinterpret_cast<uint32_t *>(sec.data() + 0x60) = 0x1070;
+    std::memcpy(sec.data() + 0x70, "DoEvil", 7);
+    const auto r = scanBytes(L"antimal_t47_exp.exe",
+                             BuildMinimalPe64(sec, IMAGE_DIRECTORY_ENTRY_EXPORT,
+                                              0x1000, sizeof(IMAGE_EXPORT_DIRECTORY)));
+    Expect(!r.peExports.empty(), "scan mirrors the export list");
+    Expect(has(r.findings, "pe.exe_exports"), "EXE with exports -> finding");
+  }
+  // OriginalFilename != on-disk name -> filetype.versioninfo_mismatch. kernel32
+  // copied to a different name trips the rename/masquerade tell.
+  {
+    wchar_t sysDir[MAX_PATH]{};
+    GetSystemDirectoryW(sysDir, MAX_PATH);
+    const auto k32 = antimal::ReadAllBytes(std::wstring(sysDir) + L"\\kernel32.dll");
+    const auto r = scanBytes(L"antimal_t47_rename.exe", k32);
+    Expect(has(r.findings, "filetype.versioninfo_mismatch"),
+           "renamed PE (OriginalFilename mismatch) -> finding");
+  }
+  // Negative: kernel32 under its REAL name must NOT trip the masquerade tell --
+  // its OriginalFilename stem matches "kernel32" -- guarding the stem normalizer.
+  {
+    wchar_t sysDir[MAX_PATH]{};
+    GetSystemDirectoryW(sysDir, MAX_PATH);
+    const auto r = antimal::ScanFile(std::wstring(sysDir) + L"\\kernel32.dll");
+    Expect(!has(r.findings, "filetype.versioninfo_mismatch"),
+           "clean file (matching OriginalFilename stem) does not fire mismatch");
+  }
+}
+
+// The PE-depth fields are serialized into the scan JSON.
+void TestPeDepthJson() {
+  wchar_t sysDir[MAX_PATH]{};
+  GetSystemDirectoryW(sysDir, MAX_PATH);
+  const auto r = antimal::ScanFile(std::wstring(sysDir) + L"\\kernel32.dll");
+  Expect(r.peVersionInfo.present, "scan carries kernel32 VERSIONINFO");
+  Expect(!r.peExports.empty(), "scan carries kernel32 exports");
+  const std::string json = antimal::ToJson(r);
+  for (const char *key : {"isDotNet", "dotNetRuntimeVersion", "exportName",
+                          "exports", "tlsCallbackCount", "versionInfo", "pdbPath",
+                          "richHash"}) {
+    const std::string msg = std::string("scan JSON contains the ") + key + " field";
+    Expect(json.find(std::string("\"") + key + "\"") != std::string::npos,
+           msg.c_str());
+  }
+  Expect(json.find("\"companyName\"") != std::string::npos,
+         "scan JSON nests versionInfo.companyName");
+}
+
+// The PE-depth fields appear in the human-readable CLI scan text.
+void TestPeDepthText() {
+  wchar_t sysDir[MAX_PATH]{};
+  GetSystemDirectoryW(sysDir, MAX_PATH);
+  const auto r = antimal::ScanFile(std::wstring(sysDir) + L"\\kernel32.dll");
+  const std::string t = antimal::FormatScanText(r);
+  Expect(t.find("exports:") != std::string::npos, "scan text lists the export count");
+  Expect(t.find("Microsoft") != std::string::npos,
+         "scan text shows the VERSIONINFO company");
 }
 
 // MD5 (triage hash) + the pefile-compatible imphash. MD5 is checked against the
@@ -6553,6 +6809,11 @@ int main() {
     TestPeParserSelfExe();
     TestPeParserExportsAndVersion();
     TestPeParserSyntheticDirectories();
+    TestPeParserPe32();
+    TestParseRichHeaderSynthetic();
+    TestPeDepthFindings();
+    TestPeDepthJson();
+    TestPeDepthText();
     TestMd5AndImphash();
     TestFileTypeId();
     TestImportCapabilities();

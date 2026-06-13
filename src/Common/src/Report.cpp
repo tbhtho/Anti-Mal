@@ -365,6 +365,26 @@ ScanResult ParseScan(const JsonValue *value) {
       static_cast<uint64_t>(DoubleValue(Member(*value, "peOverlaySize")));
   scan.peOverlayEntropy = DoubleValue(Member(*value, "peOverlayEntropy"));
   scan.embeddedExecutables = IntValue(Member(*value, "embeddedExecutables"));
+  scan.isDll = BoolValue(Member(*value, "isDll"));
+  scan.isDotNet = BoolValue(Member(*value, "isDotNet"));
+  scan.dotNetRuntimeVersion = StringValue(Member(*value, "dotNetRuntimeVersion"));
+  scan.exportName = StringValue(Member(*value, "exportName"));
+  scan.peExports = StringArrayValue(Member(*value, "exports"));
+  scan.tlsCallbackCount =
+      static_cast<uint32_t>(IntValue(Member(*value, "tlsCallbackCount")));
+  scan.pdbPath = StringValue(Member(*value, "pdbPath"));
+  scan.richHash = StringValue(Member(*value, "richHash"));
+  if (const JsonValue *vi = Member(*value, "versionInfo")) {
+    scan.peVersionInfo.present = BoolValue(Member(*vi, "present"));
+    scan.peVersionInfo.companyName = StringValue(Member(*vi, "companyName"));
+    scan.peVersionInfo.productName = StringValue(Member(*vi, "productName"));
+    scan.peVersionInfo.fileDescription = StringValue(Member(*vi, "fileDescription"));
+    scan.peVersionInfo.originalFilename = StringValue(Member(*vi, "originalFilename"));
+    scan.peVersionInfo.internalName = StringValue(Member(*vi, "internalName"));
+    scan.peVersionInfo.fileVersion = StringValue(Member(*vi, "fileVersion"));
+    scan.peVersionInfo.productVersion = StringValue(Member(*vi, "productVersion"));
+    scan.peVersionInfo.legalCopyright = StringValue(Member(*vi, "legalCopyright"));
+  }
   scan.peSections = ParseSections(Member(*value, "peSections"));
   scan.findings = ParseFindings(Member(*value, "findings"));
   scan.score = IntValue(Member(*value, "score"));
@@ -1858,7 +1878,10 @@ std::string BuildHtmlReportWithFrames(const AnalysisReport &report,
   // writable+executable or high-entropy section is the visible packer tell.
   if (scan.isPe && !scan.peSections.empty()) {
     html << "<section class=\"panel\"><h2>PE sections</h2>";
-    if (scan.imphash.size() || scan.peTimestamp || scan.peOverlaySize) {
+    if (scan.imphash.size() || scan.peTimestamp || scan.peOverlaySize ||
+        scan.isDotNet || !scan.peExports.empty() || scan.tlsCallbackCount ||
+        !scan.pdbPath.empty() || scan.peVersionInfo.present ||
+        !scan.richHash.empty()) {
       html << "<div class=\"kv\">";
       if (!scan.imphash.empty()) {
         html << "<div class=\"k\">imphash</div><div class=\"mono\">"
@@ -1873,6 +1896,40 @@ std::string BuildHtmlReportWithFrames(const AnalysisReport &report,
         std::snprintf(ob, sizeof(ob), "%.2f", scan.peOverlayEntropy);
         html << "<div class=\"k\">overlay</div><div class=\"mono\">"
              << scan.peOverlaySize << " bytes, entropy " << ob << "</div>";
+      }
+      if (scan.isDotNet) {
+        html << "<div class=\"k\">.NET</div><div>managed (CLR "
+             << HtmlEscape(scan.dotNetRuntimeVersion) << ")</div>";
+      }
+      if (!scan.peExports.empty()) {
+        html << "<div class=\"k\">exports</div><div>" << scan.peExports.size();
+        if (!scan.exportName.empty()) {
+          html << " &middot; " << HtmlEscape(scan.exportName);
+        }
+        html << "</div>";
+      }
+      if (scan.tlsCallbackCount) {
+        html << "<div class=\"k\">TLS callbacks</div><div>"
+             << scan.tlsCallbackCount << "</div>";
+      }
+      if (scan.peVersionInfo.present) {
+        html << "<div class=\"k\">version</div><div>"
+             << HtmlEscape(scan.peVersionInfo.companyName);
+        if (!scan.peVersionInfo.productName.empty()) {
+          html << " &middot; " << HtmlEscape(scan.peVersionInfo.productName);
+        }
+        if (!scan.peVersionInfo.originalFilename.empty()) {
+          html << " (" << HtmlEscape(scan.peVersionInfo.originalFilename) << ")";
+        }
+        html << "</div>";
+      }
+      if (!scan.pdbPath.empty()) {
+        html << "<div class=\"k\">PDB</div><div class=\"mono\">"
+             << HtmlEscape(scan.pdbPath) << "</div>";
+      }
+      if (!scan.richHash.empty()) {
+        html << "<div class=\"k\">richhash</div><div class=\"mono\">"
+             << HtmlEscape(scan.richHash) << "</div>";
       }
       html << "</div>";
     }

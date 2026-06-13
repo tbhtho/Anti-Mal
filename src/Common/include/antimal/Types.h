@@ -129,12 +129,22 @@ struct ScanResult {
   std::string imphash; // pefile-compatible import hash; empty for non-PE / no imports
   double entropy = 0.0;
   bool isPe = false;
+  bool isDll = false;                // IMAGE_FILE_DLL in the file header
   bool authenticodeSigned = false;
   uint32_t peTimestamp = 0;          // PE compile timestamp (unix epoch secs)
   std::vector<PeSection> peSections; // section table + per-section entropy
   uint64_t peOverlaySize = 0;        // bytes appended after the last section
   double peOverlayEntropy = 0.0;     // entropy of that overlay region
   int embeddedExecutables = 0;       // count of PE images embedded past offset 0
+  // --- T47 depth (surfaced from PeInfo) ---
+  bool isDotNet = false;               // managed .NET assembly (Cor20 header)
+  std::string dotNetRuntimeVersion;    // CLR "major.minor", else ""
+  std::string exportName;              // export directory's module name
+  std::vector<std::string> peExports;  // named export symbols
+  uint32_t tlsCallbackCount = 0;       // # of pre-entry-point TLS callbacks
+  PeVersionInfo peVersionInfo;         // RT_VERSION StringFileInfo
+  std::string pdbPath;                 // CodeView RSDS PDB path (IOC), else ""
+  std::string richHash;                // MSVC Rich-header toolchain fingerprint
   std::vector<std::string> imports;
   std::vector<ScanFinding> findings;
   int score = 0;

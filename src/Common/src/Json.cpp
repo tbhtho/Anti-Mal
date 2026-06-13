@@ -499,6 +499,27 @@ std::string ToJson(const ScanResult &scan) {
   obj.AddNumber("peOverlaySize", static_cast<int64_t>(scan.peOverlaySize));
   obj.AddDouble("peOverlayEntropy", scan.peOverlayEntropy);
   obj.AddNumber("embeddedExecutables", scan.embeddedExecutables);
+  obj.AddBool("isDll", scan.isDll);
+  obj.AddBool("isDotNet", scan.isDotNet);
+  obj.AddString("dotNetRuntimeVersion", scan.dotNetRuntimeVersion);
+  obj.AddString("exportName", scan.exportName);
+  obj.AddRaw("exports", JsonStringArray(scan.peExports));
+  obj.AddNumber("tlsCallbackCount", scan.tlsCallbackCount);
+  obj.AddString("pdbPath", scan.pdbPath);
+  obj.AddString("richHash", scan.richHash);
+  {
+    JsonObjectBuilder vi;
+    vi.AddBool("present", scan.peVersionInfo.present);
+    vi.AddString("companyName", scan.peVersionInfo.companyName);
+    vi.AddString("productName", scan.peVersionInfo.productName);
+    vi.AddString("fileDescription", scan.peVersionInfo.fileDescription);
+    vi.AddString("originalFilename", scan.peVersionInfo.originalFilename);
+    vi.AddString("internalName", scan.peVersionInfo.internalName);
+    vi.AddString("fileVersion", scan.peVersionInfo.fileVersion);
+    vi.AddString("productVersion", scan.peVersionInfo.productVersion);
+    vi.AddString("legalCopyright", scan.peVersionInfo.legalCopyright);
+    obj.AddRaw("versionInfo", vi.Finish());
+  }
   obj.AddRaw("peSections", sections.str());
   obj.AddRaw("imports", JsonStringArray(scan.imports));
   obj.AddRaw("findings", findings.str());
