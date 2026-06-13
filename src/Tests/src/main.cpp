@@ -2724,6 +2724,146 @@ void TestPeParser() {
   }
 }
 
+// --- T47 PE parser depth ------------------------------------------------------
+
+// Builds a minimal but valid 64-bit PE in memory: DOS + NT headers + one section
+// that maps RVA 0x1000 to `sectionBytes` (placed at file offset 0x200), with
+// DataDirectory[dirIndex] = {dirRva, dirSize}. ImageBase is fixed at 0x140000000
+// so callback VAs are predictable. Lets a single data directory be exercised
+// without needing a real compiler artifact that happens to carry it.
+static std::vector<uint8_t> BuildMinimalPe64(const std::vector<uint8_t> &sectionBytes,
+                                             int dirIndex, uint32_t dirRva,
+                                             uint32_t dirSize) {
+  const uint32_t kSectionRaw = 0x200;
+  uint32_t rawSize =
+      static_cast<uint32_t>(((sectionBytes.size() + 0x1FF) / 0x200) * 0x200);
+  if (rawSize == 0) {
+    rawSize = 0x200;
+  }
+  std::vector<uint8_t> buf(static_cast<size_t>(kSectionRaw) + rawSize, 0);
+
+  auto *dos = reinterpret_cast<IMAGE_DOS_HEADER *>(buf.data());
+  dos->e_magic = IMAGE_DOS_SIGNATURE;
+  dos->e_lfanew = 0x40;
+
+  auto *nt = reinterpret_cast<IMAGE_NT_HEADERS64 *>(buf.data() + 0x40);
+  nt->Signature = IMAGE_NT_SIGNATURE;
+  nt->FileHeader.Machine = IMAGE_FILE_MACHINE_AMD64;
+  nt->FileHeader.NumberOfSections = 1;
+  nt->FileHeader.SizeOfOptionalHeader = sizeof(IMAGE_OPTIONAL_HEADER64);
+  nt->FileHeader.Characteristics = IMAGE_FILE_EXECUTABLE_IMAGE;
+  nt->OptionalHeader.Magic = IMAGE_NT_OPTIONAL_HDR64_MAGIC;
+  nt->OptionalHeader.ImageBase = 0x140000000ull;
+  nt->OptionalHeader.SectionAlignment = 0x1000;
+  nt->OptionalHeader.FileAlignment = 0x200;
+  nt->OptionalHeader.Subsystem = IMAGE_SUBSYSTEM_WINDOWS_CUI;
+  nt->OptionalHeader.NumberOfRvaAndSizes = IMAGE_NUMBEROF_DIRECTORY_ENTRIES;
+  if (dirIndex >= 0 && dirIndex < IMAGE_NUMBEROF_DIRECTORY_ENTRIES) {
+    nt->OptionalHeader.DataDirectory[dirIndex].VirtualAddress = dirRva;
+    nt->OptionalHeader.DataDirectory[dirIndex].Size = dirSize;
+  }
+
+  auto *sec = IMAGE_FIRST_SECTION(nt);
+  std::memcpy(sec->Name, ".data", 5);
+  sec->Misc.VirtualSize = rawSize;
+  sec->VirtualAddress = 0x1000;
+  sec->SizeOfRawData = rawSize;
+  sec->PointerToRawData = kSectionRaw;
+  sec->Characteristics = IMAGE_SCN_MEM_READ | IMAGE_SCN_CNT_INITIALIZED_DATA;
+
+  if (!sectionBytes.empty()) {
+    std::memcpy(buf.data() + kSectionRaw, sectionBytes.data(), sectionBytes.size());
+  }
+  return buf;
+}
+
+// A native MSVC EXE: not a DLL, not managed, exports nothing, but carries a
+// linker-emitted Rich header (a deterministic toolchain fingerprint).
+void TestPeParserSelfExe() {
+  wchar_t modulePath[MAX_PATH]{};
+  GetModuleFileNameW(nullptr, modulePath, MAX_PATH);
+  const auto pe = antimal::ParsePeFile(modulePath);
+  Expect(pe.isPe, "self exe parses as PE");
+  Expect(!pe.isDll, "self exe is not a DLL");
+  Expect(!pe.isDotNet, "native self exe is not .NET");
+  Expect(pe.exports.empty(), "an EXE exports no functions");
+  Expect(pe.hasRichHeader, "MSVC self exe carries a Rich header");
+  Expect(pe.richHash.size() == 32, "richhash is a 32-char MD5");
+  Expect(antimal::ParsePeFile(modulePath).richHash == pe.richHash,
+         "richhash is deterministic across parses");
+}
+
+// Real-file fixture for the export table + VERSIONINFO: kernel32.dll is always
+// present, is a DLL, exports CreateFileW, and carries a Microsoft StringFileInfo.
+void TestPeParserExportsAndVersion() {
+  wchar_t sysDir[MAX_PATH]{};
+  GetSystemDirectoryW(sysDir, MAX_PATH);
+  const std::wstring k32 = std::wstring(sysDir) + L"\\kernel32.dll";
+  const auto pe = antimal::ParsePeFile(k32);
+  Expect(pe.isPe, "kernel32 parses as PE");
+  Expect(pe.isDll, "kernel32 is a DLL");
+  Expect(!pe.exports.empty(), "kernel32 has an export table");
+  Expect(std::find(pe.exports.begin(), pe.exports.end(), "CreateFileW") !=
+             pe.exports.end(),
+         "kernel32 exports CreateFileW");
+  std::string en = pe.exportName;
+  for (char &c : en) {
+    c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+  }
+  Expect(en == "kernel32.dll", "export directory names the module KERNEL32.dll");
+  Expect(pe.versionInfo.present, "kernel32 has a VERSIONINFO resource");
+  Expect(pe.versionInfo.companyName.find("Microsoft") != std::string::npos,
+         "kernel32 CompanyName is Microsoft");
+}
+
+// Hand-crafted minimal PEs prove the directory-walk logic for TLS callbacks,
+// .NET/CLR detection, and the CodeView PDB path -- machine-independent, mirroring
+// how TestMd5AndImphash re-derives its contract rather than trusting a producer.
+void TestPeParserSyntheticDirectories() {
+  // TLS: two non-null callbacks then a null terminator -> count == 2.
+  {
+    std::vector<uint8_t> sec(0x200, 0);
+    auto *tls = reinterpret_cast<IMAGE_TLS_DIRECTORY64 *>(sec.data());
+    tls->AddressOfCallBacks = 0x140000000ull + 0x1100; // RVA 0x1100
+    auto *cbs = reinterpret_cast<uint64_t *>(sec.data() + 0x100);
+    cbs[0] = 0x140000000ull + 0x2000;
+    cbs[1] = 0x140000000ull + 0x2000;
+    cbs[2] = 0;
+    const auto pe = antimal::ParsePe(BuildMinimalPe64(
+        sec, IMAGE_DIRECTORY_ENTRY_TLS, 0x1000, sizeof(IMAGE_TLS_DIRECTORY64)));
+    Expect(pe.isPe, "minimal TLS PE parses");
+    Expect(pe.tlsCallbackCount == 2, "two TLS callbacks counted");
+  }
+  // .NET: a Cor20 header (cb, major=2, minor=5) under DataDirectory[14].
+  {
+    std::vector<uint8_t> sec(0x40, 0);
+    *reinterpret_cast<uint32_t *>(sec.data() + 0) = 72; // cb
+    *reinterpret_cast<uint16_t *>(sec.data() + 4) = 2;  // MajorRuntimeVersion
+    *reinterpret_cast<uint16_t *>(sec.data() + 6) = 5;  // MinorRuntimeVersion
+    const auto pe = antimal::ParsePe(BuildMinimalPe64(
+        sec, IMAGE_DIRECTORY_ENTRY_COM_DESCRIPTOR, 0x1000, 72));
+    Expect(pe.isDotNet, ".NET sample detected via Cor20 header");
+    Expect(pe.dotNetRuntimeVersion == "2.5", ".NET runtime version is major.minor");
+  }
+  // Debug: a CodeView RSDS record leaks the PDB path.
+  {
+    std::vector<uint8_t> sec(0x100, 0);
+    auto *dbg = reinterpret_cast<IMAGE_DEBUG_DIRECTORY *>(sec.data());
+    dbg->Type = IMAGE_DEBUG_TYPE_CODEVIEW;
+    dbg->AddressOfRawData = 0x1040; // RVA of the RSDS blob
+    dbg->PointerToRawData = 0x240;  // file offset of the RSDS blob (sec + 0x40)
+    const char *pdb = "C:\\proj\\sample.pdb";
+    uint8_t *rsds = sec.data() + 0x40;
+    std::memcpy(rsds, "RSDS", 4); // CvSignature
+    std::memcpy(rsds + 24, pdb, std::strlen(pdb) + 1); // after GUID(16)+Age(4)
+    dbg->SizeOfData = 24 + static_cast<DWORD>(std::strlen(pdb) + 1);
+    const auto pe = antimal::ParsePe(BuildMinimalPe64(
+        sec, IMAGE_DIRECTORY_ENTRY_DEBUG, 0x1000, sizeof(IMAGE_DEBUG_DIRECTORY)));
+    Expect(pe.debugEntryCount == 1, "one debug directory entry");
+    Expect(pe.pdbPath == "C:\\proj\\sample.pdb", "CodeView PDB path extracted");
+  }
+}
+
 // MD5 (triage hash) + the pefile-compatible imphash. MD5 is checked against the
 // canonical RFC-1321 test vectors; imphash canonicalization (lowercase, strip a
 // trailing .dll/.ocx/.sys, "ordN" ordinals, comma-join, then MD5) is checked by
@@ -6410,6 +6550,9 @@ int main() {
     TestIdeInterruptRetriedUntilDelivered();
     TestMmioBusRouting();
     TestPeParser();
+    TestPeParserSelfExe();
+    TestPeParserExportsAndVersion();
+    TestPeParserSyntheticDirectories();
     TestMd5AndImphash();
     TestFileTypeId();
     TestImportCapabilities();

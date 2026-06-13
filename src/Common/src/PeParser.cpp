@@ -11,6 +11,7 @@
 #include <algorithm>
 #include <array>
 #include <cmath>
+#include <cstring>
 #include <stdexcept>
 
 namespace antimal {
@@ -99,6 +100,410 @@ std::string SectionName(const BYTE name[IMAGE_SIZEOF_SHORT_NAME]) {
   return s;
 }
 
+// ---- T47 depth: data-directory views + per-feature parsers -------------------
+
+// A magic-aware view over the optional header so the directory parsers below are
+// correct for both PE32 and PE32+ (the legacy import code reads the 64-bit
+// layout directly; these newer features do not inherit that 32-bit quirk).
+struct OptHeaderView {
+  bool valid = false;
+  bool is64 = false;
+  uint64_t imageBase = 0;
+  uint32_t numberOfRvaAndSizes = 0;
+  const IMAGE_DATA_DIRECTORY *dirs = nullptr;
+};
+
+OptHeaderView ViewOptHeader(const IMAGE_NT_HEADERS *nt) {
+  OptHeaderView v;
+  const WORD magic = nt->OptionalHeader.Magic;
+  if (magic == IMAGE_NT_OPTIONAL_HDR32_MAGIC) {
+    const auto *o =
+        reinterpret_cast<const IMAGE_OPTIONAL_HEADER32 *>(&nt->OptionalHeader);
+    v = {true, false, o->ImageBase, o->NumberOfRvaAndSizes, o->DataDirectory};
+  } else if (magic == IMAGE_NT_OPTIONAL_HDR64_MAGIC) {
+    const auto *o =
+        reinterpret_cast<const IMAGE_OPTIONAL_HEADER64 *>(&nt->OptionalHeader);
+    v = {true, true, o->ImageBase, o->NumberOfRvaAndSizes, o->DataDirectory};
+  }
+  return v;
+}
+
+IMAGE_DATA_DIRECTORY DirOf(const OptHeaderView &opt, int index) {
+  if (!opt.valid || index < 0 ||
+      static_cast<uint32_t>(index) >= opt.numberOfRvaAndSizes) {
+    return IMAGE_DATA_DIRECTORY{0, 0};
+  }
+  return opt.dirs[index];
+}
+
+// Rich header: an MSVC-linker fingerprint hidden in the DOS stub between the DOS
+// header and e_lfanew. Scan forward for the "Rich" marker, read the trailing XOR
+// key, walk back to the decoded "DanS" start, and MD5 the decoded payload (the
+// pefile "richhash"). Empty when absent (a tamper tell on an otherwise-MSVC PE).
+void ParseRichHeader(const std::vector<uint8_t> &data, size_t ntOffset,
+                     PeInfo &info) {
+  const size_t lo = 0x40;
+  const size_t hi = std::min(ntOffset, data.size());
+  if (hi <= lo + 8) {
+    return;
+  }
+  size_t richPos = 0;
+  bool foundRich = false;
+  for (size_t off = lo; off + 8 <= hi; off += 4) {
+    uint32_t v = 0;
+    std::memcpy(&v, data.data() + off, 4);
+    if (v == 0x68636952u) { // 'Rich'
+      richPos = off;
+      foundRich = true;
+      break;
+    }
+  }
+  if (!foundRich) {
+    return;
+  }
+  uint32_t key = 0;
+  std::memcpy(&key, data.data() + richPos + 4, 4);
+  size_t dansPos = 0;
+  bool foundDans = false;
+  for (size_t p = richPos; p >= lo + 4; p -= 4) {
+    uint32_t enc = 0;
+    std::memcpy(&enc, data.data() + p - 4, 4);
+    if ((enc ^ key) == 0x536E6144u) { // 'DanS'
+      dansPos = p - 4;
+      foundDans = true;
+      break;
+    }
+    if (p < lo + 8) {
+      break; // guard against size_t underflow on the next decrement
+    }
+  }
+  if (!foundDans) {
+    return;
+  }
+  std::vector<uint8_t> clear;
+  clear.reserve(richPos - dansPos);
+  for (size_t off = dansPos; off + 4 <= richPos; off += 4) {
+    uint32_t enc = 0;
+    std::memcpy(&enc, data.data() + off, 4);
+    const uint32_t dec = enc ^ key;
+    clear.push_back(static_cast<uint8_t>(dec & 0xFF));
+    clear.push_back(static_cast<uint8_t>((dec >> 8) & 0xFF));
+    clear.push_back(static_cast<uint8_t>((dec >> 16) & 0xFF));
+    clear.push_back(static_cast<uint8_t>((dec >> 24) & 0xFF));
+  }
+  info.hasRichHeader = true;
+  info.richHash = Md5Hex(clear);
+}
+
+// Export table (DataDirectory[0]): the module's internal name + its named export
+// symbols (sorted/deduped, capped). A non-DLL exporting functions is unusual.
+void ParseExports(const std::vector<uint8_t> &data, const IMAGE_NT_HEADERS *nt,
+                  const OptHeaderView &opt, PeInfo &info) {
+  const IMAGE_DATA_DIRECTORY d = DirOf(opt, IMAGE_DIRECTORY_ENTRY_EXPORT);
+  if (!d.VirtualAddress) {
+    return;
+  }
+  const auto *exp =
+      PtrAt<IMAGE_EXPORT_DIRECTORY>(data, RvaToOffset(data, nt, d.VirtualAddress));
+  if (!exp) {
+    return;
+  }
+  if (exp->Name) {
+    info.exportName = ReadAsciiZ(data, RvaToOffset(data, nt, exp->Name));
+  }
+  const size_t namesOff = RvaToOffset(data, nt, exp->AddressOfNames);
+  if (namesOff && exp->NumberOfNames) {
+    const DWORD cap = std::min<DWORD>(exp->NumberOfNames, 4096);
+    for (DWORD i = 0; i < cap; ++i) {
+      const auto *nameRva = PtrAt<DWORD>(data, namesOff + i * sizeof(DWORD));
+      if (!nameRva) {
+        break;
+      }
+      std::string nm = ReadAsciiZ(data, RvaToOffset(data, nt, *nameRva));
+      if (!nm.empty()) {
+        info.exports.push_back(std::move(nm));
+      }
+    }
+    std::sort(info.exports.begin(), info.exports.end());
+    info.exports.erase(std::unique(info.exports.begin(), info.exports.end()),
+                       info.exports.end());
+  }
+}
+
+// TLS callbacks (DataDirectory[9]): count non-null entries in AddressOfCallBacks
+// (a VA -> RVA via ImageBase). Callbacks run before the entry point.
+void ParseTls(const std::vector<uint8_t> &data, const IMAGE_NT_HEADERS *nt,
+              const OptHeaderView &opt, PeInfo &info) {
+  const IMAGE_DATA_DIRECTORY d = DirOf(opt, IMAGE_DIRECTORY_ENTRY_TLS);
+  if (!d.VirtualAddress) {
+    return;
+  }
+  const size_t off = RvaToOffset(data, nt, d.VirtualAddress);
+  uint64_t callbacksVa = 0;
+  if (opt.is64) {
+    const auto *t = PtrAt<IMAGE_TLS_DIRECTORY64>(data, off);
+    if (!t) {
+      return;
+    }
+    callbacksVa = t->AddressOfCallBacks;
+  } else {
+    const auto *t = PtrAt<IMAGE_TLS_DIRECTORY32>(data, off);
+    if (!t) {
+      return;
+    }
+    callbacksVa = t->AddressOfCallBacks;
+  }
+  if (callbacksVa <= opt.imageBase) {
+    return;
+  }
+  size_t cbOff =
+      RvaToOffset(data, nt, static_cast<DWORD>(callbacksVa - opt.imageBase));
+  if (!cbOff) {
+    return;
+  }
+  uint32_t count = 0;
+  for (uint32_t i = 0; i < 256; ++i) {
+    uint64_t entry = 0;
+    if (opt.is64) {
+      const auto *e = PtrAt<uint64_t>(data, cbOff + i * sizeof(uint64_t));
+      if (!e) {
+        break;
+      }
+      entry = *e;
+    } else {
+      const auto *e = PtrAt<uint32_t>(data, cbOff + i * sizeof(uint32_t));
+      if (!e) {
+        break;
+      }
+      entry = *e;
+    }
+    if (entry == 0) {
+      break;
+    }
+    ++count;
+  }
+  info.tlsCallbackCount = count;
+}
+
+// .NET / CLR (DataDirectory[14]): presence of a Cor20 header marks a managed
+// image; we surface its runtime version (major.minor).
+void ParseDotNet(const std::vector<uint8_t> &data, const IMAGE_NT_HEADERS *nt,
+                 const OptHeaderView &opt, PeInfo &info) {
+  const IMAGE_DATA_DIRECTORY d = DirOf(opt, IMAGE_DIRECTORY_ENTRY_COM_DESCRIPTOR);
+  if (!d.VirtualAddress) {
+    return;
+  }
+  // Minimal IMAGE_COR20_HEADER view: cb(4), MajorRuntimeVersion(2),
+  // MinorRuntimeVersion(2). (corhdr.h is not on the Common include path.)
+  struct Cor20Mini {
+    uint32_t cb;
+    uint16_t major;
+    uint16_t minor;
+  };
+  const auto *c = PtrAt<Cor20Mini>(data, RvaToOffset(data, nt, d.VirtualAddress));
+  if (!c) {
+    return;
+  }
+  info.isDotNet = true;
+  info.dotNetRuntimeVersion =
+      std::to_string(c->major) + "." + std::to_string(c->minor);
+}
+
+// Debug directory (DataDirectory[6]): count entries; for a CodeView (RSDS)
+// record, extract the embedded PDB path (after the 24-byte sig+GUID+age prefix).
+void ParseDebug(const std::vector<uint8_t> &data, const IMAGE_NT_HEADERS *nt,
+                const OptHeaderView &opt, PeInfo &info) {
+  const IMAGE_DATA_DIRECTORY d = DirOf(opt, IMAGE_DIRECTORY_ENTRY_DEBUG);
+  if (!d.VirtualAddress || d.Size < sizeof(IMAGE_DEBUG_DIRECTORY)) {
+    return;
+  }
+  const size_t base = RvaToOffset(data, nt, d.VirtualAddress);
+  if (!base) {
+    return;
+  }
+  const uint32_t count = std::min<uint32_t>(
+      d.Size / static_cast<uint32_t>(sizeof(IMAGE_DEBUG_DIRECTORY)), 64);
+  info.debugEntryCount = count;
+  for (uint32_t i = 0; i < count; ++i) {
+    const auto *dbg = PtrAt<IMAGE_DEBUG_DIRECTORY>(
+        data, base + i * sizeof(IMAGE_DEBUG_DIRECTORY));
+    if (!dbg) {
+      break;
+    }
+    if (dbg->Type != IMAGE_DEBUG_TYPE_CODEVIEW) {
+      continue;
+    }
+    size_t cvOff = dbg->PointerToRawData;
+    if (cvOff == 0 || cvOff >= data.size()) {
+      cvOff = RvaToOffset(data, nt, dbg->AddressOfRawData);
+    }
+    if (cvOff == 0 || cvOff + 24 > data.size()) {
+      continue;
+    }
+    if (std::memcmp(data.data() + cvOff, "RSDS", 4) != 0) {
+      continue;
+    }
+    info.pdbPath = ReadAsciiZ(data, cvOff + 24); // skip CvSig(4)+GUID(16)+Age(4)
+    break;
+  }
+}
+
+// Parse a VS_VERSIONINFO blob's StringFileInfo into the known fields. The node
+// tree is { wLength, wValueLength, wType, szKey(UTF-16Z), pad, Value, children },
+// 32-bit aligned relative to the blob base. Every length is bounded so a
+// malformed resource fails closed rather than looping.
+void ParseVersionStrings(const uint8_t *blob, size_t len, PeVersionInfo &vi) {
+  auto Align4 = [](size_t x) { return (x + 3) & ~static_cast<size_t>(3); };
+  auto ReadKey = [&](size_t pos, size_t limit, size_t &outEnd) {
+    std::string s;
+    size_t p = pos;
+    while (p + 2 <= limit) {
+      uint16_t w = 0;
+      std::memcpy(&w, blob + p, 2);
+      p += 2;
+      if (w == 0) {
+        break;
+      }
+      s.push_back(w < 0x80 ? static_cast<char>(w) : '?');
+    }
+    outEnd = p;
+    return s;
+  };
+  if (len < 6) {
+    return;
+  }
+  uint16_t rootLen = 0;
+  std::memcpy(&rootLen, blob, 2);
+  if (rootLen == 0 || rootLen > len) {
+    rootLen = static_cast<uint16_t>(len);
+  }
+  uint16_t rootValLen = 0;
+  std::memcpy(&rootValLen, blob + 2, 2);
+  size_t keyEnd = 0;
+  if (ReadKey(6, rootLen, keyEnd) != "VS_VERSION_INFO") {
+    return;
+  }
+  size_t pos = Align4(Align4(keyEnd) + rootValLen); // skip VS_FIXEDFILEINFO value
+  while (pos + 6 <= rootLen) {
+    uint16_t cLen = 0;
+    std::memcpy(&cLen, blob + pos, 2);
+    if (cLen == 0) {
+      break;
+    }
+    size_t cEnd = std::min<size_t>(pos + cLen, rootLen);
+    size_t cKeyEnd = 0;
+    const std::string cKey = ReadKey(pos + 6, cEnd, cKeyEnd);
+    if (cKey == "StringFileInfo") {
+      size_t st = Align4(cKeyEnd);
+      while (st + 6 <= cEnd) {
+        uint16_t stLen = 0;
+        std::memcpy(&stLen, blob + st, 2);
+        if (stLen == 0) {
+          break;
+        }
+        size_t stEnd = std::min<size_t>(st + stLen, cEnd);
+        size_t stKeyEnd = 0;
+        ReadKey(st + 6, stEnd, stKeyEnd); // lang/codepage key, ignored
+        size_t s = Align4(stKeyEnd);
+        while (s + 6 <= stEnd) {
+          uint16_t sLen = 0;
+          std::memcpy(&sLen, blob + s, 2);
+          if (sLen == 0) {
+            break;
+          }
+          size_t sEnd = std::min<size_t>(s + sLen, stEnd);
+          size_t sKeyEnd = 0;
+          const std::string name = ReadKey(s + 6, sEnd, sKeyEnd);
+          size_t vEnd = 0;
+          const std::string val = ReadKey(Align4(sKeyEnd), sEnd, vEnd);
+          vi.present = true;
+          if (name == "CompanyName") {
+            vi.companyName = val;
+          } else if (name == "ProductName") {
+            vi.productName = val;
+          } else if (name == "FileDescription") {
+            vi.fileDescription = val;
+          } else if (name == "OriginalFilename") {
+            vi.originalFilename = val;
+          } else if (name == "InternalName") {
+            vi.internalName = val;
+          } else if (name == "FileVersion") {
+            vi.fileVersion = val;
+          } else if (name == "ProductVersion") {
+            vi.productVersion = val;
+          } else if (name == "LegalCopyright") {
+            vi.legalCopyright = val;
+          }
+          s = Align4(sEnd);
+        }
+        st = Align4(stEnd);
+      }
+    }
+    pos = Align4(cEnd);
+  }
+}
+
+// VERSIONINFO (DataDirectory[2] -> RT_VERSION resource): walk the 3-level
+// resource tree to the first RT_VERSION data entry, then parse its StringFileInfo.
+void ParseVersionInfo(const std::vector<uint8_t> &data, const IMAGE_NT_HEADERS *nt,
+                      const OptHeaderView &opt, PeInfo &info) {
+  const IMAGE_DATA_DIRECTORY d = DirOf(opt, IMAGE_DIRECTORY_ENTRY_RESOURCE);
+  if (!d.VirtualAddress) {
+    return;
+  }
+  const size_t resBase = RvaToOffset(data, nt, d.VirtualAddress);
+  const auto *root = PtrAt<IMAGE_RESOURCE_DIRECTORY>(data, resBase);
+  if (!root) {
+    return;
+  }
+  const int rootCount = root->NumberOfNamedEntries + root->NumberOfIdEntries;
+  const size_t l1Entries = resBase + sizeof(IMAGE_RESOURCE_DIRECTORY);
+  size_t verDir = 0;
+  for (int i = 0; i < rootCount && i < 256; ++i) {
+    const auto *e = PtrAt<IMAGE_RESOURCE_DIRECTORY_ENTRY>(
+        data, l1Entries + i * sizeof(IMAGE_RESOURCE_DIRECTORY_ENTRY));
+    if (!e) {
+      break;
+    }
+    if (!e->NameIsString && e->Id == 16 /*RT_VERSION*/ && e->DataIsDirectory) {
+      verDir = resBase + e->OffsetToDirectory;
+      break;
+    }
+  }
+  if (!verDir) {
+    return;
+  }
+  const auto *l2 = PtrAt<IMAGE_RESOURCE_DIRECTORY>(data, verDir);
+  if (!l2 || (l2->NumberOfNamedEntries + l2->NumberOfIdEntries) <= 0) {
+    return;
+  }
+  const auto *l2e = PtrAt<IMAGE_RESOURCE_DIRECTORY_ENTRY>(
+      data, verDir + sizeof(IMAGE_RESOURCE_DIRECTORY));
+  if (!l2e || !l2e->DataIsDirectory) {
+    return;
+  }
+  const size_t l3Dir = resBase + l2e->OffsetToDirectory;
+  const auto *l3 = PtrAt<IMAGE_RESOURCE_DIRECTORY>(data, l3Dir);
+  const auto *l3e = PtrAt<IMAGE_RESOURCE_DIRECTORY_ENTRY>(
+      data, l3Dir + sizeof(IMAGE_RESOURCE_DIRECTORY));
+  if (!l3 || !l3e || l3e->DataIsDirectory) {
+    return;
+  }
+  const auto *de = PtrAt<IMAGE_RESOURCE_DATA_ENTRY>(data, resBase + l3e->OffsetToData);
+  if (!de || de->Size == 0) {
+    return;
+  }
+  const size_t blobOff = RvaToOffset(data, nt, de->OffsetToData);
+  if (!blobOff || blobOff >= data.size()) {
+    return;
+  }
+  size_t blobLen = de->Size;
+  if (blobOff + blobLen > data.size()) {
+    blobLen = data.size() - blobOff;
+  }
+  ParseVersionStrings(data.data() + blobOff, blobLen, info.versionInfo);
+}
+
 } // namespace
 
 std::string ComputeImphash(
@@ -141,9 +546,11 @@ PeInfo ParsePe(const std::vector<uint8_t> &data) {
   }
 
   info.isPe = true;
+  info.isDll = (nt->FileHeader.Characteristics & IMAGE_FILE_DLL) != 0;
   info.machine = nt->FileHeader.Machine;
   info.numberOfSections = nt->FileHeader.NumberOfSections;
   info.timeDateStamp = nt->FileHeader.TimeDateStamp;
+  ParseRichHeader(data, ntOffset, info); // DOS-stub fingerprint, import-independent
 
   // Section table + per-section entropy (parsed before the import-directory
   // early-outs below, so a PE with no imports still reports its sections).
@@ -200,6 +607,15 @@ PeInfo ParsePe(const std::vector<uint8_t> &data) {
     importRva = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT].VirtualAddress;
     importSize = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT].Size;
   }
+
+  // T47 depth: the remaining data directories are parsed regardless of whether
+  // the file imports anything (a packed stub or a resource-only DLL may not).
+  const OptHeaderView opt = ViewOptHeader(nt);
+  ParseExports(data, nt, opt, info);
+  ParseTls(data, nt, opt, info);
+  ParseDotNet(data, nt, opt, info);
+  ParseDebug(data, nt, opt, info);
+  ParseVersionInfo(data, nt, opt, info);
 
   if (!importRva || !importSize) {
     return info;
