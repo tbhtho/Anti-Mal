@@ -233,6 +233,7 @@ BehaviorScore ScoreSandboxBehavior(const DynamicRunSummary &summary,
   // score ONLY events at/after it. ISO-8601 UTC timestamps compare
   // lexicographically. When no anchor is found, the gate is a no-op (count all).
   std::string sampleExecTime;
+  uint32_t sampleRootPid = 0;
   for (const auto &e : events) {
     const std::string a = Lower(e.action);
     if ((a == "process.create" || Has(a, "sample.received")) &&
@@ -240,7 +241,36 @@ BehaviorScore ScoreSandboxBehavior(const DynamicRunSummary &summary,
         (sampleExecTime.empty() || e.timestampUtc < sampleExecTime)) {
       sampleExecTime = e.timestampUtc;
     }
+    // The agent's process.create of the staged sample is the subtree root.
+    if (a == "process.create" && e.processId != 0 && sampleRootPid == 0) {
+      sampleRootPid = e.processId;
+    }
   }
+
+  // The sample's process subtree (root + descendants via parentProcessId).
+  // Process-based signals (suspicious command lines, privilege escalation) are
+  // restricted to it so the OS's OWN LOLBins -- rundll32/regsvr32/mshta/... that
+  // Windows boot/login/shell run constantly and legitimately -- cannot
+  // masquerade as the sample's malice. When the root is unknown (no
+  // process.create), the subtree is empty and the restriction is a no-op.
+  std::set<uint32_t> sampleSubtree;
+  if (sampleRootPid != 0) {
+    sampleSubtree.insert(sampleRootPid);
+    bool changed = true;
+    while (changed) {
+      changed = false;
+      for (const auto &e : events) {
+        if (Lower(e.category) == "process" && e.processId != 0 &&
+            e.parentProcessId != 0 && sampleSubtree.count(e.parentProcessId) &&
+            sampleSubtree.insert(e.processId).second) {
+          changed = true;
+        }
+      }
+    }
+  }
+  const auto inSampleSubtree = [&](uint32_t pid) {
+    return sampleSubtree.empty() || sampleSubtree.count(pid) != 0;
+  };
 
   for (const auto &e : events) {
     // Skip the pre-execution boot/login baseline.
@@ -320,14 +350,19 @@ BehaviorScore ScoreSandboxBehavior(const DynamicRunSummary &summary,
         parentRank = IntegrityRank(*parentLvl);
       }
       if (childRank >= 3 /* High or System */ && parentRank >= 1 &&
-          parentRank <= 2 /* Low or Medium */) {
+          parentRank <= 2 /* Low or Medium */ && inSampleSubtree(e.processId)) {
         ++privEsc;
       }
     }
 
-    // --- Suspicious command lines (loader / LOLBins). One per distinct tell.
-    if (const char *label = SuspiciousCommandLineLabel(e.commandLine)) {
-      suspiciousCmds.insert(label);
+    // --- Suspicious command lines (loader / LOLBins). One per distinct tell,
+    // and ONLY for the sample's own process subtree -- Windows runs rundll32 /
+    // regsvr32 / mshta legitimately during boot/login, which would otherwise
+    // corroborate a Malicious verdict for a benign sample.
+    if (inSampleSubtree(e.processId)) {
+      if (const char *label = SuspiciousCommandLineLabel(e.commandLine)) {
+        suspiciousCmds.insert(label);
+      }
     }
 
     // --- Crashes. A non-sample crash is weak (could be instability); the

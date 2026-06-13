@@ -5445,6 +5445,57 @@ void TestBehaviorScoreExcludesBootBaseline() {
          "NOT Malicious");
 }
 
+// Suspicious LOLBins (rundll32/...) run by the OS during boot/login must NOT
+// corroborate Malicious; the same LOLBin run by the sample's own child must.
+void TestBehaviorScoreSubtreeCmdlineAttribution() {
+  using antimal::DynamicRunSummary;
+  using antimal::EventRecord;
+  using antimal::ScoreSandboxBehavior;
+  using antimal::Verdict;
+  auto proc = [](const std::string &ts, uint32_t pid, uint32_t ppid,
+                 const std::string &act, const std::string &cmd) {
+    EventRecord e;
+    e.timestampUtc = ts;
+    e.category = "process";
+    e.action = act;
+    e.processId = pid;
+    e.parentProcessId = ppid;
+    e.imagePath = "rundll32.exe";
+    e.commandLine = cmd;
+    return e;
+  };
+  DynamicRunSummary s;
+  s.sampleExecuted = true;
+  std::vector<EventRecord> ev;
+  // Agent launches the sample (subtree root pid 1900).
+  ev.push_back(proc("2026-01-01T00:10:00Z", 1900, 0, "process.create", ""));
+  // An OS process (parent = services 600, NOT the sample) runs a pattern-matching
+  // but legitimate rundll32 LOLBin.
+  ev.push_back(proc("2026-01-01T00:10:01Z", 700, 600, "process.start",
+                    "rundll32.exe shell32.dll,Control_RunDLL"));
+  // Boot persistence noise.
+  for (int i = 0; i < 30; ++i) {
+    EventRecord r;
+    r.timestampUtc = "2026-01-01T00:10:02Z";
+    r.category = "registry";
+    r.action = "registry.value";
+    r.target = "HKLM\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Run\\os" +
+               std::to_string(i);
+    ev.push_back(r);
+  }
+  const auto bsOs = ScoreSandboxBehavior(s, ev, false);
+  Expect(bsOs.verdict != Verdict::Malicious,
+         "behavior: an OS LOLBin outside the sample subtree does not corroborate "
+         "Malicious");
+  // The SAME LOLBin, but run by a child OF the sample (pid 1950, parent 1900).
+  ev.push_back(proc("2026-01-01T00:10:03Z", 1950, 1900, "process.start",
+                    "rundll32.exe shell32.dll,Control_RunDLL"));
+  const auto bsSample = ScoreSandboxBehavior(s, ev, false);
+  Expect(bsSample.verdict == Verdict::Malicious,
+         "behavior: a LOLBin run by the sample's own child DOES corroborate "
+         "Malicious");
+}
+
 void TestBehaviorScoreVerdict() {
   using antimal::AnalysisReport;
   using antimal::BehaviorScore;
@@ -7012,6 +7063,7 @@ int main() {
     TestDroppedFileEnrichment();
     TestBehaviorScoreVerdict();
     TestBehaviorScoreExcludesBootBaseline();
+    TestBehaviorScoreSubtreeCmdlineAttribution();
     TestReportSections();
     TestPacketInspector();
     TestE1000Device();
