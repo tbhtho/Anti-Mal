@@ -129,6 +129,8 @@ public:
     return lastPm1HostStopRequested_;
   }
   uint16_t LastPm1ControlValue() const noexcept { return pm1Control_; }
+  uint16_t LastPm1EnableValue() const noexcept { return pm1Enable_; }
+  uint64_t Pm1aStatusReads() const noexcept { return pm1aStatusReads_; }
   uint64_t Pm1SleepRequestCount() const noexcept {
     return pm1SleepRequestCount_;
   }
@@ -267,6 +269,12 @@ private:
   // permanent 0 and spinning forever.
   bool pm1TmrSts_ = false;
   uint32_t pm1TmrLastMsb_ = 0;
+  // PM1a_EN (kPmIoBase+0x02): the event-enable register the OS arms before it
+  // waits on a PM1 event. Modelled R/W purely so we can OBSERVE what the guest
+  // armed (diagnostic only -- we do not yet actuate the enabled events). It is
+  // the datum that names which PM1 event the OS waits on if it ever polls.
+  uint16_t pm1Enable_ = 0;
+  uint64_t pm1aStatusReads_ = 0; // diagnostic: total PM1a_STS reads.
 
 public:
   // Returns the 8-bit vector base the guest programmed into the master 8259

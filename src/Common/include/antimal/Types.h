@@ -221,6 +221,8 @@ struct DynamicRunSummary {
   bool pm1HostStopRequested = false;
   uint32_t pm1SleepType = 0;
   uint32_t pm1ControlValue = 0;
+  uint32_t pm1EnableValue = 0;
+  uint64_t pm1aStatusReads = 0;
   uint64_t pm1SleepRequests = 0;
   uint64_t kdPacketsReceived = 0;
   uint64_t kdControlPacketsReceived = 0;

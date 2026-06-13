@@ -540,6 +540,10 @@ DynamicRunSummary ParseDynamicSummary(const JsonValue *value) {
       static_cast<uint32_t>(IntValue(Member(*value, "pm1SleepType")));
   summary.pm1ControlValue =
       static_cast<uint32_t>(IntValue(Member(*value, "pm1ControlValue")));
+  summary.pm1EnableValue =
+      static_cast<uint32_t>(IntValue(Member(*value, "pm1EnableValue")));
+  summary.pm1aStatusReads =
+      static_cast<uint64_t>(IntValue(Member(*value, "pm1aStatusReads")));
   summary.pm1SleepRequests =
       static_cast<uint64_t>(IntValue(Member(*value, "pm1SleepRequests")));
   summary.kdPacketsReceived =

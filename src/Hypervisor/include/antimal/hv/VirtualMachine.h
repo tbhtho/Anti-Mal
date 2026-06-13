@@ -106,6 +106,8 @@ struct VmRunSummary {
   bool pm1HostStopRequested = false;
   uint8_t pm1SleepType = 0;
   uint16_t pm1ControlValue = 0;
+  uint16_t pm1EnableValue = 0;
+  uint64_t pm1aStatusReads = 0;
   uint64_t pm1SleepRequests = 0;
   VmNetworkMode networkMode = VmNetworkMode::Disabled;
   int steps = 0;

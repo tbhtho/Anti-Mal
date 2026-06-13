@@ -575,6 +575,20 @@ void PcIoDevices::OnWrite(uint16_t port, uint32_t value, uint8_t accessSize) {
       }
       return;
     }
+    if (port >= kPmIoBase + 0x02 && port < kPmIoBase + 0x04) {
+      // PM1a_EN: record the event-enable mask the OS armed (R/W). We don't act
+      // on it yet; it makes the guest's intent observable for the spin diagnosis.
+      const uint8_t off = static_cast<uint8_t>(port - (kPmIoBase + 0x02));
+      if (accessSize >= 2 && off == 0) {
+        pm1Enable_ = static_cast<uint16_t>(value & 0xFFFFu);
+      } else {
+        const uint16_t m = static_cast<uint16_t>(0xFFu << (off * 8u));
+        const uint16_t inc =
+            static_cast<uint16_t>((value & 0xFFu) << (off * 8u));
+        pm1Enable_ = static_cast<uint16_t>((pm1Enable_ & ~m) | inc);
+      }
+      return;
+    }
     if (port >= kPmIoBase + 0x04 && port < kPmIoBase + 0x06) {
       const uint8_t offset =
           static_cast<uint8_t>(port - (kPmIoBase + 0x04));
@@ -1413,11 +1427,29 @@ uint32_t PcIoDevices::ReadPmIo(uint16_t port, uint8_t accessSize) {
     const uint8_t shift = static_cast<uint8_t>((port - kPmTimerPort) * 8u);
     return value >> shift;
   }
+  if (port >= kPmIoBase + 0x02 && port < kPmIoBase + 0x04) {
+    // PM1a_EN: return what the guest armed, so an event-wait-vs-poll is visible
+    // (the cold-boot HAL spin diagnosis needs to know which event is enabled).
+    const uint8_t shift =
+        static_cast<uint8_t>((port - (kPmIoBase + 0x02)) * 8u);
+    const uint32_t mask = accessSize == 1 ? 0xFFu : 0xFFFFu;
+    return (static_cast<uint32_t>(pm1Enable_) >> shift) & mask;
+  }
   if (port >= kPmIoBase && port < kPmIoBase + 0x02) {
+    ++pm1aStatusReads_;  // diagnostic: how hard the guest polls PM1a status.
     // PM1a status. Bit 0 = TMR_STS: set (sticky) when the PM timer's MSB
     // (bit 23 of the 24-bit counter) toggles. Without this the register reads a
     // permanent 0 and any PM1-status poll (a PM-timer-overflow wait, as the
     // OS-called OVMF runtime path does) spins forever. Cleared by write-1.
+    // Since CurrentPmTimer() is free-running wall-clock, the MSB toggles every
+    // ~2.34 s of REAL time regardless of guest spin rate -- so a TMR_STS poller
+    // is guaranteed forward progress and can never spin unbounded on this bit.
+    // (A live cold boot measured pm1aStatusReads=2, confirming the OS does not
+    // busy-poll TMR_STS; the prior "405M-read PM1a spin" root cause was wrong --
+    // the real cold-boot wall is the i8042 device-init spin at "Getting devices
+    // ready", not this register. Other PM1a_STS bits -- BM_STS, GBL_STS,
+    // PWRBTN_STS, RTC_STS, WAK_STS -- are intentionally hardwired 0; we lack
+    // their event sources. pm1Enable_ records which the OS armed, for diagnosis.)
     const uint32_t timer = CurrentPmTimer();
     const uint32_t msb = (timer >> 23) & 1u;
     if (msb != pm1TmrLastMsb_) {

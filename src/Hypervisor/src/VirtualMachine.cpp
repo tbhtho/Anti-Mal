@@ -2091,6 +2091,8 @@ VmRunSummary VirtualMachine::RunLoop(
       summary.pm1SleepEnable = pcIo_.LastPm1SleepEnable();
       summary.pm1SleepType = pcIo_.LastSleepType();
       summary.pm1ControlValue = pcIo_.LastPm1ControlValue();
+      summary.pm1EnableValue = pcIo_.LastPm1EnableValue();
+      summary.pm1aStatusReads = pcIo_.Pm1aStatusReads();
       summary.pm1HostStopRequested = pcIo_.LastPm1HostStopRequested();
       summary.pm1SleepRequests = pcIo_.Pm1SleepRequestCount();
       summary.halted = true;
@@ -3134,6 +3136,8 @@ VmRunSummary VirtualMachine::RunLoop(
   summary.pm1SleepEnable = pcIo_.LastPm1SleepEnable();
   summary.pm1SleepType = pcIo_.LastSleepType();
   summary.pm1ControlValue = pcIo_.LastPm1ControlValue();
+  summary.pm1EnableValue = pcIo_.LastPm1EnableValue();
+  summary.pm1aStatusReads = pcIo_.Pm1aStatusReads();
   summary.pm1HostStopRequested = pcIo_.LastPm1HostStopRequested();
   summary.pm1SleepRequests = pcIo_.Pm1SleepRequestCount();
   summary.hpetReads = hpet_.Reads();
