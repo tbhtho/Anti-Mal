@@ -11,6 +11,12 @@
 namespace antimal {
 namespace {
 
+// Hard cap on tool output we will retain + run regexes over. Real yara/capa/diec
+// output is KB-to-low-MB; this bounds memory and regex cost if a tool emits
+// pathologically large output. Enforced both at the subprocess drain (so we
+// never even hold more) and defensively at the top of each parser.
+constexpr size_t kMaxToolOutputBytes = 16ull * 1024 * 1024;
+
 // Best-effort JSON token finder. We don't have a full JSON parser, so we
 // extract values via narrow regexes pinned to the schemas these tools emit.
 // This is fragile but acceptable: each tool emits stable, well-documented
@@ -29,18 +35,43 @@ std::string ExtractStringField(std::string_view json, std::string_view key) {
 std::vector<std::string> ExtractStringArrayField(std::string_view json,
                                                  std::string_view key) {
   std::vector<std::string> out;
-  const std::string pattern = std::string("\"") + std::string(key) +
-                              "\"\\s*:\\s*\\[([^\\]]*)\\]";
+  // Locate the array's opening '[' only; then scan forward in a depth- and
+  // quote-aware way. A naive `\[([^\]]*)\]` capture breaks when a value contains
+  // a literal ']' (capa emits "Foo [T1059]") or the array holds nested arrays
+  // ("parts": [...]). Bounded by the array's closing bracket at depth 0.
+  const std::string pattern =
+      std::string("\"") + std::string(key) + "\"\\s*:\\s*\\[";
   std::regex re(pattern);
   std::cmatch match;
   if (!std::regex_search(json.data(), json.data() + json.size(), match, re)) {
     return out;
   }
-  const std::string array = match[1].str();
-  std::regex item("\"([^\"\\\\]*(?:\\\\.[^\"\\\\]*)*)\"");
-  for (auto it = std::sregex_iterator(array.begin(), array.end(), item);
-       it != std::sregex_iterator(); ++it) {
-    out.push_back((*it)[1].str());
+  size_t pos = static_cast<size_t>(match.position(0)) +
+               static_cast<size_t>(match.length(0)); // just past '['
+  int depth = 1;
+  while (pos < json.size() && depth > 0) {
+    const char c = json[pos];
+    if (c == '"') {
+      std::string val;
+      ++pos;
+      while (pos < json.size() && json[pos] != '"') {
+        if (json[pos] == '\\' && pos + 1 < json.size()) {
+          ++pos; // skip the escape, keep the escaped char verbatim
+        }
+        val.push_back(json[pos]);
+        ++pos;
+      }
+      ++pos; // closing quote
+      out.push_back(std::move(val));
+    } else if (c == '[') {
+      ++depth;
+      ++pos;
+    } else if (c == ']') {
+      --depth;
+      ++pos;
+    } else {
+      ++pos;
+    }
   }
   return out;
 }
@@ -120,6 +151,7 @@ YaraScanResult RunYara(const std::filesystem::path &samplePath,
     };
     SubprocessOptions opts;
     opts.timeout = std::chrono::milliseconds(15000);
+    opts.maxOutputBytes = kMaxToolOutputBytes;
     auto run = RunSubprocess(*yaraBinary, args, opts);
     if (!run.launched) {
       result.failureReason = run.failureReason;
@@ -136,41 +168,7 @@ YaraScanResult RunYara(const std::filesystem::path &samplePath,
     combinedOutput += run.stdoutText;
   }
 
-  // Output format with -g -m:
-  //   rulename [tag1,tag2] [author="foo", family="bar"] /abs/path/sample.exe
-  std::regex line(
-      R"(^([A-Za-z_][\w]*)\s*(?:\[([^\]]*)\])?\s*(?:\[([^\]]*)\])?\s+(.+)$)");
-  std::set<std::string> seenRules;
-  std::istringstream stream(combinedOutput);
-  std::string text;
-  while (std::getline(stream, text)) {
-    std::smatch m;
-    if (!std::regex_search(text, m, line)) continue;
-    YaraMatch match;
-    match.ruleName = m[1].str();
-    if (!seenRules.insert(match.ruleName).second) continue;
-    if (m[2].matched && !m[2].str().empty()) {
-      std::string tags = m[2].str();
-      size_t pos = 0;
-      while (pos < tags.size()) {
-        size_t end = tags.find(',', pos);
-        if (end == std::string::npos) end = tags.size();
-        match.tags.push_back(Trim(tags.substr(pos, end - pos)));
-        pos = end + 1;
-      }
-    }
-    if (m[3].matched && !m[3].str().empty()) {
-      std::string meta = m[3].str();
-      size_t pos = 0;
-      while (pos < meta.size()) {
-        size_t end = meta.find(',', pos);
-        if (end == std::string::npos) end = meta.size();
-        match.meta.push_back(Trim(meta.substr(pos, end - pos)));
-        pos = end + 1;
-      }
-    }
-    result.matches.push_back(std::move(match));
-  }
+  result.matches = ParseYaraOutput(combinedOutput);
   result.succeeded = true;
   return result;
 }
@@ -194,6 +192,7 @@ CapaScanResult RunCapa(const std::filesystem::path &samplePath) {
   };
   SubprocessOptions opts;
   opts.timeout = std::chrono::milliseconds(60000);
+  opts.maxOutputBytes = kMaxToolOutputBytes;
   auto run = RunSubprocess(*capaBinary, args, opts);
   if (!run.launched) {
     result.failureReason = run.failureReason;
@@ -211,44 +210,7 @@ CapaScanResult RunCapa(const std::filesystem::path &samplePath) {
     return result;
   }
 
-  // capa schema (v6): {"rules": {"<name>": {"meta": {"attack": [...], "mbc": [...], "namespace": "..."}, ...}}}
-  // We extract per-rule, since each rule may have multiple ATT&CK / MBC tags.
-  const std::string &out = run.stdoutText;
-  // Use a custom raw-string delimiter (RE...RE) because the default
-  // (...) collides with the literal `)"` that appears inside the pattern.
-  std::regex ruleStart(
-      R"RE("([A-Za-z][^"]+)"\s*:\s*\{[^{]*"meta"\s*:\s*\{)RE");
-  for (auto it = std::sregex_iterator(out.begin(), out.end(), ruleStart);
-       it != std::sregex_iterator(); ++it) {
-    CapaCapability cap;
-    cap.name = (*it)[1].str();
-    // Read a window forward to find this rule's meta block.
-    const size_t windowStart = it->position(0);
-    const size_t windowEnd = std::min(out.size(), windowStart + 4096);
-    std::string_view window(&out[windowStart], windowEnd - windowStart);
-    cap.ruleNamespace = ExtractStringField(window, "namespace");
-    // ATT&CK techniques: capa emits "T1055" or "Inject Code::Process Injection [T1055]"
-    auto attack = ExtractStringArrayField(window, "attack");
-    for (const auto &a : attack) {
-      std::regex te(R"(T\d{4}(?:\.\d{3})?)");
-      std::smatch tm;
-      if (std::regex_search(a, tm, te)) {
-        cap.mitreTechniques.push_back(tm.str());
-      }
-    }
-    auto mbc = ExtractStringArrayField(window, "mbc");
-    for (const auto &m : mbc) cap.mbcBehaviors.push_back(m);
-
-    // Dedupe within a single rule.
-    auto dedupe = [](std::vector<std::string> &v) {
-      std::sort(v.begin(), v.end());
-      v.erase(std::unique(v.begin(), v.end()), v.end());
-    };
-    dedupe(cap.mitreTechniques);
-    dedupe(cap.mbcBehaviors);
-
-    result.capabilities.push_back(std::move(cap));
-  }
+  result.capabilities = ParseCapaJson(run.stdoutText);
   result.succeeded = true;
   return result;
 }
@@ -272,6 +234,7 @@ DieScanResult RunDie(const std::filesystem::path &samplePath) {
   };
   SubprocessOptions opts;
   opts.timeout = std::chrono::milliseconds(20000);
+  opts.maxOutputBytes = kMaxToolOutputBytes;
   auto run = RunSubprocess(*dieBinary, args, opts);
   if (!run.launched) {
     result.failureReason = run.failureReason;
@@ -286,22 +249,128 @@ DieScanResult RunDie(const std::filesystem::path &samplePath) {
     return result;
   }
 
-  // DIE schema: {"detects": [{"type":"...", "name":"...", "version":"...", "options":"..."}]}
-  // Walk the detects array.
-  const std::string &out = run.stdoutText;
-  std::regex detectRe(
-      R"RE(\{\s*"type"\s*:\s*"([^"]*)"\s*,\s*"name"\s*:\s*"([^"]*)"\s*(?:,\s*"version"\s*:\s*"([^"]*)")?\s*(?:,\s*"options"\s*:\s*"([^"]*)")?\s*\})RE");
-  for (auto it = std::sregex_iterator(out.begin(), out.end(), detectRe);
-       it != std::sregex_iterator(); ++it) {
-    DieDetection d;
-    d.type = (*it)[1].str();
-    d.name = (*it)[2].str();
-    if ((*it)[3].matched) d.version = (*it)[3].str();
-    if ((*it)[4].matched) d.options = (*it)[4].str();
-    result.detections.push_back(std::move(d));
-  }
+  result.detections = ParseDieJson(run.stdoutText);
   result.succeeded = true;
   return result;
+}
+
+// --- T50: exposed, length-capped, malformed-tolerant tool-output parsers -----
+
+std::vector<YaraMatch> ParseYaraOutput(const std::string &outputIn) {
+  std::vector<YaraMatch> matches;
+  std::string capped;
+  const std::string &output = (outputIn.size() > kMaxToolOutputBytes)
+                                  ? (capped = outputIn.substr(0, kMaxToolOutputBytes))
+                                  : outputIn;
+  // -g -m line: rulename [tag1,tag2] [author=foo,family=bar] /abs/path/sample.exe
+  static const std::regex line(
+      R"(^([A-Za-z_][\w]*)\s*(?:\[([^\]]*)\])?\s*(?:\[([^\]]*)\])?\s+(.+)$)");
+  std::set<std::string> seenRules;
+  std::istringstream stream(output);
+  std::string text;
+  while (std::getline(stream, text)) {
+    // A real yara -g -m line is short; skip absurd lines so a pathological
+    // single run can't blow std::regex's complexity limit.
+    if (text.size() > 65536) continue;
+    std::smatch m;
+    bool matched = false;
+    try {
+      matched = std::regex_search(text, m, line);
+    } catch (const std::regex_error &) {
+      continue; // degrade gracefully on a complexity blowup
+    }
+    if (!matched) continue;
+    YaraMatch match;
+    match.ruleName = m[1].str();
+    if (!seenRules.insert(match.ruleName).second) continue;
+    if (m[2].matched && !m[2].str().empty()) {
+      std::string tags = m[2].str();
+      size_t pos = 0;
+      while (pos < tags.size()) {
+        size_t end = tags.find(',', pos);
+        if (end == std::string::npos) end = tags.size();
+        match.tags.push_back(Trim(tags.substr(pos, end - pos)));
+        pos = end + 1;
+      }
+    }
+    if (m[3].matched && !m[3].str().empty()) {
+      std::string meta = m[3].str();
+      size_t pos = 0;
+      while (pos < meta.size()) {
+        size_t end = meta.find(',', pos);
+        if (end == std::string::npos) end = meta.size();
+        match.meta.push_back(Trim(meta.substr(pos, end - pos)));
+        pos = end + 1;
+      }
+    }
+    matches.push_back(std::move(match));
+  }
+  return matches;
+}
+
+std::vector<CapaCapability> ParseCapaJson(const std::string &jsonIn) {
+  std::vector<CapaCapability> caps;
+  std::string_view json(jsonIn);
+  if (json.size() > kMaxToolOutputBytes) {
+    json = json.substr(0, kMaxToolOutputBytes);
+  }
+  // capa schema (v6): {"rules": {"<name>": {"meta": {"attack":[...],"mbc":[...],"namespace":"..."}}}}
+  static const std::regex ruleStart(
+      R"RE("([A-Za-z][^"]+)"\s*:\s*\{[^{]*"meta"\s*:\s*\{)RE");
+  static const std::regex te(R"(T\d{4}(?:\.\d{3})?)");
+  try {
+    for (auto it = std::cregex_iterator(json.data(), json.data() + json.size(), ruleStart);
+         it != std::cregex_iterator(); ++it) {
+      CapaCapability cap;
+      cap.name = (*it)[1].str();
+      const size_t windowStart = static_cast<size_t>(it->position(0));
+      const size_t windowEnd = std::min(json.size(), windowStart + 4096);
+      std::string_view window(json.data() + windowStart, windowEnd - windowStart);
+      cap.ruleNamespace = ExtractStringField(window, "namespace");
+      for (const auto &a : ExtractStringArrayField(window, "attack")) {
+        std::smatch tm;
+        if (std::regex_search(a, tm, te)) cap.mitreTechniques.push_back(tm.str());
+      }
+      for (const auto &m : ExtractStringArrayField(window, "mbc")) {
+        cap.mbcBehaviors.push_back(m);
+      }
+      auto dedupe = [](std::vector<std::string> &v) {
+        std::sort(v.begin(), v.end());
+        v.erase(std::unique(v.begin(), v.end()), v.end());
+      };
+      dedupe(cap.mitreTechniques);
+      dedupe(cap.mbcBehaviors);
+      caps.push_back(std::move(cap));
+    }
+  } catch (const std::regex_error &) {
+    // pathological input hit the complexity limit: keep what we extracted.
+  }
+  return caps;
+}
+
+std::vector<DieDetection> ParseDieJson(const std::string &jsonIn) {
+  std::vector<DieDetection> dets;
+  std::string_view json(jsonIn);
+  if (json.size() > kMaxToolOutputBytes) {
+    json = json.substr(0, kMaxToolOutputBytes);
+  }
+  // DIE schema: {"detects": [{"type":"...","name":"...","version":"...","options":"..."}]}
+  static const std::regex detectRe(
+      R"RE(\{\s*"type"\s*:\s*"([^"]*)"\s*,\s*"name"\s*:\s*"([^"]*)"\s*(?:,\s*"version"\s*:\s*"([^"]*)")?\s*(?:,\s*"options"\s*:\s*"([^"]*)")?\s*\})RE");
+  try {
+    for (auto it = std::cregex_iterator(json.data(), json.data() + json.size(), detectRe);
+         it != std::cregex_iterator(); ++it) {
+      DieDetection d;
+      d.type = (*it)[1].str();
+      d.name = (*it)[2].str();
+      if ((*it)[3].matched) d.version = (*it)[3].str();
+      if ((*it)[4].matched) d.options = (*it)[4].str();
+      dets.push_back(std::move(d));
+    }
+  } catch (const std::regex_error &) {
+    // pathological input hit the complexity limit: keep what we extracted.
+  }
+  return dets;
 }
 
 } // namespace antimal

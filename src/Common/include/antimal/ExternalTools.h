@@ -37,6 +37,11 @@ struct YaraScanResult {
 YaraScanResult RunYara(const std::filesystem::path &samplePath,
                        const std::filesystem::path &rulesDir);
 
+// Parses yara.exe's `-g -m` line output into matches. Exposed for offline
+// fixture tests; input is length-capped before any regex runs so a hostile or
+// runaway tool cannot OOM/ReDoS the host. Tolerant of malformed lines.
+std::vector<YaraMatch> ParseYaraOutput(const std::string &output);
+
 // ----- capa -------------------------------------------------------------
 
 struct CapaCapability {
@@ -56,6 +61,10 @@ struct CapaScanResult {
 
 CapaScanResult RunCapa(const std::filesystem::path &samplePath);
 
+// Parses capa's `-j` JSON into capabilities. Exposed for offline fixture tests;
+// input is length-capped before any regex runs. Tolerant of malformed JSON.
+std::vector<CapaCapability> ParseCapaJson(const std::string &json);
+
 // ----- Detect It Easy ---------------------------------------------------
 
 struct DieDetection {
@@ -73,5 +82,9 @@ struct DieScanResult {
 };
 
 DieScanResult RunDie(const std::filesystem::path &samplePath);
+
+// Parses diec.exe's `-j` JSON into detections. Exposed for offline fixture
+// tests; input is length-capped before any regex runs. Tolerant of malformed JSON.
+std::vector<DieDetection> ParseDieJson(const std::string &json);
 
 } // namespace antimal

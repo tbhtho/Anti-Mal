@@ -43,13 +43,28 @@ bool CreateInheritablePipe(PipeEnds &pipe, bool readInheritable, bool writeInher
 
 // Drains a pipe into `out` until EOF. Runs on a worker thread so the parent
 // doesn't block when the child fills both stdout and stderr buffers at once.
-void DrainPipe(HANDLE readEnd, std::string &out) {
+// `cap` (0 = unlimited) bounds how much is retained; once reached the drainer
+// keeps reading to EOF but discards the rest and sets `truncated`, so a tool
+// that emits pathologically large output can't OOM the host yet still never
+// blocks on a full pipe.
+void DrainPipe(HANDLE readEnd, std::string &out, size_t cap, bool &truncated) {
   std::array<char, 4096> buffer{};
   DWORD read = 0;
   while (ReadFile(readEnd, buffer.data(), static_cast<DWORD>(buffer.size()),
                   &read, nullptr) &&
          read > 0) {
-    out.append(buffer.data(), read);
+    if (cap == 0) {
+      out.append(buffer.data(), read);
+    } else if (out.size() < cap) {
+      const size_t room = cap - out.size();
+      const size_t take = (read <= room) ? read : room;
+      out.append(buffer.data(), take);
+      if (take < read) {
+        truncated = true;
+      }
+    } else {
+      truncated = true; // at cap: keep draining (discard) so the child runs on
+    }
   }
 }
 
@@ -173,10 +188,18 @@ SubprocessResult RunSubprocess(const std::filesystem::path &executable,
   result.launched = true;
 
   // Drain pipes on worker threads to avoid deadlocking on full pipe buffers.
-  std::thread outDrainer([&] { DrainPipe(outPipe.readEnd, result.stdoutText); });
+  bool outTruncated = false;
+  bool errTruncated = false;
+  std::thread outDrainer([&] {
+    DrainPipe(outPipe.readEnd, result.stdoutText, options.maxOutputBytes,
+              outTruncated);
+  });
   std::thread errDrainer;
   if (!options.combineStderrIntoStdout) {
-    errDrainer = std::thread([&] { DrainPipe(errPipe.readEnd, result.stderrText); });
+    errDrainer = std::thread([&] {
+      DrainPipe(errPipe.readEnd, result.stderrText, options.maxOutputBytes,
+                errTruncated);
+    });
   }
 
   DWORD waitTimeout = INFINITE;
@@ -204,6 +227,7 @@ SubprocessResult RunSubprocess(const std::filesystem::path &executable,
   if (errDrainer.joinable()) {
     errDrainer.join();
   }
+  result.truncated = outTruncated || errTruncated;
 
   CloseHandle(outPipe.readEnd);
   if (!options.combineStderrIntoStdout) {

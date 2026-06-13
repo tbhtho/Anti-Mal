@@ -3120,6 +3120,76 @@ void TestPeDepthText() {
          "scan text shows the VERSIONINFO company");
 }
 
+// T50: RunSubprocess caps captured output at maxOutputBytes (OOM guard for a
+// tool that emits pathologically large output).
+void TestSubprocessOutputCap() {
+  const auto big = std::filesystem::temp_directory_path() / "antimal_t50_big.txt";
+  {
+    std::ofstream f(big, std::ios::binary | std::ios::trunc);
+    const std::string chunk(65536, 'A');
+    for (int i = 0; i < 32; ++i) { // ~2 MB
+      f.write(chunk.data(), static_cast<std::streamsize>(chunk.size()));
+    }
+  }
+  antimal::SubprocessOptions opts;
+  opts.timeout = std::chrono::milliseconds(15000);
+  opts.maxOutputBytes = 64 * 1024;
+  const auto r = antimal::RunSubprocess(
+      "cmd.exe", {"/c", "type", antimal::PathToUtf8(big)}, opts);
+  std::error_code ec;
+  std::filesystem::remove(big, ec);
+  Expect(r.launched, "cmd.exe type launches");
+  Expect(r.stdoutText.size() <= 64u * 1024u + 4096u,
+         "stdout is capped to ~maxOutputBytes");
+  Expect(r.truncated, "oversized output is flagged truncated");
+}
+
+// T50: the external-tool output parsers are offline-fixture-testable, tolerant
+// of malformed input, and length-capped so a hostile/runaway tool cannot
+// OOM/ReDoS the host.
+void TestExternalToolParsers() {
+  using namespace antimal;
+
+  const std::string capaJson =
+      R"({"rules": {"create process": {"meta": {"namespace": "host-interaction/process/create", "attack": ["Execution::Command and Scripting Interpreter [T1059]"], "mbc": ["Process::Create Process [C0017]"]}}}})";
+  const auto caps = ParseCapaJson(capaJson);
+  Expect(!caps.empty(), "capa JSON parses to a capability");
+  bool sawTech = false;
+  for (const auto &c : caps) {
+    for (const auto &t : c.mitreTechniques) {
+      if (t == "T1059") {
+        sawTech = true;
+      }
+    }
+  }
+  Expect(sawTech, "capa capability carries the T1059 technique");
+  ParseCapaJson("{\"rules\": {\"x\": {\"meta\": {"); // truncated
+  ParseCapaJson("not json at all");
+  ParseCapaJson(std::string(20 * 1024 * 1024, '{')); // huge -> length-capped
+  Expect(true, "malformed/huge capa JSON does not crash or hang");
+
+  const auto ym = ParseYaraOutput(
+      "Win_Trojan_Emotet [banker,trojan] [author=Foo,family=Emotet] "
+      "C:\\s\\sample.exe\n");
+  Expect(ym.size() == 1, "one yara match parsed");
+  if (ym.size() == 1) {
+    Expect(ym[0].ruleName == "Win_Trojan_Emotet", "yara rule name parsed");
+    Expect(ym[0].tags.size() == 2, "yara tags parsed");
+  }
+  ParseYaraOutput(std::string(20 * 1024 * 1024, 'A')); // huge -> length-capped
+  Expect(true, "huge yara input does not crash or hang");
+
+  const auto dd = ParseDieJson(
+      R"({"detects": [{"type":"packer","name":"UPX","version":"3.96","options":"NRV"}]})");
+  Expect(dd.size() == 1, "one DIE detection parsed");
+  if (dd.size() == 1) {
+    Expect(dd[0].name == "UPX" && dd[0].type == "packer",
+           "DIE detection fields parsed");
+  }
+  ParseDieJson("{\"detects\": [{\"type\":"); // malformed
+  Expect(true, "malformed DIE JSON does not crash");
+}
+
 // MD5 (triage hash) + the pefile-compatible imphash. MD5 is checked against the
 // canonical RFC-1321 test vectors; imphash canonicalization (lowercase, strip a
 // trailing .dll/.ocx/.sys, "ordN" ordinals, comma-join, then MD5) is checked by
@@ -6814,6 +6884,8 @@ int main() {
     TestPeDepthFindings();
     TestPeDepthJson();
     TestPeDepthText();
+    TestSubprocessOutputCap();
+    TestExternalToolParsers();
     TestMd5AndImphash();
     TestFileTypeId();
     TestImportCapabilities();
