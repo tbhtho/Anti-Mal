@@ -392,7 +392,7 @@ BehaviorScore ScoreSandboxBehavior(const DynamicRunSummary &summary,
     // flagged as loaded from a writable, non-system path (details["suspicion"]
     // set, MITRE-tagged). De-duped by module path so a repeated load of the same
     // hijacked DLL counts once.
-    if (cat == "image" && Has(act, "load")) {
+    if (cat == "image" && Has(act, "load") && inSampleSubtree(e.processId)) {
       const std::string *susp = Detail(e, "suspicion");
       if ((susp && !susp->empty()) || !e.mitre.empty()) {
         suspiciousModules.insert(tgtL.empty() ? act : tgtL);
@@ -401,8 +401,11 @@ BehaviorScore ScoreSandboxBehavior(const DynamicRunSummary &summary,
 
     // --- Any other MITRE-tagged behavior we did not already count above.
     // Registry persistence and suspicious image loads are scored explicitly, so
-    // exclude both categories here to avoid double-counting.
-    if (!e.mitre.empty() && cat != "registry" && cat != "image") {
+    // exclude both categories here to avoid double-counting. Subtree-gated so an
+    // OS process's MITRE-tagged behavior can't corroborate the sample (same
+    // discipline as the egress / cmdline / privesc / side-load signals).
+    if (!e.mitre.empty() && cat != "registry" && cat != "image" &&
+        inSampleSubtree(e.processId)) {
       ++otherMitre;
     }
   }
