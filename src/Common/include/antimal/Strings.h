@@ -78,6 +78,22 @@ struct MultiByteXorIoc {
 std::vector<MultiByteXorIoc>
 MineMultiByteXorObfuscatedUrls(const std::vector<uint8_t> &data);
 
+// C2/config IOCs recovered from BASE64-wrapped blobs. Malware commonly stashes
+// its config (C2 URLs/IPs/domains) inside a base64 string that the plaintext
+// miner reports only as an opaque blob. This decodes each detected base64 blob
+// (standard + URL-safe alphabet) one level and mines the decoded bytes for real
+// IOCs -- surfacing C2 that was a base64 layer deep. Deduplicated + capped.
+struct Base64DecodedIocs {
+  std::vector<std::string> urls;
+  std::vector<std::string> ips;
+  std::vector<std::string> domains;
+  size_t blobsDecoded = 0; // # of base64 blobs that yielded at least one IOC
+};
+
+std::vector<uint8_t> DecodeBase64(const std::string &s); // {} on invalid input
+
+Base64DecodedIocs MineBase64WrappedIocs(const std::vector<uint8_t> &data);
+
 // ExtractDomain (URL -> host) lives in BrowserImpact.h and is reused here.
 
 } // namespace antimal

@@ -4620,6 +4620,62 @@ void TestMultiByteXorObfuscatedUrlMining() {
          "mbxor-url: pseudo-random data yields no false hits");
 }
 
+void TestBase64WrappedIocMining() {
+  using antimal::MineBase64WrappedIocs;
+  using antimal::DecodeBase64;
+  // Standard base64 encoder for building fixtures.
+  auto b64enc = [](const std::string &in) {
+    static const char *t =
+        "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    std::string o;
+    size_t i = 0;
+    while (i + 2 < in.size()) {
+      uint32_t n = (uint8_t)in[i] << 16 | (uint8_t)in[i + 1] << 8 | (uint8_t)in[i + 2];
+      o += t[(n >> 18) & 63]; o += t[(n >> 12) & 63]; o += t[(n >> 6) & 63]; o += t[n & 63];
+      i += 3;
+    }
+    if (i < in.size()) {
+      uint32_t n = (uint8_t)in[i] << 16;
+      if (i + 1 < in.size()) n |= (uint8_t)in[i + 1] << 8;
+      o += t[(n >> 18) & 63]; o += t[(n >> 12) & 63];
+      if (i + 1 < in.size()) { o += t[(n >> 6) & 63]; o += '='; } else { o += "=="; }
+    }
+    return o;
+  };
+
+  const std::string url = "https://c2.hidden-base64.example.org/panel/gate.php?id=98765";
+  const std::string blob = b64enc(url); // ~80 chars, > the 48-char blob threshold
+
+  // Decoder round-trips.
+  const auto dec = DecodeBase64(blob);
+  Expect(std::string(dec.begin(), dec.end()) == url,
+         "b64: DecodeBase64 round-trips the encoded URL");
+
+  // Blob embedded in surrounding bytes -> URL recovered from inside the base64.
+  std::vector<uint8_t> data;
+  const std::string pre = "cfg=";
+  data.insert(data.end(), pre.begin(), pre.end());
+  data.insert(data.end(), blob.begin(), blob.end());
+  data.push_back(0);
+  const auto rec = MineBase64WrappedIocs(data);
+  bool found = false;
+  for (const auto &u : rec.urls) if (u == url) found = true;
+  Expect(found, "b64: recovered the base64-wrapped C2 URL");
+  Expect(rec.blobsDecoded >= 1, "b64: counted the decoded blob");
+
+  // A plaintext URL is NOT reported as base64-wrapped (already visible).
+  std::vector<uint8_t> plain(url.begin(), url.end());
+  Expect(MineBase64WrappedIocs(plain).urls.empty(),
+         "b64: plaintext URL not double-reported as base64-wrapped");
+
+  // base64 of non-IOC binary yields no false IOCs.
+  const std::string nb = b64enc(std::string(60, '\x01'));
+  std::vector<uint8_t> noise(nb.begin(), nb.end());
+  const auto nrec = MineBase64WrappedIocs(noise);
+  Expect(nrec.urls.empty() && nrec.ips.empty() && nrec.domains.empty(),
+         "b64: non-IOC base64 yields no false IOCs");
+}
+
 void TestTagger() {
   antimal::Tagger tagger;
   tagger.LoadBuiltinRules();
@@ -7331,6 +7387,7 @@ int main() {
     TestIocMining();
     TestXorObfuscatedUrlMining();
     TestMultiByteXorObfuscatedUrlMining();
+    TestBase64WrappedIocMining();
     TestTagger();
     TestSubprocessEcho();
     TestSubprocessToolMissing();

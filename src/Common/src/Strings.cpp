@@ -477,4 +477,76 @@ MineMultiByteXorObfuscatedUrls(const std::vector<uint8_t> &data) {
   return out;
 }
 
+std::vector<uint8_t> DecodeBase64(const std::string &s) {
+  // Standard + URL-safe alphabet; ignores whitespace; tolerant of missing pad.
+  auto val = [](unsigned char c) -> int {
+    if (c >= 'A' && c <= 'Z') return c - 'A';
+    if (c >= 'a' && c <= 'z') return c - 'a' + 26;
+    if (c >= '0' && c <= '9') return c - '0' + 52;
+    if (c == '+' || c == '-') return 62;
+    if (c == '/' || c == '_') return 63;
+    return -1;
+  };
+  std::vector<uint8_t> out;
+  out.reserve(s.size() * 3 / 4 + 3);
+  uint32_t acc = 0;
+  int bits = 0;
+  for (const char ch : s) {
+    if (ch == '=' ) break;
+    const int v = val(static_cast<unsigned char>(ch));
+    if (v < 0) {
+      if (ch == ' ' || ch == '\r' || ch == '\n' || ch == '\t') continue;
+      return {}; // a stray non-base64 byte -> not a clean blob
+    }
+    acc = (acc << 6) | static_cast<uint32_t>(v);
+    bits += 6;
+    if (bits >= 8) {
+      bits -= 8;
+      out.push_back(static_cast<uint8_t>((acc >> bits) & 0xFF));
+    }
+  }
+  return out;
+}
+
+Base64DecodedIocs MineBase64WrappedIocs(const std::vector<uint8_t> &data) {
+  Base64DecodedIocs out;
+  constexpr size_t kMaxBlobs = 256;  // bound pathological inputs
+  // Reuse the existing plaintext miner's base64-blob detection, and remember the
+  // plaintext IOCs so we only surface what was HIDDEN inside the base64.
+  const auto plainStrings = ExtractAllStrings(data);
+  const auto plain = MineIocs(plainStrings);
+  std::set<std::string> plainUrls(plain.urls.begin(), plain.urls.end());
+  std::set<std::string> plainIps(plain.ips.begin(), plain.ips.end());
+  std::set<std::string> plainDoms(plain.domains.begin(), plain.domains.end());
+  std::set<std::string> seenUrl, seenIp, seenDom;
+  size_t processed = 0;
+  for (const auto &blob : plain.base64Blobs) {
+    if (++processed > kMaxBlobs) break;
+    const auto decoded = DecodeBase64(blob);
+    if (decoded.size() < 4) continue;
+    const auto inner = MineIocsFromBytes(decoded);
+    bool yielded = false;
+    for (const auto &u : inner.urls) {
+      if (!plainUrls.count(u) && seenUrl.insert(u).second) {
+        out.urls.push_back(u);
+        yielded = true;
+      }
+    }
+    for (const auto &ip : inner.ips) {
+      if (!plainIps.count(ip) && seenIp.insert(ip).second) {
+        out.ips.push_back(ip);
+        yielded = true;
+      }
+    }
+    for (const auto &d : inner.domains) {
+      if (!plainDoms.count(d) && seenDom.insert(d).second) {
+        out.domains.push_back(d);
+        yielded = true;
+      }
+    }
+    if (yielded) ++out.blobsDecoded;
+  }
+  return out;
+}
+
 } // namespace antimal

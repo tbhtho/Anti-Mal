@@ -158,6 +158,24 @@ void Enrich(ScanResult &result, const std::vector<uint8_t> &data,
       AddFinding(result, "strings.multibyte_xor_obfuscated_url", msg,
                  std::min<int>(35, static_cast<int>(mbXorUrls.size()) * 18));
     }
+    // Recover C2/config hidden one base64 layer deep (a very common scheme the
+    // plaintext miner only reports as an opaque blob).
+    const auto b64 = MineBase64WrappedIocs(data);
+    const size_t b64Total = b64.urls.size() + b64.ips.size() + b64.domains.size();
+    if (b64Total > 0) {
+      for (const auto &u : b64.urls) result.iocs.urls.push_back(u);
+      for (const auto &ip : b64.ips) result.iocs.ips.push_back(ip);
+      for (const auto &d : b64.domains) result.iocs.domains.push_back(d);
+      std::string msg = "Base64-wrapped C2/IOC(s) recovered (" +
+                        std::to_string(b64.blobsDecoded) + " blob(s)): ";
+      size_t shown = 0;
+      for (const auto &u : b64.urls) { if (shown++) msg += ", "; if (shown <= 3) msg += u; }
+      for (const auto &ip : b64.ips) { if (shown <= 3) { if (shown++) msg += ", "; msg += ip; } }
+      if (b64Total > 3) msg += ", +" + std::to_string(b64Total - 3) + " more";
+      // Config hidden behind base64 is a meaningful obfuscation+network signal.
+      AddFinding(result, "strings.base64_wrapped_ioc", msg,
+                 std::min<int>(30, static_cast<int>(b64Total) * 12));
+    }
     if (!minedIocs.suspiciousApis.empty()) {
       AddFinding(result, "strings.suspicious_apis",
                  "Strings mention suspicious Windows APIs: " +
