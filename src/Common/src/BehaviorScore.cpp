@@ -133,9 +133,15 @@ const char *SuspiciousCommandLineLabel(const std::string &cmdRaw) {
        Has(c, "-enc"))) {
     return "hidden powershell download/exec";
   }
+  // rundll32 abuse. NOTE: do NOT match a bare "shell32" — `rundll32
+  // shell32.dll,Control_RunDLL` (Control Panel applets), ShellExec_RunDLL and
+  // OpenAs_RunDLL are run constantly + legitimately by Windows shell/boot, so the
+  // old `Has(c,"shell32")` clause was a steady false positive. The genuine
+  // anomalies are a script protocol, url.dll,OpenURL, or a DLL masquerading under
+  // an image/data extension (a common payload-hiding trick).
   if (Has(c, "rundll32") &&
-      (Has(c, "javascript:") || Has(c, "url.dll") || Has(c, "shell32") ||
-       Has(c, ".jpg") || Has(c, ".png") || Has(c, ".dat") || Has(c, ".tmp"))) {
+      (Has(c, "javascript:") || Has(c, "url.dll") || Has(c, ".jpg") ||
+       Has(c, ".png") || Has(c, ".dat") || Has(c, ".tmp"))) {
     return "rundll32 with anomalous arguments";
   }
   if (Has(c, "mshta") &&

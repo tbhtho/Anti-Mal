@@ -5627,10 +5627,10 @@ void TestBehaviorScoreSubtreeCmdlineAttribution() {
   std::vector<EventRecord> ev;
   // Agent launches the sample (subtree root pid 1900).
   ev.push_back(proc("2026-01-01T00:10:00Z", 1900, 0, "process.create", ""));
-  // An OS process (parent = services 600, NOT the sample) runs a pattern-matching
-  // but legitimate rundll32 LOLBin.
+  // An OS process (parent = services 600, NOT the sample) runs a genuinely
+  // anomalous rundll32 (a DLL masquerading as a .jpg) -- must NOT corroborate.
   ev.push_back(proc("2026-01-01T00:10:01Z", 700, 600, "process.start",
-                    "rundll32.exe shell32.dll,Control_RunDLL"));
+                    "rundll32.exe c:\\windows\\temp\\update.jpg,start"));
   // Boot persistence noise.
   for (int i = 0; i < 30; ++i) {
     EventRecord r;
@@ -5645,13 +5645,34 @@ void TestBehaviorScoreSubtreeCmdlineAttribution() {
   Expect(bsOs.verdict != Verdict::Malicious,
          "behavior: an OS LOLBin outside the sample subtree does not corroborate "
          "Malicious");
-  // The SAME LOLBin, but run by a child OF the sample (pid 1950, parent 1900).
+  // The SAME anomalous rundll32, but run by a child OF the sample (pid 1950).
   ev.push_back(proc("2026-01-01T00:10:03Z", 1950, 1900, "process.start",
-                    "rundll32.exe shell32.dll,Control_RunDLL"));
+                    "rundll32.exe c:\\windows\\temp\\update.jpg,start"));
   const auto bsSample = ScoreSandboxBehavior(s, ev, false);
   Expect(bsSample.verdict == Verdict::Malicious,
          "behavior: a LOLBin run by the sample's own child DOES corroborate "
          "Malicious");
+
+  // FP guard: benign `rundll32 shell32.dll,Control_RunDLL` (Control Panel applets,
+  // run constantly by Windows) is NOT a suspicious command line -- even run by the
+  // sample itself it must not corroborate Malicious on its own.
+  std::vector<EventRecord> benign;
+  benign.push_back(proc("2026-01-01T00:10:00Z", 2000, 0, "process.create", ""));
+  benign.push_back(proc("2026-01-01T00:10:01Z", 2050, 2000, "process.start",
+                        "rundll32.exe shell32.dll,Control_RunDLL"));
+  for (int i = 0; i < 30; ++i) {
+    EventRecord r;
+    r.timestampUtc = "2026-01-01T00:10:02Z";
+    r.category = "registry";
+    r.action = "registry.value";
+    r.target = "HKLM\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Run\\b" +
+               std::to_string(i);
+    benign.push_back(r);
+  }
+  const auto bsBenign = ScoreSandboxBehavior(s, benign, false);
+  Expect(bsBenign.verdict != Verdict::Malicious,
+         "behavior: a sample running benign Control_RunDLL is not flagged -> not "
+         "corroborated Malicious");
 }
 
 void TestBehaviorScoreSubtreeNetworkAttribution() {
