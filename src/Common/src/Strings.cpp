@@ -395,4 +395,86 @@ MineXorObfuscatedUrls(const std::vector<uint8_t> &data) {
   return out;
 }
 
+std::vector<MultiByteXorIoc>
+MineMultiByteXorObfuscatedUrls(const std::vector<uint8_t> &data) {
+  std::vector<MultiByteXorIoc> out;
+  constexpr size_t kMinUrl = 12;
+  constexpr size_t kMaxUrl = kMaxStringValueLength;
+  constexpr size_t kMaxScan = 32u * 1024u * 1024u;
+  constexpr size_t kMaxHits = 256;
+  if (data.size() < kMinUrl) {
+    return out;
+  }
+  const size_t n = std::min(data.size(), kMaxScan);
+  static const char kHttp[4] = {'h', 't', 't', 'p'};
+  std::set<std::string> seen;
+  for (size_t i = 0; i + 7 < n; ++i) {
+    // Try repeating-key lengths 2..4. The known "http" prefix at data[i..i+3]
+    // fixes key[(i+m) % L] for m=0..3, which fully determines a length<=4 key.
+    for (size_t L = 2; L <= 4; ++L) {
+      uint8_t key[4] = {0, 0, 0, 0};
+      bool kset[4] = {false, false, false, false};
+      bool consistent = true;
+      for (size_t m = 0; m < 4; ++m) {
+        const size_t idx = (i + m) % L;
+        const uint8_t kb = static_cast<uint8_t>(data[i + m] ^ kHttp[m]);
+        if (kset[idx] && key[idx] != kb) {
+          consistent = false;
+          break;
+        }
+        key[idx] = kb;
+        kset[idx] = true;
+      }
+      if (!consistent) {
+        continue;
+      }
+      // Require >=2 distinct key bytes. An all-equal key (incl. all-zero) is
+      // either plaintext or a single-byte key already covered by the function
+      // above -- skip it so a URL is never double-reported.
+      bool distinct = false;
+      for (size_t p = 1; p < L; ++p) {
+        if (key[p] != key[0]) {
+          distinct = true;
+          break;
+        }
+      }
+      if (!distinct) {
+        continue;
+      }
+      // Decode forward under the recovered repeating key (phase = absolute pos).
+      std::string url;
+      url.reserve(64);
+      size_t j = i;
+      for (; j < n && url.size() < kMaxUrl; ++j) {
+        const uint8_t c = static_cast<uint8_t>(data[j] ^ key[j % L]);
+        if (!IsUrlByte(c)) {
+          break;
+        }
+        url.push_back(static_cast<char>(c));
+      }
+      if (url.rfind("http://", 0) != 0 && url.rfind("https://", 0) != 0) {
+        continue;
+      }
+      while (!url.empty()) {
+        const char b = url.back();
+        if (b == '.' || b == ',' || b == ';' || b == ':' || b == '\'' ||
+            b == '"' || b == ')' || b == ']' || b == '}') {
+          url.pop_back();
+        } else {
+          break;
+        }
+      }
+      if (url.size() >= kMinUrl && seen.insert(url).second) {
+        out.push_back({url, std::vector<uint8_t>(key, key + L)});
+        if (out.size() >= kMaxHits) {
+          return out;
+        }
+        i = j; // skip past the decoded run (++i lands just after it)
+        break; // one recovery per offset; don't re-detect under a longer L
+      }
+    }
+  }
+  return out;
+}
+
 } // namespace antimal

@@ -63,6 +63,21 @@ struct ObfuscatedIoc {
 std::vector<ObfuscatedIoc>
 MineXorObfuscatedUrls(const std::vector<uint8_t> &data);
 
+// A C2/config URL recovered from MULTI-byte (repeating-key) XOR -- the common
+// step up from single-byte XOR that the function above misses. Uses the same
+// known-plaintext "http" anchor: the 4 known prefix bytes fully reveal every
+// byte of a length<=4 repeating key (each prefix char exposes key[(i+m) % L]),
+// then the run is decoded under that key and scheme-validated. Degenerate keys
+// (all-equal == single-byte, already covered above) are skipped so a URL is
+// never double-reported.
+struct MultiByteXorIoc {
+  std::string value;        // the decoded http(s):// URL
+  std::vector<uint8_t> key; // the 2..4 byte repeating XOR key (absolute phase)
+};
+
+std::vector<MultiByteXorIoc>
+MineMultiByteXorObfuscatedUrls(const std::vector<uint8_t> &data);
+
 // ExtractDomain (URL -> host) lives in BrowserImpact.h and is reused here.
 
 } // namespace antimal

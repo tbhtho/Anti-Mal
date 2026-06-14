@@ -133,6 +133,31 @@ void Enrich(ScanResult &result, const std::vector<uint8_t> &data,
       AddFinding(result, "strings.xor_obfuscated_url", msg,
                  std::min<int>(30, static_cast<int>(xorUrls.size()) * 15));
     }
+    // Step up: recover multi-byte (2-4 byte repeating key) XOR-obfuscated C2
+    // URLs that the single-byte pass can't see -- a common real-malware scheme.
+    const auto mbXorUrls = MineMultiByteXorObfuscatedUrls(data);
+    if (!mbXorUrls.empty()) {
+      static const char kHex[] = "0123456789ABCDEF";
+      std::string msg = "Multi-byte-XOR-obfuscated URL(s) decoded: ";
+      for (size_t i = 0; i < mbXorUrls.size(); ++i) {
+        result.iocs.urls.push_back(mbXorUrls[i].value);
+        if (i < 3) {
+          if (i) msg += ", ";
+          msg += mbXorUrls[i].value + " (XOR 0x";
+          for (const uint8_t b : mbXorUrls[i].key) {
+            msg += kHex[(b >> 4) & 0xF];
+            msg += kHex[b & 0xF];
+          }
+          msg += ")";
+        }
+      }
+      if (mbXorUrls.size() > 3) {
+        msg += ", +" + std::to_string(mbXorUrls.size() - 3) + " more";
+      }
+      // A multi-byte key is a stronger obfuscation signal than single-byte.
+      AddFinding(result, "strings.multibyte_xor_obfuscated_url", msg,
+                 std::min<int>(35, static_cast<int>(mbXorUrls.size()) * 18));
+    }
     if (!minedIocs.suspiciousApis.empty()) {
       AddFinding(result, "strings.suspicious_apis",
                  "Strings mention suspicious Windows APIs: " +

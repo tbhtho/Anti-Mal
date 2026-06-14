@@ -4571,6 +4571,55 @@ void TestXorObfuscatedUrlMining() {
          "xor-url: two URLs under different keys both recovered");
 }
 
+void TestMultiByteXorObfuscatedUrlMining() {
+  using antimal::MineMultiByteXorObfuscatedUrls;
+  // 2-byte repeating key. Leading noise length is a multiple of the key length
+  // so the recovered key (absolute phase) equals the encoding key exactly.
+  const std::string url = "https://multi.c2.example.org/panel?b=7";
+  const std::vector<uint8_t> key2 = {0x5A, 0x3C};
+  std::vector<uint8_t> data;
+  for (int i = 0; i < 32; ++i) // 32 % 2 == 0
+    data.push_back(static_cast<uint8_t>(i * 7 + 1));
+  for (size_t m = 0; m < url.size(); ++m)
+    data.push_back(static_cast<uint8_t>(url[m]) ^ key2[(32 + m) % key2.size()]);
+  data.push_back(static_cast<uint8_t>(' ') ^ key2[(32 + url.size()) % key2.size()]);
+  for (int i = 0; i < 16; ++i) data.push_back(0xCC);
+  const auto hits = MineMultiByteXorObfuscatedUrls(data);
+  Expect(hits.size() == 1, "mbxor-url: one multi-byte-XOR URL recovered");
+  if (!hits.empty()) {
+    Expect(hits[0].value == url, "mbxor-url: decoded URL matches the original");
+    Expect(hits[0].key == key2, "mbxor-url: recovered the 2-byte key");
+  }
+
+  // 3-byte key, noise length a multiple of 3.
+  const std::string u3 = "http://three.byte.key.example.net/a";
+  const std::vector<uint8_t> key3 = {0x11, 0x22, 0x33};
+  std::vector<uint8_t> d3;
+  for (int i = 0; i < 33; ++i) // 33 % 3 == 0
+    d3.push_back(static_cast<uint8_t>(i * 5 + 3));
+  for (size_t m = 0; m < u3.size(); ++m)
+    d3.push_back(static_cast<uint8_t>(u3[m]) ^ key3[(33 + m) % key3.size()]);
+  d3.push_back(static_cast<uint8_t>('\n') ^ key3[(33 + u3.size()) % key3.size()]);
+  const auto h3 = MineMultiByteXorObfuscatedUrls(d3);
+  Expect(h3.size() == 1 && !h3.empty() && h3[0].value == u3,
+         "mbxor-url: 3-byte-key URL recovered");
+
+  // A single-byte-XOR URL is NOT double-reported by the multi-byte miner
+  // (its key derives to all-equal bytes, which we skip).
+  std::vector<uint8_t> sb;
+  for (char c : u3) sb.push_back(static_cast<uint8_t>(c) ^ 0x5A);
+  sb.push_back(static_cast<uint8_t>(' ') ^ 0x5A);
+  Expect(MineMultiByteXorObfuscatedUrls(sb).empty(),
+         "mbxor-url: single-byte XOR is not reported by the multi-byte miner");
+
+  // Deterministic pseudo-random data yields no false positives.
+  std::vector<uint8_t> noise;
+  for (int i = 0; i < 8192; ++i)
+    noise.push_back(static_cast<uint8_t>((i * 131 + 17) & 0xFF));
+  Expect(MineMultiByteXorObfuscatedUrls(noise).empty(),
+         "mbxor-url: pseudo-random data yields no false hits");
+}
+
 void TestTagger() {
   antimal::Tagger tagger;
   tagger.LoadBuiltinRules();
@@ -7281,6 +7330,7 @@ int main() {
     TestStringExtraction();
     TestIocMining();
     TestXorObfuscatedUrlMining();
+    TestMultiByteXorObfuscatedUrlMining();
     TestTagger();
     TestSubprocessEcho();
     TestSubprocessToolMissing();
