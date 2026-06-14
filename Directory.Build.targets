@@ -1,0 +1,9 @@
+<Project>
+  <!-- Embed the shared application manifest into every .exe output (long-path
+       aware, UTF-8 active codepage, asInvoker, Win10/11). Imported AFTER each
+       project sets ConfigurationType, so the condition resolves correctly.
+       Static libs are skipped. -->
+  <ItemGroup Condition="'$(ConfigurationType)' == 'Application'">
+    <Manifest Include="$(MSBuildThisFileDirectory)build\antimal.exe.manifest" />
+  </ItemGroup>
+</Project>

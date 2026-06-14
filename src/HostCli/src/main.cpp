@@ -6,6 +6,7 @@
 #include "antimal/Json.h"
 #include "antimal/Report.h"
 #include "antimal/Scanner.h"
+#include "antimal/Version.h"
 #include "antimal/hv/BlockDevice.h"
 
 #include <windows.h>
@@ -2941,6 +2942,12 @@ int wmain(int argc, wchar_t **argv) {
       return 2;
     }
     const std::string command = Arg(argc, argv, 1);
+    if (command == "version" || command == "--version" || command == "-v") {
+      std::cout << antimal::kProductName << " " << antimal::kVersionString
+                << " (" << antimal::kProductTagline << ")\n"
+                << "built " << antimal::kBuildDate << "\n";
+      return 0;
+    }
     if (command == "init") {
       return CommandInit();
     }
