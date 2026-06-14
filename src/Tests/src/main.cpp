@@ -41,6 +41,7 @@
 #include "antimal/hv/KdPipeBridge.h"
 #include "antimal/hv/KdSerialDebugger.h"
 #include "antimal/hv/LiveFrameShm.h"
+#include "antimal/hv/ScreenState.h"
 #include "antimal/hv/LiveInputProtocol.h"
 #include "antimal/hv/MmioBus.h"
 #include "antimal/hv/MmioEmulator.h"
@@ -1360,6 +1361,58 @@ void TestPs2MouseCommandSequence() {
 
   Expect(ps2.MouseBytesQueued() >= 14,
          "PS/2 mouse: full multi-byte init replies queued (no truncation)");
+}
+
+// Coarse framebuffer screen-state classifier (Blank/Sparse/Rich). Formalizes the
+// frame-size heuristic that distinguished a boot/spinner frame from a desktop.
+void TestScreenStateClassifier() {
+  using antimal::hv::ClassifyScreenState;
+  using antimal::hv::ScreenState;
+  const uint32_t W = 256, H = 144, stride = W * 4;
+  std::vector<uint8_t> fb(static_cast<size_t>(stride) * H);
+  auto setPx = [&](uint32_t x, uint32_t y, uint8_t b, uint8_t g, uint8_t r) {
+    uint8_t *p =
+        fb.data() + static_cast<size_t>(y) * stride + static_cast<size_t>(x) * 4;
+    p[0] = b; p[1] = g; p[2] = r; p[3] = 0xFF;
+  };
+
+  // BLANK: a single flat colour everywhere -> luma spread 0.
+  for (uint32_t y = 0; y < H; ++y)
+    for (uint32_t x = 0; x < W; ++x) setPx(x, y, 0x20, 0x20, 0x20);
+  const auto blank = ClassifyScreenState(fb.data(), W, H, stride);
+  Expect(blank.state == ScreenState::Blank, "screen-state: flat frame is Blank");
+
+  // SPARSE: mostly black with one small bright block (boot/spinner-like): wide
+  // luma spread but few colours + almost no overall detail.
+  for (uint32_t y = 0; y < H; ++y)
+    for (uint32_t x = 0; x < W; ++x) setPx(x, y, 0, 0, 0);
+  for (uint32_t y = H / 2 - 6; y < H / 2 + 6; ++y)
+    for (uint32_t x = W / 2 - 12; x < W / 2 + 12; ++x)
+      setPx(x, y, 0xFF, 0xFF, 0xFF);
+  const auto sparse = ClassifyScreenState(fb.data(), W, H, stride);
+  Expect(sparse.lumaSpread >= antimal::hv::kScreenBlankLumaSpread,
+         "screen-state: sparse frame has wide luma spread");
+  Expect(sparse.state == ScreenState::Sparse,
+         "screen-state: mostly-black + small block is Sparse");
+
+  // RICH: a varied colourful pattern across the whole frame (desktop-like) ->
+  // many colour buckets + high local detail.
+  for (uint32_t y = 0; y < H; ++y)
+    for (uint32_t x = 0; x < W; ++x)
+      setPx(x, y, static_cast<uint8_t>((x * 7 + y * 3) & 0xFF),
+            static_cast<uint8_t>((x * 3 + y * 11) & 0xFF),
+            static_cast<uint8_t>((x * 13 + y * 5) & 0xFF));
+  const auto rich = ClassifyScreenState(fb.data(), W, H, stride);
+  Expect(rich.state == ScreenState::Rich,
+         "screen-state: varied colourful frame is Rich");
+  Expect(rich.colorBuckets > blank.colorBuckets,
+         "screen-state: rich has more colour variety than blank");
+
+  // Degenerate inputs classify Unknown, never crash.
+  Expect(ClassifyScreenState(nullptr, 0, 0, 0).state == ScreenState::Unknown,
+         "screen-state: null frame is Unknown");
+  Expect(ClassifyScreenState(fb.data(), 4, 4, 16).state == ScreenState::Unknown,
+         "screen-state: tiny frame is Unknown");
 }
 
 uint16_t ReadLe16(const std::vector<uint8_t> &data, size_t offset) {
@@ -7054,6 +7107,7 @@ int main() {
     TestSerialRxFifoResetPreservesBacklog();
     TestPs2QueuedInput();
     TestPs2MouseCommandSequence();
+    TestScreenStateClassifier();
     TestLiveInputProtocol();
     TestLiveFrameShmContract();
     TestLiveFramePublishGate();

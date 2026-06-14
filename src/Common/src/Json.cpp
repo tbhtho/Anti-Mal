@@ -230,6 +230,7 @@ std::string ToJson(const DynamicRunSummary &summary) {
   obj.AddNumber("pm1ControlValue", summary.pm1ControlValue);
   obj.AddNumber("pm1EnableValue", summary.pm1EnableValue);
   obj.AddNumber("pm1aStatusReads", summary.pm1aStatusReads);
+  obj.AddNumber("screenStateReached", summary.screenStateReached);
   obj.AddNumber("pm1SleepRequests", summary.pm1SleepRequests);
   obj.AddNumber("kdPacketsReceived", summary.kdPacketsReceived);
   obj.AddNumber("kdControlPacketsReceived",

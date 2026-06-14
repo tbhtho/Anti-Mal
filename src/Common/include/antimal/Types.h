@@ -224,6 +224,7 @@ struct DynamicRunSummary {
   uint32_t pm1EnableValue = 0;
   uint64_t pm1aStatusReads = 0;
   uint64_t pm1SleepRequests = 0;
+  uint32_t screenStateReached = 0; // richest framebuffer state (0=unknown..3=rich)
   uint64_t kdPacketsReceived = 0;
   uint64_t kdControlPacketsReceived = 0;
   uint64_t kdDataPacketsReceived = 0;

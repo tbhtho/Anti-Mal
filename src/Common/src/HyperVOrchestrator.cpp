@@ -9347,6 +9347,7 @@ DynamicRunSummary ToDynamicSummary(const hv::VmRunSummary &vm,
   summary.pm1ControlValue = vm.pm1ControlValue;
   summary.pm1EnableValue = vm.pm1EnableValue;
   summary.pm1aStatusReads = vm.pm1aStatusReads;
+  summary.screenStateReached = vm.screenStateReached;
   summary.pm1SleepRequests = vm.pm1SleepRequests;
   summary.kdPacketsReceived = vm.kdSummary.packetsReceived;
   summary.kdControlPacketsReceived = vm.kdSummary.controlPacketsReceived;
@@ -9545,6 +9546,12 @@ std::string FormatVmDiagnostics(const hv::VmRunSummary &vm) {
   out << "pm1EnableValue: 0x" << std::hex << std::uppercase
       << vm.pm1EnableValue << std::dec << "\n";
   out << "pm1aStatusReads: " << vm.pm1aStatusReads << "\n";
+  out << "screenStateReached: " << vm.screenStateReached << " ("
+      << (vm.screenStateReached >= 3   ? "rich"
+          : vm.screenStateReached == 2 ? "sparse"
+          : vm.screenStateReached == 1 ? "blank"
+                                       : "unknown")
+      << ")\n";
   out << "pm1SleepEnable: " << (vm.pm1SleepEnable ? "true" : "false") << "\n";
   out << "pm1SleepType: S" << static_cast<int>(vm.pm1SleepType) << "\n";
   out << "pm1HostStopRequested: "

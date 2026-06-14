@@ -109,6 +109,7 @@ struct VmRunSummary {
   uint16_t pm1EnableValue = 0;
   uint64_t pm1aStatusReads = 0;
   uint64_t pm1SleepRequests = 0;
+  uint32_t screenStateReached = 0; // richest ScreenState (0=unknown..3=rich)
   VmNetworkMode networkMode = VmNetworkMode::Disabled;
   int steps = 0;
   uint32_t processorCount = 1;

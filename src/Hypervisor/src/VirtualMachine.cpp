@@ -2,6 +2,7 @@
 
 #include "antimal/hv/KdPipeBridge.h"
 #include "antimal/hv/LiveFrameShm.h"
+#include "antimal/hv/ScreenState.h"
 #include "antimal/hv/LiveInputProtocol.h"
 
 #include <Windows.h>
@@ -1394,6 +1395,12 @@ VmRunSummary VirtualMachine::RunLoop(
   auto lastPacedCom2 = runStarted;        // throttle paced host->guest delivery
   // Live framebuffer mirror -> named shm (production <canvas> display path).
   auto lastFramePublish = runStarted;
+  // Richest screen state any published frame reaches this run (Blank<Sparse<Rich)
+  // -- a deterministic boot-outcome signal surfaced in the run summary. Sampled
+  // on its own cadence so it runs even in headless CLI detonations (where the
+  // live-canvas mirror below is disabled because there is no shm consumer).
+  auto richestScreenState = ScreenState::Unknown;
+  auto lastScreenClassify = runStarted;
   // Geometry debounce: the guest's post-login modesets are a multi-register
   // sequence (ENABLE 1->0->1, XRES then YRES then BPP written separately), so the
   // 30Hz publisher can sample a half-applied tuple. Publishing those transient
@@ -2709,6 +2716,36 @@ VmRunSummary VirtualMachine::RunLoop(
       lastPacedCom2 = now;
       madeProgress = true;
     }
+    // Classify the guest screen state ~4x/s, INDEPENDENT of the live-canvas
+    // mirror below (which only runs when an shm consumer is attached). This makes
+    // screenStateReached a reliable boot-outcome signal for headless detonations.
+    if (now - lastScreenClassify >= std::chrono::milliseconds{250}) {
+      lastScreenClassify = now;
+      const uint32_t w = static_cast<uint32_t>(vbe_.Width());
+      const uint32_t h = static_cast<uint32_t>(vbe_.Height());
+      const uint32_t bpp = static_cast<uint32_t>(vbe_.Bpp());
+      const uint32_t bytespp = bpp ? bpp / 8u : 4u;
+      const uint64_t fbBytes = vbe_.FramebufferBytes();
+      uint8_t *const fbBase = vbe_.FramebufferHost();
+      if (vbe_.Enabled() && fbBase && bpp == 32 && w >= 64 && h >= 64 &&
+          w <= 8192 && h <= 8192 &&
+          static_cast<uint64_t>(w) * h * 4ull <= fbBytes) {
+        const uint32_t stride =
+            vbe_.VirtWidth() ? vbe_.VirtWidth() * bytespp : w * bytespp;
+        // Honor the guest's pan offset so we classify the VISIBLE buffer, not a
+        // blank back buffer (Windows page-flips the desktop via Y_OFFSET).
+        const uint64_t off = static_cast<uint64_t>(vbe_.YOffset()) * stride +
+                             static_cast<uint64_t>(vbe_.XOffset()) * bytespp;
+        const uint64_t lastByte =
+            off + static_cast<uint64_t>(h - 1) * stride + w * bytespp;
+        const uint8_t *src = (lastByte <= fbBytes) ? fbBase + off : fbBase;
+        const uint32_t srcStride = (lastByte <= fbBytes) ? stride : w * bytespp;
+        if (const auto ss = ClassifyScreenState(src, w, h, srcStride).state;
+            static_cast<uint8_t>(ss) > static_cast<uint8_t>(richestScreenState)) {
+          richestScreenState = ss;
+        }
+      }
+    }
     // Mirror the guest framebuffer to shared memory ~30x/s for the live canvas
     // display (the UI maps the section read-only and blits it -- no PNG/disk).
     if (framePub && now - lastFramePublish >= std::chrono::milliseconds{33}) {
@@ -3140,6 +3177,7 @@ VmRunSummary VirtualMachine::RunLoop(
   summary.pm1aStatusReads = pcIo_.Pm1aStatusReads();
   summary.pm1HostStopRequested = pcIo_.LastPm1HostStopRequested();
   summary.pm1SleepRequests = pcIo_.Pm1SleepRequestCount();
+  summary.screenStateReached = static_cast<uint32_t>(richestScreenState);
   summary.hpetReads = hpet_.Reads();
   summary.hpetWrites = hpet_.Writes();
   if (tpmEventLogPopulated_) {
