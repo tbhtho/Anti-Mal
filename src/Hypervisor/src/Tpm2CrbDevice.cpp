@@ -37,8 +37,12 @@ constexpr uint32_t kInterfaceIdValue =
 // sane value so callers that read either get a "real TPM" signal.
 constexpr uint32_t kFifoInterfaceCapabilityValue = 0;
 constexpr uint8_t kFifoStatusExValue = 0;
-constexpr uint16_t kVendorId = 0x1AF4; // Red Hat / QEMU virtio vendor ID.
-constexpr uint16_t kDeviceId = 0x0001;
+// Anti-evasion: the guest-readable TPM_DID_VID register identifies the TPM as
+// STMicroelectronics (matching the "STM " manufacturer + Dell SMBIOS), NOT the
+// QEMU/virtio swtpm signature 0x1AF4/0x0001. Values live in Tpm2CrbDevice.h as
+// the single source of truth so the anti-evasion test guards the shipped bytes.
+constexpr uint16_t kVendorId = kTpmCrbVendorId; // 0x104A STMicroelectronics
+constexpr uint16_t kDeviceId = kTpmCrbDeviceId;
 
 constexpr uint32_t kTpmCcHierarchyChangeAuth = 0x00000129;
 constexpr uint32_t kTpmCcSelfTest = 0x00000143;

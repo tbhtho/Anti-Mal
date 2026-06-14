@@ -1474,8 +1474,14 @@ void TestTpm2CrbDevice() {
          "TPM2 CRB: selected interface is CRB");
 
   Expect(tpm.OnRead(base + 0x34, 4, &value), "TPM2 CRB: VID/DID dword read");
-  Expect((value & 0xFFFFu) == 0x1AF4u, "TPM2 CRB: vendor ID");
-  Expect(((value >> 16) & 0xFFFFu) == 0x0001u, "TPM2 CRB: device ID");
+  // Anti-evasion: the TPM_DID_VID register must report the shipped
+  // STMicroelectronics identity, never the QEMU/virtio swtpm signature
+  // 0x1AF4/0x0001 that a sample could read to fingerprint the sandbox.
+  Expect((value & 0xFFFFu) == antimal::hv::kTpmCrbVendorId, "TPM2 CRB: vendor ID");
+  Expect(((value >> 16) & 0xFFFFu) == antimal::hv::kTpmCrbDeviceId,
+         "TPM2 CRB: device ID");
+  Expect((value & 0xFFFFu) != 0x1AF4u,
+         "TPM2 CRB: vendor ID is not the QEMU/virtio leak");
 
   tpm.OnWrite(base + 0x08, 4, 1);
   Expect(tpm.OnRead(base + 0x0C, 4, &value), "TPM2 CRB: locality status read");

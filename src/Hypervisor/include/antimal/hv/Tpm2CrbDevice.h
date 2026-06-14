@@ -57,6 +57,17 @@ inline constexpr std::array<uint32_t, 5> kTpmIdentityWords = {
     0x322E3200u, // VENDOR_STRING_4      "2.2\0"
 };
 
+// The CRB hardware TPM_DID_VID register (MMIO offset 0x34 VID / 0x36 DID) the
+// guest reads to identify the TPM silicon. Anti-evasion: this MUST match the
+// command-level manufacturer above (STMicroelectronics) and MUST NOT be the
+// QEMU/virtio swtpm signature 0x1AF4/0x0001, which any sample can read to
+// fingerprint the sandbox. 0x104A is STMicroelectronics' registered PCI-SIG
+// vendor ID (consistent with the "STM " TPM_PT_MANUFACTURER). Single source of
+// truth so the anti-evasion unit test guards the shipped value, not a copy.
+// NEVER set kTpmCrbVendorId back to 0x1AF4 (Red Hat / QEMU virtio).
+inline constexpr uint16_t kTpmCrbVendorId = 0x104Au; // STMicroelectronics
+inline constexpr uint16_t kTpmCrbDeviceId = 0x0000u;
+
 class Tpm2CrbDevice final : public IMmioDevice {
 public:
   static constexpr uint64_t kDefaultMmioBase = 0xFED40000ull;
