@@ -198,6 +198,12 @@ CpuidExitResult Vcpu::EmulateCpuidExit() {
     } else {
       rdx &= ~(1u << 28);
     }
+    // Anti-evasion: pin the reported Family/Model/Stepping to the persona CPU
+    // (Intel Comet Lake-S, 06_A5_05) so it matches the spoofed brand string in
+    // leaves 0x80000002-4 and the OptiPlex 7080 SMBIOS, instead of leaking the
+    // host's real microarchitecture (a Raptor Lake hybrid part). Windows fully
+    // supports Comet Lake; the silicon still executes every instruction natively.
+    rax = 0x000A0655u;
     break;
   case 0x00000007u:
     if (subleaf == 0) {
@@ -291,6 +297,31 @@ CpuidExitResult Vcpu::EmulateCpuidExit() {
     rcx = (rcx & ~0x000000FFu) |
           ((std::min<uint32_t>(processorCount_, 256u) - 1u) & 0xFFu);
     rcx &= ~0x0000FF00u;
+    break;
+  // Anti-evasion: the processor brand string (leaves 0x80000002-4) otherwise
+  // passes through WHP's host value, leaking the host's real CPU (a Raptor Lake
+  // hybrid part) -- both a sandbox tell (inconsistent with the OptiPlex 7080
+  // persona) and a privacy leak of the operator's hardware. Pin it to a fixed
+  // "Intel(R) Core(TM) i7-10700 CPU @ 2.90GHz" (a real 10th-gen CPU the OptiPlex
+  // 7080 ships, consistent with the leaf-1 F/M/S above). 48 ASCII bytes packed
+  // little-endian, NUL-padded; purely informational so it cannot break the boot.
+  case 0x80000002u: // "Intel(R) Core(TM) "
+    rax = 0x65746E49u; // "Inte"
+    rbx = 0x2952286Cu; // "l(R)"
+    rcx = 0x726F4320u; // " Cor"
+    rdx = 0x4D542865u; // "e(TM"
+    break;
+  case 0x80000003u: // ") i7-10700 CPU @"
+    rax = 0x37692029u; // ") i7"
+    rbx = 0x3730312Du; // "-107"
+    rcx = 0x43203030u; // "00 C"
+    rdx = 0x40205550u; // "PU @"
+    break;
+  case 0x80000004u: // " 2.90GHz\0..."
+    rax = 0x392E3220u; // " 2.9"
+    rbx = 0x7A484730u; // "0GHz"
+    rcx = 0u;
+    rdx = 0u;
     break;
   default:
     if (leaf >= 0x40000000u && leaf <= 0x400000FFu) {
