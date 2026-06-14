@@ -844,6 +844,25 @@ public:
     return current;
   }
 
+  // Diagnostic: list the immediate children of a directory (name/size/dir).
+  struct DirChild {
+    std::string name;
+    uint64_t size = 0;
+    bool directory = false;
+  };
+  std::vector<DirChild> ListDir(std::string path) {
+    std::vector<DirChild> out;
+    const auto dir = FindPath(std::move(path));
+    if (!dir || !dir->directory) {
+      return out;
+    }
+    for (const auto &e : ReadDirectory(dir->fileRecord)) {
+      if (e.nameSpace == 2) continue; // skip DOS 8.3 aliases
+      out.push_back({e.name, e.size, e.directory});
+    }
+    return out;
+  }
+
   uint16_t BytesPerSector() const noexcept { return bytesPerSector_; }
   uint8_t SectorsPerCluster() const noexcept { return sectorsPerCluster_; }
   size_t ClusterBytes() const noexcept {
@@ -2567,6 +2586,22 @@ int CommandBaseInspect(int argc, wchar_t **argv,
         std::cout << "MISSING: Windows\\System32\\winload.efi\n";
         ok = false;
       }
+      // --list-ntfs-dir <path> lists a directory's immediate children (offline,
+      // read-only) -- e.g. enumerate CodeIntegrity\CiPolicies\Active to find an
+      // unknown SAC/.cip, or winevt\Logs to confirm which channels exist.
+      if (const auto ntfsDir = OptionValue(argc, argv, "--list-ntfs-dir")) {
+        std::string rel = *ntfsDir;
+        for (auto &ch : rel) {
+          if (ch == '/') ch = '\\';
+        }
+        const auto kids = ntfs.ListDir(rel);
+        std::cout << "=== DIR " << rel << " (" << kids.size()
+                  << " entries) ===\n";
+        for (const auto &k : kids) {
+          std::cout << (k.directory ? "  <DIR>  " : "  FILE  ") << k.name
+                    << "  size=" << k.size << "\n";
+        }
+      }
       // --dump-ntfs-file <path> [--dump-ntfs-out <out>] extracts an arbitrary
       // file from the Windows NTFS volume read-only (no OS mount, no admin) for
       // offline disassembly -- e.g. ntoskrnl.exe / hal.dll / a boot driver when
@@ -2587,7 +2622,7 @@ int CommandBaseInspect(int argc, wchar_t **argv,
                     << " fileRecord=" << entry->fileRecord << "\n";
           PrintNtfsDataRuns(rel, *entry, windows->firstLba,
                             ntfs.SectorsPerCluster());
-          const auto bytes = ntfs.ReadFile(*entry, 64ull * 1024ull * 1024ull);
+          const auto bytes = ntfs.ReadFile(*entry, 320ull * 1024ull * 1024ull);
           if (bytes.empty()) {
             std::cout << "error: unreadable file bytes for " << rel << "\n";
             ok = false;
@@ -2880,6 +2915,25 @@ int CommandExport(int argc, wchar_t **argv) {
 
 } // namespace
 
+int CommandDumpHive(int argc, wchar_t **argv) {
+  // dump-hive --file <regf-hive> [--path <Sub\Path>] [--filter <substr>]
+  //          [--values] [--depth N]
+  const auto file = OptionValue(argc, argv, "--file");
+  if (!file) {
+    std::cerr << "dump-hive: --file <regf-hive> required\n";
+    return 2;
+  }
+  const std::string path = OptionValue(argc, argv, "--path").value_or("");
+  const std::string filter = OptionValue(argc, argv, "--filter").value_or("");
+  const bool values = HasFlag(argc, argv, "--values");
+  int depth = 6;
+  if (const auto d = OptionValue(argc, argv, "--depth")) {
+    try { depth = std::stoi(*d); } catch (...) {}
+  }
+  std::cout << antimal::DebugDumpHiveFile(*file, path, filter, values, depth);
+  return 0;
+}
+
 int wmain(int argc, wchar_t **argv) {
   try {
     if (argc < 2) {
@@ -2889,6 +2943,9 @@ int wmain(int argc, wchar_t **argv) {
     const std::string command = Arg(argc, argv, 1);
     if (command == "init") {
       return CommandInit();
+    }
+    if (command == "dump-hive") {
+      return CommandDumpHive(argc, argv);
     }
     if (command == "scan") {
       return CommandScan(argc, argv);

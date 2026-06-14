@@ -111,6 +111,15 @@ VhdxRawConversionResult ConvertVhdxToRaw(const std::filesystem::path &vhdxPath,
 // concurrent run can never delete a still-running sibling's disposable overlay.
 bool RunDirIsLiveLocked(const std::filesystem::path &runDir);
 
+// Offline registry-hive enumerator (diagnostics). Reads a raw regf hive FILE,
+// navigates to startPath (backslash-separated; "" = root), and returns the key
+// subtree to maxDepth as text. dumpValues decodes each key's values; filter
+// (case-insensitive substring) limits printed/descended branches.
+std::string DebugDumpHiveFile(const std::string &hiveFilePath,
+                              const std::string &startPath,
+                              const std::string &filterSubstr, bool dumpValues,
+                              int maxDepth);
+
 // A workspace run directory as seen by the retention sweep.
 struct WorkspaceRunInfo {
   std::string name;          // run-dir name

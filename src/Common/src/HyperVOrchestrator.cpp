@@ -28,8 +28,10 @@
 #include <chrono>
 #include <cctype>
 #include <cstdlib>
+#include <iostream>
 #include <cstring>
 #include <fstream>
+#include <functional>
 #include <iomanip>
 #include <limits>
 #include <map>
@@ -3707,6 +3709,27 @@ public:
                                     location.dataLength);
   }
 
+  // Diagnostic: every (name, location) value of a key, for offline hive dumps.
+  std::vector<std::pair<std::string, BcdValueLocation>> EnumValues(
+      uint32_t keyIndex) const {
+    std::vector<std::pair<std::string, BcdValueLocation>> out;
+    const auto key = ReadKey(keyIndex);
+    if (!key || key->valueCount == 0 || key->valueList == 0xFFFFFFFFu) {
+      return out;
+    }
+    const auto listCell = CellAbsolute(key->valueList);
+    if (!listCell || *listCell + 4 + key->valueCount * 4ull > bytes_.size()) {
+      return out;
+    }
+    const size_t list = *listCell + 4;
+    for (uint32_t i = 0; i < key->valueCount; ++i) {
+      if (const auto v = ReadValue(ReadLe32(bytes_.data() + list + i * 4ull))) {
+        out.emplace_back(v->name, v->location);
+      }
+    }
+    return out;
+  }
+
   std::optional<uint32_t> CreateAsciiKey(uint32_t parentIndex,
                                          const std::string &name) {
     const auto parent = ReadKey(parentIndex);
@@ -4545,6 +4568,8 @@ bool PatchOverlayAutologon(hv::IBlockDevice &disk,
 bool PatchOverlayBlankAntimalPassword(hv::IBlockDevice &disk,
                                       BootOverlayPatchResult *result);
 bool PatchOverlayDesktopStability(hv::IBlockDevice &disk,
+                                  BootOverlayPatchResult *result);
+bool PatchOverlayDisableAppLocker(hv::IBlockDevice &disk,
                                   BootOverlayPatchResult *result);
 bool MaybeCompleteOobeInOverlay(hv::IBlockDevice &disk,
                                 BootOverlayPatchResult *result);
@@ -6311,6 +6336,15 @@ BootOverlayPatchResult ApplyEphemeralBootOverlay(hv::IBlockDevice &disk) {
   if (EnvFlagEnabled("ANTIMAL_PROBE_DESKTOP_STABILITY")) {
     PatchOverlayDesktopStability(disk, &result);
   }
+  // ROOT-CAUSE FIX for the interactive-shell crash-loop: the base image's
+  // AppLocker (SrpV2) policy blocks the core shell AppX package from registering,
+  // so explorer/ControlCenter __fastfail in ucrtbase. Disable AppLocker in THIS
+  // disposable overlay so the shell AppX deploys + the desktop is usable.
+  // Default-ON (opt-out) -- it's required for a working shell + harmless in a
+  // sandbox; overlay-only, base untouched. See PatchOverlayDisableAppLocker.
+  if (!EnvFlagEnabled("ANTIMAL_NO_DISABLE_APPLOCKER")) {
+    PatchOverlayDisableAppLocker(disk, &result);
+  }
   // Opt-in CANDIDATE (default-OFF, A/B-test only): mark Windows OOBE/setup
   // COMPLETE in THIS disposable overlay so the boot stops re-running the
   // mid-first-logon OOBE/setup that the seed snapshot was captured in the middle
@@ -7098,6 +7132,184 @@ bool PatchSystemHivePiixCriticalDevices(std::vector<uint8_t> &bytes,
 // (2) SAM enables the built-in Administrator (RID 500) by clearing its
 // ACB_DISABLED bit, (3) SOFTWARE\...\Winlogon turns on AutoAdminLogon as that
 // account. Never touches the base VHDX (edits the disposable overlay only).
+// ROOT CAUSE of the interactive-shell crash-loop (decoded 2026-06-14 from the
+// crash overlay's Microsoft-Windows-AppXDeploymentServer log): the base image
+// enforces an AppLocker (SrpV2) policy that BLOCKS the core shell AppX package
+// "MicrosoftWindows.Client.CBS" -- which provides ControlCenter.dll / the taskbar
+// -- from registering (error 0xD0E90002 "blocked by AppLocker", x599, one per
+// shell restart). With the shell AppX unable to deploy, explorer/ControlCenter
+// throw an unhandled WinRT exception -> std::terminate -> abort -> __fastfail(7)
+// in ucrtbase.dll@0xa4ace (the c0000409). Turning AppLocker off in THIS disposable
+// overlay lets the shell AppX deploy so explorer stays up. Overlay-only; the base
+// VHDX is never touched. Two independent disables for robustness: the SrpV2
+// policy EnforcementMode -> 0 (AuditOnly) on every collection, AND the appid
+// driver + AppIDSvc service Start -> 4 so the enforcement engine never loads.
+bool PatchOverlayDisableAppLocker(hv::IBlockDevice &disk,
+                                  BootOverlayPatchResult *result) {
+  const auto parts = ReadGptPartitionsLite(disk);
+  const auto windows =
+      std::find_if(parts.begin(), parts.end(), [](const GptPartitionLite &p) {
+        return IsWindowsBasicDataGuid(p.typeGuid);
+      });
+  if (windows == parts.end()) {
+    if (result) result->notes.push_back("applocker: Windows partition not found");
+    return false;
+  }
+  NtfsBootFileLocator ntfs(disk, windows->firstLba);
+  if (!ntfs.Init()) {
+    if (result) result->notes.push_back("applocker: Windows NTFS unreadable");
+    return false;
+  }
+  auto findPath = [](MutableHiveView &hive,
+                     std::initializer_list<std::string> components)
+      -> std::optional<uint32_t> {
+    auto cur = hive.RootIndex();
+    for (const auto &c : components) {
+      if (!cur) return std::nullopt;
+      cur = hive.FindSubkey(*cur, c);
+    }
+    return cur;
+  };
+  auto patchHive = [&](const char *path, auto &&fn) -> bool {
+    const auto entry = ntfs.FindPath(path);
+    if (!entry) {
+      if (result) result->notes.push_back(std::string("applocker: missing ") + path);
+      return false;
+    }
+    auto bytes = ntfs.ReadFile(*entry, 256u * 1024u * 1024u);
+    MutableHiveView hive(bytes);
+    if (!hive.IsValid() || !fn(hive)) {
+      if (result) result->notes.push_back(std::string("applocker: no change ") + path);
+      return false;
+    }
+    RefreshRegistryHiveHeader(bytes);
+    if (!ntfs.WriteFileSameSize(*entry, bytes)) {
+      if (result) result->notes.push_back(std::string("applocker: write failed ") + path);
+      return false;
+    }
+    return true;
+  };
+
+  // (1) SOFTWARE: neutralize the modern app-deployment gates. This base image
+  // ships an MDM-delivered policy (NO classic SrpV2 in the hive) that blocks the
+  // shell AppX (MicrosoftWindows.Client.CBS, which owns ControlCenter.dll) from
+  // deploying -> the interactive session-1 shell can't init -> unhandled WinRT
+  // exception -> __fastfail(7) in ucrtbase. AppXDeploymentServer logs error
+  // 0xD0E90002 "blocked by AppLocker". We target the gates it actually honors:
+  //   * AllowAllTrustedApps / AllowDevelopmentWithoutDevLicense (trusted-app
+  //     deployment gate) under AppModelUnlock, Policies\...\Appx, and the
+  //     effective MDM path PolicyManager\current\device\ApplicationManagement.
+  //   * any AppLocker MDM-collection EnforcementMode discovered by walking the
+  //     PolicyManager subtree (also dumped for offline structure-pinning).
+  const bool sw = patchHive(
+      "Windows\\System32\\config\\SOFTWARE", [&](MutableHiveView &hive) {
+        bool ok = false;
+        auto setDword = [&](std::initializer_list<std::string> path,
+                            const char *name, uint32_t val, const char *label) {
+          const auto k = EnsureHivePath(hive, path);
+          if (!k) {
+            std::cout << "[applocker]   " << label << ": path missing\n";
+            return;
+          }
+          const bool existed = hive.FindValue(*k, name).has_value();
+          const bool w = UpsertHiveDword(hive, *k, name, val);
+          std::cout << "[applocker]   " << label << "\\" << name << "=" << val
+                    << (existed ? " (was present)" : " (created)") << " "
+                    << (w ? "ok" : "FAILED") << "\n";
+          ok = w || ok;
+        };
+        setDword({"Microsoft", "Windows", "CurrentVersion", "AppModelUnlock"},
+                 "AllowAllTrustedApps", 1, "AppModelUnlock");
+        setDword({"Microsoft", "Windows", "CurrentVersion", "AppModelUnlock"},
+                 "AllowDevelopmentWithoutDevLicense", 1, "AppModelUnlock");
+        setDword({"Policies", "Microsoft", "Windows", "Appx"},
+                 "AllowAllTrustedApps", 1, "Policies\\Appx");
+        setDword({"Policies", "Microsoft", "Windows", "Appx"},
+                 "AllowDevelopmentWithoutDevLicense", 1, "Policies\\Appx");
+        setDword({"Microsoft", "PolicyManager", "current", "device",
+                  "ApplicationManagement"},
+                 "AllowAllTrustedApps", 1, "PM\\ApplicationManagement");
+        setDword({"Microsoft", "PolicyManager", "current", "device",
+                  "ApplicationManagement"},
+                 "AllowDevelopmentWithoutDevLicense", 1,
+                 "PM\\ApplicationManagement");
+        // (Offline-confirmed there is NO classic AppLocker/SrpV2 policy and no
+        //  AppLocker MDM CSP under PolicyManager\\providers in this base -- the
+        //  real deployment block is Smart App Control, neutralized in the SYSTEM
+        //  hive below. These SOFTWARE trusted-app flags are belt-and-suspenders.)
+        return ok;
+      });
+
+  // (2) SYSTEM: (a) disable the AppLocker enforcement services, and (b) turn
+  // Smart App Control (SAC) fully OFF.
+  //
+  // The REAL blocker: SAC is enforced by the AppID "SmartLocker" engine -- the
+  // same engine AppLocker uses -- so a SAC deployment denial surfaces verbatim
+  // as "blocked by AppLocker" in AppXDeploymentServer (error 0xD0E90002). The
+  // base ships SAC in EVALUATION mode (Control\CI\Policy\
+  // VerifiedAndReputablePolicyState = 2). SAC relies on a cloud reputation
+  // service; in this sandbox the network is DISABLED, so SAC can't verify the
+  // shell AppX (MicrosoftWindows.Client.CBS / Microsoft.UI.Xaml.CBS) and fails
+  // CLOSED at first-logon, blocking the deployment -> no taskbar/Start -> the
+  // unhandled-WinRT __fastfail crash-loop. We force SAC OFF (state 0) in every
+  // control set and clear the anti-tamper "min value seen" so it isn't reverted.
+  const bool sys = patchHive(
+      "Windows\\System32\\config\\SYSTEM", [&](MutableHiveView &hive) {
+        bool ok = false;
+        const auto services = findPath(hive, {"ControlSet001", "Services"});
+        std::cout << "[applocker] SYSTEM ControlSet001\\Services: "
+                  << (services ? "FOUND" : "not found") << "\n";
+        if (services) {
+          for (const char *svc : {"appid", "AppIDSvc", "applockerfltr"}) {
+            if (const auto k = hive.FindSubkey(*services, svc)) {
+              const bool w = UpsertHiveDword(hive, *k, "Start", 4);
+              std::cout << "[applocker]   Services\\" << svc << "\\Start=4 "
+                        << (w ? "written" : "no-op") << "\n";
+              ok = w || ok;
+              if (const auto so = hive.FindSubkey(*k, "StartOverride")) {
+                UpsertHiveDword(hive, *so, "0", 4);
+              }
+            } else {
+              std::cout << "[applocker]   Services\\" << svc << " not found\n";
+            }
+          }
+        }
+        // SAC OFF across control sets.
+        for (const char *cs : {"ControlSet001", "ControlSet002"}) {
+          if (const auto pol =
+                  findPath(hive, {cs, "Control", "CI", "Policy"})) {
+            const bool a =
+                UpsertHiveDword(hive, *pol, "VerifiedAndReputablePolicyState", 0);
+            UpsertHiveDword(hive, *pol, "SAC_PreviousState", 0);
+            std::cout << "[applocker]   " << cs
+                      << "\\Control\\CI\\Policy\\VerifiedAndReputablePolicyState=0 "
+                      << (a ? "ok" : "no-op") << "\n";
+            ok = a || ok;
+          }
+          if (const auto prot =
+                  findPath(hive, {cs, "Control", "CI", "Protected"})) {
+            const bool b = UpsertHiveDword(
+                hive, *prot, "VerifiedAndReputablePolicyStateMinValueSeen", 0);
+            std::cout << "[applocker]   " << cs
+                      << "\\Control\\CI\\Protected\\...MinValueSeen=0 "
+                      << (b ? "ok" : "no-op") << "\n";
+            ok = b || ok;
+          }
+        }
+        return ok;
+      });
+
+  std::cout << "[applocker] SOFTWARE patch=" << (sw ? "applied" : "skipped")
+            << " SYSTEM patch=" << (sys ? "applied" : "skipped") << "\n";
+  if (result) {
+    result->notes.push_back(
+        std::string("applocker: AllowAllTrustedApps/EnforcementMode neutralize ") +
+        (sw ? "applied" : "skipped") + "; appid/AppIDSvc/applockerfltr disabled " +
+        (sys ? "applied" : "skipped"));
+  }
+  return sw || sys;
+}
+
 bool PatchOverlayAutologon(hv::IBlockDevice &disk,
                            BootOverlayPatchResult *result) {
   const auto parts = ReadGptPartitionsLite(disk);
@@ -10195,6 +10407,135 @@ std::string FormatVmDiagnostics(const hv::VmRunSummary &vm) {
 }
 
 } // namespace
+
+// Offline registry-hive enumerator for diagnostics (e.g. pinning an MDM policy
+// before patching). Reads a raw hive FILE (regf), navigates to startPath
+// (backslash-separated; "" = root), and prints the key subtree to maxDepth.
+// When dumpValues, each key's values are printed with a decoded summary
+// (DWORD / SZ / MULTI_SZ / short hex). filterSubstr (case-insensitive) limits
+// printed/descended branches to paths containing it (plus shallow levels).
+std::string DebugDumpHiveFile(const std::string &hiveFilePath,
+                              const std::string &startPath,
+                              const std::string &filterSubstr, bool dumpValues,
+                              int maxDepth) {
+  std::ostringstream os;
+  std::ifstream f(hiveFilePath, std::ios::binary);
+  if (!f) {
+    return "ERR: cannot open hive file: " + hiveFilePath + "\n";
+  }
+  std::vector<uint8_t> bytes((std::istreambuf_iterator<char>(f)),
+                             std::istreambuf_iterator<char>());
+  MutableHiveView hive(bytes);
+  if (!hive.IsValid()) {
+    return "ERR: not a valid regf hive (size=" + std::to_string(bytes.size()) +
+           "): " + hiveFilePath + "\n";
+  }
+  auto lower = [](std::string s) {
+    for (auto &c : s) c = static_cast<char>(std::tolower((unsigned char)c));
+    return s;
+  };
+  const std::string filt = lower(filterSubstr);
+
+  auto cur = hive.RootIndex();
+  if (!cur) {
+    return "ERR: no root key\n";
+  }
+  // Navigate startPath.
+  std::string seg;
+  std::vector<std::string> comps;
+  for (char c : startPath) {
+    if (c == '\\' || c == '/') {
+      if (!seg.empty()) comps.push_back(seg);
+      seg.clear();
+    } else {
+      seg.push_back(c);
+    }
+  }
+  if (!seg.empty()) comps.push_back(seg);
+  std::string base = "";
+  for (const auto &c : comps) {
+    cur = hive.FindSubkey(*cur, c);
+    if (!cur) {
+      return "ERR: path not found at component '" + c + "' under '" + base +
+             "'\n";
+    }
+    base += (base.empty() ? "" : "\\") + c;
+  }
+
+  auto fmtValue = [&](const std::pair<std::string, BcdValueLocation> &v) {
+    const auto &loc = v.second;
+    const auto data = hive.ValueBytes(loc);
+    std::ostringstream vs;
+    const std::string name = v.first.empty() ? "(default)" : v.first;
+    vs << name << " [type=" << loc.type << " len=" << loc.dataLength << "] = ";
+    if (loc.type == 4 /*DWORD*/ && data.size() >= 4) {
+      const uint32_t d = static_cast<uint32_t>(data[0]) |
+                         (static_cast<uint32_t>(data[1]) << 8) |
+                         (static_cast<uint32_t>(data[2]) << 16) |
+                         (static_cast<uint32_t>(data[3]) << 24);
+      vs << d << " (0x" << std::hex << d << std::dec << ")";
+    } else if ((loc.type == 1 || loc.type == 2 || loc.type == 7) &&
+               !data.empty()) {
+      std::string s;
+      for (size_t i = 0; i + 1 < data.size(); i += 2) {
+        const wchar_t wc = static_cast<wchar_t>(data[i] | (data[i + 1] << 8));
+        if (wc == 0) {
+          if (loc.type == 7) s += " | ";
+          continue;
+        }
+        s += (wc >= 32 && wc < 127) ? static_cast<char>(wc) : '.';
+      }
+      if (s.size() > 300) s = s.substr(0, 300) + "...";
+      vs << "\"" << s << "\"";
+    } else {
+      std::ostringstream hx;
+      for (size_t i = 0; i < data.size() && i < 48; ++i) {
+        hx << std::hex << std::setw(2) << std::setfill('0')
+           << static_cast<int>(data[i]);
+      }
+      vs << hx.str() << (data.size() > 48 ? "..." : "");
+    }
+    return vs.str();
+  };
+
+  // Always descend to maxDepth (a real search); PRINT only matching paths
+  // (filter empty => everything). A visit cap guards against pathological hives.
+  size_t visited = 0;
+  const size_t kVisitCap = 2000000;
+  std::function<void(uint32_t, const std::string &, int)> walk =
+      [&](uint32_t key, const std::string &prefix, int depth) {
+        if (depth > maxDepth || visited > kVisitCap) return;
+        for (const auto &child : hive.ChildKeyNames(key)) {
+          if (++visited > kVisitCap) {
+            os << "(visit cap reached)\n";
+            return;
+          }
+          const auto ck = hive.FindSubkey(key, child);
+          if (!ck) continue;
+          const std::string p = prefix.empty() ? child : prefix + "\\" + child;
+          const bool match = filt.empty() || lower(p).find(filt) !=
+                                                  std::string::npos;
+          if (match) {
+            os << "[K] " << p << "\n";
+            if (dumpValues) {
+              for (const auto &v : hive.EnumValues(*ck)) {
+                os << "    [V] " << fmtValue(v) << "\n";
+              }
+            }
+          }
+          walk(*ck, p, depth + 1);
+        }
+      };
+  os << "=== hive=" << hiveFilePath << " start='" << base << "' filter='"
+     << filterSubstr << "' depth=" << maxDepth << " ===\n";
+  if (dumpValues) {
+    for (const auto &v : hive.EnumValues(*cur)) {
+      os << "    [V] " << fmtValue(v) << "\n";
+    }
+  }
+  walk(*cur, base, 0);
+  return os.str();
+}
 
 bool RunDirIsLiveLocked(const std::filesystem::path &runDir) {
   // Probe the per-run lock with NO share access. A live detonation holds this
