@@ -325,10 +325,17 @@ BehaviorScore ScoreSandboxBehavior(const DynamicRunSummary &summary,
       }
     }
 
-    // --- Network: outbound connection to a genuinely external endpoint.
+    // --- Network: outbound connection to a genuinely external endpoint,
+    // ATTRIBUTED to the sample's process subtree. The TCP telemetry carries the
+    // owning PID (GetExtendedTcpTable TCP_TABLE_OWNER_PID -> EventRecord.processId),
+    // so we exclude Windows' own concurrent background egress (telemetry, NTP,
+    // Update, NCSI) that the post-execution time gate can't filter -- only the
+    // sample (or a process it spawned) making external egress is a malice signal.
+    // Same subtree discipline as the suspicious-command-line / privesc signals.
     if (cat == "network" &&
         (Has(act, "connect") || Has(act, "connection") || Has(act, "dns") ||
-         Has(act, "request") || Has(act, "http"))) {
+         Has(act, "request") || Has(act, "http")) &&
+        inSampleSubtree(e.processId)) {
       if (IsExternalEndpoint(e.target)) {
         externalEndpoints.insert(tgtL);
       }

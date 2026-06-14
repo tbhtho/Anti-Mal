@@ -5654,6 +5654,63 @@ void TestBehaviorScoreSubtreeCmdlineAttribution() {
          "Malicious");
 }
 
+void TestBehaviorScoreSubtreeNetworkAttribution() {
+  using antimal::DynamicRunSummary;
+  using antimal::EventRecord;
+  using antimal::ScoreSandboxBehavior;
+  using antimal::Verdict;
+  auto proc = [](const std::string &ts, uint32_t pid, uint32_t ppid,
+                 const std::string &act) {
+    EventRecord e;
+    e.timestampUtc = ts;
+    e.category = "process";
+    e.action = act;
+    e.processId = pid;
+    e.parentProcessId = ppid;
+    e.imagePath = "svchost.exe";
+    return e;
+  };
+  auto net = [](const std::string &ts, uint32_t pid, const std::string &remote) {
+    EventRecord e;
+    e.timestampUtc = ts;
+    e.category = "network";
+    e.action = "network.connect";
+    e.processId = pid;
+    e.target = remote;
+    return e;
+  };
+  DynamicRunSummary s;
+  s.sampleExecuted = true;
+  std::vector<EventRecord> ev;
+  // Agent launches the sample (subtree root pid 1900).
+  ev.push_back(proc("2026-01-01T00:10:00Z", 1900, 0, "process.create"));
+  // Windows' OWN concurrent background egress from a non-sample svchost
+  // (pid 700, parent services 600) -- e.g. telemetry / Update. External, but NOT
+  // the sample, so it must NOT corroborate a Malicious verdict.
+  ev.push_back(net("2026-01-01T00:10:01Z", 700, "20.190.160.5:443"));
+  // Boot persistence noise drives the raw score high (as in the cmdline test).
+  for (int i = 0; i < 30; ++i) {
+    EventRecord r;
+    r.timestampUtc = "2026-01-01T00:10:02Z";
+    r.category = "registry";
+    r.action = "registry.value";
+    r.target = "HKLM\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Run\\os" +
+               std::to_string(i);
+    ev.push_back(r);
+  }
+  const auto bsOs = ScoreSandboxBehavior(s, ev, false);
+  Expect(bsOs.verdict != Verdict::Malicious,
+         "behavior: OS background egress outside the sample subtree does not "
+         "corroborate Malicious");
+  // The SAME external egress, but from a child OF the sample (pid 1950).
+  ev.push_back(proc("2026-01-01T00:10:03Z", 1950, 1900, "process.start"));
+  ev.push_back(net("2026-01-01T00:10:04Z", 1950, "185.220.101.7:443"));
+  const auto bsSample = ScoreSandboxBehavior(s, ev, false);
+  Expect(bsSample.verdict == Verdict::Malicious,
+         "behavior: external egress by the sample's own child DOES corroborate "
+         "Malicious");
+}
+
 void TestBehaviorScoreVerdict() {
   using antimal::AnalysisReport;
   using antimal::BehaviorScore;
@@ -7225,6 +7282,7 @@ int main() {
     TestBehaviorScoreVerdict();
     TestBehaviorScoreExcludesBootBaseline();
     TestBehaviorScoreSubtreeCmdlineAttribution();
+    TestBehaviorScoreSubtreeNetworkAttribution();
     TestReportSections();
     TestPacketInspector();
     TestE1000Device();
