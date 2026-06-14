@@ -46,6 +46,23 @@ ExtractedIocs MineIocs(const std::vector<std::string> &strings);
 // Convenience wrapper: ExtractAllStrings + MineIocs in one call.
 ExtractedIocs MineIocsFromBytes(const std::vector<uint8_t> &data);
 
+// A C2/config URL recovered from single-byte-XOR obfuscation (the most common
+// malware string-hiding scheme). The plaintext string miner above misses these
+// because the bytes aren't printable until XORed back.
+struct ObfuscatedIoc {
+  std::string value;  // the decoded http(s):// URL
+  uint8_t xorKey = 0; // the single-byte XOR key (always non-zero)
+};
+
+// Recovers single-byte-XOR-obfuscated http(s) URLs from raw bytes in ONE O(n)
+// pass: at each offset, tests whether 4 bytes spell "http" under a consistent
+// single-byte key, then decodes forward and requires a valid "://" scheme. The
+// "http://"-under-XOR pattern is ~7 specific bytes, so a chance match in random
+// data is astronomically unlikely -> a hit is almost certainly real obfuscated
+// config. Deduplicated + capped; key 0 (plaintext) is skipped.
+std::vector<ObfuscatedIoc>
+MineXorObfuscatedUrls(const std::vector<uint8_t> &data);
+
 // ExtractDomain (URL -> host) lives in BrowserImpact.h and is reused here.
 
 } // namespace antimal

@@ -316,4 +316,83 @@ ExtractedIocs MineIocsFromBytes(const std::vector<uint8_t> &data) {
   return MineIocs(ExtractAllStrings(data));
 }
 
+namespace {
+// URL-safe byte set (RFC 3986 reserved + unreserved). We decode forward over
+// these until the first non-URL byte terminates the obfuscated string.
+inline bool IsUrlByte(uint8_t c) {
+  if ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+      (c >= '0' && c <= '9')) {
+    return true;
+  }
+  switch (c) {
+  case ':': case '/': case '?': case '#': case '[': case ']': case '@':
+  case '!': case '$': case '&': case '\'': case '(': case ')': case '*':
+  case '+': case ',': case ';': case '=': case '%': case '-': case '.':
+  case '_': case '~':
+    return true;
+  default:
+    return false;
+  }
+}
+} // namespace
+
+std::vector<ObfuscatedIoc>
+MineXorObfuscatedUrls(const std::vector<uint8_t> &data) {
+  std::vector<ObfuscatedIoc> out;
+  constexpr size_t kMinUrl = 12;             // "http://" + >=5 host chars
+  constexpr size_t kMaxUrl = kMaxStringValueLength;
+  constexpr size_t kMaxScan = 32u * 1024u * 1024u; // bound pathological inputs
+  constexpr size_t kMaxHits = 256;
+  if (data.size() < kMinUrl) {
+    return out;
+  }
+  const size_t n = std::min(data.size(), kMaxScan);
+  std::set<std::string> seen;
+  for (size_t i = 0; i + 7 < n; ++i) {
+    // Single-byte key implied by aligning data[i] to 'h'. The same key must turn
+    // the next three bytes into "ttp" for an "http" prefix under that key.
+    const uint8_t k = static_cast<uint8_t>(data[i] ^ 'h');
+    if (k == 0) {
+      continue; // key 0 == plaintext; already covered by the plaintext miner.
+    }
+    if ((data[i + 1] ^ k) != 't' || (data[i + 2] ^ k) != 't' ||
+        (data[i + 3] ^ k) != 'p') {
+      continue;
+    }
+    // Decode forward under the implied key until a non-URL byte / length cap.
+    std::string url;
+    url.reserve(64);
+    size_t j = i;
+    for (; j < n && url.size() < kMaxUrl; ++j) {
+      const uint8_t c = static_cast<uint8_t>(data[j] ^ k);
+      if (!IsUrlByte(c)) {
+        break;
+      }
+      url.push_back(static_cast<char>(c));
+    }
+    // Require a real scheme so a stray "http"-under-XOR run isn't a false hit.
+    if (url.rfind("http://", 0) != 0 && url.rfind("https://", 0) != 0) {
+      continue;
+    }
+    // Trim trailing punctuation that's rarely part of a URL.
+    while (!url.empty()) {
+      const char b = url.back();
+      if (b == '.' || b == ',' || b == ';' || b == ':' || b == '\'' ||
+          b == '"' || b == ')' || b == ']' || b == '}') {
+        url.pop_back();
+      } else {
+        break;
+      }
+    }
+    if (url.size() >= kMinUrl && seen.insert(url).second) {
+      out.push_back({url, k});
+      if (out.size() >= kMaxHits) {
+        break;
+      }
+    }
+    i = j; // skip past the decoded run (the for-loop ++i lands just after it).
+  }
+  return out;
+}
+
 } // namespace antimal

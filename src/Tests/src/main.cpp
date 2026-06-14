@@ -4530,6 +4530,47 @@ void TestIocMining() {
   Expect(!iocs.base64Blobs.empty(), "ioc mining: base64 blob found");
 }
 
+void TestXorObfuscatedUrlMining() {
+  using antimal::MineXorObfuscatedUrls;
+  const std::string url = "http://evil-c2.example.com/gate.php?id=42";
+  const uint8_t key = 0x5A;
+  std::vector<uint8_t> data;
+  // Leading noise whose byte deltas can't spell "http" under any single key.
+  for (int i = 0; i < 32; ++i) data.push_back(static_cast<uint8_t>(i * 7 + 1));
+  for (char c : url) data.push_back(static_cast<uint8_t>(c) ^ key);
+  data.push_back(static_cast<uint8_t>(' ' ^ key)); // decodes to a space -> stops
+  for (int i = 0; i < 16; ++i) data.push_back(0xCC);
+
+  const auto hits = MineXorObfuscatedUrls(data);
+  Expect(hits.size() == 1, "xor-url: exactly one obfuscated URL recovered");
+  if (!hits.empty()) {
+    Expect(hits[0].value == url, "xor-url: decoded URL matches the original");
+    Expect(hits[0].xorKey == key, "xor-url: recovered the single-byte XOR key");
+  }
+
+  // A plaintext URL (key 0) is NOT reported here -- the plaintext miner owns it.
+  std::vector<uint8_t> plain(url.begin(), url.end());
+  Expect(MineXorObfuscatedUrls(plain).empty(),
+         "xor-url: plaintext URL is not double-reported as obfuscated");
+
+  // Deterministic pseudo-random data yields no false positives.
+  std::vector<uint8_t> noise;
+  for (int i = 0; i < 8192; ++i)
+    noise.push_back(static_cast<uint8_t>((i * 131 + 17) & 0xFF));
+  Expect(MineXorObfuscatedUrls(noise).empty(),
+         "xor-url: pseudo-random data yields no false hits");
+
+  // Two distinct URLs under different keys are both recovered + deduped.
+  std::vector<uint8_t> two;
+  const std::string url2 = "https://cdn.bad.net/x";
+  for (char c : url) two.push_back(static_cast<uint8_t>(c) ^ 0x11);
+  two.push_back(static_cast<uint8_t>('\n' ^ 0x11));
+  for (char c : url2) two.push_back(static_cast<uint8_t>(c) ^ 0x33);
+  two.push_back(static_cast<uint8_t>('\n' ^ 0x33));
+  Expect(MineXorObfuscatedUrls(two).size() == 2,
+         "xor-url: two URLs under different keys both recovered");
+}
+
 void TestTagger() {
   antimal::Tagger tagger;
   tagger.LoadBuiltinRules();
@@ -7161,6 +7202,7 @@ int main() {
     TestBrowserRisk();
     TestStringExtraction();
     TestIocMining();
+    TestXorObfuscatedUrlMining();
     TestTagger();
     TestSubprocessEcho();
     TestSubprocessToolMissing();

@@ -111,6 +111,28 @@ void Enrich(ScanResult &result, const std::vector<uint8_t> &data,
   if (options.mineIocs) {
     minedIocs = MineIocsFromBytes(data);
     result.iocs = ConvertIocs(minedIocs);
+    // Recover single-byte-XOR-obfuscated C2 URLs the plaintext miner can't see.
+    const auto xorUrls = MineXorObfuscatedUrls(data);
+    if (!xorUrls.empty()) {
+      static const char kHex[] = "0123456789ABCDEF";
+      std::string msg = "Single-byte-XOR-obfuscated URL(s) decoded: ";
+      for (size_t i = 0; i < xorUrls.size(); ++i) {
+        result.iocs.urls.push_back(xorUrls[i].value);
+        if (i < 3) {
+          if (i) msg += ", ";
+          msg += xorUrls[i].value + " (XOR 0x";
+          msg += kHex[(xorUrls[i].xorKey >> 4) & 0xF];
+          msg += kHex[xorUrls[i].xorKey & 0xF];
+          msg += ")";
+        }
+      }
+      if (xorUrls.size() > 3) {
+        msg += ", +" + std::to_string(xorUrls.size() - 3) + " more";
+      }
+      // Obfuscated C2 is a strong malware signal (obfuscation + a network IOC).
+      AddFinding(result, "strings.xor_obfuscated_url", msg,
+                 std::min<int>(30, static_cast<int>(xorUrls.size()) * 15));
+    }
     if (!minedIocs.suspiciousApis.empty()) {
       AddFinding(result, "strings.suspicious_apis",
                  "Strings mention suspicious Windows APIs: " +
