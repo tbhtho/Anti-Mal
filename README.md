@@ -10,7 +10,7 @@ Overall progress: [█████████████████░] 92%
 
 AntiMal has two major layers:
 
-1. **Static enrichment — ships today.** Hash, entropy, PE metadata, strings + IOC mining, rule/tag tracker, optional YARA/capa/DIE, optional MalwareBazaar/VirusTotal lookups (off by default), JSON + HTML reports.
+1. **Static enrichment — ships today.** Multi-hash + entropy, deep PE metadata, magic-byte file typing, **file-type-aware analyzers for scripts / `.lnk` / Office-OLE macros / archives**, strings + IOC mining with **obfuscated-C2 recovery** (XOR / base64 / PowerShell `-EncodedCommand`), rule/tag tracker, optional YARA/capa/DIE, optional MalwareBazaar/VirusTotal lookups (off by default), JSON + HTML reports.
 2. **Dynamic "live sandbox" — boots to a real desktop, with a deep analysis pipeline; one blocker left.** The in-house WHP VM boots Windows 11 25H2 **to an actual desktop** (live-confirmed 2026-06-09: the console showed the bloom desktop with Recycle Bin + Edge icons at a live **`LIVE · 14 FPS`** readout, telemetry *Watching*), the **WebView2 live console** streams the framebuffer + accepts keyboard/mouse, and the **host↔guest telemetry pipeline streams live** (122 KB of `events.jsonl` captured on that boot).
 
 **The full boot chain works:** OVMF → `bootmgfw` → `winload.efi` → code-integrity → **ntoskrnl** → kernel Phase 0/1 → **AHCI storage mount** → win32k/dxgkrnl/display → OOBE → **VM warm-reset (guest reboot is serviced)** → account creation → **login → "Preparing Windows" → desktop**. Walls cleared to get here: the `0xc0000225` code-integrity abort (source-built TPM2 OVMF), the `0xc0430001` winload wall (our own ACPI checksum bug), the **`0x7B INACCESSIBLE_BOOT_DEVICE`** storage wall (a from-scratch PCI-native **AHCI** controller — `storahci.sys` binds it), VM warm-reset, **injected-input garbling** (fixed by pacing), and a **CET kernel hang** (fixed by masking CET in CPUID leaf 7).
@@ -26,11 +26,17 @@ In-guest sample execution is **wired but gated off by default** behind a two-key
 - Win32 GUI: `AntiMal.exe`
 - CLI scanner and report tools: `AntiMal.HostCli.exe`
 - Static enrichment:
-  - SHA-256
-  - entropy
-  - PE import and signature metadata
-  - ASCII/UTF-16 string extraction
-  - IOC mining for URLs, IPs, domains, registry paths, file paths, mutex hints, base64 blobs, and suspicious APIs
+  - multi-hash triage: **MD5 / SHA-1 / SHA-256 / imphash** + Shannon entropy
+  - **deep PE parse**: imports, Authenticode signature, section table + per-section entropy, compile timestamp, overlay + embedded-PE (dropper) detection, exports, VERSIONINFO, TLS callbacks, .NET/CLR, Rich header, debug/PDB path
+  - **magic-byte file-type identification** + masquerade detection (a PE wearing a `.pdf`/`.doc` extension; an OriginalFilename mismatch)
+  - **file-type-aware analyzers** for the non-PE delivery formats malware actually ships in:
+    - **scripts** (PowerShell / JScript / VBScript / batch / HTA / WSF): encoded commands, download cradles, LOLBin fetches, AMSI bypass, IEX/shell exec, hidden/bypass flags, char-code obfuscation — and **one-layer deobfuscation** that decodes a PowerShell `-EncodedCommand` and recovers the hidden C2
+    - **`.lnk` shortcuts** (MS-SHLLINK): recovers the embedded command line + target and flags a shortcut that silently launches a LOLBin (powershell/cmd/mshta/rundll32/…)
+    - **Office / OLE documents**: VBA-macro presence, auto-exec entry points, and embedded exploit objects (Equation Editor CVE-2017-11882 family)
+    - **archives / OOXML** (zip family): macro-doc detection (`vbaProject.bin`) plus executable payloads, double-extension lures, and password-protected entries
+  - ASCII/UTF-16 string extraction + IOC mining for URLs, IPs, domains, registry paths, file paths, mutex hints, base64 blobs, and suspicious APIs
+  - **obfuscated-C2 recovery**: single-byte XOR, multi-byte (2–4 byte repeating-key) XOR, and base64-wrapped URLs/IPs/domains the plaintext miner can't see
+  - import-table → behavioral-capability mapping (anti-debug, keylogging, screen capture, injection, …)
   - rule-based tracker tags
   - optional YARA/capa/DIE wrappers
   - optional MalwareBazaar/VirusTotal hash lookups

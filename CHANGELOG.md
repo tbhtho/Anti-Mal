@@ -8,6 +8,32 @@ that landed on `main`.
 
 ## [Unreleased]
 
+### 2026-06-16 — static-engine breadth: file-type-aware analyzers (M3)
+The static layer previously only deeply analyzed PE files and silently skipped the
+non-PE formats malware ships in. This session adds dedicated, bounds-safe analyzers
+and routes `ScanFile` to them by magic bytes. All TDD, no boots, build + tests green.
+- **`.lnk` shortcut parsing (T67):** `ShellLinkParser` walks MS-SHLLINK and recovers
+  the embedded command line + target; flags a shortcut that silently launches a LOLBin
+  (powershell/cmd/mshta/rundll32/…).
+- **Script analyzer (T70):** `ScriptAnalyzer` classifies PowerShell/JScript/VBScript/
+  batch/HTA/WSF and flags encoded commands, download cradles, LOLBin fetches, AMSI
+  bypass, IEX/shell exec, hidden/bypass flags, and char-code obfuscation. It
+  **deobfuscates one layer** — `DecodePowerShellEncodedCommand` decodes a base64
+  `-EncodedCommand` (UTF-16LE, ASCII fallback) and recovers the hidden C2 into the IOC set.
+- **Container analyzer (T68):** `ContainerAnalyzer` detects VBA-macro presence (OLE
+  storage names + OOXML `vbaProject.bin`), best-effort auto-exec entry points, OLE
+  exploit objects (Equation Editor CVE-2017-11882), and walks a zip central directory to
+  flag executable payloads, double-extension lures, and password-protected entries.
+- **File-type routing (T48):** `ScanFile` dispatches by magic bytes and re-classifies
+  `detectedType` (powershell/ooxml/…); `ScanPath` now sweeps scripts/shortcuts/docs/
+  archives, not just `.exe/.dll/.scr/.sys/.bin`.
+- **UI/report:** the scan panel now surfaces the detected file type + a score-sorted
+  findings table (Any.Run-style tracker rows). Fixed the CLI's "(by magic bytes)" type
+  label, which is now content-classified for scripts/OOXML.
+- All three parsers read fully untrusted bytes and are bounds-safe (oversize counts,
+  corrupt headers, truncated buffers, zero-advance loops all unit-tested) + adversarially
+  reviewed.
+
 ### 2026-06-13 — no-boot static/host-side sweep
 - **PE parser depth (T47):** parse export table, VERSIONINFO, TLS callbacks,
   .NET/CLR, Rich header, and the debug/PDB path — all bounds-safe and surfaced as
