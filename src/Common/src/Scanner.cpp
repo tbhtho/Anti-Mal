@@ -5,6 +5,7 @@
 #include "antimal/FileUtil.h"
 #include "antimal/IntelLookup.h"
 #include "antimal/ContainerAnalyzer.h"
+#include "antimal/PdfAnalyzer.h"
 #include "antimal/PeParser.h"
 #include "antimal/ScriptAnalyzer.h"
 #include "antimal/ShellLinkParser.h"
@@ -574,6 +575,16 @@ ScanResult ScanFile(const std::filesystem::path &path,
         for (const auto &f : container.findings) {
           AddFinding(result, f.ruleId, f.message, f.score);
         }
+      }
+    }
+
+    // PDF routing: a weaponized PDF runs JavaScript on open, auto-triggers an
+    // action, launches an external program, or carries an embedded payload —
+    // structural markers no other path inspects (with name hex-escape decoding).
+    if (result.detectedType == "pdf") {
+      const PdfAnalysis pdf = AnalyzePdf(data);
+      for (const auto &f : pdf.findings) {
+        AddFinding(result, f.ruleId, f.message, f.score);
       }
     }
 

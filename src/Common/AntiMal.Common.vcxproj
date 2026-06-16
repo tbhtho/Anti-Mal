@@ -56,6 +56,7 @@
     <ClInclude Include="include\antimal\NetworkTelemetry.h" />
     <ClInclude Include="include\antimal\RegistryTelemetry.h" />
     <ClInclude Include="include\antimal\PacketInspector.h" />
+    <ClInclude Include="include\antimal\PdfAnalyzer.h" />
     <ClInclude Include="include\antimal\PeParser.h" />
     <ClInclude Include="include\antimal\ProcessTelemetry.h" />
     <ClInclude Include="include\antimal\Report.h" />
@@ -92,6 +93,7 @@
     <ClCompile Include="src\NetworkTelemetry.cpp" />
     <ClCompile Include="src\RegistryTelemetry.cpp" />
     <ClCompile Include="src\PacketInspector.cpp" />
+    <ClCompile Include="src\PdfAnalyzer.cpp" />
     <ClCompile Include="src\PeParser.cpp" />
     <ClCompile Include="src\ProcessTelemetry.cpp" />
     <ClCompile Include="src\Report.cpp" />

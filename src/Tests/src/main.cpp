@@ -19,6 +19,7 @@
 #include "antimal/JsonValue.h"
 #include "antimal/NetworkTelemetry.h"
 #include "antimal/PacketInspector.h"
+#include "antimal/PdfAnalyzer.h"
 #include "antimal/PeParser.h"
 #include "antimal/RegistryTelemetry.h"
 #include "antimal/ProcessTelemetry.h"
@@ -4014,6 +4015,90 @@ void TestContainerAnalyzer() {
   }
 }
 
+// PDF maldoc analyzer: structural action markers + name-hex-escape
+// de-obfuscation. Builds synthetic PDFs (header + markers; no object parsing).
+void TestPdfAnalyzer() {
+  using antimal::AnalyzePdf;
+  using antimal::PdfAnalysis;
+  auto bytes = [](const std::string &s) {
+    return std::vector<uint8_t>(s.begin(), s.end());
+  };
+  auto has = [](const PdfAnalysis &a, const char *id) {
+    for (const auto &f : a.findings) {
+      if (f.ruleId == id) return true;
+    }
+    return false;
+  };
+
+  // --- JavaScript that auto-runs on open ---
+  {
+    const auto a = AnalyzePdf(bytes(
+        "%PDF-1.7\n1 0 obj<</OpenAction<</S/JavaScript/JS(app.alert\\(1\\))>>>>\n"
+        "endobj\n%%EOF"));
+    Expect(a.isPdf && a.hasJavaScript, "PDF: /JavaScript detected");
+    Expect(has(a, "pdf.javascript"), "PDF: javascript finding");
+    Expect(a.hasAutoAction && has(a, "pdf.auto_action"),
+           "PDF: /OpenAction + JS -> auto-action finding");
+  }
+
+  // --- /Launch external program ---
+  {
+    const auto a =
+        AnalyzePdf(bytes("%PDF-1.5\n/Type/Action/S/Launch/Win<</F(cmd.exe)>>\n"));
+    Expect(a.hasLaunch && has(a, "pdf.launch_action"),
+           "PDF: /Launch action flagged");
+  }
+
+  // --- /EmbeddedFile payload ---
+  {
+    const auto a = AnalyzePdf(
+        bytes("%PDF-1.6\n/Type/Filespec/EF<</F 2 0 R>>/EmbeddedFile\n"));
+    Expect(a.hasEmbeddedFile && has(a, "pdf.embedded_file"),
+           "PDF: /EmbeddedFile flagged");
+  }
+
+  // --- Hex-escaped name hides /JavaScript (/J#61vaScript) ---
+  {
+    const auto a = AnalyzePdf(
+        bytes("%PDF-1.7\n/OpenAction<</S/J#61vaScript/JS(x)>>\n"));
+    Expect(a.hasJavaScript, "PDF: hex-escaped /J#61vaScript decodes to JavaScript");
+    Expect(a.nameObfuscation && has(a, "pdf.name_obfuscation"),
+           "PDF: name hex-escape obfuscation flagged");
+  }
+
+  // --- /URI target extracted ---
+  {
+    const auto a = AnalyzePdf(
+        bytes("%PDF-1.4\n/Type/Action/S/URI/URI(http://evil.example/x)\n"));
+    bool got = false;
+    for (const auto &u : a.uris) {
+      if (u.find("evil.example") != std::string::npos) got = true;
+    }
+    Expect(got, "PDF: /URI action target extracted");
+  }
+
+  // --- Benign PDF: /OpenAction GoTo (no code), /Catalog, no actions ---
+  {
+    const auto a = AnalyzePdf(bytes(
+        "%PDF-1.7\n1 0 obj<</Type/Catalog/Pages 2 0 R/OpenAction[3 0 R/Fit]>>\n"
+        "endobj\ntrailer<</Root 1 0 R>>\n%%EOF"));
+    Expect(a.isPdf, "PDF: benign catalog still identified as a PDF");
+    Expect(a.findings.empty(), "PDF: benign GoTo /OpenAction yields no findings");
+  }
+
+  // --- /JBIG2Decode must NOT match the /JS JavaScript token ---
+  {
+    const auto a = AnalyzePdf(bytes("%PDF-1.5\n/Filter/JBIG2Decode\n"));
+    Expect(!a.hasJavaScript, "PDF: /JBIG2Decode is not a /JS JavaScript token");
+  }
+
+  // --- Non-PDF input ---
+  {
+    Expect(!AnalyzePdf(bytes("MZ\x90 this is not a pdf")).isPdf,
+           "PDF: non-PDF input rejected");
+  }
+}
+
 // Import-table -> behavioral-capability mapping (the static "what can this do"
 // row). Pure over a synthetic "dll!func" import list.
 void TestImportCapabilities() {
@@ -7931,6 +8016,7 @@ int main() {
     TestShellLinkParser();
     TestScriptAnalyzer();
     TestContainerAnalyzer();
+    TestPdfAnalyzer();
     TestImportCapabilities();
     TestBrowserRisk();
     TestStringExtraction();
