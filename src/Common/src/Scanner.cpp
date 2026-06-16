@@ -5,6 +5,7 @@
 #include "antimal/FileUtil.h"
 #include "antimal/IntelLookup.h"
 #include "antimal/PeParser.h"
+#include "antimal/ScriptAnalyzer.h"
 #include "antimal/ShellLinkParser.h"
 #include "antimal/Strings.h"
 #include "antimal/Tagger.h"
@@ -540,6 +541,25 @@ ScanResult ScanFile(const std::filesystem::path &path,
       }
     }
 
+    // Script routing: scripts (PowerShell/JScript/VBScript/batch/HTA/WSF) are
+    // the dominant non-PE delivery format the PE pipeline never sees. Analyze
+    // whenever the content is not a known binary container (AnalyzeScript gates
+    // on a text/binary check internally, so an extensionless or mis-extensioned
+    // dropper is still covered). Recovered C2 URLs are merged into result.iocs
+    // AFTER Enrich() below, which reassigns result.iocs.
+    std::vector<std::string> scriptRecoveredUrls;
+    if (result.detectedType.empty() || result.detectedType == "script") {
+      const std::string ext = ToLowerAscii(PathToUtf8(path.extension()));
+      const ScriptAnalysis script = AnalyzeScript(data, ext);
+      if (script.isScript) {
+        result.detectedType = script.language; // e.g. "powershell"
+        for (const auto &f : script.findings) {
+          AddFinding(result, f.ruleId, f.message, f.score);
+        }
+        scriptRecoveredUrls = script.recoveredUrls;
+      }
+    }
+
     const PeInfo pe = ParsePe(data);
     result.isPe = pe.isPe;
     result.imports = pe.imports;
@@ -704,6 +724,16 @@ ScanResult ScanFile(const std::filesystem::path &path,
 
     // Enrichment pipeline (strings/IOCs, YARA, capa, DIE, intel, tagger).
     Enrich(result, data, options);
+
+    // Merge C2 URLs recovered from deobfuscated script layers (e.g. a decoded
+    // PowerShell -EncodedCommand). Done here because Enrich() reassigns
+    // result.iocs from the plaintext miner, which would otherwise drop them.
+    for (const auto &u : scriptRecoveredUrls) {
+      if (std::find(result.iocs.urls.begin(), result.iocs.urls.end(), u) ==
+          result.iocs.urls.end()) {
+        result.iocs.urls.push_back(u);
+      }
+    }
 
     result.score = std::min(result.score, 100);
     result.verdict = VerdictFromScore(result.score);

