@@ -826,7 +826,7 @@ std::string FormatScanText(const ScanResult &result) {
   out << "  score: " << result.score << " (" << ToString(result.verdict) << ")\n";
   out << "  entropy: " << result.entropy << "\n";
   if (!result.detectedType.empty()) {
-    out << "  type: " << result.detectedType << " (by magic bytes)\n";
+    out << "  type: " << result.detectedType << " (detected by content)\n";
   }
   out << "  pe: " << (result.isPe ? "yes" : "no")
       << ", signed: " << (result.authenticodeSigned ? "yes" : "no") << "\n";
