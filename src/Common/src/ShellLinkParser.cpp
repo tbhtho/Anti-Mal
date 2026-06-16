@@ -145,9 +145,12 @@ ShellLinkInfo ParseShellLink(const std::vector<uint8_t> &data) {
   // Weaponized-LNK detection: the target (relative path / resolved LocalBasePath)
   // or the arguments invoke a LOLBin. Most malicious shortcuts also stamp the
   // interpreter name straight into the arguments (cmd target, powershell args).
-  const std::string hay = ToLowerAscii(info.relativePath + "\n" + info.localBasePath +
-                                       "\n" + info.commandLineArgs + "\n" +
-                                       info.iconLocation);
+  // The presentation-only ICON_LOCATION is excluded: benign shortcuts routinely
+  // borrow a system binary's icon (e.g. cmd.exe,0), which must not read as
+  // "launches a LOLBin".
+  const std::string hay = ToLowerAscii(info.relativePath + "\n" +
+                                       info.localBasePath + "\n" +
+                                       info.commandLineArgs);
   if (const char *l = MatchLolbin(hay)) {
     info.runsLolbin = true;
     info.lolbin = l;

@@ -181,9 +181,13 @@ void AnalyzeZip(const std::vector<uint8_t> &d, ContainerAnalysis &out) {
       list += execNames[i];
     }
     if (execNames.size() > 5) list += ", +" + std::to_string(execNames.size() - 5) + " more";
+    // Modest weight: a bare executable member is extremely common in legitimate
+    // software distributions, so on its own (even alongside an encrypted entry)
+    // it must stay below the Suspicious bar. The double-extension lure below
+    // carries the higher, malice-specific weight.
     out.findings.push_back(
         {"archive.executable_payload",
-         "Archive contains executable payload(s): " + list, 35});
+         "Archive contains executable payload(s): " + list, 20});
   }
   if (!doubleExtNames.empty()) {
     out.findings.push_back(
@@ -203,8 +207,11 @@ void AnalyzeOle(const std::vector<uint8_t> &d, ContainerAnalysis &out) {
   out.kind = "ole";
   // VBA-macro presence: the OLE storage/stream names that always accompany a
   // VBA project. Reliable from the raw directory bytes (UTF-16LE).
-  static const std::array<const char *, 6> kVbaMarkers = {
-      "_VBA_PROJECT", "VBA", "Macros", "ThisDocument", "vbaProject", "Module1"};
+  // Specific OLE storage/stream names that accompany a real VBA project. The
+  // bare 3-char "VBA" is deliberately excluded — it matches incidental document
+  // text (a tutorial that merely mentions VBA) and falsely asserts a macro.
+  static const std::array<const char *, 5> kVbaMarkers = {
+      "_VBA_PROJECT", "vbaProject", "Macros", "ThisDocument", "Module1"};
   for (const char *m : kVbaMarkers) {
     if (ContainsAsciiOrUtf16(d, m)) {
       out.hasMacros = true;
@@ -233,9 +240,11 @@ void AnalyzeOle(const std::vector<uint8_t> &d, ContainerAnalysis &out) {
       break;
     }
   }
-  // OLE-embedded exploit objects (memory-corruption maldocs).
-  static const std::array<const char *, 4> kExploitObjects = {
-      "Equation.3", "Microsoft Equation", "OLE2Link", "Package"};
+  // OLE-embedded exploit objects (memory-corruption maldocs). Only specific
+  // exploit-associated class names — NOT the generic "Package" (Object Packager)
+  // storage that any benign document with an embedded attachment carries.
+  static const std::array<const char *, 3> kExploitObjects = {
+      "Equation.3", "Microsoft Equation", "OLE2Link"};
   for (const char *m : kExploitObjects) {
     if (ContainsAsciiOrUtf16(d, m)) {
       out.findings.push_back(

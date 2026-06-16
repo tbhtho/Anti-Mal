@@ -237,10 +237,20 @@ ScriptAnalysis AnalyzeScript(const std::vector<uint8_t> &data,
   }
 
   // -- Download cradles / network fetch --
-  if (any({"downloadstring", "downloadfile", "downloaddata", "net.webclient",
-           "invoke-webrequest", "invoke-restmethod", "start-bitstransfer"})) {
+  // The Net.WebClient/DownloadString family is the high-signal cradle pattern.
+  if (any({"downloadstring", "downloadfile", "downloaddata", "net.webclient"})) {
     add("script.download_cradle",
-        "Downloads content from a remote host (download cradle)", 30);
+        "Downloads content from a remote host (Net.WebClient download cradle)",
+        30);
+  } else if (any({"invoke-webrequest", "invoke-restmethod", "start-bitstransfer",
+                  "iwr ", " irm "})) {
+    // Invoke-WebRequest / -RestMethod / BITS are first-class supported cmdlets,
+    // pervasive in legitimate installers and CI bootstrap. Flag at a lower
+    // weight so a download alone (even with hidden/bypass flags) can't reach
+    // the Suspicious bar without a corroborating cradle/obfuscation signal.
+    add("script.web_download",
+        "Downloads content from a remote host (Invoke-WebRequest / -RestMethod)",
+        15);
   }
   if (any({"-urlcache", "bitsadmin", "/transfer"}) ||
       (any({"certutil"}) && any({"-decode", "-urlcache", "-split"})) ||

