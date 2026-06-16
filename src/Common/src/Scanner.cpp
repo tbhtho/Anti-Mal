@@ -4,6 +4,7 @@
 #include "antimal/ExternalTools.h"
 #include "antimal/FileUtil.h"
 #include "antimal/IntelLookup.h"
+#include "antimal/ContainerAnalyzer.h"
 #include "antimal/PeParser.h"
 #include "antimal/ScriptAnalyzer.h"
 #include "antimal/ShellLinkParser.h"
@@ -557,6 +558,22 @@ ScanResult ScanFile(const std::filesystem::path &path,
           AddFinding(result, f.ruleId, f.message, f.score);
         }
         scriptRecoveredUrls = script.recoveredUrls;
+      }
+    }
+
+    // Container routing: OLE documents (legacy .doc/.xls macros) and zip-family
+    // containers (OOXML macro docs + archives smuggling executables) — neither
+    // the PE nor the script path inspects these.
+    if (result.detectedType == "ole" || result.detectedType == "zip") {
+      const std::string ext = ToLowerAscii(PathToUtf8(path.extension()));
+      const ContainerAnalysis container = AnalyzeContainer(data, ext);
+      if (container.isContainer) {
+        if (!container.kind.empty()) {
+          result.detectedType = container.kind; // "ooxml" | "ole" | "zip"
+        }
+        for (const auto &f : container.findings) {
+          AddFinding(result, f.ruleId, f.message, f.score);
+        }
       }
     }
 

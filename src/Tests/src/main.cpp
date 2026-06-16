@@ -3,6 +3,7 @@
 #include "antimal/BridgeRouter.h"
 #include "antimal/BrowserImpact.h"
 #include "antimal/Config.h"
+#include "antimal/ContainerAnalyzer.h"
 #include "antimal/Crypto.h"
 #include "antimal/DetonationProtocol.h"
 #include "antimal/EventJournal.h"
@@ -3776,6 +3777,155 @@ void TestScriptAnalyzer() {
       if (u.find("c2.recovered") != std::string::npos) url = true;
     }
     Expect(url, "PS scan: deobfuscated C2 URL merged into IOC set");
+  }
+}
+
+// Container analyzer: OLE/OOXML macro detection + zip archive payload
+// inspection. Builds synthetic OLE marker blobs and a minimal valid zip
+// (local headers + central directory + EOCD) to exercise the detectors.
+void TestContainerAnalyzer() {
+  using antimal::AnalyzeContainer;
+  using antimal::ContainerAnalysis;
+  auto has = [](const ContainerAnalysis &a, const char *id) {
+    for (const auto &f : a.findings) {
+      if (f.ruleId == id) return true;
+    }
+    return false;
+  };
+
+  // Minimal valid ZIP with the given (name, encrypted) entries; no file data.
+  auto buildZip = [](const std::vector<std::pair<std::string, bool>> &entries) {
+    std::vector<uint8_t> z;
+    auto u16 = [&](uint16_t v) {
+      z.push_back(static_cast<uint8_t>(v & 0xFF));
+      z.push_back(static_cast<uint8_t>((v >> 8) & 0xFF));
+    };
+    auto u32 = [&](uint32_t v) {
+      for (int i = 0; i < 4; ++i) z.push_back(static_cast<uint8_t>((v >> (8 * i)) & 0xFF));
+    };
+    std::vector<uint32_t> localOffsets;
+    for (const auto &e : entries) {
+      localOffsets.push_back(static_cast<uint32_t>(z.size()));
+      u32(0x04034b50);                                   // local header sig
+      u16(20);                                           // version needed
+      u16(e.second ? 0x0001 : 0x0000);                   // gp flag (bit0=encrypted)
+      u16(0); u16(0); u16(0);                            // method, time, date
+      u32(0); u32(0); u32(0);                            // crc, comp, uncomp
+      u16(static_cast<uint16_t>(e.first.size()));        // name len
+      u16(0);                                            // extra len
+      for (char c : e.first) z.push_back(static_cast<uint8_t>(c));
+    }
+    const uint32_t cdStart = static_cast<uint32_t>(z.size());
+    for (size_t i = 0; i < entries.size(); ++i) {
+      const auto &e = entries[i];
+      u32(0x02014b50);                                   // central dir sig
+      u16(20); u16(20);                                  // version made/needed
+      u16(e.second ? 0x0001 : 0x0000);                   // gp flag
+      u16(0); u16(0); u16(0);                            // method, time, date
+      u32(0); u32(0); u32(0);                            // crc, comp, uncomp
+      u16(static_cast<uint16_t>(e.first.size()));        // name len
+      u16(0); u16(0); u16(0);                            // extra, comment, disk
+      u16(0); u32(0);                                    // int/ext attrs
+      u32(localOffsets[i]);                              // local header offset
+      for (char c : e.first) z.push_back(static_cast<uint8_t>(c));
+    }
+    const uint32_t cdSize = static_cast<uint32_t>(z.size()) - cdStart;
+    u32(0x06054b50);                                     // EOCD sig
+    u16(0); u16(0);                                      // disk numbers
+    u16(static_cast<uint16_t>(entries.size()));          // entries this disk
+    u16(static_cast<uint16_t>(entries.size()));          // total entries
+    u32(cdSize); u32(cdStart); u16(0);                   // size, offset, comment
+    return z;
+  };
+
+  // OLE compound-file header + a UTF-16LE marker string appended.
+  auto buildOle = [](const std::vector<std::string> &utf16Markers) {
+    std::vector<uint8_t> b = {0xD0, 0xCF, 0x11, 0xE0, 0xA1, 0xB1, 0x1A, 0xE1};
+    b.resize(512, 0); // header region
+    for (const auto &m : utf16Markers) {
+      for (char c : m) {
+        b.push_back(static_cast<uint8_t>(c));
+        b.push_back(0x00); // UTF-16LE
+      }
+      b.push_back(0x00);
+      b.push_back(0x00);
+    }
+    return b;
+  };
+
+  // --- OOXML macro document: word/vbaProject.bin present ---
+  {
+    auto z = buildZip({{"[Content_Types].xml", false},
+                       {"word/document.xml", false},
+                       {"word/vbaProject.bin", false}});
+    const auto a = AnalyzeContainer(z, ".docm");
+    Expect(a.isContainer && a.kind == "ooxml", "OOXML container classified");
+    Expect(a.hasMacros && has(a, "macro.vba_present"),
+           "OOXML vbaProject.bin -> macro present");
+  }
+
+  // --- ZIP archive smuggling an executable + a password-protected entry ---
+  {
+    auto z = buildZip({{"readme.txt", false},
+                       {"setup.exe", false},
+                       {"secret.bin", true}});
+    const auto a = AnalyzeContainer(z, ".zip");
+    Expect(a.isContainer && a.kind == "zip", "plain zip classified");
+    Expect(has(a, "archive.executable_payload"),
+           "zip with .exe entry -> executable payload flagged");
+    Expect(has(a, "archive.encrypted"),
+           "zip with encrypted entry -> encrypted flagged");
+  }
+
+  // --- Double-extension lure inside a zip ---
+  {
+    auto z = buildZip({{"invoice.pdf.exe", false}});
+    const auto a = AnalyzeContainer(z, ".zip");
+    Expect(has(a, "archive.double_extension"),
+           "invoice.pdf.exe -> double-extension flagged");
+  }
+
+  // --- Benign zip: only a text file, no findings ---
+  {
+    auto z = buildZip({{"notes.txt", false}});
+    const auto a = AnalyzeContainer(z, ".zip");
+    Expect(a.isContainer && a.findings.empty(),
+           "benign zip has no malicious findings");
+  }
+
+  // --- OLE with VBA storage names + an auto-exec procedure name ---
+  {
+    auto b = buildOle({"VBA", "_VBA_PROJECT", "Macros", "ThisDocument",
+                       "Document_Open"});
+    const auto a = AnalyzeContainer(b, ".doc");
+    Expect(a.isContainer && a.kind == "ole", "OLE container classified");
+    Expect(a.hasMacros && has(a, "macro.vba_present"),
+           "OLE VBA storage names -> macro present");
+    Expect(a.hasAutoExecMacro && has(a, "macro.auto_exec"),
+           "OLE Document_Open -> auto-exec macro flagged");
+  }
+
+  // --- OLE exploit object: Equation Editor (CVE-2017-11882 family) ---
+  {
+    auto b = buildOle({"Equation.3"});
+    const auto a = AnalyzeContainer(b, ".doc");
+    Expect(has(a, "ole.exploit_object"),
+           "OLE Equation.3 object -> exploit-object flagged");
+  }
+
+  // --- Non-container input is rejected ---
+  {
+    std::vector<uint8_t> txt = {'h', 'e', 'l', 'l', 'o', ' ', 'w', 'o', 'r', 'l', 'd'};
+    Expect(!AnalyzeContainer(txt, ".txt").isContainer,
+           "plain text is not a container");
+  }
+
+  // --- Truncated zip (EOCD points past the buffer) does not crash ---
+  {
+    std::vector<uint8_t> z = {'P', 'K', 0x03, 0x04};
+    z.resize(40, 0);
+    const auto a = AnalyzeContainer(z, ".zip");
+    Expect(a.isContainer, "garbage-after-PK still classified as a zip-family container");
   }
 }
 
@@ -7695,6 +7845,7 @@ int main() {
     TestFileTypeId();
     TestShellLinkParser();
     TestScriptAnalyzer();
+    TestContainerAnalyzer();
     TestImportCapabilities();
     TestBrowserRisk();
     TestStringExtraction();
