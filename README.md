@@ -34,6 +34,7 @@ In-guest sample execution is **wired but gated off by default** behind a two-key
     - **`.lnk` shortcuts** (MS-SHLLINK): recovers the embedded command line + target and flags a shortcut that silently launches a LOLBin (powershell/cmd/mshta/rundll32/…)
     - **Office / OLE documents**: VBA-macro presence, auto-exec entry points, and embedded exploit objects (Equation Editor CVE-2017-11882 family)
     - **archives / OOXML** (zip family): macro-doc detection (`vbaProject.bin`) plus executable payloads, double-extension lures, and password-protected entries
+    - **PDF**: `/JavaScript`, auto-actions (`/OpenAction`,`/AA`), `/Launch` external-program, `/EmbeddedFile`, and `/RichMedia` — with PDF name hex-escape de-obfuscation (`/J#61vaScript` → `/JavaScript`)
   - ASCII/UTF-16 string extraction + IOC mining for URLs, IPs, domains, registry paths, file paths, mutex hints, base64 blobs, and suspicious APIs
   - **obfuscated-C2 recovery**: single-byte XOR, multi-byte (2–4 byte repeating-key) XOR, and base64-wrapped URLs/IPs/domains the plaintext miner can't see
   - import-table → behavioral-capability mapping (anti-debug, keylogging, screen capture, injection, …)

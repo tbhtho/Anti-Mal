@@ -24,9 +24,19 @@ and routes `ScanFile` to them by magic bytes. All TDD, no boots, build + tests g
   storage names + OOXML `vbaProject.bin`), best-effort auto-exec entry points, OLE
   exploit objects (Equation Editor CVE-2017-11882), and walks a zip central directory to
   flag executable payloads, double-extension lures, and password-protected entries.
+- **PDF maldoc analyzer (T69):** `PdfAnalyzer` flags `/JavaScript`, auto-actions
+  (`/OpenAction`,`/AA`), `/Launch`, `/EmbeddedFile`, and `/RichMedia`, de-obfuscating PDF
+  name hex-escapes (`/J#61vaScript` → `/JavaScript`) and using complete-name-token
+  matching to limit false positives.
 - **File-type routing (T48):** `ScanFile` dispatches by magic bytes and re-classifies
-  `detectedType` (powershell/ooxml/…); `ScanPath` now sweeps scripts/shortcuts/docs/
+  `detectedType` (powershell/ooxml/pdf/…); `ScanPath` now sweeps scripts/shortcuts/docs/
   archives, not just `.exe/.dll/.scr/.sys/.bin`.
+- **Adversarial review + FP calibration:** a multi-pass adversarial review of the new
+  untrusted-byte parsers found **zero memory-safety bugs** and 5 false-positive
+  calibration issues, all fixed with regression tests (benign "Package" OLE object no
+  longer accused of CVE-2017-11882; bare "VBA" no longer asserts a macro; benign installer
+  zip and benign `Invoke-WebRequest` scripts stay below Suspicious; a `.lnk` borrowing
+  cmd.exe's icon is no longer "weaponized").
 - **UI/report:** the scan panel now surfaces the detected file type + a score-sorted
   findings table (Any.Run-style tracker rows). Fixed the CLI's "(by magic bytes)" type
   label, which is now content-classified for scripts/OOXML.
