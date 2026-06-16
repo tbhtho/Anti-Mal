@@ -4,6 +4,7 @@
 #include "antimal/ExternalTools.h"
 #include "antimal/FileUtil.h"
 #include "antimal/IntelLookup.h"
+#include "antimal/ConfigExtractor.h"
 #include "antimal/ContainerAnalyzer.h"
 #include "antimal/PdfAnalyzer.h"
 #include "antimal/PeParser.h"
@@ -550,6 +551,7 @@ ScanResult ScanFile(const std::filesystem::path &path,
     // dropper is still covered). Recovered C2 URLs are merged into result.iocs
     // AFTER Enrich() below, which reassigns result.iocs.
     std::vector<std::string> scriptRecoveredUrls;
+    CobaltStrikeConfig csConfig; // populated below; C2 merged into IOCs post-Enrich
     if (result.detectedType.empty() || result.detectedType == "script") {
       const std::string ext = ToLowerAscii(PathToUtf8(path.extension()));
       const ScriptAnalysis script = AnalyzeScript(data, ext);
@@ -586,6 +588,22 @@ ScanResult ScanFile(const std::filesystem::path &path,
       for (const auto &f : pdf.findings) {
         AddFinding(result, f.ruleId, f.message, f.score);
       }
+    }
+
+    // Config / C2 extraction (any file type): recover an embedded Cobalt Strike
+    // beacon configuration statically — the C2 it would talk to, without
+    // detonation. A decoded CS config is a definitive malware verdict.
+    csConfig = ExtractCobaltStrikeConfig(data);
+    if (csConfig.found) {
+      std::string msg = "Cobalt Strike beacon configuration extracted (XOR 0x";
+      static const char kHex[] = "0123456789ABCDEF";
+      msg += kHex[(csConfig.xorKey >> 4) & 0xF];
+      msg += kHex[csConfig.xorKey & 0xF];
+      msg += ")";
+      if (csConfig.port) msg += ", port " + std::to_string(csConfig.port);
+      if (!csConfig.c2Servers.empty()) msg += ", C2 " + csConfig.c2Servers.front();
+      if (!csConfig.userAgent.empty()) msg += ", UA '" + csConfig.userAgent + "'";
+      AddFinding(result, "config.cobalt_strike", msg, 90);
     }
 
     const PeInfo pe = ParsePe(data);
@@ -760,6 +778,22 @@ ScanResult ScanFile(const std::filesystem::path &path,
       if (std::find(result.iocs.urls.begin(), result.iocs.urls.end(), u) ==
           result.iocs.urls.end()) {
         result.iocs.urls.push_back(u);
+      }
+    }
+
+    // Merge Cobalt Strike C2 hosts (extracted from the decoded config) into the
+    // IOC set — categorized as IP vs domain.
+    if (csConfig.found) {
+      auto looksLikeIpv4 = [](const std::string &h) {
+        return !h.empty() &&
+               h.find_first_not_of("0123456789.") == std::string::npos &&
+               std::count(h.begin(), h.end(), '.') == 3;
+      };
+      for (const auto &host : csConfig.c2Servers) {
+        auto &list = looksLikeIpv4(host) ? result.iocs.ips : result.iocs.domains;
+        if (std::find(list.begin(), list.end(), host) == list.end()) {
+          list.push_back(host);
+        }
       }
     }
 

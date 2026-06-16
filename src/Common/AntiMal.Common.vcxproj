@@ -37,6 +37,7 @@
     <ClInclude Include="include\antimal\BridgeRouter.h" />
     <ClInclude Include="include\antimal\BrowserImpact.h" />
     <ClInclude Include="include\antimal\Config.h" />
+    <ClInclude Include="include\antimal\ConfigExtractor.h" />
     <ClInclude Include="include\antimal\ContainerAnalyzer.h" />
     <ClInclude Include="include\antimal\BehaviorScore.h" />
     <ClInclude Include="include\antimal\Crypto.h" />
@@ -75,6 +76,7 @@
     <ClCompile Include="src\BridgeRouter.cpp" />
     <ClCompile Include="src\BrowserImpact.cpp" />
     <ClCompile Include="src\Config.cpp" />
+    <ClCompile Include="src\ConfigExtractor.cpp" />
     <ClCompile Include="src\ContainerAnalyzer.cpp" />
     <ClCompile Include="src\Crypto.cpp" />
     <ClCompile Include="src\EventJournal.cpp" />

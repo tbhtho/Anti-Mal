@@ -3,6 +3,7 @@
 #include "antimal/BridgeRouter.h"
 #include "antimal/BrowserImpact.h"
 #include "antimal/Config.h"
+#include "antimal/ConfigExtractor.h"
 #include "antimal/ContainerAnalyzer.h"
 #include "antimal/Crypto.h"
 #include "antimal/DetonationProtocol.h"
@@ -4099,6 +4100,103 @@ void TestPdfAnalyzer() {
   }
 }
 
+// Cobalt Strike beacon-config extraction: build a synthetic XOR-encoded TLV
+// config, embed it in a buffer, and assert the C2/port/UA are recovered. The
+// marquee config/C2 extraction win (T18).
+void TestCobaltStrikeConfig() {
+  using antimal::CobaltStrikeConfig;
+  using antimal::ExtractCobaltStrikeConfig;
+
+  // Build a CS config block (index/type/len BE TLV records) and XOR-encode it
+  // with `key`, embedded between junk bytes.
+  auto build = [](uint8_t key) {
+    std::vector<uint8_t> tlv;
+    auto rec = [&](uint16_t idx, uint16_t type, const std::vector<uint8_t> &val) {
+      tlv.push_back(static_cast<uint8_t>(idx >> 8));
+      tlv.push_back(static_cast<uint8_t>(idx & 0xFF));
+      tlv.push_back(static_cast<uint8_t>(type >> 8));
+      tlv.push_back(static_cast<uint8_t>(type & 0xFF));
+      tlv.push_back(static_cast<uint8_t>(val.size() >> 8));
+      tlv.push_back(static_cast<uint8_t>(val.size() & 0xFF));
+      tlv.insert(tlv.end(), val.begin(), val.end());
+    };
+    auto sh = [](uint16_t v) {
+      return std::vector<uint8_t>{static_cast<uint8_t>(v >> 8),
+                                  static_cast<uint8_t>(v & 0xFF)};
+    };
+    auto in = [](uint32_t v) {
+      return std::vector<uint8_t>{
+          static_cast<uint8_t>(v >> 24), static_cast<uint8_t>(v >> 16),
+          static_cast<uint8_t>(v >> 8), static_cast<uint8_t>(v & 0xFF)};
+    };
+    auto st = [](const std::string &s) {
+      return std::vector<uint8_t>(s.begin(), s.end());
+    };
+    rec(1, 1, sh(8));                              // BeaconType = HTTPS
+    rec(2, 1, sh(443));                            // Port
+    rec(3, 2, in(60000));                          // SleepTime ms
+    rec(5, 1, sh(37));                             // Jitter
+    rec(8, 3, st("192.168.1.10,/submit.php"));     // C2
+    rec(9, 3, st("Mozilla/5.0 (Windows NT 10.0; Win64; x64)")); // UserAgent
+    rec(37, 2, in(0x12345678));                    // Watermark
+    rec(0, 0, {});                                 // terminator
+    std::vector<uint8_t> buf(64, 0xCC);            // junk prefix
+    for (uint8_t b : tlv) buf.push_back(static_cast<uint8_t>(b ^ key));
+    buf.resize(buf.size() + 32, 0xDD);             // junk suffix
+    return buf;
+  };
+
+  for (uint8_t key : {static_cast<uint8_t>(0x2e), static_cast<uint8_t>(0x69)}) {
+    const CobaltStrikeConfig cfg = ExtractCobaltStrikeConfig(build(key));
+    Expect(cfg.found, "CS: config located + decoded");
+    Expect(cfg.xorKey == key, "CS: correct XOR key reported");
+    Expect(cfg.beaconType == 8, "CS: beacon type (HTTPS) decoded");
+    Expect(cfg.port == 443, "CS: C2 port decoded");
+    Expect(cfg.sleepMs == 60000, "CS: sleep time decoded");
+    Expect(cfg.jitter == 37, "CS: jitter decoded");
+    Expect(cfg.watermark == 0x12345678u, "CS: watermark decoded");
+    Expect(cfg.userAgent.find("Mozilla") != std::string::npos,
+           "CS: user-agent decoded");
+    bool host = false, uri = false;
+    for (const auto &h : cfg.c2Servers)
+      if (h == "192.168.1.10") host = true;
+    for (const auto &u : cfg.uris)
+      if (u == "/submit.php") uri = true;
+    Expect(host, "CS: C2 host parsed");
+    Expect(uri, "CS: request URI parsed");
+  }
+
+  // No config present -> not found, no crash.
+  {
+    std::vector<uint8_t> junk(512, 0xAB);
+    Expect(!ExtractCobaltStrikeConfig(junk).found,
+           "CS: random bytes contain no config");
+    Expect(!ExtractCobaltStrikeConfig({}).found, "CS: empty input is safe");
+  }
+
+  // --- End-to-end: ScanFile surfaces the CS config as a high-confidence finding
+  // and the C2 in the IOC set. ---
+  {
+    const auto buf = build(0x2e);
+    const auto tmp =
+        std::filesystem::temp_directory_path() / "antimal_test_beacon.bin";
+    {
+      std::ofstream os(tmp, std::ios::binary);
+      os.write(reinterpret_cast<const char *>(buf.data()),
+               static_cast<std::streamsize>(buf.size()));
+    }
+    const antimal::ScanResult r = antimal::ScanFile(tmp);
+    std::error_code ec;
+    std::filesystem::remove(tmp, ec);
+    bool finding = false;
+    for (const auto &f : r.findings)
+      if (f.ruleId == "config.cobalt_strike") finding = true;
+    Expect(finding, "CS scan: cobalt_strike finding surfaced");
+    Expect(r.verdict == antimal::Verdict::Malicious,
+           "CS scan: a beacon config is a malicious verdict");
+  }
+}
+
 // Import-table -> behavioral-capability mapping (the static "what can this do"
 // row). Pure over a synthetic "dll!func" import list.
 void TestImportCapabilities() {
@@ -8017,6 +8115,7 @@ int main() {
     TestScriptAnalyzer();
     TestContainerAnalyzer();
     TestPdfAnalyzer();
+    TestCobaltStrikeConfig();
     TestImportCapabilities();
     TestBrowserRisk();
     TestStringExtraction();
