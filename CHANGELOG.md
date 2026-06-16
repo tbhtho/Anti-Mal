@@ -31,6 +31,12 @@ and routes `ScanFile` to them by magic bytes. All TDD, no boots, build + tests g
 - **File-type routing (T48):** `ScanFile` dispatches by magic bytes and re-classifies
   `detectedType` (powershell/ooxml/pdf/…); `ScanPath` now sweeps scripts/shortcuts/docs/
   archives, not just `.exe/.dll/.scr/.sys/.bin`.
+- **Cobalt Strike beacon-config extractor (T18 — static C2 extraction):** `ConfigExtractor`
+  locates an embedded CS beacon config (XOR-encoded TLV, key 0x2e/0x69), decodes it, and
+  recovers the C2 host(s)/port/user-agent/sleep/watermark **without detonation** — surfaced
+  as a high-confidence `config.cobalt_strike` finding (→ Malicious) with the C2 merged into
+  the IOC set. FP-guarded (a hit requires a valid port + C2, not just the signature). The
+  marquee gap vs commercial sandboxes; first family of an extensible config-extraction layer.
 - **Adversarial review + FP calibration:** a multi-pass adversarial review of the new
   untrusted-byte parsers found **zero memory-safety bugs** and 5 false-positive
   calibration issues, all fixed with regression tests (benign "Package" OLE object no
