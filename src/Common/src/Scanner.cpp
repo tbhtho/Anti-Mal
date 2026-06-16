@@ -5,6 +5,7 @@
 #include "antimal/FileUtil.h"
 #include "antimal/IntelLookup.h"
 #include "antimal/PeParser.h"
+#include "antimal/ShellLinkParser.h"
 #include "antimal/Strings.h"
 #include "antimal/Tagger.h"
 
@@ -508,6 +509,37 @@ ScanResult ScanFile(const std::filesystem::path &path,
       }
     }
 
+    // Shell-link (.lnk) routing: a shortcut whose target is a living-off-the-land
+    // binary and whose arguments carry an encoded payload is a top-tier delivery
+    // vector that no PE-centric analysis would ever see. Recover + flag it.
+    if (result.detectedType == "lnk") {
+      const ShellLinkInfo lnk = ParseShellLink(data);
+      if (lnk.isLnk) {
+        auto cap = [](std::string s, size_t n) {
+          if (s.size() > n) s = s.substr(0, n) + "...";
+          return s;
+        };
+        const std::string target =
+            !lnk.localBasePath.empty() ? lnk.localBasePath : lnk.relativePath;
+        if (lnk.runsLolbin) {
+          AddFinding(result, "lnk.weaponized",
+                     "Shortcut silently launches LOLBin '" + lnk.lolbin + "'" +
+                         (target.empty() ? "" : " (target " + cap(target, 120) + ")") +
+                         (lnk.commandLineArgs.empty()
+                              ? ""
+                              : " with arguments: " + cap(lnk.commandLineArgs, 240)),
+                     45);
+        } else if (!lnk.commandLineArgs.empty() || !target.empty()) {
+          AddFinding(result, "lnk.command_line",
+                     "Shortcut target '" + cap(target, 120) + "'" +
+                         (lnk.commandLineArgs.empty()
+                              ? ""
+                              : " args: " + cap(lnk.commandLineArgs, 240)),
+                     5);
+        }
+      }
+    }
+
     const PeInfo pe = ParsePe(data);
     result.isPe = pe.isPe;
     result.imports = pe.imports;
@@ -710,9 +742,21 @@ std::vector<ScanResult> ScanPath(const std::filesystem::path &path,
       ec.clear();
       continue;
     }
+    // Extensions worth analyzing in a directory sweep: native executables plus
+    // the non-PE delivery formats malware actually ships in (shortcuts that
+    // launch LOLBins; scripts; macro-bearing documents; archives/containers).
+    // ScanFile routes each to the right analyzer by magic bytes.
+    static const std::set<std::string> kScanExtensions = {
+        ".exe", ".dll", ".scr", ".sys", ".bin", ".com", ".cpl", ".ocx",
+        ".lnk",
+        ".ps1", ".psm1", ".bat", ".cmd", ".vbs", ".vbe", ".js", ".jse",
+        ".wsf", ".wsh", ".hta",
+        ".doc", ".docm", ".dot", ".dotm", ".xls", ".xlsm", ".xlsb", ".xlsx",
+        ".ppt", ".pptm", ".docx", ".rtf",
+        ".zip", ".jar", ".cab", ".7z", ".rar", ".iso", ".img", ".gz",
+        ".pdf"};
     const auto ext = ToLowerAscii(entry.path().extension().string());
-    if (ext == ".exe" || ext == ".dll" || ext == ".scr" || ext == ".sys" ||
-        ext == ".bin") {
+    if (kScanExtensions.count(ext)) {
       results.push_back(ScanFile(entry.path(), options));
     }
   }
