@@ -38,35 +38,56 @@ Write-Host "=== Fix-AntiMalBase ===" -ForegroundColor Cyan
 if (-not (Test-Path $base)) { throw "base VHDX not found: $base" }
 
 # --- 1. Backup -------------------------------------------------------------
-$bak = "$base.bak-cipfix-$(Get-Date -Format yyyyMMdd-HHmmss)"
-Write-Host "[1/6] Backing up base (14 GB; a few minutes)..."
-$free = (Get-PSDrive ($base.Substring(0,1))).Free
+# The only base mutations here (rename a .cip, write a .ps1) are individually
+# reversible, but keep a full-image restore point too. Reuse an existing full
+# backup if present (saves a 14 GB copy + disk space); else make one if it fits.
+Write-Host "[1/6] Ensuring a base restore point..."
 $size = (Get-Item $base).Length
-if ($free -lt $size * 1.1) { throw "Not enough free space for a backup ($([math]::Round($size/1GB,1)) GB needed)." }
-Copy-Item -LiteralPath $base -Destination $bak
-Note "backup -> $bak"
+$existing = Get-ChildItem (Split-Path $base) -Filter 'AntiMalBase.vhdx.bak*' -ErrorAction SilentlyContinue |
+            Where-Object { $_.Length -ge $size * 0.9 } | Sort-Object LastWriteTime -Descending | Select-Object -First 1
+if ($existing) {
+  $bak = $existing.FullName
+  Note "reusing existing full backup: $($existing.Name) ($([math]::Round($existing.Length/1GB,1)) GB)"
+} else {
+  $bak = "$base.bak-cipfix-$(Get-Date -Format yyyyMMdd-HHmmss)"
+  $free = (Get-PSDrive ($base.Substring(0,1))).Free
+  if ($free -lt $size * 1.1) { throw "No existing backup and not enough free space ($([math]::Round($size/1GB,1)) GB needed). Free space or keep a .bak." }
+  Copy-Item -LiteralPath $base -Destination $bak
+  Note "backup -> $bak"
+}
 
 # --- 2. Mount --------------------------------------------------------------
 Write-Host "[2/6] Mounting base read/write..."
 $img = Mount-DiskImage -ImagePath $base -Access ReadWrite -PassThru
-Start-Sleep -Seconds 2
-$diskNum = ($img | Get-DiskImage).Number
+# Resolve the mounted disk number robustly (it isn't populated instantly).
+$diskNum = $null
+for ($t = 0; $t -lt 30 -and ($null -eq $diskNum); $t++) {
+  Start-Sleep -Milliseconds 500
+  $diskNum = (Get-DiskImage -ImagePath $base -ErrorAction SilentlyContinue).Number
+}
+Note "mounted base as disk number: $diskNum"
+if ($null -eq $diskNum) { Dismount-DiskImage -ImagePath $base -ErrorAction SilentlyContinue | Out-Null; throw "could not resolve the mounted base disk number" }
 $cleanup = @()  # access paths to remove on exit
 try {
-  $parts = Get-Partition -DiskNumber $diskNum
+  $parts = Get-Partition -DiskNumber $diskNum -ErrorAction Stop
+  Note ("partitions: " + (($parts | ForEach-Object { "#$($_.PartitionNumber) $($_.Type) $([math]::Round($_.Size/1GB,1))GB drv=$($_.DriveLetter)" }) -join ' | '))
 
-  # locate the Windows partition (NTFS w/ \Windows\System32) and the ESP
+  # locate the Windows partition (NTFS w/ \Windows\System32) and the ESP. Skip
+  # filesystem-less partitions (MSR/Reserved) -- assigning them a letter yields a
+  # bogus drive that Test-Path chokes on.
   $winDrive = $null; $espDrive = $null
   foreach ($p in $parts) {
+    if (-not ($p | Get-Volume -ErrorAction SilentlyContinue)) { continue } # no filesystem -> skip (MSR)
     $dl = $p.DriveLetter
     if (-not $dl) {
-      # assign a temp letter so we can read it (ESP usually has none)
+      # assign a temp letter so we can read it (an unlettered ESP)
       try { $p | Add-PartitionAccessPath -AssignDriveLetter -ErrorAction Stop; $p = Get-Partition -DiskNumber $diskNum -PartitionNumber $p.PartitionNumber; $dl = $p.DriveLetter; if ($dl) { $cleanup += ,@($p.PartitionNumber, "$dl`:") } } catch {}
     }
     if (-not $dl) { continue }
     $root = "$dl`:\"
-    if (Test-Path (Join-Path $root 'Windows\System32\config\SOFTWARE')) { $winDrive = "$dl`:" }
-    if ($p.GptType -eq $espGuid -or (Test-Path (Join-Path $root 'EFI\Microsoft\Boot'))) { $espDrive = "$dl`:" }
+    if (-not (Test-Path $root -ErrorAction SilentlyContinue)) { continue } # not a usable drive
+    if (Test-Path (Join-Path $root 'Windows\System32\config\SOFTWARE') -ErrorAction SilentlyContinue) { $winDrive = "$dl`:" }
+    if ($p.GptType -eq $espGuid -or (Test-Path (Join-Path $root 'EFI\Microsoft\Boot') -ErrorAction SilentlyContinue)) { $espDrive = "$dl`:" }
   }
   Write-Host "[3/6] State:"
   Note "Windows partition: $winDrive"
@@ -90,11 +111,18 @@ try {
   if ($espDrive) { $targets += Join-Path $espDrive ("EFI\Microsoft\Boot\CiPolicies\Active\" + $cipName) }
   $disabledAny = $false
   foreach ($t in $targets) {
-    if (Test-Path $t) {
-      Rename-Item -LiteralPath $t -NewName ($cipName + '.disabled') -Force
+    if (-not (Test-Path $t)) { Note "not found (ok): $t"; continue }
+    try {
+      # CodeIntegrity .cip files are TrustedInstaller/SYSTEM-protected: take
+      # ownership + grant Administrators + clear read-only before renaming.
+      # (No-op/harmless on the FAT ESP.) *>$null so native stderr can't trip Stop.
+      takeown.exe /f "$t" /a *>$null
+      icacls.exe "$t" /grant "*S-1-5-32-544:F" *>$null
+      attrib.exe -r -s -h "$t" *>$null
+      Rename-Item -LiteralPath $t -NewName ($cipName + '.disabled') -Force -ErrorAction Stop
       Note "disabled: $t"
       $disabledAny = $true
-    } else { Note "not found (ok): $t" }
+    } catch { Note "FAILED to disable $t : $($_.Exception.Message)" }
   }
   if (-not $disabledAny) { Note "WARNING: no {60FD87F8} .cip found to disable -- the policy may live elsewhere." }
 
@@ -119,6 +147,9 @@ try {
   Set-Content -Path (Join-Path $winDrive 'antimal-regshell.ps1') -Value $reg -Encoding UTF8 -Force
   Note "wrote C:\antimal-regshell.ps1 (dependency-first, no CiTool, never hangs)"
 
+} catch {
+  Note "ERROR: $($_.Exception.Message)"
+  Note ("  at: " + ($_.InvocationInfo.PositionMessage -replace "`r?`n", ' '))
 } finally {
   # --- 6. Cleanup + dismount ----------------------------------------------
   Write-Host "[6/6] Dismounting..."
