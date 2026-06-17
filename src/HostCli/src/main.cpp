@@ -2,6 +2,7 @@
 #include "antimal/BrowserImpact.h"
 #include "antimal/Config.h"
 #include "antimal/DetectionSummary.h"
+#include "antimal/EventTime.h"
 #include "antimal/UsabilityDiagnostics.h"
 #include "antimal/EventJournal.h"
 #include "antimal/FileUtil.h"
@@ -203,7 +204,7 @@ void PrintUsage() {
       << "  antimal fs-find [--vhdx <d.vhdx>] [--overlay <o.cow>] <name-substring>   (offline recursive search)\n"
       << "  antimal fs-scan [--vhdx <d.vhdx>] [--overlay <o.cow>] <guest\\path>   (extract + static-scan a guest file)\n"
       << "  antimal reg-ls [--hive software|system|sam|...] [--overlay <o.cow>] <reg\\key> [--values] [--depth N] [--filter <s>]\n"
-      << "  antimal report <run-id-or-report.json> [--html] [--detections|--usability [--json]]\n"
+      << "  antimal report <run-id-or-report.json> [--html] [--detections|--usability|--timeline [--json]]\n"
       << "  antimal browser-impact <run-id-or-report.json> --decrypt-browser-secrets\n"
       << "  antimal export <run-id-or-report.json> --format stix|misp|csv [--out <file>]\n"
       << "  antimal similarity <fileA> <fileB> [--json]   (fuzzy-hash similarity 0..100)\n"
@@ -3005,6 +3006,27 @@ int CommandReport(int argc, wchar_t **argv) {
       std::cout << "\n";
     }
     if (!u.remediation.empty()) std::cout << "next: " << u.remediation << "\n";
+    return 0;
+  }
+  if (HasFlag(argc, argv, "--timeline")) {
+    // The behavioral timeline with relative offsets (T+Xs from the run start),
+    // a quick terminal view without opening the HTML.
+    int64_t anchor = -1;
+    for (const auto &e : report.events) {
+      const int64_t ep = antimal::ParseIso8601ToEpochSeconds(e.timestampUtc);
+      if (ep >= 0 && (anchor < 0 || ep < anchor)) anchor = ep;
+    }
+    std::cout << "Timeline (" << report.events.size() << " events):\n";
+    for (const auto &e : report.events) {
+      const std::string rel = antimal::RelativeTimeLabel(
+          antimal::ParseIso8601ToEpochSeconds(e.timestampUtc), anchor);
+      std::cout << "  " << (rel.empty() ? e.timestampUtc : rel) << "  "
+                << e.category << "." << e.action;
+      const std::string what = !e.commandLine.empty() ? e.commandLine : e.target;
+      if (!what.empty()) std::cout << "  " << what;
+      if (!e.mitre.empty()) std::cout << "  [" << e.mitre << "]";
+      std::cout << "\n";
+    }
     return 0;
   }
   if (HasFlag(argc, argv, "--html")) {
