@@ -30,6 +30,7 @@
 #include <iomanip>
 #include <iostream>
 #include <limits>
+#include <map>
 #include <optional>
 #include <sstream>
 #include <string>
@@ -201,6 +202,7 @@ void PrintUsage() {
       << "  antimal similarity <fileA> <fileB> [--json]   (fuzzy-hash similarity 0..100)\n"
       << "  antimal similarity <file> --to <ctph-digest>\n"
       << "  antimal doctor [--json]              (host & workflow readiness check)\n"
+      << "  antimal boot-report [--workspace <dir>] [--json]  (boot reliability over all runs)\n"
       << "  antimal simulate [--scenario stealer|ransomware|loader] [--out <dir>] [--run-id <id>]\n"
       << "  antimal report-diff <run-or-report-A> <run-or-report-B> [--json]  (what changed)\n";
 }
@@ -3108,6 +3110,73 @@ int CommandReportDiff(int argc, wchar_t **argv) {
   return diff.Identical() ? 0 : 1;
 }
 
+// `boot-report` — aggregate boot reliability across every run in the workspace
+// (T05). Scans each run dir's report.json, classifies its boot outcome, and
+// prints a per-stage histogram + desktop/user-mode reach rates. This makes boot
+// reliability MEASURABLE from the runs the user produces, without this tool ever
+// launching a boot itself.
+int CommandBootReport(int argc, wchar_t **argv) {
+  const auto config = antimal::LoadConfig(antimal::DefaultConfigPath());
+  std::filesystem::path ws = config.workspaceRoot;
+  if (const auto w = OptionValue(argc, argv, "--workspace")) {
+    ws = std::filesystem::path(antimal::Utf8ToWide(*w));
+  }
+  if (!std::filesystem::exists(ws)) {
+    std::cerr << "No such workspace: " << antimal::PathToUtf8(ws) << "\n";
+    return 2;
+  }
+
+  int total = 0, reachedDesktop = 0, reachedUserMode = 0;
+  std::map<std::string, int> byStage;     // stage -> count
+  std::map<std::string, int> byCategory;  // category -> count
+  std::error_code ec;
+  for (const auto &entry : std::filesystem::directory_iterator(ws, ec)) {
+    if (!entry.is_directory()) continue;
+    const std::string name = antimal::PathToUtf8(entry.path().filename());
+    if (!name.empty() && name[0] == '_') continue; // _base, _intel_cache, ...
+    const auto rpt = entry.path() / "report.json";
+    if (!std::filesystem::exists(rpt)) continue;
+    const auto report = antimal::LoadReportBestEffort(rpt);
+    const antimal::BootOutcome bo =
+        antimal::ClassifyBootOutcome(report.dynamicSummary);
+    ++total;
+    ++byStage[bo.stage];
+    ++byCategory[bo.category];
+    if (bo.reachedDesktop) ++reachedDesktop;
+    if (bo.reachedUserMode) ++reachedUserMode;
+  }
+
+  auto pct = [](int n, int d) {
+    return d > 0 ? (100.0 * n / d) : 0.0;
+  };
+  if (HasFlag(argc, argv, "--json")) {
+    std::cout << "{\"runs\":" << total << ",\"reachedDesktop\":" << reachedDesktop
+              << ",\"reachedUserMode\":" << reachedUserMode << ",\"byStage\":{";
+    bool first = true;
+    for (const auto &kv : byStage) {
+      std::cout << (first ? "" : ",") << JsonQuote(kv.first) << ":" << kv.second;
+      first = false;
+    }
+    std::cout << "}}\n";
+    return 0;
+  }
+  std::cout << "AntiMal boot reliability over " << total << " run(s) in "
+            << antimal::PathToUtf8(ws) << "\n";
+  if (total == 0) {
+    std::cout << "  (no runs with a report.json yet -- run `detonate` first)\n";
+    return 0;
+  }
+  for (const auto &kv : byStage) {
+    std::cout << "  stage " << kv.first << ": " << kv.second << " ("
+              << static_cast<int>(pct(kv.second, total) + 0.5) << "%)\n";
+  }
+  std::cout << "  reached user mode: " << reachedUserMode << "/" << total << " ("
+            << static_cast<int>(pct(reachedUserMode, total) + 0.5) << "%)\n";
+  std::cout << "  reached desktop:   " << reachedDesktop << "/" << total << " ("
+            << static_cast<int>(pct(reachedDesktop, total) + 0.5) << "%)\n";
+  return 0;
+}
+
 // `doctor` — host + workflow readiness preflight. Reports, line by line, whether
 // AntiMal can boot a guest and run the scan/report workflow on THIS machine, with
 // an actionable hint per failure. Exit 0 when boot-ready, 1 when a hard blocker
@@ -3380,6 +3449,9 @@ int wmain(int argc, wchar_t **argv) {
     }
     if (command == "report-diff") {
       return CommandReportDiff(argc, argv);
+    }
+    if (command == "boot-report") {
+      return CommandBootReport(argc, argv);
     }
     PrintUsage();
     return 2;
