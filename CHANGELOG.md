@@ -8,6 +8,25 @@ that landed on `main`.
 
 ## [Unreleased]
 
+### 2026-06-17 — interactive app reached in the VM: a web browser (Edge) runs in-guest
+For the first time an interactive GUI application was launched and rendered inside the live VM,
+on a guest where the Windows modern shell still crash-loops. The crashing component
+(`explorer.exe`/ShellHost, `0xC0000409`) is not fixed but **sidestepped**: a new overlay-only,
+opt-in patch swaps the Winlogon `Shell` for `cmd.exe` (a stable console shell with no AppX/modern-
+shell dependency), and the app is launched from there.
+- **`PatchOverlaySetShellCmd` / `ANTIMAL_PROBE_SHELL_CMD`** — same-size REG_SZ edit of
+  `HKLM\SOFTWARE\…\Winlogon\Shell` (`explorer.exe` → `cmd.exe`) in the disposable overlay
+  (base untouched). Live-verified: the guest shows a working `cmd` console instead of a black
+  screen + ShellHost crash dialog.
+- **`ANTIMAL_PROBE_RUN_CMD`** — deterministically launches an app by creating
+  `HKLM\SOFTWARE\Microsoft\Command Processor\AutoRun` (e.g. `start msedge`), so the cmd shell runs
+  it the instant it starts (no keystroke timing/focus).
+- **`ANTIMAL_PROBE_TYPE_CMD`** — fallback keystroke injector (types a command + Enter into the
+  focused window); how Edge was first launched live.
+- Proof: `private development documentation` (Microsoft Edge first-run page,
+  full-screen in the guest). The static malware-analysis product was already complete; this
+  additionally demonstrates reaching a real interactive in-guest GUI app.
+
 ### 2026-06-16 — static-engine breadth: file-type-aware analyzers (M3)
 The static layer previously only deeply analyzed PE files and silently skipped the
 non-PE formats malware ships in. This session adds dedicated, bounds-safe analyzers

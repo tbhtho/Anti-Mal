@@ -4569,6 +4569,8 @@ bool PatchOverlayBlankAntimalPassword(hv::IBlockDevice &disk,
                                       BootOverlayPatchResult *result);
 bool PatchOverlayDesktopStability(hv::IBlockDevice &disk,
                                   BootOverlayPatchResult *result);
+bool PatchOverlaySetShellCmd(hv::IBlockDevice &disk,
+                             BootOverlayPatchResult *result);
 bool PatchOverlayDisableAppLocker(hv::IBlockDevice &disk,
                                   BootOverlayPatchResult *result);
 bool MaybeCompleteOobeInOverlay(hv::IBlockDevice &disk,
@@ -6336,6 +6338,14 @@ BootOverlayPatchResult ApplyEphemeralBootOverlay(hv::IBlockDevice &disk) {
   if (EnvFlagEnabled("ANTIMAL_PROBE_DESKTOP_STABILITY")) {
     PatchOverlayDesktopStability(disk, &result);
   }
+  // Opt-in: replace the Winlogon Shell (explorer.exe, which crash-loops on this
+  // minimal VMM) with cmd.exe in THIS disposable overlay, so logon launches a
+  // STABLE console shell we can drive (type `start msedge` etc.) regardless of
+  // the broken modern-shell/AppX provisioning. Pairs with ANTIMAL_PROBE_RUN_CMD.
+  // Overlay-only; base untouched.
+  if (EnvFlagEnabled("ANTIMAL_PROBE_SHELL_CMD")) {
+    PatchOverlaySetShellCmd(disk, &result);
+  }
   // ROOT-CAUSE FIX for the interactive-shell crash-loop: the base image's
   // AppLocker (SrpV2) policy blocks the core shell AppX package from registering,
   // so explorer/ControlCenter __fastfail in ucrtbase. Disable AppLocker in THIS
@@ -7774,6 +7784,112 @@ bool PatchOverlayDesktopStability(hv::IBlockDevice &disk,
                             (soft ? "ok" : "no") + " SYSTEM=" + (sys ? "ok" : "no"));
   }
   return soft || sys;
+}
+
+// Replace the Winlogon Shell (explorer.exe) with cmd.exe in THIS disposable
+// overlay. explorer crash-loops on this minimal VMM (broken modern-shell/AppX
+// provisioning), but cmd.exe is a rock-solid console shell that lets us launch
+// an app (e.g. `start msedge`) on an otherwise shell-less desktop. Same-size
+// REG_SZ edit: "cmd.exe" (UTF-16LE + NUL) is shorter than "explorer.exe", so we
+// zero-pad to the original value length (the hive/NTFS writer is same-size only).
+// Overlay-only; base untouched. Opt-in via ANTIMAL_PROBE_SHELL_CMD.
+bool PatchOverlaySetShellCmd(hv::IBlockDevice &disk,
+                             BootOverlayPatchResult *result) {
+  const auto parts = ReadGptPartitionsLite(disk);
+  const auto windows =
+      std::find_if(parts.begin(), parts.end(), [](const GptPartitionLite &p) {
+        return IsWindowsBasicDataGuid(p.typeGuid);
+      });
+  if (windows == parts.end()) {
+    if (result) result->notes.push_back("shell-cmd: Windows partition not found");
+    return false;
+  }
+  NtfsBootFileLocator ntfs(disk, windows->firstLba);
+  if (!ntfs.Init()) {
+    if (result) result->notes.push_back("shell-cmd: Windows NTFS unreadable");
+    return false;
+  }
+  const auto entry = ntfs.FindPath("Windows\\System32\\config\\SOFTWARE");
+  if (!entry) {
+    if (result) result->notes.push_back("shell-cmd: SOFTWARE hive missing");
+    return false;
+  }
+  auto bytes = ntfs.ReadFile(*entry, 256u * 1024u * 1024u);
+  MutableHiveView hive(bytes);
+  if (!hive.IsValid()) {
+    if (result) result->notes.push_back("shell-cmd: SOFTWARE hive invalid");
+    return false;
+  }
+  auto cur = hive.RootIndex();
+  for (const std::string &c : {std::string("Microsoft"), std::string("Windows NT"),
+                               std::string("CurrentVersion"),
+                               std::string("Winlogon")}) {
+    if (!cur) break;
+    cur = hive.FindSubkey(*cur, c);
+  }
+  if (!cur) {
+    if (result) result->notes.push_back("shell-cmd: Winlogon key not found");
+    return false;
+  }
+  const auto sv = hive.FindValue(*cur, "Shell");
+  if (!sv) {
+    if (result) result->notes.push_back("shell-cmd: Shell value not found");
+    return false;
+  }
+  const auto v = hive.ValueBytes(*sv);
+  static const char kCmd[] = "cmd.exe";
+  const size_t needed = sizeof(kCmd) * 2; // 8 UTF-16 units incl NUL = 16 bytes
+  if (v.size() < needed) {
+    if (result)
+      result->notes.push_back("shell-cmd: existing Shell value too short (" +
+                              std::to_string(v.size()) + " bytes)");
+    return false;
+  }
+  std::vector<uint8_t> nv(v.size(), 0); // same length, zero-padded (REG_SZ stops at NUL)
+  for (size_t i = 0; kCmd[i] != '\0'; ++i) {
+    nv[i * 2] = static_cast<uint8_t>(kCmd[i]);
+  }
+  if (!hive.UpsertBinaryValueSameSize(*cur, "Shell", sv->type, nv)) {
+    if (result) result->notes.push_back("shell-cmd: Shell write failed");
+    return false;
+  }
+  // Deterministic app launch: set the Command Processor AutoRun value so the
+  // cmd shell runs ANTIMAL_PROBE_RUN_CMD (e.g. "start msedge") the instant it
+  // starts -- no keystroke timing/focus to fight. cmd reads HKLM+HKCU AutoRun on
+  // every launch. Created via the same hive primitives AppLocker uses to create
+  // values (UpsertBinaryValueSameSize allocates a new cell when absent).
+  {
+    char cmdEnv[256]{};
+    size_t cmdNeeded = 0;
+    if (getenv_s(&cmdNeeded, cmdEnv, sizeof(cmdEnv), "ANTIMAL_PROBE_RUN_CMD") == 0 &&
+        cmdNeeded > 1 && cmdEnv[0] != '\0') {
+      const auto cmdProc = EnsureHivePath(hive, {"Microsoft", "Command Processor"});
+      if (cmdProc) {
+        std::vector<uint8_t> sz; // REG_SZ as UTF-16LE + terminator
+        for (const char *p = cmdEnv; *p; ++p) {
+          sz.push_back(static_cast<uint8_t>(*p));
+          sz.push_back(0);
+        }
+        sz.push_back(0);
+        sz.push_back(0);
+        if (hive.UpsertBinaryValueSameSize(*cmdProc, "AutoRun", REG_SZ, sz)) {
+          if (result)
+            result->notes.push_back(std::string("shell-cmd: AutoRun -> '") +
+                                    cmdEnv + "'");
+        } else if (result) {
+          result->notes.push_back("shell-cmd: AutoRun write failed");
+        }
+      }
+    }
+  }
+  RefreshRegistryHiveHeader(bytes);
+  if (!ntfs.WriteFileSameSize(*entry, bytes)) {
+    if (result) result->notes.push_back("shell-cmd: SOFTWARE write-back failed");
+    return false;
+  }
+  if (result)
+    result->notes.push_back("shell-cmd: Winlogon Shell -> cmd.exe (overlay only)");
+  return true;
 }
 
 // CANDIDATE (default-OFF, opt-in via ANTIMAL_PROBE_COMPLETE_OOBE): mark Windows
@@ -11534,6 +11650,75 @@ DetonationResult InHouseOrchestrator::PrepareAndRun(
           request.keyboardBursts.push_back(
               {milliseconds{static_cast<int64_t>(off) * 1000 + 700},
                enter}); // submit empty password
+        }
+      }
+      // ANTIMAL_PROBE_TYPE_CMD: TYPE this command + Enter into the focused window
+      // post-login (e.g. into the Shell=cmd console, or a Task Manager Run box) to
+      // LAUNCH AN APP on the otherwise shell-less desktop. Fragile (keystroke
+      // timing/focus); the deterministic path is ANTIMAL_PROBE_RUN_CMD via the cmd
+      // AutoRun value (see PatchOverlaySetShellCmd). Boot-UI probe only; does NOT
+      // authorize sample execution.
+      {
+        char cmdEnv[256]{};
+        size_t cmdNeeded = 0;
+        if (getenv_s(&cmdNeeded, cmdEnv, sizeof(cmdEnv), "ANTIMAL_PROBE_TYPE_CMD") ==
+                0 &&
+            cmdNeeded > 1 && cmdEnv[0] != '\0') {
+          using namespace std::chrono;
+          const std::string cmd(cmdEnv);
+          // ASCII -> Set-1 make scancode (US layout); reports Left-Shift wrap.
+          auto mapKey = [](char c, bool &shift) -> int {
+            shift = false;
+            if (c >= 'A' && c <= 'Z') {
+              shift = true;
+              c = static_cast<char>(c - 'A' + 'a');
+            }
+            if (c >= 'a' && c <= 'z') {
+              static const uint8_t L[] = {
+                  0x1E, 0x30, 0x2E, 0x20, 0x12, 0x21, 0x22, 0x23, 0x17,
+                  0x24, 0x25, 0x26, 0x32, 0x31, 0x18, 0x19, 0x10, 0x13,
+                  0x1F, 0x14, 0x16, 0x2F, 0x11, 0x2D, 0x15, 0x2C};
+              return L[c - 'a'];
+            }
+            if (c >= '0' && c <= '9') {
+              static const uint8_t D[] = {0x0B, 0x02, 0x03, 0x04, 0x05,
+                                          0x06, 0x07, 0x08, 0x09, 0x0A};
+              return D[c - '0'];
+            }
+            switch (c) {
+            case ' ': return 0x39;
+            case '-': return 0x0C;
+            case '.': return 0x34;
+            case '/': return 0x35;
+            case '\\': return 0x2B;
+            case ':': shift = true; return 0x27;
+            case '_': shift = true; return 0x0C;
+            case '"': shift = true; return 0x28;
+            default: return -1;
+            }
+          };
+          std::vector<std::vector<uint8_t>> keys;
+          for (char c : cmd) {
+            bool shift = false;
+            const int code = mapKey(c, shift);
+            if (code < 0) continue;
+            std::vector<uint8_t> k;
+            if (shift) k.push_back(0x2A);
+            k.push_back(static_cast<uint8_t>(code));
+            k.push_back(static_cast<uint8_t>(code | 0x80));
+            if (shift) k.push_back(0xAA);
+            keys.push_back(std::move(k));
+          }
+          keys.push_back({0x1C, 0x9C}); // Enter (run the command)
+          const int64_t spacingMs = 90;
+          for (int off : {300, 360, 420, 480, 540}) {
+            for (size_t k = 0; k < keys.size(); ++k) {
+              request.keyboardBursts.push_back(
+                  {milliseconds{static_cast<int64_t>(off) * 1000 +
+                                static_cast<int64_t>(k) * spacingMs},
+                   keys[k]});
+            }
+          }
         }
       }
       // ANTIMAL_PROBE_BYPASS_DRIVER_SIG: at this delay (seconds), the host
