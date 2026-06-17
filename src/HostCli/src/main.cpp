@@ -1,6 +1,7 @@
 #include "antimal/BrowserImpact.h"
 #include "antimal/Config.h"
 #include "antimal/FileUtil.h"
+#include "antimal/FuzzyHash.h"
 #include "antimal/HyperVOrchestrator.h"
 #include "antimal/IocExport.h"
 #include "antimal/Json.h"
@@ -161,7 +162,9 @@ void PrintUsage() {
       << "                       [--dump-bcd <out.bcd>] [--dump-system <out.hive>]\n"
       << "  antimal report <run-id-or-report.json> --html\n"
       << "  antimal browser-impact <run-id-or-report.json> --decrypt-browser-secrets\n"
-      << "  antimal export <run-id-or-report.json> --format stix|misp|csv [--out <file>]\n";
+      << "  antimal export <run-id-or-report.json> --format stix|misp|csv [--out <file>]\n"
+      << "  antimal similarity <fileA> <fileB>   (fuzzy-hash similarity 0..100)\n"
+      << "  antimal similarity <file> --to <ctph-digest>\n";
 }
 
 antimal::ScannerOptions BuildScannerOptions(int argc, wchar_t **argv,
@@ -2914,6 +2917,61 @@ int CommandExport(int argc, wchar_t **argv) {
   return 0;
 }
 
+// `similarity` — compare two samples (or a sample against a known CTPH digest)
+// using the context-triggered piecewise hash. Answers the analyst question "is
+// this a variant of something I've already seen?" without a full enrichment scan.
+int CommandSimilarity(int argc, wchar_t **argv) {
+  if (argc < 3) {
+    std::cerr << "usage: antimal similarity <fileA> <fileB>\n"
+              << "       antimal similarity <file> --to <ctph-digest>\n";
+    return 2;
+  }
+  const std::filesystem::path fileA(argv[2]);
+  if (!std::filesystem::exists(fileA)) {
+    std::cerr << "No such file: " << antimal::PathToUtf8(fileA) << "\n";
+    return 2;
+  }
+  const std::string digestA = antimal::ComputeCtph(antimal::ReadAllBytes(fileA));
+
+  std::string digestB;
+  std::string labelB;
+  if (const auto to = OptionValue(argc, argv, "--to")) {
+    digestB = *to;
+    labelB = "(given digest)";
+  } else if (argc >= 4 && argv[3][0] != L'-') {
+    const std::filesystem::path fileB(argv[3]);
+    if (!std::filesystem::exists(fileB)) {
+      std::cerr << "No such file: " << antimal::PathToUtf8(fileB) << "\n";
+      return 2;
+    }
+    digestB = antimal::ComputeCtph(antimal::ReadAllBytes(fileB));
+    labelB = antimal::PathToUtf8(fileB);
+  } else {
+    std::cerr << "Provide a second file or --to <ctph-digest>.\n";
+    return 2;
+  }
+
+  std::cout << antimal::PathToUtf8(fileA) << "\n  ctph: " << digestA << "\n";
+  std::cout << labelB << "\n  ctph: " << digestB << "\n";
+  const int score = antimal::CompareCtph(digestA, digestB);
+  if (score < 0) {
+    std::cout << "similarity: n/a (a digest is malformed)\n";
+    return 2;
+  }
+  std::cout << "similarity: " << score << " / 100";
+  if (score >= 90) {
+    std::cout << "  (near-identical / same sample family)";
+  } else if (score >= 50) {
+    std::cout << "  (strongly related / likely variant)";
+  } else if (score > 0) {
+    std::cout << "  (weakly related)";
+  } else {
+    std::cout << "  (unrelated)";
+  }
+  std::cout << "\n";
+  return 0;
+}
+
 } // namespace
 
 int CommandDumpHive(int argc, wchar_t **argv) {
@@ -2971,6 +3029,9 @@ int wmain(int argc, wchar_t **argv) {
     }
     if (command == "export") {
       return CommandExport(argc, argv);
+    }
+    if (command == "similarity" || command == "compare") {
+      return CommandSimilarity(argc, argv);
     }
     PrintUsage();
     return 2;
