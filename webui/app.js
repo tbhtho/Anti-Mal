@@ -591,6 +591,15 @@
     var dm = $('#vm-display-mode'); if (dm) dm.textContent = '';
     releaseHeldKeys();
   }
+  // Reset the live canvas to a placeholder and STOP blitting the previous run's
+  // shared-buffer pixels. Without this, clicking Boot flashes the prior run's last
+  // frame (the "jumps to the latest-run screenshot" glitch) until the new VM
+  // publishes its first frame.
+  function clearLiveFrame(msg) {
+    usingSharedFrames = false; curFrameW = 0; curFrameH = 0;
+    if (liveRaf) { cancelAnimationFrame(liveRaf); liveRaf = 0; }
+    var box = $('#live-frame'); if (box) box.textContent = msg || ''; // drops the stale canvas/img
+  }
   // Single source of truth for the VM status indicators (#vm-badge + #mode-badge +
   // the inline #vm-live-status), so they can never desync. Replaces the ad-hoc
   // writes scattered across the boot/detonate/stop/poll handlers.
@@ -760,6 +769,7 @@
     if (bb) bb.onclick = function () {
       appendLog('INFO', 'Booting live VM…');
       setVmState('booting', 'starting…');
+      clearLiveFrame('Booting the VM…'); // drop any stale/previous-run frame immediately
       send('vm.boot').then(function (r) {
         var ok = r && r.ok && r.result && r.result.started;
         appendLog(ok ? 'INFO' : 'ERROR', ok ? ('Live VM booting' + (r.result.seeded ? ' from snapshot' : ' (full OOBE)') + '…') : 'VM boot failed: ' + String((r && r.result && r.result.error) || 'unknown'));
