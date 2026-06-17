@@ -43,6 +43,11 @@ unit-tested. A living `private development documentation` tracks done/remaining 
 - **Filterable `report --timeline`:** `--category <c>`, `--mitre` (only events carrying a technique),
   and `--limit N` make a large telemetry stream triageable; the header shows matched/total. Also
   fixed a redundant `category.action` render (e.g. `process.process.running` → `process.running`).
+- **`yara-gen` — auto-generated YARA rules (`YaraGen`):** scans a sample and emits a ready-to-tune
+  hunt rule from its most distinctive strings (IOC URLs/domains/mutexes ranked first; PE boilerplate
+  and import-table DLL names filtered) plus sha256/imphash/filetype meta and a PE-magic + filesize +
+  `N of ($s*)` condition. Falls back to a magic/size/sha256 rule when no distinctive strings survive.
+  Pure + deterministic + unit-tested; `antimal yara-gen <sample> [--out rule.yar] [--name R]`.
 - **Severity-ranked Detections summary (`DetectionSummary`):** unifies static findings + persistence
   + suspicious network into one ranked behavior list; in the report + `report --detections [--json]`.
 - **Desktop-usability classifier (`UsabilityDiagnostics`):** measures which usability goals a run

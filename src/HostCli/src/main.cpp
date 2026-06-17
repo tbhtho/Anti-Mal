@@ -18,6 +18,7 @@
 #include "antimal/Scanner.h"
 #include "antimal/Subprocess.h"
 #include "antimal/Version.h"
+#include "antimal/YaraGen.h"
 #include "antimal/hv/BlockDevice.h"
 
 #include <windows.h>
@@ -214,7 +215,8 @@ void PrintUsage() {
       << "  antimal boot-report [--workspace <dir>] [--json]  (boot reliability over all runs)\n"
       << "  antimal rebuild-report <run-id-or-dir> [--html] [--force]  (recover report.json from events.jsonl)\n"
       << "  antimal simulate [--scenario stealer|ransomware|loader|coinminer|wiper] [--out <dir>] [--run-id <id>]\n"
-      << "  antimal report-diff <run-or-report-A> <run-or-report-B> [--json]  (what changed)\n";
+      << "  antimal report-diff <run-or-report-A> <run-or-report-B> [--json]  (what changed)\n"
+      << "  antimal yara-gen <sample> [--out rule.yar] [--name R] [--max-strings N]  (auto YARA rule)\n";
 }
 
 antimal::ScannerOptions BuildScannerOptions(int argc, wchar_t **argv,
@@ -3188,6 +3190,38 @@ int CommandSimilarity(int argc, wchar_t **argv) {
   return 0;
 }
 
+// `yara-gen` — auto-generate a YARA rule from a sample's static analysis. The
+// natural next step after triage/IOC export: scan the file, pick its most
+// distinctive strings + imphash/sha256/magic, and emit a ready-to-tune hunt
+// rule. Prints to stdout or, with --out, writes a .yar file.
+int CommandYaraGen(int argc, wchar_t **argv) {
+  if (argc < 3) {
+    std::cerr << "usage: antimal yara-gen <sample> [--out rule.yar] "
+                 "[--name RuleName] [--max-strings N]\n";
+    return 2;
+  }
+  const std::filesystem::path sample(argv[2]);
+  if (!std::filesystem::exists(sample)) {
+    std::cerr << "sample not found: " << antimal::PathToUtf8(sample) << "\n";
+    return 2;
+  }
+  const auto scan = antimal::ScanFile(sample);
+  const auto bytes = antimal::ReadAllBytes(sample);
+  antimal::YaraGenOptions opts;
+  if (const auto n = OptionValue(argc, argv, "--name")) opts.ruleName = *n;
+  if (const auto m = OptionValue(argc, argv, "--max-strings")) {
+    try { opts.maxStrings = static_cast<size_t>(std::stoul(*m)); } catch (...) {}
+  }
+  const std::string rule = antimal::GenerateYaraRule(scan, bytes, opts);
+  if (const auto outPath = OptionValue(argc, argv, "--out")) {
+    antimal::WriteTextFile(std::filesystem::path(*outPath), rule);
+    std::cout << "wrote " << *outPath << "\n";
+  } else {
+    std::cout << rule;
+  }
+  return 0;
+}
+
 // `report-diff` — show what changed between two analysis reports (T78). Pairs
 // with `similarity`: compare the same sample run twice (a determinism check) or
 // two related variants. Exit 1 when material differences exist (so a
@@ -3978,6 +4012,9 @@ int wmain(int argc, wchar_t **argv) {
     }
     if (command == "rebuild-report") {
       return CommandRebuildReport(argc, argv);
+    }
+    if (command == "yara-gen") {
+      return CommandYaraGen(argc, argv);
     }
     if (command == "fs-ls" || command == "fs-cat" || command == "fs-find" ||
         command == "fs-scan" || command == "reg-ls") {

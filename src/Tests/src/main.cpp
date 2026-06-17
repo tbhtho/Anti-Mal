@@ -45,6 +45,7 @@
 #include "antimal/Strings.h"
 #include "antimal/Subprocess.h"
 #include "antimal/Tagger.h"
+#include "antimal/YaraGen.h"
 #include "antimal/WerReport.h"
 #include "antimal/hv/AcpiTables.h"
 #include "antimal/hv/BlockDevice.h"
@@ -3734,6 +3735,70 @@ void TestRebuildReportFromEvents() {
          "rebuild: process tree rebuildable from the reloaded report");
   std::error_code ec;
   std::filesystem::remove(tmp, ec);
+}
+
+// YARA rule auto-generation: distinctive strings survive, PE boilerplate and
+// the import-table DLL names are filtered out, IOC strings are preferred, and
+// the rule is syntactically complete + deterministic.
+void TestYaraGen() {
+  using namespace antimal;
+  // A synthetic PE-ish buffer: MZ magic, the universal DOS-stub boilerplate
+  // (must be filtered), a couple of boilerplate DLL names (filtered), an IOC
+  // URL + a distinctive token (must survive).
+  std::vector<uint8_t> bytes;
+  auto put = [&](const std::string &s) {
+    for (char c : s) bytes.push_back(static_cast<uint8_t>(c));
+    bytes.push_back(0); // NUL terminator separates strings for the extractor
+  };
+  bytes.push_back('M');
+  bytes.push_back('Z');
+  put("This program cannot be run in DOS mode");
+  put("KERNEL32.DLL");
+  put("http://malicious.example/gate.php");
+  put("EvilBeaconConfig_Marker_2026");
+  put("Mozilla/5.0 CustomStealerAgent v3");
+  // pad to a realistic size so the filesize bound is sane
+  bytes.resize(bytes.size() + 2048, 0);
+
+  ScanResult scan;
+  scan.isPe = true;
+  scan.sha256 = "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789";
+  scan.imphash = "00112233445566778899aabbccddeeff";
+  scan.detectedType = "pe";
+
+  const std::string rule = GenerateYaraRule(scan, bytes);
+
+  Expect(rule.find("rule AntiMal_abcdef012345") != std::string::npos,
+         "yara: rule name derived from sha256");
+  Expect(rule.find("strings:") != std::string::npos &&
+             rule.find("condition:") != std::string::npos,
+         "yara: has strings + condition sections");
+  Expect(rule.find("uint16(0) == 0x5A4D") != std::string::npos,
+         "yara: PE magic condition emitted");
+  Expect(rule.find(scan.sha256) != std::string::npos,
+         "yara: sha256 in meta");
+  Expect(rule.find("EvilBeaconConfig_Marker_2026") != std::string::npos,
+         "yara: distinctive token survives");
+  Expect(rule.find("http://malicious.example/gate.php") != std::string::npos,
+         "yara: IOC URL survives");
+  Expect(rule.find("DOS mode") == std::string::npos,
+         "yara: DOS-stub boilerplate filtered out");
+  Expect(rule.find("KERNEL32.DLL") == std::string::npos,
+         "yara: import-table DLL boilerplate filtered out");
+  // Balanced braces -> single complete rule.
+  Expect(std::count(rule.begin(), rule.end(), '{') == 1 &&
+             std::count(rule.begin(), rule.end(), '}') == 1,
+         "yara: exactly one complete rule block");
+  // Deterministic.
+  Expect(GenerateYaraRule(scan, bytes) == rule, "yara: deterministic output");
+
+  // No-distinctive-strings fallback still yields a complete rule anchored on
+  // magic + size + the sha256 note.
+  std::vector<uint8_t> tiny = {'M', 'Z'};
+  const std::string fb = GenerateYaraRule(scan, tiny);
+  Expect(fb.find("condition:") != std::string::npos &&
+             fb.find("filesize <") != std::string::npos,
+         "yara: fallback rule has a magic/size condition");
 }
 
 // Detections summary: aggregates static findings + persistence + suspicious
@@ -9009,6 +9074,7 @@ int main() {
     TestFramePacingStats();
     TestSimulatedReport();
     TestRebuildReportFromEvents();
+    TestYaraGen();
     TestBootDiagnostics();
     TestCommandLineClassifier();
     TestUsabilityDiagnostics();

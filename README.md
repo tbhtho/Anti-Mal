@@ -149,6 +149,15 @@ bin\x64\Release\AntiMal.HostCli.exe similarity A.exe B.exe
 bin\x64\Release\AntiMal.HostCli.exe similarity A.exe --to 24576:abc...:def...
 ```
 
+Turn a triaged sample into a hunting rule — `yara-gen` scans the file and emits
+a ready-to-tune YARA rule from its most distinctive strings + imphash/sha256/PE
+magic (IOC strings ranked first; common PE boilerplate filtered out):
+
+```powershell
+bin\x64\Release\AntiMal.HostCli.exe yara-gen suspicious.exe
+bin\x64\Release\AntiMal.HostCli.exe yara-gen suspicious.exe --out hunt.yar --name MyFamily
+```
+
 Generate a complete Any.Run-style report from a SYNTHETIC detonation — no VM,
 firmware, or hardware required. This exercises the events → report.json →
 report.html (+ filmstrip) pipeline end-to-end and is the documented local
