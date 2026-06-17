@@ -2,6 +2,7 @@
 
 #include "antimal/FileUtil.h"
 #include "antimal/Json.h"
+#include "antimal/MitreCatalog.h"
 
 #include <functional>
 #include <map>
@@ -1169,7 +1170,20 @@ bool EmitMitreChips(std::ostringstream &html,
   html << "<div class=\"mitre-chips\">";
   for (const auto &t : techniques) {
     if (t.empty()) continue;
-    html << "<span class=\"tag capability\">" << HtmlEscape(t) << "</span>";
+    const std::string name = MitreTechniqueName(t);
+    html << "<span class=\"tag capability\"";
+    if (!name.empty()) html << " title=\"" << HtmlEscape(name) << "\"";
+    html << ">" << HtmlEscape(t);
+    if (!name.empty()) {
+      // Short inline label: the sub-technique part (after the last ": "), or the
+      // whole name for a base technique. Full name is in the hover title.
+      const auto pos = name.rfind(": ");
+      const std::string shortName =
+          (pos == std::string::npos) ? name : name.substr(pos + 2);
+      html << " <span style=\"opacity:.7\">" << HtmlEscape(shortName)
+           << "</span>";
+    }
+    html << "</span>";
   }
   html << "</div>";
   return true;

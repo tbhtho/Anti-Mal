@@ -26,6 +26,7 @@
 #include "antimal/PeParser.h"
 #include "antimal/RegistryTelemetry.h"
 #include "antimal/ProcessTelemetry.h"
+#include "antimal/MitreCatalog.h"
 #include "antimal/Report.h"
 #include "antimal/ReportDiff.h"
 #include "antimal/Simulation.h"
@@ -3588,6 +3589,22 @@ void TestSimulatedReport() {
     std::error_code ec;
     std::filesystem::remove(tmp, ec);
   }
+}
+
+// MITRE catalog: known IDs (base + sub-technique) resolve to names; unknown IDs
+// return "" (so the report falls back to the bare ID, never a wrong label).
+void TestMitreCatalog() {
+  using antimal::MitreTechniqueName;
+  Expect(MitreTechniqueName("T1547.001").find("Registry Run Keys") !=
+             std::string::npos,
+         "mitre: sub-technique resolves to its name");
+  Expect(MitreTechniqueName("T1059.001").find("PowerShell") != std::string::npos,
+         "mitre: PowerShell technique resolves");
+  Expect(MitreTechniqueName("T1071") == "Application Layer Protocol",
+         "mitre: base technique resolves");
+  Expect(MitreTechniqueName("T9999").empty(),
+         "mitre: an unknown technique returns empty (falls back to the ID)");
+  Expect(MitreTechniqueName("").empty(), "mitre: empty id returns empty");
 }
 
 // Report-to-report diff (T78): a report vs itself is materially identical; a
@@ -8374,6 +8391,7 @@ int main() {
     TestFuzzyHash();
     TestFramePacingStats();
     TestSimulatedReport();
+    TestMitreCatalog();
     TestReportDiff();
     TestAuthenticodeSigner();
     TestFileTypeId();

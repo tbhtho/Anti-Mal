@@ -52,6 +52,7 @@
     <ClInclude Include="include\antimal\IocExport.h" />
     <ClInclude Include="include\antimal\ImageLoadTelemetry.h" />
     <ClInclude Include="include\antimal\IntelLookup.h" />
+    <ClInclude Include="include\antimal\MitreCatalog.h" />
     <ClInclude Include="include\antimal\Json.h" />
     <ClInclude Include="include\antimal\JsonValue.h" />
     <ClInclude Include="include\antimal\FileSystemTelemetry.h" />
@@ -92,6 +93,7 @@
     <ClCompile Include="src\IocExport.cpp" />
     <ClCompile Include="src\ImageLoadTelemetry.cpp" />
     <ClCompile Include="src\IntelLookup.cpp" />
+    <ClCompile Include="src\MitreCatalog.cpp" />
     <ClCompile Include="src\Json.cpp" />
     <ClCompile Include="src\JsonValue.cpp" />
     <ClCompile Include="src\FileSystemTelemetry.cpp" />
