@@ -37,6 +37,14 @@ unit-tested. A living `private development documentation` tracks done/remaining 
   recursively search, and extract-then-static-scan the guest's files straight from the disk image
   (base VHDX + optional run overlay) via the in-house NtfsReader — File-Explorer-style access and
   in-guest-artifact triage with NO boot, working around the crash-looping in-guest File Explorer.
+- **Offline guest registry browsing (`reg-ls`):** extract + list/search a guest hive (SOFTWARE/
+  SYSTEM/SAM/…) from the disk image — inspect Run keys / Services / persistence with no boot.
+- **In-guest GUI file browser (`AntiMal.GuestAgent.exe --file-browser`):** a dependency-light Win32
+  file browser with NO modern-shell dependency, launchable from the cmd-shell sidestep — working
+  *live* file browsing in the guest even though the Win11 File Explorer crash-loops. Host-verifiable.
+- **Command-line / LOLBin classifier (`CommandLineClassifier`):** flags encoded PowerShell, download
+  cradles, rundll32/regsvr32/mshta proxy exec, certutil/bitsadmin ingress, vssadmin recovery
+  inhibition, schtasks/sc persistence, etc. — in the Detections summary + inline in the process tree.
 - **Built-in packer ID** (UPX/Themida/VMProtect/… by section signatures) and **enriched IOC export**
   (classifier-recognized persistence). Plus report-HTML structural + malformed-input robustness
   regression tests.

@@ -179,7 +179,13 @@ bin\x64\Release\AntiMal.HostCli.exe fs-find "invoice" --max-results 50
 bin\x64\Release\AntiMal.HostCli.exe fs-cat  "\Windows\System32\drivers\etc\hosts" --out hosts.txt
 bin\x64\Release\AntiMal.HostCli.exe fs-scan "\Users\analyst\AppData\Local\Temp\dropped.exe"
 #   add --overlay C:\AntiMalRuns\<run>\disk\overlay.cow to inspect a run's changes
+bin\x64\Release\AntiMal.HostCli.exe reg-ls --hive software "Microsoft\Windows\CurrentVersion\Run" --values
 ```
+
+For **live** in-guest browsing when the Win11 modern shell crash-loops, the
+GuestAgent ships its own dependency-light file browser — launch it from the
+cmd-shell sidestep: `AntiMal.GuestAgent.exe --file-browser [start-dir]` (a plain
+Win32 ListView, no `explorer.exe`/AppX dependency).
 
 Read a run's behavior summary, ranked detections, or measured desktop-usability
 without opening the HTML (all support `--json` for automation), and aggregate
