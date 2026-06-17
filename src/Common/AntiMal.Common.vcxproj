@@ -36,6 +36,7 @@
   <ItemGroup>
     <ClInclude Include="include\antimal\BridgeRouter.h" />
     <ClInclude Include="include\antimal\BrowserImpact.h" />
+    <ClInclude Include="include\antimal\CommandLineClassifier.h" />
     <ClInclude Include="include\antimal\Config.h" />
     <ClInclude Include="include\antimal\ConfigExtractor.h" />
     <ClInclude Include="include\antimal\ContainerAnalyzer.h" />
@@ -86,6 +87,7 @@
     <ClCompile Include="src\BehaviorScore.cpp" />
     <ClCompile Include="src\BootDiagnostics.cpp" />
     <ClCompile Include="src\BridgeRouter.cpp" />
+    <ClCompile Include="src\CommandLineClassifier.cpp" />
     <ClCompile Include="src\BrowserImpact.cpp" />
     <ClCompile Include="src\Config.cpp" />
     <ClCompile Include="src\ConfigExtractor.cpp" />

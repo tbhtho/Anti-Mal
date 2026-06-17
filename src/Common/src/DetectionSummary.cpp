@@ -1,5 +1,6 @@
 #include "antimal/DetectionSummary.h"
 
+#include "antimal/CommandLineClassifier.h"
 #include "antimal/NetworkClassifier.h"
 #include "antimal/PersistenceClassifier.h"
 
@@ -69,6 +70,14 @@ std::vector<Detection> BuildDetections(const AnalysisReport &report) {
     const NetworkIndicator ni = ClassifyEndpoint(e.target);
     if (!ni.suspicious) continue;
     add(3, "network", ni.note + ": " + e.target, e.mitre);
+  }
+
+  // 4) Suspicious / living-off-the-land command lines (process events).
+  for (const auto &e : report.events) {
+    if (e.commandLine.empty()) continue;
+    const CommandLineThreat t = ClassifyCommandLine(e.commandLine);
+    if (!t.suspicious) continue;
+    add(2, "command", t.reason + ": " + e.commandLine, t.technique);
   }
 
   std::sort(out.begin(), out.end(), [](const Detection &a, const Detection &b) {
