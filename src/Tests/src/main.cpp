@@ -3565,10 +3565,28 @@ void TestSimulatedReport() {
   }
   Expect(hasNestedChild, "sim: process tree has a nested child (subtree)");
 
+  Expect(r.dynamicSummary.liveFramePacingSummary.find("fps") != std::string::npos,
+         "sim: live-frame pacing summary populated");
+
   const auto r2 = antimal::BuildSimulatedReport("sim-x");
   Expect(r2.scannerVerdict.sha256 == r.scannerVerdict.sha256 &&
              r2.events.size() == r.events.size(),
          "sim: deterministic");
+
+  // The pacing summary must be serialized and survive a write -> load round-trip.
+  Expect(antimal::ToJson(r).find("liveFramePacingSummary") != std::string::npos,
+         "sim: pacing summary is serialized to report JSON");
+  {
+    const auto tmp =
+        std::filesystem::temp_directory_path() / "antimal-sim-roundtrip.json";
+    antimal::WriteReportJson(tmp, r);
+    const auto loaded = antimal::LoadReportBestEffort(tmp);
+    Expect(loaded.dynamicSummary.liveFramePacingSummary ==
+               r.dynamicSummary.liveFramePacingSummary,
+           "sim: pacing summary round-trips through report JSON");
+    std::error_code ec;
+    std::filesystem::remove(tmp, ec);
+  }
 }
 
 // Magic-byte file-type identification (extension-independent), the basis for

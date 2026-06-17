@@ -9676,6 +9676,7 @@ DynamicRunSummary ToDynamicSummary(const hv::VmRunSummary &vm,
   summary.guestAgentConnected = false;
   summary.networkMode = networkMode;
   summary.framesCaptured = vm.framesCaptured;
+  summary.liveFramePacingSummary = vm.liveFramePacingSummary;
   summary.eventsCaptured = vm.eventsCaptured;
   summary.artifactsCaptured = vm.artifactsCaptured;
   summary.vcpuExits = static_cast<uint32_t>(std::max(0, vm.steps));

@@ -164,6 +164,9 @@ AnalysisReport BuildSimulatedReport(const std::string &runId) {
   d.eventsCaptured = static_cast<uint32_t>(report.events.size());
   d.artifactsCaptured = 2;
   d.screenStateReached = 3; // rich (a real desktop)
+  d.liveFramePacingSummary =
+      "28.6fps (target 30) p50 34.9ms p95 41.2ms min 31.0ms max 58.0ms "
+      "on-target 86% frames 540 blank-skips 7";
 
   return report;
 }

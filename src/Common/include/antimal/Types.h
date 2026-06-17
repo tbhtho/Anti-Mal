@@ -226,6 +226,10 @@ struct DynamicRunSummary {
   uint64_t pm1aStatusReads = 0;
   uint64_t pm1SleepRequests = 0;
   uint32_t screenStateReached = 0; // richest framebuffer state (0=unknown..3=rich)
+  // Measured live-display cadence (FramePacingStats::Summary()): achieved FPS vs
+  // target + interval p50/p95/min/max + on-target % + blank-skips. Empty for
+  // headless runs with no live-frame consumer. Carried from VmRunSummary.
+  std::string liveFramePacingSummary;
   uint64_t kdPacketsReceived = 0;
   uint64_t kdControlPacketsReceived = 0;
   uint64_t kdDataPacketsReceived = 0;

@@ -547,6 +547,8 @@ DynamicRunSummary ParseDynamicSummary(const JsonValue *value) {
       static_cast<uint64_t>(IntValue(Member(*value, "pm1aStatusReads")));
   summary.screenStateReached =
       static_cast<uint32_t>(IntValue(Member(*value, "screenStateReached")));
+  summary.liveFramePacingSummary =
+      StringValue(Member(*value, "liveFramePacingSummary"));
   summary.pm1SleepRequests =
       static_cast<uint64_t>(IntValue(Member(*value, "pm1SleepRequests")));
   summary.kdPacketsReceived =
@@ -1611,6 +1613,11 @@ std::string BuildHtmlReportWithFrames(const AnalysisReport &report,
     if (!report.dynamicSummary.bootStage.empty()) {
       html << "<div class=\"k\">boot stage</div><div class=\"mono\">"
            << HtmlEscape(report.dynamicSummary.bootStage) << "</div>";
+    }
+    if (!report.dynamicSummary.liveFramePacingSummary.empty()) {
+      html << "<div class=\"k\">live display</div><div class=\"mono\">"
+           << HtmlEscape(report.dynamicSummary.liveFramePacingSummary)
+           << "</div>";
     }
     if (!report.dynamicSummary.windowsKernelReadGateStatus.empty()) {
       html << "<div class=\"k\">kernel gate</div><div class=\"mono\">"
