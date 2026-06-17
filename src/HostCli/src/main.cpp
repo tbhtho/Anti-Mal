@@ -3012,14 +3012,41 @@ int CommandReport(int argc, wchar_t **argv) {
   }
   if (HasFlag(argc, argv, "--timeline")) {
     // The behavioral timeline with relative offsets (T+Xs from the run start),
-    // a quick terminal view without opening the HTML.
+    // a quick terminal view without opening the HTML. Filters make a large
+    // telemetry stream (recovered runs can carry hundreds of events) triageable:
+    //   --category <c>  only events in that category (process/registry/file/...)
+    //   --mitre         only events carrying a MITRE technique (the hot subset)
+    //   --limit <N>     cap the number of rows printed
+    const auto catFilter = OptionValue(argc, argv, "--category");
+    const bool mitreOnly = HasFlag(argc, argv, "--mitre");
+    size_t limit = 0; // 0 = unlimited
+    if (const auto v = OptionValue(argc, argv, "--limit")) {
+      try { limit = static_cast<size_t>(std::stoul(*v)); } catch (...) { limit = 0; }
+    }
     int64_t anchor = -1;
     for (const auto &e : report.events) {
       const int64_t ep = antimal::ParseIso8601ToEpochSeconds(e.timestampUtc);
       if (ep >= 0 && (anchor < 0 || ep < anchor)) anchor = ep;
     }
-    std::cout << "Timeline (" << report.events.size() << " events):\n";
+    auto keep = [&](const antimal::EventRecord &e) {
+      if (catFilter && e.category != *catFilter) return false;
+      if (mitreOnly && e.mitre.empty()) return false;
+      return true;
+    };
+    size_t matched = 0, shown = 0;
+    for (const auto &e : report.events) if (keep(e)) ++matched;
+    std::cout << "Timeline (" << matched << " of " << report.events.size()
+              << " events";
+    if (catFilter) std::cout << ", category=" << *catFilter;
+    if (mitreOnly) std::cout << ", mitre-only";
+    std::cout << "):\n";
     for (const auto &e : report.events) {
+      if (!keep(e)) continue;
+      if (limit && shown >= limit) {
+        std::cout << "  ... " << (matched - shown) << " more (raise --limit)\n";
+        break;
+      }
+      ++shown;
       const std::string rel = antimal::RelativeTimeLabel(
           antimal::ParseIso8601ToEpochSeconds(e.timestampUtc), anchor);
       std::cout << "  " << (rel.empty() ? e.timestampUtc : rel) << "  "
