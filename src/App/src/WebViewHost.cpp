@@ -1312,12 +1312,26 @@ void WebViewHost::RegisterHandlers() {
       SetEnvironmentVariableW(L"ANTIMAL_PROBE_LOGIN_PASSWORD", nullptr);
       SetEnvironmentVariableW(L"ANTIMAL_PROBE_OOBE_AUTOLOGON", nullptr);
       SetEnvironmentVariableW(L"ANTIMAL_PROBE_PRESS_ENTER_SEC", nullptr);
+      // Escape the "Preparing Windows" hang: the seed snapshot was captured
+      // mid-first-logon, so every boot re-runs first-logon AppX provisioning,
+      // which crash-loops ShellHost (ucrtbase 0xC0000409) and wedges for 10-15+
+      // min. COMPLETE_OOBE marks Windows setup done so first-logon doesn't re-run,
+      // and SHELL_CMD swaps the crashing explorer shell for a stable cmd console
+      // so the session is actually usable. Overlay-only; applies to the plain
+      // "Boot VM (live)" session, NOT detonation (which keeps the authentic shell).
+      SetEnvironmentVariableW(L"ANTIMAL_PROBE_COMPLETE_OOBE", L"1");
+      SetEnvironmentVariableW(L"ANTIMAL_PROBE_SHELL_CMD", L"1");
+      SetEnvironmentVariableW(L"ANTIMAL_PROBE_RUN_CMD", nullptr); // plain session: no auto-launch
     } else {
       SetEnvironmentVariableW(L"ANTIMAL_SEED_OVERLAY", nullptr);
       SetEnvironmentVariableW(L"ANTIMAL_PROBE_OOBE_KEYS", L"250");
       SetEnvironmentVariableW(L"ANTIMAL_PROBE_PRESS_ENTER_SEC", nullptr);
       // Full OOBE sets AutoAdminLogon via the in-guest script; no login typing.
       SetEnvironmentVariableW(L"ANTIMAL_PROBE_LOGIN_PASSWORD", nullptr);
+      // A cold full-OOBE boot must NOT skip OOBE; clear the seeded-only knobs.
+      SetEnvironmentVariableW(L"ANTIMAL_PROBE_COMPLETE_OOBE", nullptr);
+      SetEnvironmentVariableW(L"ANTIMAL_PROBE_SHELL_CMD", nullptr);
+      SetEnvironmentVariableW(L"ANTIMAL_PROBE_RUN_CMD", nullptr);
     }
     // vm.boot is always a non-executing healthcheck boot -- clear any stale
     // detonate arming a prior vm.detonate left in this process's environment so
@@ -1397,6 +1411,12 @@ void WebViewHost::RegisterHandlers() {
       SetEnvironmentVariableW(L"ANTIMAL_PROBE_PRESS_ENTER_SEC", nullptr);
       SetEnvironmentVariableW(L"ANTIMAL_PROBE_LOGIN_PASSWORD", nullptr);
     }
+    // Detonation keeps the AUTHENTIC guest environment: clear any usable-session
+    // knobs a prior "Boot VM (live)" left in this process's env (they would inherit
+    // via the NULL-environment CreateProcess and change what the malware sees).
+    SetEnvironmentVariableW(L"ANTIMAL_PROBE_SHELL_CMD", nullptr);
+    SetEnvironmentVariableW(L"ANTIMAL_PROBE_COMPLETE_OOBE", nullptr);
+    SetEnvironmentVariableW(L"ANTIMAL_PROBE_RUN_CMD", nullptr);
     // Three-key execution gate + deploy the execute-capable agent into the
     // disposable overlay so the sample runs (and runs VISIBLY via SP5).
     SetEnvironmentVariableW(L"ANTIMAL_FORCE_DYNAMIC_EXEC", L"1");   // key 1

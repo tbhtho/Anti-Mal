@@ -57,6 +57,8 @@
   var liveFrameBuffer = null;    // host-shared ArrayBuffer of live RGBA pixels
   var usingSharedFrames = false; // true once the canvas path is live (no <img>)
   var liveFrameCount = 0, liveFps = 0, liveFpsTimer = null; // canvas fps readout
+  var liveStartMs = 0;   // session start (ms) for the uptime readout
+  var evtBurst = null;   // {line,n,t} — collapse telemetry log floods into one line
   function send(cmd, args) {
     var reqId = nextReqId++;
     return new Promise(function (resolve) {
@@ -166,11 +168,11 @@
     vm: function () {
       var steps = [['OVMF firmware', 'done'], ['bootmgfw.efi', 'done'], ['winload.efi', 'done'], ['ntoskrnl', 'done'], ['AHCI storage mount', 'done'], ['win32k / GUI stack', 'done'], ['Getting Ready (OOBE)', 'done'], ['GuestAgent heartbeat', 'cur'], ['Artifact return', 'todo']];
       return '<h1 class="page-title">VM Analysis</h1><p class="page-sub">In-house WHP sandbox: live view, state, boot timeline, and safety gates.</p>' +
-        '<div class="panel"><h2>Live VM <span id="vm-live-status" class="page-sub" style="font-weight:400"></span><span id="vm-display-mode" class="page-sub" style="font-weight:600;margin-left:10px;font-size:12px"></span></h2>' +
+        '<div class="panel"><h2>VM Console <span id="vm-live-status" class="page-sub" style="font-weight:400"></span><span id="vm-display-mode" class="page-sub" style="font-weight:600;margin-left:10px;font-size:12px"></span></h2>' +
         '<div class="actions"><button class="btn primary" id="vm-boot-btn">Boot VM (live)</button><button class="btn danger" id="vm-detonate-btn">Detonate Sample (live)</button><button class="btn" id="vm-stop-btn">Stop</button><button class="btn" id="vm-fs-btn" title="Fill the screen with the VM (Esc to exit)">⛶ Fullscreen</button></div>' +
         '<div class="screenframe" id="live-frame" tabindex="0" style="margin-top:12px;outline:none">Click “Boot VM (live)” for a clean session, or “Detonate Sample (live)” to run a BENIGN sample inside it.</div>' +
         '</div>' +
-        '<div class="panel"><h2>Live Process Telemetry <span id="vm-telemetry-status" class="page-sub" style="font-weight:400"></span></h2>' +
+        '<div class="panel"><h2>Process Telemetry <span id="vm-telemetry-status" class="page-sub" style="font-weight:400"></span></h2>' +
         '<div id="vm-events"><p class="page-sub" style="margin:0">No events yet — boot the VM to stream live process activity from the GuestAgent over COM2.</p></div></div>' +
         '<div class="row"><div class="panel" style="flex:1;min-width:280px"><h2>VM State</h2>' +
         '<div id="vm-state"><p class="page-sub" style="margin:0">Loading…</p></div>' +
@@ -436,8 +438,28 @@
   // P5 live telemetry: a run.watch worker streams journal events here.
   function onTelemetry(d) {
     if (!d) return;
+    // VM stopped/ended: drop the still-draining backlog so the status log can't
+    // keep scrolling with no VM running (the WebView message queue can hold
+    // thousands of events buffered during a crash-loop). livePollTimer is the
+    // definitive "a live VM is streaming" flag, cleared by stopLivePoll().
+    if (!livePollTimer) return;
     var cat = String(d.category || '?'), act = String(d.action || ''), tgt = String(d.target || '');
-    appendLog('INFO', 'EVT ' + cat + (act ? ' · ' + act : '') + (tgt ? ' · ' + shortPath(tgt) : ''));
+    var msg = 'EVT ' + cat + (act ? ' · ' + act : '') + (tgt ? ' · ' + shortPath(tgt) : '');
+    // Coalesce floods: a crash-loop can emit 100+/sec. Within a short window,
+    // collapse onto one log line with a running count instead of spamming N lines.
+    var now = Date.now();
+    if (evtBurst && evtBurst.line && evtBurst.line.parentNode && (now - evtBurst.t) < 400) {
+      evtBurst.n++; evtBurst.t = now;
+      var more = evtBurst.line.querySelector('.evt-more');
+      if (!more) {
+        more = document.createElement('span'); more.className = 'evt-more'; more.style.opacity = '0.55';
+        var mm = evtBurst.line.querySelector('.msg'); if (mm) mm.appendChild(more);
+      }
+      if (more) more.textContent = '  (+' + evtBurst.n + ' more)';
+    } else {
+      appendLog('INFO', msg);
+      evtBurst = { line: logEl ? logEl.lastChild : null, n: 0, t: now };
+    }
     // Prefer the VM page's live panel; fall back to the dashboard feed.
     var box = $('#vm-events') || $('#dash-events'); if (!box) return;
     var tbody = box.querySelector('tbody');
@@ -453,6 +475,7 @@
       '</td><td class="mono">' + esc(d.pid | 0) + '</td><td class="mono" title="' + esc(d.fullImagePath || '') + '">' + esc(img) + '</td><td class="mono">' + esc(d.user || '') + '</td><td class="mono">' + esc(d.integrity || '') + '</td><td class="mono" title="' + esc(d.commandLine || '') + '">' + esc(cmd) + '</td><td class="mono">' + esc(tgt) +
       '</td>' + dropCell(d) + '<td>' + (d.mitre ? '<span class="tag">' + esc(d.mitre) + '</span>' : '') + '</td>';
     tbody.insertBefore(tr, tbody.firstChild);
+    while (tbody.children.length > 500) tbody.removeChild(tbody.lastChild); // cap DOM growth on floods
   }
   function onRunStatus(d) {
     if (!d) return;
@@ -564,6 +587,7 @@
     liveMouse = { btn: 0, dx: 0, dy: 0 };
     usingSharedFrames = false; // next boot re-establishes the shared canvas path
     liveFrameCount = 0; liveFps = 0;
+    liveStartMs = 0; evtBurst = null;
     var dm = $('#vm-display-mode'); if (dm) dm.textContent = '';
     releaseHeldKeys();
   }
@@ -578,7 +602,7 @@
     }
     var live = $('#vm-live-status'), lt = '';
     if (state === 'booting') { badge('#vm-badge', 'booting', 'VM Booting'); badge('#mode-badge', 'idle', 'Sandbox Ready'); lt = '· ' + (detail || 'booting…'); }
-    else if (state === 'running') { badge('#vm-badge', 'ready', 'VM Running'); badge('#mode-badge', 'idle', 'Sandbox Ready'); lt = '· ' + (detail || 'live'); }
+    else if (state === 'running') { badge('#vm-badge', 'ready', 'VM Running'); badge('#mode-badge', 'idle', 'Sandbox Ready'); lt = detail ? '· ' + detail : ''; }
     else if (state === 'detonating') { badge('#vm-badge', 'ready', 'VM Running'); badge('#mode-badge', 'blocked', 'Detonating'); lt = '· ' + (detail || 'detonating'); }
     else if (state === 'stopped') { badge('#vm-badge', 'idle', 'VM Idle'); badge('#mode-badge', 'idle', 'Sandbox Ready'); lt = '· stopped'; }
     else { badge('#vm-badge', 'idle', 'VM Idle'); badge('#mode-badge', 'idle', 'Sandbox Ready'); lt = ''; }
@@ -669,20 +693,26 @@
   // advancing frameSeq (the VM process stalled/exited) -- NOT the old blank-skip
   // freeze, which is fixed host-side (LiveFramePublishGate). Surfacing "stalled"
   // vs a real fps is exactly what the "live vm fps = 0" confusion needed.
+  function fmtUptime(ms) {
+    var s = Math.floor(ms / 1000), m = Math.floor(s / 60);
+    return m + ':' + pad2(s % 60);
+  }
   function updateDisplayMode() {
     var el = $('#vm-display-mode'); if (!el) return;
     if (!livePollTimer || !usingSharedFrames) { el.textContent = ''; return; }
     liveFps = liveFrameCount; liveFrameCount = 0;
+    var up = liveStartMs ? ' · up ' + fmtUptime(Date.now() - liveStartMs) : '';
     if (liveFps > 0) {
-      el.textContent = '● live · ' + liveFps + ' fps';
+      el.textContent = '● ' + liveFps + ' fps' + up;
       el.style.color = '#7ee2a8';
     } else {
-      el.textContent = '○ stalled · 0 fps';
+      el.textContent = '○ stalled · 0 fps' + up;
       el.style.color = '#d9a441';
     }
   }
   function startLivePoll() {
     stopLivePoll();
+    liveStartMs = Date.now(); // begin the uptime clock
     liveWatchRun = null; // each boot re-tails the new run's journal
     liveMouseTimer = setInterval(flushLiveMouse, 50);
     liveFpsTimer = setInterval(updateDisplayMode, 1000);
@@ -793,11 +823,18 @@
         loadVm._inputWired = true;
         document.addEventListener('pointerlockchange', function () {
           var f = document.getElementById('live-frame');
+          var cv = document.getElementById('live-frame-canvas');
           if (vmCaptured()) {
-            if (f) f.style.outline = '2px solid #4ea1ff';
-            var cv = document.getElementById('live-frame-canvas'); // center the synthetic pointer on capture
-            liveCursor.x = cv ? cv.width / 2 : 0; liveCursor.y = cv ? cv.height / 2 : 0; liveCursor.valid = !!cv;
-          } else { if (f) f.style.outline = 'none'; liveCursor.valid = false; releaseHeldKeys(); } // never leave a key stuck
+            // Hide the HOST cursor over the VM so only the guest's pointer shows
+            // (WebView2 does NOT hide the OS cursor on pointer-lock, hence cursor:none).
+            if (f) { f.style.outline = '2px solid #4ea1ff'; f.style.cursor = 'none'; }
+            if (cv) cv.style.cursor = 'none';
+            liveCursor.x = cv ? cv.width / 2 : 0; liveCursor.y = cv ? cv.height / 2 : 0; liveCursor.valid = !!cv; // center the synthetic pointer on capture
+          } else {
+            if (f) { f.style.outline = 'none'; f.style.cursor = ''; } // restore the host cursor on release
+            if (cv) cv.style.cursor = '';
+            liveCursor.valid = false; releaseHeldKeys(); // never leave a key stuck
+          }
         });
         // While driving the VM, the scroll wheel must NOT scroll the host page.
         // passive:false so preventDefault actually takes effect. (Delivering the
