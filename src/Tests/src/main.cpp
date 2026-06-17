@@ -3786,6 +3786,30 @@ void TestPersistenceClassifier() {
          "persist: an ordinary temp-file drop is not persistence");
 }
 
+// Report HTML structure: a rich (simulated) report must render every analyst
+// panel. Guards the renderer (heavily modified) against a panel silently
+// dropping out. Asserts stable section markers, not brittle exact markup.
+void TestReportHtmlStructure() {
+  const auto report = antimal::BuildSimulatedReport("html-x");
+  const std::string html = antimal::BuildHtmlReport(report);
+  auto has = [&](const char *needle) {
+    return html.find(needle) != std::string::npos;
+  };
+  Expect(has("Verdict"), "html: Verdict panel present");
+  Expect(has("Detections ("), "html: Detections summary present");
+  Expect(has("boot outcome"), "html: boot outcome row present");
+  Expect(has("live display"), "html: live-display pacing row present");
+  Expect(has("Persistence"), "html: Persistence panel present");
+  Expect(has("Mechanism"), "html: persistence Mechanism column present");
+  Expect(has("Network"), "html: Network panel present");
+  Expect(has("MITRE ATT"), "html: MITRE panel present");
+  Expect(has("Full Event Timeline"), "html: event timeline present");
+  Expect(has("T+"), "html: relative-time offsets present");
+  Expect(has("Registry Run Keys"), "html: MITRE technique names rendered");
+  // Untrusted strings must be HTML-escaped (no raw script injection vector).
+  Expect(!has("<script>alert"), "html: no obvious injection");
+}
+
 // Packer identification from PE section-name signatures (no external tool).
 void TestPackerDetection() {
   using antimal::DetectPackerFromSections;
@@ -8726,6 +8750,7 @@ int main() {
     TestSimulatedReport();
     TestBootDiagnostics();
     TestPackerDetection();
+    TestReportHtmlStructure();
     TestPersistenceClassifier();
     TestNetworkClassifier();
     TestEventTime();
