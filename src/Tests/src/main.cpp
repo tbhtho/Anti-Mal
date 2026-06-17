@@ -3649,6 +3649,93 @@ void TestSimulatedReport() {
   }
 }
 
+// Reconstructing a report from raw events the way `rebuild-report` does (when a
+// run's events.jsonl survives but report.json was never finalized). Exercises
+// the exact pure-builder chain the command relies on -- journal round-trip ->
+// process tree / MITRE / behavior score -> report JSON round-trip -- so a
+// serialization regression that would break recovered reports is caught here.
+void TestRebuildReportFromEvents() {
+  using namespace antimal;
+  std::vector<EventRecord> events;
+  auto proc = [&](uint32_t pid, uint32_t ppid, const char *img,
+                  const char *mitre) {
+    EventRecord e;
+    e.timestampUtc = "2026-06-17T18:00:00Z";
+    e.source = "GuestAgent";
+    e.category = "process";
+    e.action = "process.start";
+    e.processId = pid;
+    e.parentProcessId = ppid;
+    e.imagePath = img;
+    e.mitre = mitre ? mitre : "";
+    events.push_back(e);
+  };
+  proc(100, 0, "explorer.exe", "");
+  proc(200, 100, "sample.exe", "T1059.001");   // child of explorer
+  proc(300, 200, "powershell.exe", "T1086");   // grandchild
+  // A registry persistence event the recovered report should preserve.
+  {
+    EventRecord e;
+    e.source = "GuestAgent";
+    e.category = "registry";
+    e.action = "registry.set";
+    e.processId = 200;
+    e.target = "HKLM\\Software\\Microsoft\\Windows\\CurrentVersion\\Run\\evil";
+    events.push_back(e);
+  }
+
+  // Serialize -> parse, proving the on-disk journal shape the command reads
+  // survives unchanged (this is EXACTLY what EventJournalTailer::ReadAll yields).
+  std::vector<EventRecord> recovered;
+  for (const auto &e : events) {
+    recovered.push_back(ParseEventJsonLine(SerializeEventJsonLine(e)));
+  }
+  Expect(recovered.size() == events.size(), "rebuild: journal round-trip count");
+
+  // Mirror CommandRebuildReport's assembly.
+  AnalysisReport report;
+  report.runId = "rebuilt-x";
+  report.events = recovered;
+  report.mitreTechniques =
+      AggregateMitreTechniques(recovered, report.scannerVerdict);
+  report.dynamicSummary.started = true;
+  report.dynamicSummary.eventsCaptured =
+      static_cast<uint32_t>(recovered.size());
+  report.dynamicSummary.status = "recovered (rebuilt from events.jsonl)";
+  bool guestTelemetry = false;
+  for (const auto &e : recovered)
+    if (e.source == "GuestAgent") guestTelemetry = true;
+  report.dynamicSummary.windowsUserModeGateReached = guestTelemetry;
+  const auto bs = ScoreSandboxBehavior(report.dynamicSummary, recovered);
+  report.sandboxVerdict = bs.verdict;
+  report.verdictScore = bs.score;
+
+  Expect(guestTelemetry, "rebuild: GuestAgent telemetry detected -> user-mode gate");
+  const auto tree = BuildProcessTree(recovered);
+  Expect(tree.size() == 3, "rebuild: process tree has the 3 started processes");
+  bool nested = false;
+  for (const auto &n : tree)
+    if (n.depth >= 2) nested = true;
+  Expect(nested, "rebuild: process tree preserves the grandchild depth");
+  Expect(report.mitreTechniques.size() >= 2,
+         "rebuild: MITRE techniques aggregated from events");
+
+  // Full report JSON round-trip -- a recovered report must serialize + reload.
+  const auto tmp =
+      std::filesystem::temp_directory_path() / "antimal-rebuild-roundtrip.json";
+  WriteReportJson(tmp, report);
+  const auto loaded = LoadReportBestEffort(tmp);
+  Expect(loaded.runId == "rebuilt-x", "rebuild: runId round-trips");
+  Expect(loaded.events.size() == recovered.size(),
+         "rebuild: events survive the report round-trip");
+  Expect(loaded.dynamicSummary.status.find("recovered") != std::string::npos,
+         "rebuild: recovered status round-trips");
+  Expect(BuildProcessTree(loaded.events).size() == 3,
+         "rebuild: process tree rebuildable from the reloaded report");
+  std::error_code ec;
+  std::filesystem::remove(tmp, ec);
+}
+
 // Detections summary: aggregates static findings + persistence + suspicious
 // network into one severity-ranked list (high -> info), de-duplicated.
 void TestDetectionSummary() {
@@ -8921,6 +9008,7 @@ int main() {
     TestFuzzyHash();
     TestFramePacingStats();
     TestSimulatedReport();
+    TestRebuildReportFromEvents();
     TestBootDiagnostics();
     TestCommandLineClassifier();
     TestUsabilityDiagnostics();
