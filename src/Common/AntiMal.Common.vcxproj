@@ -64,6 +64,7 @@
     <ClInclude Include="include\antimal\Report.h" />
     <ClInclude Include="include\antimal\Scanner.h" />
     <ClInclude Include="include\antimal\ScriptAnalyzer.h" />
+    <ClInclude Include="include\antimal\Simulation.h" />
     <ClInclude Include="include\antimal\Screenshot.h" />
     <ClInclude Include="include\antimal\ShellLinkParser.h" />
     <ClInclude Include="include\antimal\Strings.h" />
@@ -103,6 +104,7 @@
     <ClCompile Include="src\Report.cpp" />
     <ClCompile Include="src\Scanner.cpp" />
     <ClCompile Include="src\ScriptAnalyzer.cpp" />
+    <ClCompile Include="src\Simulation.cpp" />
     <ClCompile Include="src\Screenshot.cpp" />
     <ClCompile Include="src\ShellLinkParser.cpp" />
     <ClCompile Include="src\Strings.cpp" />

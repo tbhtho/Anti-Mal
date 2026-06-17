@@ -27,6 +27,7 @@
 #include "antimal/RegistryTelemetry.h"
 #include "antimal/ProcessTelemetry.h"
 #include "antimal/Report.h"
+#include "antimal/Simulation.h"
 #include "antimal/Scanner.h"
 #include "antimal/ScriptAnalyzer.h"
 #include "antimal/Screenshot.h"
@@ -3535,6 +3536,39 @@ void TestFramePacingStats() {
     w += 33333;
   }
   Expect(win.SampleCount() == 10, "pacing: window caps retained intervals");
+}
+
+// The synthetic local-simulation report: it must be a coherent, clearly-labeled
+// Any.Run-style report (real static hashes, a nested process tree, a malicious
+// verdict, MITRE + network aggregates) AND unmistakably marked as a simulation,
+// AND deterministic. This is the no-boot end-to-end proof of the report pipeline.
+void TestSimulatedReport() {
+  const auto r = antimal::BuildSimulatedReport("sim-x");
+  Expect(r.runId == "sim-x", "sim: runId preserved");
+  Expect(!r.events.empty(), "sim: has events");
+  Expect(r.sandboxVerdict == antimal::Verdict::Malicious, "sim: malicious verdict");
+  Expect(!r.mitreTechniques.empty(), "sim: mitre techniques populated");
+  Expect(!r.networkDomains.empty(), "sim: network domains populated");
+  Expect(r.scannerVerdict.sha256.size() == 64, "sim: real sha256");
+  Expect(!r.scannerVerdict.ctph.empty(), "sim: ctph computed");
+  Expect(r.dynamicSummary.status.find("SIMULATION") != std::string::npos,
+         "sim: run status is labeled SIMULATION");
+  Expect(!r.verdictRationale.empty() &&
+             r.verdictRationale[0].find("SIMULATION") != std::string::npos,
+         "sim: verdict rationale leads with the simulation label");
+
+  const auto tree = antimal::BuildProcessTree(r.events);
+  Expect(tree.size() >= 4, "sim: process tree has >=4 nodes");
+  bool hasNestedChild = false;
+  for (const auto &n : tree) {
+    if (n.depth > 0) hasNestedChild = true;
+  }
+  Expect(hasNestedChild, "sim: process tree has a nested child (subtree)");
+
+  const auto r2 = antimal::BuildSimulatedReport("sim-x");
+  Expect(r2.scannerVerdict.sha256 == r.scannerVerdict.sha256 &&
+             r2.events.size() == r.events.size(),
+         "sim: deterministic");
 }
 
 // Magic-byte file-type identification (extension-independent), the basis for
@@ -8243,6 +8277,7 @@ int main() {
     TestMd5AndImphash();
     TestFuzzyHash();
     TestFramePacingStats();
+    TestSimulatedReport();
     TestFileTypeId();
     TestShellLinkParser();
     TestScriptAnalyzer();

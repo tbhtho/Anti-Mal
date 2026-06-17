@@ -1,7 +1,10 @@
 #include "antimal/BrowserImpact.h"
 #include "antimal/Config.h"
+#include "antimal/EventJournal.h"
 #include "antimal/FileUtil.h"
 #include "antimal/FuzzyHash.h"
+#include "antimal/Screenshot.h"
+#include "antimal/Simulation.h"
 #include "antimal/HyperVOrchestrator.h"
 #include "antimal/IocExport.h"
 #include "antimal/Json.h"
@@ -166,7 +169,8 @@ void PrintUsage() {
       << "  antimal export <run-id-or-report.json> --format stix|misp|csv [--out <file>]\n"
       << "  antimal similarity <fileA> <fileB>   (fuzzy-hash similarity 0..100)\n"
       << "  antimal similarity <file> --to <ctph-digest>\n"
-      << "  antimal doctor [--json]              (host & workflow readiness check)\n";
+      << "  antimal doctor [--json]              (host & workflow readiness check)\n"
+      << "  antimal simulate [--out <dir>] [--run-id <id>]  (synthetic end-to-end report)\n";
 }
 
 antimal::ScannerOptions BuildScannerOptions(int argc, wchar_t **argv,
@@ -3102,6 +3106,73 @@ int CommandDoctor(int argc, wchar_t **argv) {
   return ready ? 0 : 1;
 }
 
+// `simulate` — produce a complete, openable Any.Run-style run from a SYNTHETIC
+// detonation, exercising the events -> report.json -> report.html (+ filmstrip)
+// pipeline end-to-end with NO VM / firmware / hardware dependency. This is the
+// documented local simulation for when a live boot isn't available, and a stable
+// demo/fixture. The output is unmistakably labeled as a simulation.
+int CommandSimulate(int argc, wchar_t **argv) {
+  const auto config = antimal::LoadConfig(antimal::DefaultConfigPath());
+  const std::string runId =
+      OptionValue(argc, argv, "--run-id").value_or("sim-detonation");
+  std::filesystem::path outDir;
+  if (const auto out = OptionValue(argc, argv, "--out")) {
+    outDir = std::filesystem::path(antimal::Utf8ToWide(*out));
+  } else {
+    outDir = config.workspaceRoot / std::filesystem::path(antimal::Utf8ToWide(runId));
+  }
+  std::error_code ec;
+  std::filesystem::create_directories(outDir, ec);
+  std::filesystem::create_directories(outDir / "screenshots", ec);
+
+  antimal::AnalysisReport report = antimal::BuildSimulatedReport(runId);
+
+  // events.jsonl (the live-tail artifact).
+  {
+    antimal::EventJournalWriter journal(outDir / "events.jsonl");
+    for (const auto &e : report.events) {
+      journal.Append(e);
+    }
+  }
+
+  // Synthetic filmstrip: one labeled frame per detonation stage. RenderTextToPng
+  // is the same GDI+ encoder the live orchestrator uses, so this is the real
+  // screenshot path, just fed synthetic captions.
+  static const char *kStages[] = {
+      "OVMF firmware init",      "Windows 11 boot",
+      "login -> desktop",        "stealer.exe launched",
+      "powershell download cradle", "C2 beacon -> 185.220.101.5:443",
+      "Run-key persistence written", "process exit (0x0)"};
+  uint32_t frames = 0;
+  for (const char *stage : kStages) {
+    char name[64];
+    std::snprintf(name, sizeof(name), "frame-%06u.png", frames);
+    const std::string caption =
+        std::string("AntiMal SIMULATION (synthetic)\n\n") + stage;
+    if (antimal::RenderTextToPng(outDir / "screenshots" / name, caption)) {
+      ++frames;
+    }
+  }
+  report.dynamicSummary.framesCaptured = frames;
+
+  antimal::WriteReportJson(outDir / "report.json", report);
+  antimal::WriteReportHtml(outDir / "report.html", report);
+
+  std::cout << "AntiMal local SIMULATION (synthetic -- no VM was booted)\n";
+  std::cout << "  run dir : " << antimal::PathToUtf8(outDir) << "\n";
+  std::cout << "  report  : " << antimal::PathToUtf8(outDir / "report.html") << "\n";
+  std::cout << "  events  : " << report.events.size() << " in events.jsonl\n";
+  std::cout << "  frames  : " << frames << " in screenshots/\n";
+  std::cout << "  verdict : " << antimal::ToString(report.sandboxVerdict)
+            << " (score " << report.verdictScore << ")\n";
+  std::cout << "  mitre   : ";
+  for (size_t i = 0; i < report.mitreTechniques.size(); ++i) {
+    std::cout << (i ? ", " : "") << report.mitreTechniques[i];
+  }
+  std::cout << "\nOpen report.html to see the full Any.Run-style report.\n";
+  return 0;
+}
+
 } // namespace
 
 int CommandDumpHive(int argc, wchar_t **argv) {
@@ -3165,6 +3236,9 @@ int wmain(int argc, wchar_t **argv) {
     }
     if (command == "doctor" || command == "preflight") {
       return CommandDoctor(argc, argv);
+    }
+    if (command == "simulate") {
+      return CommandSimulate(argc, argv);
     }
     PrintUsage();
     return 2;
