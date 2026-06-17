@@ -1,5 +1,6 @@
 #include "antimal/Report.h"
 
+#include "antimal/BootDiagnostics.h"
 #include "antimal/FileUtil.h"
 #include "antimal/Json.h"
 #include "antimal/MitreCatalog.h"
@@ -1625,6 +1626,16 @@ std::string BuildHtmlReportWithFrames(const AnalysisReport &report,
          << ", guest agent "
          << (report.dynamicSummary.guestAgentConnected ? "connected" : "not connected")
          << "</div>";
+    {
+      const BootOutcome bo = ClassifyBootOutcome(report.dynamicSummary);
+      html << "<div class=\"k\">boot outcome</div><div>"
+           << HtmlEscape(bo.stage) << " &middot; " << HtmlEscape(bo.detail);
+      if (!bo.remediation.empty()) {
+        html << "<div class=\"mono\" style=\"color:var(--muted);margin-top:2px\">"
+             << HtmlEscape(bo.remediation) << "</div>";
+      }
+      html << "</div>";
+    }
     if (!report.dynamicSummary.bootStage.empty()) {
       html << "<div class=\"k\">boot stage</div><div class=\"mono\">"
            << HtmlEscape(report.dynamicSummary.bootStage) << "</div>";

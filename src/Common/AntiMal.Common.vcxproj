@@ -40,6 +40,7 @@
     <ClInclude Include="include\antimal\ConfigExtractor.h" />
     <ClInclude Include="include\antimal\ContainerAnalyzer.h" />
     <ClInclude Include="include\antimal\BehaviorScore.h" />
+    <ClInclude Include="include\antimal\BootDiagnostics.h" />
     <ClInclude Include="include\antimal\Crypto.h" />
     <ClInclude Include="include\antimal\EventJournal.h" />
     <ClInclude Include="include\antimal\ExternalTools.h" />
@@ -78,6 +79,7 @@
   </ItemGroup>
   <ItemGroup>
     <ClCompile Include="src\BehaviorScore.cpp" />
+    <ClCompile Include="src\BootDiagnostics.cpp" />
     <ClCompile Include="src\BridgeRouter.cpp" />
     <ClCompile Include="src\BrowserImpact.cpp" />
     <ClCompile Include="src\Config.cpp" />

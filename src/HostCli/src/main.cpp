@@ -1,3 +1,4 @@
+#include "antimal/BootDiagnostics.h"
 #include "antimal/BrowserImpact.h"
 #include "antimal/Config.h"
 #include "antimal/EventJournal.h"
@@ -404,6 +405,12 @@ int CommandDetonate(int argc, wchar_t **argv) {
     const auto report = antimal::LoadReportBestEffort(result.reportPath);
     antimal::WriteReportHtml(result.runDir / "report.html", report);
     std::cout << "Report: " << antimal::PathToUtf8(result.reportPath) << "\n";
+    const antimal::BootOutcome bo =
+        antimal::ClassifyBootOutcome(report.dynamicSummary);
+    std::cout << "Boot outcome: " << bo.stage << " -- " << bo.detail << "\n";
+    if (!bo.remediation.empty()) {
+      std::cout << "  next: " << bo.remediation << "\n";
+    }
   }
   return result.errors.empty() ? 0 : 20;
 }

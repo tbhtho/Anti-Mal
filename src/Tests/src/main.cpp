@@ -5,6 +5,7 @@
 #include "antimal/Config.h"
 #include "antimal/ConfigExtractor.h"
 #include "antimal/ContainerAnalyzer.h"
+#include "antimal/BootDiagnostics.h"
 #include "antimal/Crypto.h"
 #include "antimal/FuzzyHash.h"
 #include "antimal/hv/FramePacing.h"
@@ -3620,6 +3621,75 @@ void TestSimulatedReport() {
            "sim: pacing summary round-trips through report JSON");
     std::error_code ec;
     std::filesystem::remove(tmp, ec);
+  }
+}
+
+// Boot-outcome classifier: collapses the scattered boot signals into a single
+// furthest-stage read with an actionable remediation. Picks the most-progressed
+// stage the evidence supports.
+void TestBootDiagnostics() {
+  using antimal::ClassifyBootOutcome;
+  using antimal::DynamicRunSummary;
+
+  // Not started.
+  {
+    DynamicRunSummary s;
+    const auto o = ClassifyBootOutcome(s);
+    Expect(o.stage == "not-started" && !o.reachedUserMode && !o.reachedDesktop,
+           "boot: a non-started run classifies as not-started");
+  }
+  // Started, no progress.
+  {
+    DynamicRunSummary s;
+    s.started = true;
+    const auto o = ClassifyBootOutcome(s);
+    Expect(o.stage == "firmware" && o.category == "no-progress",
+           "boot: started w/ no signal is firmware/no-progress");
+  }
+  // Kernel reached but not user mode.
+  {
+    DynamicRunSummary s;
+    s.started = true;
+    s.windowsKernelReadGateReached = true;
+    const auto o = ClassifyBootOutcome(s);
+    Expect(o.stage == "kernel" && !o.reachedUserMode,
+           "boot: kernel gate without user mode is kernel stage");
+  }
+  // User mode but no desktop.
+  {
+    DynamicRunSummary s;
+    s.started = true;
+    s.windowsUserModeGateReached = true;
+    const auto o = ClassifyBootOutcome(s);
+    Expect(o.stage == "user-mode" && o.reachedUserMode && !o.reachedDesktop,
+           "boot: user-mode gate without a desktop frame is user-mode stage");
+  }
+  // Desktop reached (rich screen + agent).
+  {
+    DynamicRunSummary s;
+    s.started = true;
+    s.screenStateReached = 3;
+    s.guestAgentConnected = true;
+    const auto o = ClassifyBootOutcome(s);
+    Expect(o.stage == "desktop" && o.reachedDesktop && o.reachedUserMode,
+           "boot: rich screen + agent is desktop stage");
+  }
+  // An explicit blocker is folded into the detail.
+  {
+    DynamicRunSummary s;
+    s.started = true;
+    s.windowsKernelReadGateReached = true;
+    s.bootBlocker = "criticalDevice=needs-repair";
+    const auto o = ClassifyBootOutcome(s);
+    Expect(o.detail.find("criticalDevice=needs-repair") != std::string::npos,
+           "boot: an explicit blocker appears in the detail");
+  }
+  // Every outcome carries a non-empty stage + detail.
+  {
+    DynamicRunSummary s;
+    const auto o = ClassifyBootOutcome(s);
+    Expect(!o.stage.empty() && !o.detail.empty() && !o.remediation.empty(),
+           "boot: every outcome has stage + detail + remediation");
   }
 }
 
@@ -8465,6 +8535,7 @@ int main() {
     TestFuzzyHash();
     TestFramePacingStats();
     TestSimulatedReport();
+    TestBootDiagnostics();
     TestShellcodeDetector();
     TestMitreCatalog();
     TestReportDiff();
