@@ -7900,6 +7900,13 @@ bool PatchOverlaySetShellCmd(hv::IBlockDevice &disk,
       result->notes.push_back("shell-cmd: DisableLocalMachineRunOnce -> 1");
     }
   }
+  // NOTE: IFEO Debugger-neutering of explorer.exe/ShellHost.exe was tried here and
+  // EMPIRICALLY REFUTED on this base: the overlay write applied (notes confirmed
+  // "IFEO-neutered 6 hosts") but Windows ignored it -- explorer/ShellHost still
+  // crashed 51x (0xC0000409) and systray ran only once. The base's signed WDAC
+  // policy blocks IFEO debuggers, and the mid-first-logon OOBE relaunches the shell
+  // hosts regardless. The crash-loop is NOT fixable from a disposable overlay; it
+  // needs a fresh/re-serviced base. Do not re-add IFEO here. (See CURRENT_STATE.)
   RefreshRegistryHiveHeader(bytes);
   if (!ntfs.WriteFileSameSize(*entry, bytes)) {
     if (result) result->notes.push_back("shell-cmd: SOFTWARE write-back failed");
