@@ -3232,13 +3232,30 @@ int CommandBootReport(int argc, wchar_t **argv) {
     const std::string name = antimal::PathToUtf8(entry.path().filename());
     if (!name.empty() && name[0] == '_') continue; // _base, _intel_cache, ...
     // A run dir with a job.json but no report.json is an attempted-but-incomplete
-    // run (crashed/killed before the report was written) -- count it as a failure
-    // so reliability isn't silently inflated by ignoring it.
+    // run (the host was killed/crashed before the final report was written).
+    // Don't silently drop it -- that would inflate the reliability numbers. But
+    // don't flatly call it a failure either: the live events.jsonl journal often
+    // proves the guest actually booted. GuestAgent telemetry comes from the
+    // session-0 service, so its presence proves OS-up / user-mode (NOT desktop --
+    // same rule as hostChannelBytes>0), letting us recover the real reach of a
+    // run whose report was never finalized.
     const auto rpt = entry.path() / "report.json";
     if (!std::filesystem::exists(rpt)) {
-      if (std::filesystem::exists(entry.path() / "job.json")) {
-        ++total;
-        ++incomplete;
+      if (!std::filesystem::exists(entry.path() / "job.json")) continue;
+      ++total;
+      ++incomplete;
+      bool guestTelemetry = false;
+      std::ifstream ev(entry.path() / "events.jsonl");
+      for (std::string line; std::getline(ev, line);) {
+        if (line.find("\"source\":\"GuestAgent\"") != std::string::npos) {
+          guestTelemetry = true;
+          break;
+        }
+      }
+      if (guestTelemetry) {
+        ++reachedUserMode;
+        ++byStage["user-mode (telemetry, no report)"];
+      } else {
         ++byStage["incomplete (no report)"];
       }
       continue;
