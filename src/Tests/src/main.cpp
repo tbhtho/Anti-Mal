@@ -7,6 +7,7 @@
 #include "antimal/ContainerAnalyzer.h"
 #include "antimal/BootDiagnostics.h"
 #include "antimal/Crypto.h"
+#include "antimal/EventTime.h"
 #include "antimal/FuzzyHash.h"
 #include "antimal/hv/FramePacing.h"
 #include "antimal/DetonationProtocol.h"
@@ -3624,6 +3625,35 @@ void TestSimulatedReport() {
     std::error_code ec;
     std::filesystem::remove(tmp, ec);
   }
+}
+
+// ISO-8601 epoch parsing + relative-time labels for the report timeline (T52).
+void TestEventTime() {
+  using antimal::ParseIso8601ToEpochSeconds;
+  using antimal::RelativeTimeLabel;
+
+  // Known epoch: 2026-01-01T12:00:00Z. Verify against a hand-computed value via
+  // the difference between two timestamps (avoids hardcoding the absolute epoch).
+  const int64_t t0 = ParseIso8601ToEpochSeconds("2026-01-01T12:00:00Z");
+  const int64_t t1 = ParseIso8601ToEpochSeconds("2026-01-01T12:00:13Z");
+  const int64_t t2 = ParseIso8601ToEpochSeconds("2026-01-01T12:01:05Z");
+  Expect(t0 > 0 && t1 == t0 + 13 && t2 == t0 + 65,
+         "evttime: parses ISO-8601 and the deltas are exact");
+  // The Unix epoch itself is 0.
+  Expect(ParseIso8601ToEpochSeconds("1970-01-01T00:00:00Z") == 0,
+         "evttime: the Unix epoch parses to 0");
+  // Fractional seconds + 'Z' tolerated.
+  Expect(ParseIso8601ToEpochSeconds("2026-01-01T12:00:13.250Z") == t1,
+         "evttime: fractional seconds are tolerated");
+  // Garbage -> -1.
+  Expect(ParseIso8601ToEpochSeconds("not-a-time") == -1,
+         "evttime: a non-timestamp yields -1");
+  // Relative labels.
+  Expect(RelativeTimeLabel(t1, t0) == "T+13s", "evttime: T+13s");
+  Expect(RelativeTimeLabel(t2, t0) == "T+1m05s", "evttime: T+1m05s");
+  Expect(RelativeTimeLabel(t0, t1) == "T-13s", "evttime: negative delta");
+  Expect(RelativeTimeLabel(-1, t0).empty(),
+         "evttime: unknown epoch yields an empty label");
 }
 
 // Network endpoint classifier: maps port -> service, detects private vs public
@@ -8615,6 +8645,7 @@ int main() {
     TestBootDiagnostics();
     TestPersistenceClassifier();
     TestNetworkClassifier();
+    TestEventTime();
     TestShellcodeDetector();
     TestMitreCatalog();
     TestReportDiff();

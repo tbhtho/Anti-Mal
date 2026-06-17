@@ -1,6 +1,7 @@
 #include "antimal/Report.h"
 
 #include "antimal/BootDiagnostics.h"
+#include "antimal/EventTime.h"
 #include "antimal/FileUtil.h"
 #include "antimal/Json.h"
 #include "antimal/MitreCatalog.h"
@@ -1421,6 +1422,12 @@ void EmitEventTable(std::ostringstream &html,
   html << "</div>";
   html << "<table><thead><tr><th>Time</th><th>PID</th><th>Source</th><th>Category</th><th>Action</th><th>Target</th><th>Type</th><th>SHA-256</th><th>User</th><th>Integ.</th><th>Cmd / Exit</th><th>MITRE</th></tr></thead>";
   html << "<tbody id=\"event-tbody\">";
+  // Anchor for relative timeline offsets = the earliest parseable event time.
+  int64_t anchorEpoch = -1;
+  for (const auto &e : events) {
+    const int64_t ep = ParseIso8601ToEpochSeconds(e.timestampUtc);
+    if (ep >= 0 && (anchorEpoch < 0 || ep < anchorEpoch)) anchorEpoch = ep;
+  }
   for (const auto &e : events) {
     // Prefer the command line; fall back to the exit code (rendered in hex by
     // the collector) so a crashing process shows e.g. 0xC0000409 here.
@@ -1453,9 +1460,16 @@ void EmitEventTable(std::ostringstream &html,
     const std::string search = e.imagePath + " " + e.fullImagePath + " " +
                                e.action + " " + e.target + " " + e.commandLine +
                                " " + e.userName + " " + fileType + " " + sha256;
+    const std::string relLabel =
+        RelativeTimeLabel(ParseIso8601ToEpochSeconds(e.timestampUtc), anchorEpoch);
     html << "<tr data-pid=\"" << e.processId << "\" data-search=\""
          << HtmlEscape(search) << "\">"
-         << "<td class=\"mono\">" << HtmlEscape(e.timestampUtc) << "</td>"
+         << "<td class=\"mono\">" << HtmlEscape(e.timestampUtc);
+    if (!relLabel.empty()) {
+      html << "<br><span style=\"color:var(--muted)\">" << HtmlEscape(relLabel)
+           << "</span>";
+    }
+    html << "</td>"
          << "<td class=\"mono\">" << e.processId << "</td>"
          << "<td>" << HtmlEscape(e.source) << "</td>"
          << "<td><span class=\"chip cat-" << HtmlEscape(e.category) << "\">"

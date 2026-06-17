@@ -43,6 +43,7 @@
     <ClInclude Include="include\antimal\BootDiagnostics.h" />
     <ClInclude Include="include\antimal\Crypto.h" />
     <ClInclude Include="include\antimal\EventJournal.h" />
+    <ClInclude Include="include\antimal\EventTime.h" />
     <ClInclude Include="include\antimal\ExternalTools.h" />
     <ClInclude Include="include\antimal\FileUtil.h" />
     <ClInclude Include="include\antimal\FuzzyHash.h" />
@@ -89,6 +90,7 @@
     <ClCompile Include="src\ContainerAnalyzer.cpp" />
     <ClCompile Include="src\Crypto.cpp" />
     <ClCompile Include="src\EventJournal.cpp" />
+    <ClCompile Include="src\EventTime.cpp" />
     <ClCompile Include="src\ExternalTools.cpp" />
     <ClCompile Include="src\FileUtil.cpp" />
     <ClCompile Include="src\FuzzyHash.cpp" />
