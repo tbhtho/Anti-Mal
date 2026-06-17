@@ -15,6 +15,8 @@ enum class SimScenario {
   Stealer,    // credential theft: subtree + Run-key persistence + C2 egress
   Ransomware, // shadow-copy deletion + mass file encryption + ransom note
   Loader,     // stage download + process injection / hollowing
+  Coinminer,  // resource hijacking: miner + pool C2 + persistence
+  Wiper,      // data destruction: file overwrite + shadow/recovery wipe
 };
 
 std::optional<SimScenario> ParseSimScenario(const std::string &name);

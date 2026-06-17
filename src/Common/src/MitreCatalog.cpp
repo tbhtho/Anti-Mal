@@ -69,6 +69,14 @@ std::string MitreTechniqueName(const std::string &id) {
       {"T1571", "Non-Standard Port"},
       {"T1041", "Exfiltration Over C2 Channel"},
       {"T1486", "Data Encrypted for Impact"},
+      {"T1485", "Data Destruction"},
+      {"T1490", "Inhibit System Recovery"},
+      {"T1496", "Resource Hijacking"},
+      {"T1561.002", "Disk Wipe: Disk Structure Wipe"},
+      {"T1070.001", "Indicator Removal: Clear Windows Event Logs"},
+      {"T1136.001", "Create Account: Local Account"},
+      {"T1098", "Account Manipulation"},
+      {"T1197", "BITS Jobs"},
   };
   const auto it = kCatalog.find(id);
   return it == kCatalog.end() ? std::string() : it->second;

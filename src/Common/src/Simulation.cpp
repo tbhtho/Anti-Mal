@@ -61,6 +61,8 @@ std::optional<SimScenario> ParseSimScenario(const std::string &name) {
   if (name == "stealer") return SimScenario::Stealer;
   if (name == "ransomware") return SimScenario::Ransomware;
   if (name == "loader") return SimScenario::Loader;
+  if (name == "coinminer") return SimScenario::Coinminer;
+  if (name == "wiper") return SimScenario::Wiper;
   return std::nullopt;
 }
 
@@ -69,6 +71,8 @@ const char *SimScenarioName(SimScenario scenario) {
     case SimScenario::Stealer: return "stealer";
     case SimScenario::Ransomware: return "ransomware";
     case SimScenario::Loader: return "loader";
+    case SimScenario::Coinminer: return "coinminer";
+    case SimScenario::Wiper: return "wiper";
   }
   return "stealer";
 }
@@ -199,7 +203,7 @@ AnalysisReport BuildSimulatedReport(const std::string &runId,
         ".locked with a dropped ransom note -- data-encrypted-for-impact.",
         "Wallpaper hijack to the ransom image corroborates the ransomware "
         "family tag."};
-  } else { // Loader
+  } else if (scenario == SimScenario::Loader) {
     report.samplePath = "samples/simulated/loader.exe";
     sampleBlob =
         "MZP synthetic AntiMal loader simulation -- not real. strings: "
@@ -248,6 +252,88 @@ AnalysisReport BuildSimulatedReport(const std::string &runId,
         "inside it (WriteProcessMemory + remote thread) -- classic loader.",
         "Post-injection C2 egress from the hollowed host corroborates the "
         "loader family tag."};
+  } else if (scenario == SimScenario::Coinminer) {
+    report.samplePath = "samples/simulated/svc_host.exe";
+    sampleBlob =
+        "MZP synthetic AntiMal coinminer simulation -- not real. strings: "
+        "stratum+tcp://pool.evil-mine.example:14444 xmrig --donate-level "
+        "RandomX cpu-priority hashrate";
+    scan.score = 80;
+    scan.iocs.urls = {"stratum+tcp://pool.evil-mine.example:14444"};
+    scan.iocs.domains = {"pool.evil-mine.example"};
+    scan.iocs.registryPaths = {
+        "HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Run\\WinUpdateSvc"};
+    scan.tags = {
+        {"coinminer", "family", 85, {"stratum pool + miner strings"}},
+        {"persistence", "capability", 70, {"Run-key write under HKCU"}}};
+    scan.findings = {
+        {"sim.coinminer", "Cryptocurrency-mining behavior modeled by the "
+                          "simulation",
+         60},
+        {"sim.resource_hijack", "Sustained high-CPU resource use modeled by the "
+                                "simulation",
+         25}};
+    ev.push_back(Proc(Ts(4), 4242, 4000, "svc_host.exe",
+                      "C:\\Users\\analyst\\AppData\\Roaming\\svc_host.exe "
+                      "--donate-level 0",
+                      "T1204.002"));
+    ev.push_back(Ev(Ts(4), "agent", "agent.sample.received", 4242, 4000,
+                    "svc_host.exe", "sampleExecuted=true"));
+    ev.push_back(Ev(Ts(7), "registry", "registry.set", 4242, 4000, "svc_host.exe",
+                    "HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Run\\"
+                    "WinUpdateSvc = svc_host.exe",
+                    "T1547.001"));
+    ev.push_back(Ev(Ts(9), "network", "network.connection", 4242, 4000,
+                    "svc_host.exe", "pool.evil-mine.example:14444", "T1496"));
+    report.networkDomains = {"pool.evil-mine.example"};
+    report.verdictScore = 84;
+    report.verdictRationale = {
+        kSimLabel,
+        "Connected to a stratum mining pool and ran a miner at sustained high "
+        "CPU -- resource hijacking (T1496).",
+        "Run-key persistence under a deceptive 'WinUpdateSvc' name corroborates "
+        "the coinminer tag."};
+  } else if (scenario == SimScenario::Wiper) {
+    report.samplePath = "samples/simulated/wiper.exe";
+    sampleBlob =
+        "MZP synthetic AntiMal wiper simulation -- not real. strings: "
+        "vssadmin delete shadows \\\\.\\PhysicalDrive0 WriteFile SetFilePointer "
+        "bcdedit recoveryenabled no";
+    scan.score = 90;
+    scan.iocs.suspiciousApis = {"CreateFileW", "WriteFile", "SetFilePointerEx",
+                                "DeviceIoControl"};
+    scan.tags = {
+        {"wiper", "family", 92, {"raw-disk write + recovery destruction"}},
+        {"destructive", "capability", 90, {"irrecoverable data loss"}}};
+    scan.findings = {
+        {"sim.wiper", "Destructive file/disk overwrite behavior modeled by the "
+                      "simulation",
+         70},
+        {"sim.inhibit_recovery",
+         "Shadow-copy + boot-recovery destruction modeled by the simulation",
+         30}};
+    ev.push_back(Proc(Ts(4), 4242, 4000, "wiper.exe",
+                      "C:\\Users\\analyst\\Downloads\\wiper.exe", "T1204.002"));
+    ev.push_back(Ev(Ts(4), "agent", "agent.sample.received", 4242, 4000,
+                    "wiper.exe", "sampleExecuted=true"));
+    ev.push_back(Proc(Ts(6), 4300, 4242, "cmd.exe",
+                      "cmd.exe /c vssadmin.exe delete shadows /all /quiet",
+                      "T1059.003"));
+    ev.push_back(Proc(Ts(7), 4400, 4242, "cmd.exe",
+                      "cmd.exe /c bcdedit /set {default} recoveryenabled no",
+                      "T1490"));
+    ev.push_back(Ev(Ts(9), "file", "file.modify", 4242, 4000, "wiper.exe",
+                    "C:\\Users\\analyst\\Documents\\report.docx (overwritten)",
+                    "T1485"));
+    ev.push_back(Ev(Ts(11), "file", "file.modify", 4242, 4000, "wiper.exe",
+                    "\\\\.\\PhysicalDrive0 (raw sectors overwritten)",
+                    "T1561.002"));
+    report.verdictScore = 95;
+    report.verdictRationale = {
+        kSimLabel,
+        "Deleted volume shadow copies, disabled boot recovery, then overwrote "
+        "user files and raw disk sectors -- destructive wiper (T1485/T1561).",
+        "No exfiltration or C2: impact is destruction, not theft."};
   }
 
   // Real static hashes over the scenario buffer.

@@ -3604,7 +3604,9 @@ void TestSimulatedReport() {
   // process tree, real hashes, MITRE techniques, and distinct static hashes.
   for (auto scenario : {antimal::SimScenario::Stealer,
                         antimal::SimScenario::Ransomware,
-                        antimal::SimScenario::Loader}) {
+                        antimal::SimScenario::Loader,
+                        antimal::SimScenario::Coinminer,
+                        antimal::SimScenario::Wiper}) {
     const auto s = antimal::BuildSimulatedReport("sc", scenario);
     const std::string which = antimal::SimScenarioName(scenario);
     Expect(s.sandboxVerdict == antimal::Verdict::Malicious,

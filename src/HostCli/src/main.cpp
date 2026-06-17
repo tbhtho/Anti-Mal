@@ -210,7 +210,7 @@ void PrintUsage() {
       << "  antimal similarity <file> --to <ctph-digest>\n"
       << "  antimal doctor [--json]              (host & workflow readiness check)\n"
       << "  antimal boot-report [--workspace <dir>] [--json]  (boot reliability over all runs)\n"
-      << "  antimal simulate [--scenario stealer|ransomware|loader] [--out <dir>] [--run-id <id>]\n"
+      << "  antimal simulate [--scenario stealer|ransomware|loader|coinminer|wiper] [--out <dir>] [--run-id <id>]\n"
       << "  antimal report-diff <run-or-report-A> <run-or-report-B> [--json]  (what changed)\n";
 }
 
