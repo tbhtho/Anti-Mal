@@ -731,6 +731,16 @@ std::string AuthenticodeSignerName(const std::filesystem::path &path) {
                         nullptr, &store, &msg, nullptr)) {
     return {};
   }
+  // RAII: release the crypto handles on EVERY path out of here, including an
+  // exception (e.g. bad_alloc) thrown by the allocations below.
+  struct HandleGuard {
+    HCERTSTORE &store;
+    HCRYPTMSG &msg;
+    ~HandleGuard() {
+      if (msg) CryptMsgClose(msg);
+      if (store) CertCloseStore(store, 0);
+    }
+  } handleGuard{store, msg};
 
   std::string result;
   // The signer's cert is identified by (Issuer, SerialNumber); use that to find
@@ -747,6 +757,12 @@ std::string AuthenticodeSignerName(const std::filesystem::path &path) {
           store, X509_ASN_ENCODING | PKCS_7_ASN_ENCODING, 0,
           CERT_FIND_SUBJECT_CERT, certInfo, nullptr);
       if (cert) {
+        struct CertGuard {
+          PCCERT_CONTEXT c;
+          ~CertGuard() {
+            if (c) CertFreeCertificateContext(c);
+          }
+        } certGuard{cert};
         const DWORD n = CertGetNameStringW(
             cert, CERT_NAME_SIMPLE_DISPLAY_TYPE, 0, nullptr, nullptr, 0);
         if (n > 1) { // n counts the trailing NUL; >1 means at least one char
@@ -756,13 +772,10 @@ std::string AuthenticodeSignerName(const std::filesystem::path &path) {
           while (!name.empty() && name.back() == L'\0') name.pop_back();
           result = WideToUtf8(name);
         }
-        CertFreeCertificateContext(cert);
       }
     }
   }
 
-  if (msg) CryptMsgClose(msg);
-  if (store) CertCloseStore(store, 0);
   return result;
 }
 

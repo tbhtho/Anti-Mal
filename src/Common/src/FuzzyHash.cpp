@@ -152,8 +152,13 @@ std::string ComputeCtph(const std::vector<uint8_t> &data) {
   if (len == 0) return std::string();
 
   // Pick the initial block size so the primary signature lands near full length.
+  // Cap the doubling at 2^30 so `blockSize` and `blockSize * 2` (below) always
+  // stay within uint32 — without the cap an absurdly large input (>64 GiB) would
+  // overflow blockSize, wrap, and spin the loop forever. Real inputs (a file
+  // loaded into a vector) never approach the cap, so digests are unchanged.
   uint32_t blockSize = kMinBlockSize;
-  while (static_cast<uint64_t>(blockSize) * kSpamsumLength < len) {
+  while (blockSize < 0x40000000u &&
+         static_cast<uint64_t>(blockSize) * kSpamsumLength < len) {
     blockSize *= 2;
   }
 
@@ -176,7 +181,8 @@ std::string ComputeCtph(const std::vector<uint8_t> &data) {
           h1 = kHashInit;
         }
       }
-      if (lastRh % (blockSize * 2) == blockSize * 2 - 1) {
+      const uint64_t bs2 = static_cast<uint64_t>(blockSize) * 2; // overflow-safe
+      if (lastRh % bs2 == bs2 - 1) {
         if (sig2.size() < static_cast<size_t>(kSpamsumLength / 2 - 1)) {
           sig2.push_back(kB64[h2 % 64]);
           h2 = kHashInit;
