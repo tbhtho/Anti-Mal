@@ -42,6 +42,9 @@ All increments TDD; build + `AntiMal.Tests` green.
 - **`report-diff` command (T78):** `antimal report-diff <A> <B>` shows verdict/score changes +
   added/removed IOCs/findings/MITRE/tags between two reports (determinism check / variant
   comparison; pairs with `similarity`). Pure `DiffReports` core, unit-tested.
+- **Headless automation (C04):** `similarity`, `report-diff`, and `doctor` all emit stable
+  machine-readable `--json` (shared JsonQuote helper), with branchable exit codes — scriptable /
+  SOAR-integratable alongside `detonate --json`.
 - **Shellcode / PIC detection (T93):** `DetectShellcode` flags position-independent shellcode by
   its anchored low-FP tells (GetPC `E8 00000000`+pop, PEB-walk `fs:[0x30]`/`gs:[0x60]`) in the
   places a PE parse never looks — non-PE payloads and PE overlays — with conservative FP gating.
