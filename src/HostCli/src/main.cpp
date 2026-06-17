@@ -147,6 +147,34 @@ bool HasFlag(int argc, wchar_t **argv, std::string_view name) {
   return false;
 }
 
+// Minimal JSON string quoting for the hand-rolled --json command outputs (the
+// values here are hashes / paths / IOC strings -- no control chars beyond what
+// this escapes). Shared by the doctor/similarity/report-diff machine-readable
+// paths.
+std::string JsonQuote(const std::string &s) {
+  std::string o = "\"";
+  for (char c : s) {
+    switch (c) {
+      case '\\': o += "\\\\"; break;
+      case '"': o += "\\\""; break;
+      case '\n': o += "\\n"; break;
+      case '\r': o += "\\r"; break;
+      case '\t': o += "\\t"; break;
+      default: o += c; break;
+    }
+  }
+  return o + "\"";
+}
+
+std::string JsonStrArray(const std::vector<std::string> &items) {
+  std::string o = "[";
+  for (size_t i = 0; i < items.size(); ++i) {
+    if (i) o += ",";
+    o += JsonQuote(items[i]);
+  }
+  return o + "]";
+}
+
 void PrintUsage() {
   std::cout
       << "AntiMal Host CLI\n\n"
@@ -168,11 +196,11 @@ void PrintUsage() {
       << "  antimal report <run-id-or-report.json> --html\n"
       << "  antimal browser-impact <run-id-or-report.json> --decrypt-browser-secrets\n"
       << "  antimal export <run-id-or-report.json> --format stix|misp|csv [--out <file>]\n"
-      << "  antimal similarity <fileA> <fileB>   (fuzzy-hash similarity 0..100)\n"
+      << "  antimal similarity <fileA> <fileB> [--json]   (fuzzy-hash similarity 0..100)\n"
       << "  antimal similarity <file> --to <ctph-digest>\n"
       << "  antimal doctor [--json]              (host & workflow readiness check)\n"
       << "  antimal simulate [--scenario stealer|ransomware|loader] [--out <dir>] [--run-id <id>]\n"
-      << "  antimal report-diff <run-or-report-A> <run-or-report-B>  (what changed)\n";
+      << "  antimal report-diff <run-or-report-A> <run-or-report-B> [--json]  (what changed)\n";
 }
 
 antimal::ScannerOptions BuildScannerOptions(int argc, wchar_t **argv,
@@ -2959,9 +2987,17 @@ int CommandSimilarity(int argc, wchar_t **argv) {
     return 2;
   }
 
+  const int score = antimal::CompareCtph(digestA, digestB);
+  if (HasFlag(argc, argv, "--json")) {
+    std::cout << "{\"fileA\":" << JsonQuote(antimal::PathToUtf8(fileA))
+              << ",\"ctphA\":" << JsonQuote(digestA)
+              << ",\"labelB\":" << JsonQuote(labelB)
+              << ",\"ctphB\":" << JsonQuote(digestB)
+              << ",\"similarity\":" << score << "}\n";
+    return score < 0 ? 2 : 0;
+  }
   std::cout << antimal::PathToUtf8(fileA) << "\n  ctph: " << digestA << "\n";
   std::cout << labelB << "\n  ctph: " << digestB << "\n";
-  const int score = antimal::CompareCtph(digestA, digestB);
   if (score < 0) {
     std::cout << "similarity: n/a (a digest is malformed)\n";
     return 2;
@@ -3003,6 +3039,28 @@ int CommandReportDiff(int argc, wchar_t **argv) {
   const auto a = antimal::LoadReportBestEffort(pathA);
   const auto b = antimal::LoadReportBestEffort(pathB);
   const auto diff = antimal::DiffReports(a, b);
+  if (HasFlag(argc, argv, "--json")) {
+    std::cout << "{\"a\":" << JsonQuote(antimal::PathToUtf8(pathA))
+              << ",\"b\":" << JsonQuote(antimal::PathToUtf8(pathB))
+              << ",\"identical\":" << (diff.Identical() ? "true" : "false")
+              << ",\"sandboxVerdictChanged\":"
+              << (diff.sandboxVerdictChanged ? "true" : "false")
+              << ",\"oldSandboxVerdict\":"
+              << JsonQuote(antimal::ToString(diff.oldSandboxVerdict))
+              << ",\"newSandboxVerdict\":"
+              << JsonQuote(antimal::ToString(diff.newSandboxVerdict))
+              << ",\"oldScannerScore\":" << diff.oldScannerScore
+              << ",\"newScannerScore\":" << diff.newScannerScore
+              << ",\"addedIocs\":" << JsonStrArray(diff.addedIocs)
+              << ",\"removedIocs\":" << JsonStrArray(diff.removedIocs)
+              << ",\"addedFindings\":" << JsonStrArray(diff.addedFindings)
+              << ",\"removedFindings\":" << JsonStrArray(diff.removedFindings)
+              << ",\"addedMitre\":" << JsonStrArray(diff.addedMitre)
+              << ",\"removedMitre\":" << JsonStrArray(diff.removedMitre)
+              << ",\"addedTags\":" << JsonStrArray(diff.addedTags)
+              << ",\"removedTags\":" << JsonStrArray(diff.removedTags) << "}\n";
+    return diff.Identical() ? 0 : 1;
+  }
   std::cout << "A: " << antimal::PathToUtf8(pathA) << "\n";
   std::cout << "B: " << antimal::PathToUtf8(pathB) << "\n\n";
   std::cout << antimal::FormatReportDiff(diff);
@@ -3049,14 +3107,6 @@ int CommandDoctor(int argc, wchar_t **argv) {
 
   if (json) {
     auto b = [](bool v) { return v ? "true" : "false"; };
-    auto jstr = [](const std::string &s) {
-      std::string o = "\"";
-      for (char c : s) {
-        if (c == '\\' || c == '"') o += '\\';
-        o += c;
-      }
-      return o + "\"";
-    };
     std::cout << "{"
               << "\"configFound\":" << b(configFound)
               << ",\"whpAvailable\":" << b(pf.whpAvailable)
@@ -3073,7 +3123,7 @@ int CommandDoctor(int argc, wchar_t **argv) {
               << ",\"dynamicExecutionEnabled\":" << b(config.dynamicExecutionEnabled)
               << ",\"ready\":" << b(ready) << ",\"blockers\":[";
     for (size_t i = 0; i < pf.blockers.size(); ++i) {
-      std::cout << (i ? "," : "") << jstr(pf.blockers[i]);
+      std::cout << (i ? "," : "") << JsonQuote(pf.blockers[i]);
     }
     std::cout << "]}\n";
     return ready ? 0 : 1;
