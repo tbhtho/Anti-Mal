@@ -8,6 +8,33 @@ that landed on `main`.
 
 ## [Unreleased]
 
+### 2026-06-17 — static-triage depth, analyst workflow CLIs, FPS instrumentation, local simulation
+An autonomous no-boot sweep that broadens the static engine, adds analyst-workflow CLIs,
+instruments the live display, and makes the report pipeline runnable end-to-end with no VM.
+All increments TDD; build + `AntiMal.Tests` green.
+- **CTPH fuzzy hash (T94/T14):** `FuzzyHash.{h,cpp}` — a self-contained context-triggered
+  piecewise hash (the spamsum construction) for sample similarity/clustering, with a
+  common-substring gate + block-size cap that prevent spurious high scores. `ScanResult.ctph`
+  flows through report JSON/HTML/CLI like imphash. The last open multi-hash gap.
+- **`similarity` command:** `antimal similarity <a> <b>` (and `--to <digest>`) prints both CTPH
+  digests + a 0..100 score with a plain-English band — "is this a repacked variant?" without a
+  full scan.
+- **`doctor` preflight (T66):** `antimal doctor [--json]` reports host + workflow readiness
+  (WHP, OVMF, base image, GuestAgent, workspace, enrichment tools, exec gate) with an actionable
+  hint per failure; exit 0 when boot-ready, 1 on a hard blocker (CI-gateable).
+- **Live-display frame-pacing diagnostics (FPS):** `FramePacing.h` — a pure, unit-tested
+  `FramePacingStats` (achieved FPS, interval p50/p95/min/max, on-target %, blank-skips) wired
+  into the VM publish loop and surfaced in `vm-diagnostics.txt`. The measured-diagnostics
+  foundation for the 25-30 FPS goal.
+- **`simulate` local detonation (documented simulation):** `antimal simulate` builds a complete,
+  clearly-labeled SYNTHETIC stealer run (`Simulation.{h,cpp}`) and writes report.json +
+  report.html + events.jsonl + a screenshot filmstrip — exercising the events → report → HTML
+  pipeline end-to-end with no VM/firmware/hardware dependency. Real static hashes; deterministic.
+- **Housekeeping:** repaired a mojibake em-dash + forward-slashed the TOML paths in
+  `config/antimal.toml`; completed the OOBE-automating base-build script (`BypassNRO` +
+  `-FirstLogonShutdownSec` clean-shutdown for snapshot capture); fixed an unattended-run hang in
+  `Test-AntiMalBaseBoot.ps1`.
+
 ### 2026-06-17 — interactive app reached in the VM: a web browser (Edge) runs in-guest
 For the first time an interactive GUI application was launched and rendered inside the live VM,
 on a guest where the Windows modern shell still crash-loops. The crashing component

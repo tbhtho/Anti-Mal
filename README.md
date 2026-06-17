@@ -132,6 +132,34 @@ Scan a file:
 bin\x64\Release\AntiMal.HostCli.exe scan C:\Path\To\File.exe --threshold 70
 ```
 
+Check whether this host can boot a guest and run the full workflow (WHP, OVMF,
+base image, GuestAgent, workspace, enrichment tools) — actionable, with a
+machine-readable mode for CI (exit 0 when ready, 1 on a hard blocker):
+
+```powershell
+bin\x64\Release\AntiMal.HostCli.exe doctor
+bin\x64\Release\AntiMal.HostCli.exe doctor --json
+```
+
+Ask "is this a repacked variant of something I've already triaged?" with the
+fuzzy (CTPH) hash — compare two files, or a file against a known digest:
+
+```powershell
+bin\x64\Release\AntiMal.HostCli.exe similarity A.exe B.exe
+bin\x64\Release\AntiMal.HostCli.exe similarity A.exe --to 24576:abc...:def...
+```
+
+Generate a complete Any.Run-style report from a SYNTHETIC detonation — no VM,
+firmware, or hardware required. This exercises the events → report.json →
+report.html (+ filmstrip) pipeline end-to-end and is the documented local
+simulation for environments where a live boot isn't available (the output is
+clearly labeled as synthetic):
+
+```powershell
+bin\x64\Release\AntiMal.HostCli.exe simulate
+# writes C:\AntiMalRuns\sim-detonation\{report.html,report.json,events.jsonl,screenshots\}
+```
+
 Stage and boot-probe a sample through the in-house VM path:
 
 ```powershell
