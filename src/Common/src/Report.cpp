@@ -4,6 +4,7 @@
 #include "antimal/FileUtil.h"
 #include "antimal/Json.h"
 #include "antimal/MitreCatalog.h"
+#include "antimal/NetworkClassifier.h"
 #include "antimal/PersistenceClassifier.h"
 
 #include <functional>
@@ -1091,13 +1092,21 @@ bool EmitNetworkSection(std::ostringstream &html,
         std::to_string(e.processId) + ")";
     std::string state = Detail(e, "state");
     if (state.empty()) state = e.action;
+    const NetworkIndicator ni = ClassifyEndpoint(e.target);
     rows << "<tr><td class=\"mono\">" << HtmlEscape(proc)
          << "</td><td class=\"mono\">" << HtmlEscape(e.target)
-         << "</td><td class=\"mono\">" << HtmlEscape(state) << "</td></tr>";
+         << "</td><td class=\"mono\">";
+    if (!ni.service.empty()) rows << HtmlEscape(ni.service);
+    if (ni.suspicious) {
+      if (!ni.service.empty()) rows << " ";
+      rows << "<span style=\"color:var(--bad)\">&#9888; " << HtmlEscape(ni.note)
+           << "</span>";
+    }
+    rows << "</td><td class=\"mono\">" << HtmlEscape(state) << "</td></tr>";
   }
   if (!any) return false;
   html << "<table><thead><tr><th>Process</th><th>Remote</th>"
-          "<th>State</th></tr></thead><tbody>"
+          "<th>Service</th><th>State</th></tr></thead><tbody>"
        << rows.str() << "</tbody></table>";
   return true;
 }

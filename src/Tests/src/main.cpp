@@ -28,6 +28,7 @@
 #include "antimal/RegistryTelemetry.h"
 #include "antimal/ProcessTelemetry.h"
 #include "antimal/MitreCatalog.h"
+#include "antimal/NetworkClassifier.h"
 #include "antimal/PersistenceClassifier.h"
 #include "antimal/Report.h"
 #include "antimal/ShellcodeDetector.h"
@@ -3623,6 +3624,43 @@ void TestSimulatedReport() {
     std::error_code ec;
     std::filesystem::remove(tmp, ec);
   }
+}
+
+// Network endpoint classifier: maps port -> service, detects private vs public
+// remotes, and flags known-C2 / Tor / IRC / cleartext / exposed-service ports
+// without flagging ordinary HTTPS/DNS.
+void TestNetworkClassifier() {
+  using antimal::ClassifyEndpoint;
+
+  Expect(ClassifyEndpoint("185.220.101.5:443").service == "HTTPS" &&
+             !ClassifyEndpoint("185.220.101.5:443").suspicious,
+         "net: 443 is HTTPS and not suspicious");
+  Expect(ClassifyEndpoint("8.8.8.8:53").service == "DNS",
+         "net: 53 is DNS");
+  Expect(ClassifyEndpoint("45.13.37.7:4444").suspicious &&
+             ClassifyEndpoint("45.13.37.7:4444").note.find("C2") != std::string::npos,
+         "net: 4444 is flagged as a common C2 port");
+  Expect(ClassifyEndpoint("1.2.3.4:6667").suspicious,
+         "net: 6667 (IRC) is suspicious");
+  Expect(ClassifyEndpoint("1.2.3.4:9001").service == "Tor" &&
+             ClassifyEndpoint("1.2.3.4:9001").suspicious,
+         "net: 9001 is Tor + suspicious");
+  // SMB to a public host is flagged; SMB to a private host is not.
+  Expect(ClassifyEndpoint("203.0.113.9:445").suspicious,
+         "net: SMB to a public host is suspicious");
+  Expect(!ClassifyEndpoint("192.168.1.10:445").suspicious &&
+             ClassifyEndpoint("192.168.1.10:445").privateAddr,
+         "net: SMB to a private host is not suspicious");
+  Expect(ClassifyEndpoint("127.0.0.1:8080").privateAddr,
+         "net: loopback is a private address");
+  Expect(ClassifyEndpoint("10.0.0.5:1234").privateAddr,
+         "net: 10/8 is private");
+  Expect(ClassifyEndpoint("172.16.0.1:1").privateAddr &&
+             !ClassifyEndpoint("172.32.0.1:1").privateAddr,
+         "net: 172.16-31 is private, 172.32 is not");
+  // A bare IP (no port) parses without crashing.
+  Expect(ClassifyEndpoint("1.2.3.4").port == 0,
+         "net: a bare IP yields port 0");
 }
 
 // Persistence classifier: names the autostart mechanism + MITRE from a raw
@@ -8576,6 +8614,7 @@ int main() {
     TestSimulatedReport();
     TestBootDiagnostics();
     TestPersistenceClassifier();
+    TestNetworkClassifier();
     TestShellcodeDetector();
     TestMitreCatalog();
     TestReportDiff();
