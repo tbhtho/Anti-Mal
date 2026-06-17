@@ -21,6 +21,7 @@ CMakeFiles/
 # Built dev helper (source is tools/KdDrive.cs) + base-write backups
 tools/KdDrive.exe
 config/*.prevbase*
+config/*.presession
 
 /docs/
 

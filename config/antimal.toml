@@ -1,4 +1,4 @@
-base_vhdx_path = "C:\AntiMalRuns\_base\AntiMalBase.vhdx"
+base_vhdx_path = "C:/AntiMalRuns/_base/AntiMalBase.vhdx"
 base_disk_path = "C:/AntiMalRuns/_base/AntiMalBase.raw"
 base_disk_format = "raw"
 workspace_root = "C:/AntiMalRuns"
@@ -31,7 +31,7 @@ screenshot_interval_ms = 2000
 
 # Virtual guest clock base, as a unix epoch (seconds). 0 = auto: the VM captures
 # host time once at boot (so TLS/cert validation works) and then advances the
-# guest clock on its own crystal, never re-reading the host wall-clock — so
+# guest clock on its own crystal, never re-reading the host wall-clock - so
 # reports don't leak your real date. Set a non-zero epoch to pin the guest's
 # start date (e.g. to trip date-gated "logic bomb" malware). The live control
 # path is the ANTIMAL_GUEST_EPOCH env var; this is the persisted default for it.
