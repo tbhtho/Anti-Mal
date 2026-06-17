@@ -201,6 +201,7 @@ void PrintUsage() {
       << "  antimal fs-ls  [--vhdx <d.vhdx>] [--overlay <o.cow>] <guest\\path>   (offline guest dir listing)\n"
       << "  antimal fs-cat [--vhdx <d.vhdx>] [--overlay <o.cow>] <guest\\path> [--out <file>]\n"
       << "  antimal fs-find [--vhdx <d.vhdx>] [--overlay <o.cow>] <name-substring>   (offline recursive search)\n"
+      << "  antimal fs-scan [--vhdx <d.vhdx>] [--overlay <o.cow>] <guest\\path>   (extract + static-scan a guest file)\n"
       << "  antimal report <run-id-or-report.json> [--html] [--detections|--usability [--json]]\n"
       << "  antimal browser-impact <run-id-or-report.json> --decrypt-browser-secrets\n"
       << "  antimal export <run-id-or-report.json> --format stix|misp|csv [--out <file>]\n"
@@ -3379,6 +3380,34 @@ int CommandFs(int argc, wchar_t **argv) {
     return 0;
   }
 
+  if (sub == "fs-scan") {
+    if (entry->directory) {
+      std::cerr << "fs: " << guestPath << " is a directory (use fs-ls).\n";
+      return 2;
+    }
+    const auto bytes = ntfs.ReadFile(*entry, 64ull * 1024 * 1024);
+    // Derive a safe temp name from the guest basename.
+    std::string base = guestPath;
+    const size_t slash = base.find_last_of("\\/");
+    if (slash != std::string::npos) base = base.substr(slash + 1);
+    if (base.empty()) base = "extracted.bin";
+    const auto tmp = std::filesystem::temp_directory_path() /
+                     (std::string("antimal-fsscan-") + base);
+    {
+      std::ofstream f(tmp, std::ios::binary);
+      f.write(reinterpret_cast<const char *>(bytes.data()),
+              static_cast<std::streamsize>(bytes.size()));
+    }
+    const auto scannerOpts = BuildScannerOptions(argc, argv, config);
+    const auto result = antimal::ScanFile(tmp, scannerOpts);
+    std::cout << "Scanned guest file " << guestPath << " (" << bytes.size()
+              << " bytes extracted offline)\n";
+    std::cout << antimal::FormatScanText(result);
+    std::error_code ec;
+    std::filesystem::remove(tmp, ec);
+    return result.score >= 70 ? 10 : 0;
+  }
+
   // fs-cat
   if (entry->directory) {
     std::cerr << "fs: " << guestPath << " is a directory (use fs-ls).\n";
@@ -3700,7 +3729,8 @@ int wmain(int argc, wchar_t **argv) {
     if (command == "boot-report") {
       return CommandBootReport(argc, argv);
     }
-    if (command == "fs-ls" || command == "fs-cat" || command == "fs-find") {
+    if (command == "fs-ls" || command == "fs-cat" || command == "fs-find" ||
+        command == "fs-scan") {
       return CommandFs(argc, argv);
     }
     PrintUsage();
