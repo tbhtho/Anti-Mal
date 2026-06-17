@@ -168,6 +168,29 @@ IOCs/findings/MITRE/tags (a determinism check, or variant comparison alongside
 bin\x64\Release\AntiMal.HostCli.exe report-diff <run-or-report-A> <run-or-report-B>
 ```
 
+Browse, search, extract, and triage the guest's files **offline** from the disk
+image (base VHDX + optional run overlay) — File-Explorer-style access with **no
+boot**, which sidesteps the crash-looping in-guest modern shell. Reads the
+post-detonation overlay too, so you can see exactly what a run left on disk:
+
+```powershell
+bin\x64\Release\AntiMal.HostCli.exe fs-ls   "\Users\analyst\Downloads"
+bin\x64\Release\AntiMal.HostCli.exe fs-find "invoice" --max-results 50
+bin\x64\Release\AntiMal.HostCli.exe fs-cat  "\Windows\System32\drivers\etc\hosts" --out hosts.txt
+bin\x64\Release\AntiMal.HostCli.exe fs-scan "\Users\analyst\AppData\Local\Temp\dropped.exe"
+#   add --overlay C:\AntiMalRuns\<run>\disk\overlay.cow to inspect a run's changes
+```
+
+Read a run's behavior summary, ranked detections, or measured desktop-usability
+without opening the HTML (all support `--json` for automation), and aggregate
+boot reliability across every run:
+
+```powershell
+bin\x64\Release\AntiMal.HostCli.exe report <run> --detections
+bin\x64\Release\AntiMal.HostCli.exe report <run> --usability
+bin\x64\Release\AntiMal.HostCli.exe boot-report
+```
+
 Stage and boot-probe a sample through the in-house VM path:
 
 ```powershell

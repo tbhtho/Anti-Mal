@@ -28,6 +28,18 @@ unit-tested. A living `private development documentation` tracks done/remaining 
 - **Boot-reliability aggregator (`boot-report`, T05):** scans every run's report.json and reports a
   per-stage histogram + desktop/user-mode reach rates — boot reliability is now measurable from the
   user's runs without this tool launching a boot.
+- **Severity-ranked Detections summary (`DetectionSummary`):** unifies static findings + persistence
+  + suspicious network into one ranked behavior list; in the report + `report --detections [--json]`.
+- **Desktop-usability classifier (`UsabilityDiagnostics`):** measures which usability goals a run
+  achieved (display/input/disk/exec/telemetry/browser/shell), DETECTS the Win11 modern-shell
+  crash-loop, and surfaces the cmd-shell remediation; in the report + `report --usability [--json]`.
+- **Offline guest file browsing + triage (`fs-ls`/`fs-cat`/`fs-find`/`fs-scan`):** browse, extract,
+  recursively search, and extract-then-static-scan the guest's files straight from the disk image
+  (base VHDX + optional run overlay) via the in-house NtfsReader — File-Explorer-style access and
+  in-guest-artifact triage with NO boot, working around the crash-looping in-guest File Explorer.
+- **Built-in packer ID** (UPX/Themida/VMProtect/… by section signatures) and **enriched IOC export**
+  (classifier-recognized persistence). Plus report-HTML structural + malformed-input robustness
+  regression tests.
 
 ### 2026-06-17 — static-triage depth, analyst workflow CLIs, FPS instrumentation, local simulation
 An autonomous no-boot sweep that broadens the static engine, adds analyst-workflow CLIs,
