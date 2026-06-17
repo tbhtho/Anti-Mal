@@ -4,6 +4,7 @@
 #include "antimal/FileUtil.h"
 #include "antimal/Json.h"
 #include "antimal/MitreCatalog.h"
+#include "antimal/PersistenceClassifier.h"
 
 #include <functional>
 #include <map>
@@ -1007,16 +1008,35 @@ bool EmitPersistenceSection(std::ostringstream &html,
   for (const auto &e : events) {
     const bool isRegistry =
         e.category == "registry" || e.action.find("registry") != std::string::npos;
-    if (e.mitre.empty() || !isRegistry) continue;
+    const bool isFile =
+        e.category == "file" &&
+        (ActionIs(e, "file.create") || ActionIs(e, "file.modify"));
+    if (!isRegistry && !isFile) continue;
+
+    // Classify the mechanism from the raw target (recovers the autostart surface
+    // the agent didn't pre-label), and prefer the event's own MITRE when set.
+    const PersistenceMatch m = ClassifyPersistence(e.category, e.target);
+    if (!m.matched && e.mitre.empty()) continue; // not a persistence write
     any = true;
-    rows << "<tr><td class=\"mono\">" << HtmlEscape(e.mitre)
+    const std::string mitre = !e.mitre.empty() ? e.mitre : m.mitre;
+    const std::string name = MitreTechniqueName(mitre);
+    std::string techCell = HtmlEscape(mitre);
+    if (!name.empty()) {
+      const auto pos = name.rfind(": ");
+      techCell += " <span style=\"opacity:.7\">" +
+                  HtmlEscape(pos == std::string::npos ? name : name.substr(pos + 2)) +
+                  "</span>";
+    }
+    rows << "<tr><td class=\"mono\">"
+         << HtmlEscape(m.matched ? m.mechanism : "registry autostart")
+         << "</td><td class=\"mono\">" << techCell
          << "</td><td class=\"mono\" title=\"" << HtmlEscape(e.target) << "\">"
          << HtmlEscape(TruncateForCell(e.target)) << "</td><td class=\"mono\">"
          << HtmlEscape(Detail(e, "data")) << "</td></tr>";
   }
   if (!any) return false;
-  html << "<table><thead><tr><th>Technique</th><th>Key / Value</th>"
-          "<th>Data</th></tr></thead><tbody>"
+  html << "<table><thead><tr><th>Mechanism</th><th>Technique</th>"
+          "<th>Key / Value / Path</th><th>Data</th></tr></thead><tbody>"
        << rows.str() << "</tbody></table>";
   return true;
 }

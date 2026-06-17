@@ -28,6 +28,7 @@
 #include "antimal/RegistryTelemetry.h"
 #include "antimal/ProcessTelemetry.h"
 #include "antimal/MitreCatalog.h"
+#include "antimal/PersistenceClassifier.h"
 #include "antimal/Report.h"
 #include "antimal/ShellcodeDetector.h"
 #include "antimal/ReportDiff.h"
@@ -3622,6 +3623,44 @@ void TestSimulatedReport() {
     std::error_code ec;
     std::filesystem::remove(tmp, ec);
   }
+}
+
+// Persistence classifier: names the autostart mechanism + MITRE from a raw
+// registry/file target, across the broad surface the agent doesn't pre-label,
+// and does NOT false-positive on ordinary writes.
+void TestPersistenceClassifier() {
+  using antimal::ClassifyPersistence;
+  auto reg = [](const std::string &t) { return ClassifyPersistence("registry", t); };
+  auto file = [](const std::string &t) { return ClassifyPersistence("file", t); };
+
+  Expect(reg("HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Run\\X = a.exe")
+                 .mitre == "T1547.001",
+         "persist: Run key -> T1547.001");
+  // RunOnce must win over the Run substring.
+  Expect(reg("HKLM\\...\\CurrentVersion\\RunOnce\\X").mechanism ==
+             "Registry RunOnce Key",
+         "persist: RunOnce classified distinctly from Run");
+  Expect(reg("HKLM\\SYSTEM\\CurrentControlSet\\Services\\Evil\\ImagePath = x")
+                 .mitre == "T1543.003",
+         "persist: service ImagePath -> T1543.003");
+  Expect(reg("...\\Image File Execution Options\\calc.exe\\Debugger = evil.exe")
+                 .mitre == "T1546.012",
+         "persist: IFEO Debugger -> T1546.012");
+  Expect(reg("...\\Winlogon\\Shell = explorer.exe,evil.exe").mitre == "T1547.004",
+         "persist: Winlogon Shell -> T1547.004");
+  Expect(reg("...\\CLSID\\{...}\\InprocServer32 = evil.dll").mitre == "T1546.015",
+         "persist: COM CLSID hijack -> T1546.015");
+  Expect(file("C:\\Users\\a\\AppData\\Roaming\\Microsoft\\Windows\\Start Menu\\"
+              "Programs\\Startup\\x.lnk")
+                 .mitre == "T1547.001",
+         "persist: Startup folder file -> T1547.001");
+  Expect(file("C:\\Windows\\System32\\Tasks\\EvilTask").mitre == "T1053.005",
+         "persist: scheduled-task file -> T1053.005");
+  // Negatives: an ordinary registry write / file drop is NOT persistence.
+  Expect(!reg("HKCU\\Software\\App\\Settings\\Theme = dark").matched,
+         "persist: an ordinary registry value is not persistence");
+  Expect(!file("C:\\Users\\a\\AppData\\Local\\Temp\\data.bin").matched,
+         "persist: an ordinary temp-file drop is not persistence");
 }
 
 // Boot-outcome classifier: collapses the scattered boot signals into a single
@@ -8536,6 +8575,7 @@ int main() {
     TestFramePacingStats();
     TestSimulatedReport();
     TestBootDiagnostics();
+    TestPersistenceClassifier();
     TestShellcodeDetector();
     TestMitreCatalog();
     TestReportDiff();
