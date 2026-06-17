@@ -160,6 +160,14 @@ bin\x64\Release\AntiMal.HostCli.exe simulate
 # writes C:\AntiMalRuns\sim-detonation\{report.html,report.json,events.jsonl,screenshots\}
 ```
 
+Compare two analysis reports — verdict/score changes plus added/removed
+IOCs/findings/MITRE/tags (a determinism check, or variant comparison alongside
+`similarity`). Exit 1 when material differences exist:
+
+```powershell
+bin\x64\Release\AntiMal.HostCli.exe report-diff <run-or-report-A> <run-or-report-B>
+```
+
 Stage and boot-probe a sample through the in-house VM path:
 
 ```powershell

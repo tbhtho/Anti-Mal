@@ -30,6 +30,19 @@ All increments TDD; build + `AntiMal.Tests` green.
   clearly-labeled SYNTHETIC stealer run (`Simulation.{h,cpp}`) and writes report.json +
   report.html + events.jsonl + a screenshot filmstrip — exercising the events → report → HTML
   pipeline end-to-end with no VM/firmware/hardware dependency. Real static hashes; deterministic.
+- **Authenticode signer name (T49):** `AuthenticodeSignerName` extracts the embedded PKCS#7
+  signer's display name (e.g. "Microsoft Windows"); surfaced in `ScanResult.signerName` and the
+  report/CLI. A Microsoft-signed binary reads very differently from one signed by an unknown
+  publisher. Handles freed via RAII on every path.
+- **MITRE technique names (`MitreCatalog`):** the report's ATT&CK chips now show the technique
+  NAME (e.g. "Registry Run Keys / Startup Folder") with the full name on hover, not just the ID.
+- **`report-diff` command (T78):** `antimal report-diff <A> <B>` shows verdict/score changes +
+  added/removed IOCs/findings/MITRE/tags between two reports (determinism check / variant
+  comparison; pairs with `similarity`). Pure `DiffReports` core, unit-tested.
+- **Adversarial review hardening:** a multi-pass find→verify review of the session's new
+  untrusted-input code confirmed + fixed 3 defense-in-depth issues — a CTPH block-size overflow /
+  potential infinite loop on >64 GiB input, and an Authenticode handle leak on an allocation
+  exception.
 - **Housekeeping:** repaired a mojibake em-dash + forward-slashed the TOML paths in
   `config/antimal.toml`; completed the OOBE-automating base-build script (`BypassNRO` +
   `-FirstLogonShutdownSec` clean-shutdown for snapshot capture); fixed an unattended-run hang in
