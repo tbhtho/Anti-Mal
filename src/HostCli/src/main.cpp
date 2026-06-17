@@ -7,6 +7,7 @@
 #include "antimal/Json.h"
 #include "antimal/Report.h"
 #include "antimal/Scanner.h"
+#include "antimal/Subprocess.h"
 #include "antimal/Version.h"
 #include "antimal/hv/BlockDevice.h"
 
@@ -164,7 +165,8 @@ void PrintUsage() {
       << "  antimal browser-impact <run-id-or-report.json> --decrypt-browser-secrets\n"
       << "  antimal export <run-id-or-report.json> --format stix|misp|csv [--out <file>]\n"
       << "  antimal similarity <fileA> <fileB>   (fuzzy-hash similarity 0..100)\n"
-      << "  antimal similarity <file> --to <ctph-digest>\n";
+      << "  antimal similarity <file> --to <ctph-digest>\n"
+      << "  antimal doctor [--json]              (host & workflow readiness check)\n";
 }
 
 antimal::ScannerOptions BuildScannerOptions(int argc, wchar_t **argv,
@@ -2972,6 +2974,134 @@ int CommandSimilarity(int argc, wchar_t **argv) {
   return 0;
 }
 
+// `doctor` — host + workflow readiness preflight. Reports, line by line, whether
+// AntiMal can boot a guest and run the scan/report workflow on THIS machine, with
+// an actionable hint per failure. Exit 0 when boot-ready, 1 when a hard blocker
+// (no WHP / no firmware / unwritable workspace) exists, so CI can gate on it.
+int CommandDoctor(int argc, wchar_t **argv) {
+  const bool json = HasFlag(argc, argv, "--json");
+  const auto configPath = antimal::DefaultConfigPath();
+  const bool configFound = std::filesystem::exists(configPath);
+  const auto config = antimal::LoadConfig(configPath);
+  antimal::HyperVOrchestrator orchestrator(config);
+  const antimal::HyperVPreflight pf = orchestrator.Preflight();
+
+  auto toolPresent = [](std::string_view n) {
+    return antimal::ResolveToolPath(n).has_value();
+  };
+  const bool yara = toolPresent("yara.exe");
+  const bool capa = toolPresent("capa.exe");
+  const bool die = toolPresent("diec.exe");
+
+  // Probe workspace writability (a hard requirement for any run).
+  bool workspaceWritable = false;
+  std::string workspaceNote;
+  try {
+    std::filesystem::create_directories(config.workspaceRoot);
+    const auto probe = config.workspaceRoot / ".antimal-doctor-probe";
+    {
+      std::ofstream f(probe);
+      f << "ok";
+    }
+    workspaceWritable = std::filesystem::exists(probe);
+    std::error_code ec;
+    std::filesystem::remove(probe, ec);
+  } catch (const std::exception &ex) {
+    workspaceNote = ex.what();
+  }
+
+  const bool ready = pf.whpAvailable && pf.firmwarePresent && workspaceWritable;
+
+  if (json) {
+    auto b = [](bool v) { return v ? "true" : "false"; };
+    auto jstr = [](const std::string &s) {
+      std::string o = "\"";
+      for (char c : s) {
+        if (c == '\\' || c == '"') o += '\\';
+        o += c;
+      }
+      return o + "\"";
+    };
+    std::cout << "{"
+              << "\"configFound\":" << b(configFound)
+              << ",\"whpAvailable\":" << b(pf.whpAvailable)
+              << ",\"whpDllPresent\":" << b(pf.whpDllPresent)
+              << ",\"firmwarePresent\":" << b(pf.firmwarePresent)
+              << ",\"baseVhdxPresent\":" << b(pf.baseVhdxPresent)
+              << ",\"baseVhdxReadable\":" << b(pf.baseVhdxReadable)
+              << ",\"baseDiskPresent\":" << b(pf.baseDiskPresent)
+              << ",\"guestAgentPresent\":" << b(pf.guestAgentPresent)
+              << ",\"bootCapabilityReady\":" << b(pf.bootCapabilityReady)
+              << ",\"workspaceWritable\":" << b(workspaceWritable)
+              << ",\"yara\":" << b(yara) << ",\"capa\":" << b(capa)
+              << ",\"die\":" << b(die)
+              << ",\"dynamicExecutionEnabled\":" << b(config.dynamicExecutionEnabled)
+              << ",\"ready\":" << b(ready) << ",\"blockers\":[";
+    for (size_t i = 0; i < pf.blockers.size(); ++i) {
+      std::cout << (i ? "," : "") << jstr(pf.blockers[i]);
+    }
+    std::cout << "]}\n";
+    return ready ? 0 : 1;
+  }
+
+  auto line = [](const char *status, const std::string &label,
+                 const std::string &hint = "") {
+    std::cout << "[" << status << "] " << label;
+    if (!hint.empty()) std::cout << "  -- " << hint;
+    std::cout << "\n";
+  };
+  std::cout << "AntiMal doctor -- host & workflow readiness\n\n";
+  line(configFound ? "PASS" : "WARN",
+       "config file: " + antimal::PathToUtf8(configPath),
+       configFound ? "" : "not found; using built-in defaults (run `antimal init`)");
+  line(pf.whpAvailable ? "PASS" : "FAIL", "WHP hypervisor available",
+       pf.whpAvailable
+           ? ""
+           : "enable the 'Windows Hypervisor Platform' optional feature, then reboot");
+  line(pf.firmwarePresent ? "PASS" : "FAIL",
+       "OVMF firmware: " + antimal::PathToUtf8(pf.firmwarePath),
+       pf.firmwarePresent
+           ? ""
+           : "drop firmware/OVMF.fd (see firmware/README.md or tools\\Build-Firmware.ps1)");
+  line(pf.baseVhdxPresent ? (pf.baseVhdxReadable ? "PASS" : "WARN") : "WARN",
+       "base image: " + antimal::PathToUtf8(pf.baseVhdxPath),
+       pf.baseVhdxPresent
+           ? ""
+           : "build it (GUI Build Base or tools\\New-AntiMalVmBase.ps1)");
+  line(pf.baseDiskPresent ? "PASS" : "INFO",
+       "raw base disk: " + antimal::PathToUtf8(pf.baseDiskPath),
+       pf.baseDiskPresent
+           ? ""
+           : "optional; boot falls back to the privilege-free VHDX-direct path");
+  line(pf.guestAgentPresent ? "PASS" : "WARN", "GuestAgent present",
+       pf.guestAgentPresent
+           ? ""
+           : "telemetry-streaming detonation needs the agent next to the exe");
+  line(pf.bootCapabilityReady ? "PASS" : "WARN", "boot capability ready");
+  line(workspaceWritable ? "PASS" : "FAIL",
+       "workspace writable: " + antimal::PathToUtf8(config.workspaceRoot),
+       workspaceWritable ? "" : workspaceNote);
+  line(yara ? "PASS" : "INFO", "yara.exe", yara ? "" : "optional enrichment tool");
+  line(capa ? "PASS" : "INFO", "capa.exe", capa ? "" : "optional enrichment tool");
+  line(die ? "PASS" : "INFO", "diec.exe (Detect It Easy)",
+       die ? "" : "optional enrichment tool");
+  line(config.dynamicExecutionEnabled ? "WARN" : "PASS",
+       std::string("in-guest execution gate: ") +
+           (config.dynamicExecutionEnabled ? "ARMED" : "disabled"),
+       config.dynamicExecutionEnabled
+           ? "dynamic_execution_enabled=true; a detonation still needs --allow-execution"
+           : "");
+
+  for (const auto &m : pf.messages) std::cout << "  note: " << m << "\n";
+  for (const auto &bl : pf.blockers) std::cout << "  BLOCKER: " << bl << "\n";
+
+  std::cout << "\nVerdict: "
+            << (ready ? "READY to attempt a guest boot."
+                      : "NOT READY -- resolve the FAIL line(s) above.")
+            << "\n";
+  return ready ? 0 : 1;
+}
+
 } // namespace
 
 int CommandDumpHive(int argc, wchar_t **argv) {
@@ -3032,6 +3162,9 @@ int wmain(int argc, wchar_t **argv) {
     }
     if (command == "similarity" || command == "compare") {
       return CommandSimilarity(argc, argv);
+    }
+    if (command == "doctor" || command == "preflight") {
+      return CommandDoctor(argc, argv);
     }
     PrintUsage();
     return 2;
