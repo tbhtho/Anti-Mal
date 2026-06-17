@@ -3226,8 +3226,9 @@ int CommandBootReport(int argc, wchar_t **argv) {
   }
 
   int total = 0, reachedDesktop = 0, reachedUserMode = 0, incomplete = 0;
-  std::map<std::string, int> byStage;     // stage -> count
-  std::map<std::string, int> byCategory;  // category -> count
+  std::map<std::string, int> byStage;        // stage -> count
+  std::map<std::string, int> byCategory;     // category -> count
+  std::map<std::string, int> byRemediation;  // remediation hint -> count
   std::error_code ec;
   for (const auto &entry : std::filesystem::directory_iterator(ws, ec)) {
     if (!entry.is_directory()) continue;
@@ -3257,8 +3258,10 @@ int CommandBootReport(int argc, wchar_t **argv) {
       if (guestTelemetry) {
         ++reachedUserMode;
         ++byStage["user-mode (telemetry, no report)"];
+        ++byCategory["user-mode-no-desktop"];
       } else {
         ++byStage["incomplete (no report)"];
+        ++byCategory["incomplete"];
       }
       continue;
     }
@@ -3268,6 +3271,7 @@ int CommandBootReport(int argc, wchar_t **argv) {
     ++total;
     ++byStage[bo.stage];
     ++byCategory[bo.category];
+    if (!bo.remediation.empty()) ++byRemediation[bo.remediation];
     if (bo.reachedDesktop) ++reachedDesktop;
     if (bo.reachedUserMode) ++reachedUserMode;
   }
@@ -3275,21 +3279,29 @@ int CommandBootReport(int argc, wchar_t **argv) {
   auto pct = [](int n, int d) {
     return d > 0 ? (100.0 * n / d) : 0.0;
   };
-  if (HasFlag(argc, argv, "--json")) {
-    std::cout << "{\"runs\":" << total << ",\"reachedDesktop\":" << reachedDesktop
-              << ",\"reachedUserMode\":" << reachedUserMode << ",\"byStage\":{";
+  auto emitMap = [](const std::map<std::string, int> &m) {
     bool first = true;
-    for (const auto &kv : byStage) {
+    for (const auto &kv : m) {
       std::cout << (first ? "" : ",") << JsonQuote(kv.first) << ":" << kv.second;
       first = false;
     }
+  };
+  if (HasFlag(argc, argv, "--json")) {
+    std::cout << "{\"runs\":" << total << ",\"reachedDesktop\":" << reachedDesktop
+              << ",\"reachedUserMode\":" << reachedUserMode
+              << ",\"incomplete\":" << incomplete << ",\"byStage\":{";
+    emitMap(byStage);
+    std::cout << "},\"byCategory\":{";
+    emitMap(byCategory);
+    std::cout << "},\"byRemediation\":{";
+    emitMap(byRemediation);
     std::cout << "}}\n";
     return 0;
   }
   std::cout << "AntiMal boot reliability over " << total << " run(s) in "
             << antimal::PathToUtf8(ws) << "\n";
   if (total == 0) {
-    std::cout << "  (no runs with a report.json yet -- run `detonate` first)\n";
+    std::cout << "  (no runs yet -- run `detonate` first)\n";
     return 0;
   }
   for (const auto &kv : byStage) {
@@ -3300,6 +3312,15 @@ int CommandBootReport(int argc, wchar_t **argv) {
             << static_cast<int>(pct(reachedUserMode, total) + 0.5) << "%)\n";
   std::cout << "  reached desktop:   " << reachedDesktop << "/" << total << " ("
             << static_cast<int>(pct(reachedDesktop, total) + 0.5) << "%)\n";
+  // The most common actionable next step across the classified runs -- points the
+  // operator at the highest-leverage fix for the dominant failure mode.
+  if (!byRemediation.empty()) {
+    const auto top = std::max_element(
+        byRemediation.begin(), byRemediation.end(),
+        [](const auto &a, const auto &b) { return a.second < b.second; });
+    std::cout << "  top remediation (" << top->second << " run(s)): "
+              << top->first << "\n";
+  }
   return 0;
 }
 
