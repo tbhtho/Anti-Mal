@@ -31,10 +31,11 @@
       <AdditionalOptions>/utf-8 %(AdditionalOptions)</AdditionalOptions>
     </ClCompile>
     <Link>
-      <AdditionalDependencies>bcrypt.lib;wintrust.lib;crypt32.lib;advapi32.lib;shell32.lib;winsqlite3.lib;winhttp.lib;gdiplus.lib;iphlpapi.lib;wtsapi32.lib;userenv.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <AdditionalDependencies>bcrypt.lib;wintrust.lib;crypt32.lib;advapi32.lib;shell32.lib;winsqlite3.lib;winhttp.lib;gdiplus.lib;iphlpapi.lib;wtsapi32.lib;userenv.lib;comctl32.lib;user32.lib;gdi32.lib;%(AdditionalDependencies)</AdditionalDependencies>
     </Link>
   </ItemDefinitionGroup>
   <ItemGroup>
+    <ClCompile Include="src\FileBrowser.cpp" />
     <ClCompile Include="src\main.cpp" />
   </ItemGroup>
   <ItemGroup>

@@ -1428,10 +1428,26 @@ bool HasArg(int argc, wchar_t **argv, std::wstring_view needle) {
 
 } // namespace
 
+// Defined in FileBrowser.cpp (a self-contained Win32 file browser).
+int RunFileBrowserGui(const std::wstring &startDir);
+
 int wmain(int argc, wchar_t **argv) {
   BootLog("wmain start argc=" + std::to_string(argc) +
           " service=" + (HasArg(argc, argv, L"--service") ? "1" : "0"));
   try {
+    // Minimal in-guest GUI file browser: usable File-Explorer functionality even
+    // when the Win11 modern shell crash-loops. Launch it from the cmd-shell
+    // sidestep: `AntiMal.GuestAgent.exe --file-browser [start-dir]`.
+    if (HasArg(argc, argv, L"--file-browser")) {
+      std::wstring start = L"C:\\";
+      for (int i = 1; i < argc; ++i) {
+        if (argv[i] && std::wstring_view(argv[i]) != L"--file-browser") {
+          start = argv[i];
+          break;
+        }
+      }
+      return RunFileBrowserGui(start);
+    }
     if (HasArg(argc, argv, L"--service")) {
       return RunAsService();
     }
