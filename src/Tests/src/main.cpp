@@ -1136,6 +1136,23 @@ void TestIocExport() {
   Expect(antimal::CollectIndicators(empty).empty(),
          "ioc: empty report -> no indicators");
 
+  // Unlabeled persistence (no agent MITRE) is still exported -- caught by the
+  // persistence classifier from the raw registry target.
+  {
+    antimal::AnalysisReport r2;
+    antimal::EventRecord pe;
+    pe.category = "registry";
+    pe.action = "registry.set";
+    pe.target =
+        "HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\RunOnce\\X = a.exe";
+    r2.events.push_back(pe); // deliberately no e.mitre
+    bool found = false;
+    for (const auto &i : antimal::CollectIndicators(r2)) {
+      if (i.type == "regkey" && i.value == pe.target) found = true;
+    }
+    Expect(found, "ioc: unlabeled persistence regkey caught by the classifier");
+  }
+
   // --- Injection safety: a hostile value must be escaped, not break framing ---
   antimal::AnalysisReport evil;
   evil.runId = "run-evil";

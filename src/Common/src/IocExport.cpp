@@ -2,6 +2,7 @@
 
 #include "antimal/Crypto.h"
 #include "antimal/Json.h"
+#include "antimal/PersistenceClassifier.h"
 
 #include <algorithm>
 #include <cctype>
@@ -249,14 +250,25 @@ std::vector<IocIndicator> CollectIndicators(const AnalysisReport &report) {
     Add(out, seen, "url", u, "static IOC url");
   }
 
-  // 5) Registry persistence (MITRE-tagged registry events).
+  // 5) Registry persistence: any MITRE-tagged registry event, plus registry
+  //    writes the persistence classifier recognizes even when the in-guest agent
+  //    didn't label them (so the export isn't limited to the agent's handful of
+  //    pre-tagged keys).
   for (const auto &e : report.events) {
     const bool isRegistry =
         e.category == "registry" || e.action.find("registry") != std::string::npos;
-    if (!isRegistry || e.mitre.empty() || e.target.empty()) {
+    if (!isRegistry || e.target.empty()) {
       continue;
     }
-    Add(out, seen, "regkey", e.target, "persistence (" + e.mitre + ")");
+    if (!e.mitre.empty()) {
+      Add(out, seen, "regkey", e.target, "persistence (" + e.mitre + ")");
+      continue;
+    }
+    const PersistenceMatch pm = ClassifyPersistence(e.category, e.target);
+    if (pm.matched) {
+      Add(out, seen, "regkey", e.target,
+          "persistence: " + pm.mechanism + " (" + pm.mitre + ")");
+    }
   }
 
   // 6) Mutexes (scanner IOC hints).
