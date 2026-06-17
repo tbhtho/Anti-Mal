@@ -10330,6 +10330,9 @@ std::string FormatVmDiagnostics(const hv::VmRunSummary &vm) {
   out << "com2McrWrites: " << vm.com2Stats.mcrWrites << "\n";
   out << "com2LsrReads: " << vm.com2Stats.lsrReads << "\n";
   out << "com2RxBytesQueued: " << vm.com2Stats.rxBytesQueued << "\n";
+  if (!vm.liveFramePacingSummary.empty()) {
+    out << "liveFramePacing: " << vm.liveFramePacingSummary << "\n";
+  }
   out << "com1TouchStatus: " << ClassifyCom1TouchStatus(vm) << "\n";
   out << "com1RegisterReads: " << vm.com1RegisterReads << "\n";
   out << "com1RegisterWrites: " << vm.com1RegisterWrites << "\n";

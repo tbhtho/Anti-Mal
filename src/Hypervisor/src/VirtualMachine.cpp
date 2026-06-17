@@ -1,5 +1,6 @@
 ﻿#include "antimal/hv/VirtualMachine.h"
 
+#include "antimal/hv/FramePacing.h"
 #include "antimal/hv/KdPipeBridge.h"
 #include "antimal/hv/LiveFrameShm.h"
 #include "antimal/hv/ScreenState.h"
@@ -1413,6 +1414,9 @@ VmRunSummary VirtualMachine::RunLoop(
   // Bounds the consecutive near-uniform frames we swallow, so the live view can
   // never freeze on a low-variance/crashed-shell desktop (the fps=0 "screenshot").
   LiveFramePublishGate frameGate;
+  // Measured live-display cadence (achieved FPS, interval p50/p95, on-target %,
+  // blank-skips). The diagnostics half of the path toward the 25-30 FPS goal.
+  FramePacingStats framePacing(30);
   std::unique_ptr<LiveFrameShmPublisher> framePub;
   if (!liveFrameShmName_.empty()) {
     framePub = std::make_unique<LiveFrameShmPublisher>(liveFrameShmName_);
@@ -2782,9 +2786,11 @@ VmRunSummary VirtualMachine::RunLoop(
         // still published (after the cap) so the live view can't freeze forever
         // (the fps=0 "screenshot" bug). See LiveFramePublishGate.
         if (!frameGate.ShouldPublish(LiveFrameIsBlank(src, pw, ph, srcStride))) {
+          framePacing.RecordBlankSkip();
           return;
         }
         framePub->Publish(src, pw, ph, bpp, srcStride);
+        framePacing.RecordPublish(LiveFrameNowMicros());
       };
       const bool consistent = en && bpp == 32 && w >= 64 && h >= 64 &&
                               w <= 8192 && h <= 8192 &&
@@ -3272,6 +3278,9 @@ VmRunSummary VirtualMachine::RunLoop(
   summary.crashed = summary.fatal;
   summary.completed = !summary.fatal && !summary.timedOut &&
                       !summary.idleLoop && !summary.halted;
+  if (framePacing.FramesPublished() > 0 || framePacing.BlankSkips() > 0) {
+    summary.liveFramePacingSummary = framePacing.Summary();
+  }
   return summary;
 }
 

@@ -7,6 +7,7 @@
 #include "antimal/ContainerAnalyzer.h"
 #include "antimal/Crypto.h"
 #include "antimal/FuzzyHash.h"
+#include "antimal/hv/FramePacing.h"
 #include "antimal/DetonationProtocol.h"
 #include "antimal/EventJournal.h"
 #include "antimal/ExternalTools.h"
@@ -3476,6 +3477,64 @@ void TestFuzzyHash() {
          "ctph compare flags a malformed lhs");
   Expect(CompareCtph(ha, "12:") == -1,
          "ctph compare flags a malformed rhs (missing sig2 colon)");
+}
+
+// Live-display frame-pacing diagnostics. Pure (synthetic microsecond timestamps,
+// no boot): a perfect 30fps stream measures ~30fps and is fully on-target; a
+// 10fps stream is off-target vs a 30fps goal; blank-skips are counted separately;
+// and the retained-interval window caps memory. This is the measured-diagnostics
+// foundation for the 25-30 FPS goal.
+void TestFramePacingStats() {
+  using antimal::hv::FramePacingStats;
+
+  FramePacingStats empty;
+  Expect(empty.FramesPublished() == 0 && empty.SampleCount() == 0,
+         "pacing: empty has no frames/samples");
+  Expect(empty.MeasuredFps() == 0.0, "pacing: empty fps is 0");
+  Expect(empty.Summary().find("0.0fps") != std::string::npos,
+         "pacing: empty summary reads 0.0fps");
+
+  // A perfect 30fps stream: 33,333 us between frames.
+  FramePacingStats s(30);
+  uint64_t t = 1000000;
+  for (int i = 0; i < 100; ++i) {
+    s.RecordPublish(t);
+    t += 33333;
+  }
+  Expect(s.FramesPublished() == 100, "pacing: counts 100 publishes");
+  Expect(s.SampleCount() == 99, "pacing: 99 intervals from 100 frames");
+  Expect(s.MeasuredFps() > 29.0 && s.MeasuredFps() < 31.0,
+         "pacing: ~30fps measured");
+  Expect(s.OnTargetRatio() > 0.99, "pacing: 30fps stream is on-target");
+  Expect(s.MinIntervalMs() > 33.0 && s.MaxIntervalMs() < 34.0,
+         "pacing: ~33ms intervals");
+  Expect(s.PercentileIntervalMs(0.50) <= s.PercentileIntervalMs(0.95) + 0.001,
+         "pacing: p50 <= p95");
+
+  s.RecordBlankSkip();
+  s.RecordBlankSkip();
+  Expect(s.BlankSkips() == 2, "pacing: blank-skips counted separately");
+
+  // A slow 10fps stream is off-target for a 30fps goal.
+  FramePacingStats slow(30);
+  uint64_t u = 0;
+  for (int i = 0; i < 50; ++i) {
+    slow.RecordPublish(u);
+    u += 100000; // 100 ms = 10 fps
+  }
+  Expect(slow.MeasuredFps() > 9.0 && slow.MeasuredFps() < 11.0,
+         "pacing: ~10fps measured");
+  Expect(slow.OnTargetRatio() < 0.01,
+         "pacing: 10fps is off-target for a 30fps goal");
+
+  // The retained-interval window caps memory at the most recent N.
+  FramePacingStats win(30, 10);
+  uint64_t w = 0;
+  for (int i = 0; i < 100; ++i) {
+    win.RecordPublish(w);
+    w += 33333;
+  }
+  Expect(win.SampleCount() == 10, "pacing: window caps retained intervals");
 }
 
 // Magic-byte file-type identification (extension-independent), the basis for
@@ -8183,6 +8242,7 @@ int main() {
     TestSelectRunsToReclaim();
     TestMd5AndImphash();
     TestFuzzyHash();
+    TestFramePacingStats();
     TestFileTypeId();
     TestShellLinkParser();
     TestScriptAnalyzer();

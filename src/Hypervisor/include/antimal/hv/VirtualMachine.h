@@ -468,6 +468,11 @@ struct VmRunSummary {
   uint32_t framesCaptured = 0;
   uint32_t eventsCaptured = 0;
   uint32_t artifactsCaptured = 0;
+  // Measured live-display cadence (FramePacingStats::Summary()): achieved FPS vs
+  // target, p50/p95/min/max inter-frame interval, on-target %, and blank-skips.
+  // Empty for headless runs with no live-frame consumer. The diagnostics + the
+  // path toward the 25-30 FPS goal.
+  std::string liveFramePacingSummary;
 };
 
 struct VirtualMachineOptions {

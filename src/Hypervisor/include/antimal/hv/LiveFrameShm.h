@@ -27,6 +27,21 @@
 
 namespace antimal::hv {
 
+// Monotonic microsecond clock for frame pacing (QueryPerformanceCounter-based).
+// Split out so FramePacingStats stays pure/testable; the publisher loop calls
+// this to stamp each Publish() for the live-display cadence diagnostics.
+inline uint64_t LiveFrameNowMicros() {
+  LARGE_INTEGER freq, ctr;
+  if (!QueryPerformanceFrequency(&freq) || freq.QuadPart == 0) {
+    return 0;
+  }
+  QueryPerformanceCounter(&ctr);
+  const uint64_t f = static_cast<uint64_t>(freq.QuadPart);
+  const uint64_t c = static_cast<uint64_t>(ctr.QuadPart);
+  // Split secs/remainder to avoid overflow on a large raw counter.
+  return (c / f) * 1000000ull + ((c % f) * 1000000ull) / f;
+}
+
 class LiveFrameShmPublisher {
 public:
   static constexpr uint32_t kMagic = 0x414D4C46u; // 'AMLF'

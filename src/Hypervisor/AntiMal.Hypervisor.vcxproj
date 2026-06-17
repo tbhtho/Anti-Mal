@@ -41,6 +41,7 @@
     <ClInclude Include="include\antimal\hv\Device.h" />
     <ClInclude Include="include\antimal\hv\E1000Device.h" />
     <ClInclude Include="include\antimal\hv\Firmware.h" />
+    <ClInclude Include="include\antimal\hv\FramePacing.h" />
     <ClInclude Include="include\antimal\hv\GuestMemory.h" />
     <ClInclude Include="include\antimal\hv\Hpet.h" />
     <ClInclude Include="include\antimal\hv\HostSerialChannel.h" />
