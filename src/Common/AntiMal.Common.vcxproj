@@ -44,6 +44,7 @@
     <ClInclude Include="include\antimal\EventJournal.h" />
     <ClInclude Include="include\antimal\ExternalTools.h" />
     <ClInclude Include="include\antimal\FileUtil.h" />
+    <ClInclude Include="include\antimal\FuzzyHash.h" />
     <ClInclude Include="include\antimal\GuestMonitor.h" />
     <ClInclude Include="include\antimal\HostChannel.h" />
     <ClInclude Include="include\antimal\Http.h" />
@@ -82,6 +83,7 @@
     <ClCompile Include="src\EventJournal.cpp" />
     <ClCompile Include="src\ExternalTools.cpp" />
     <ClCompile Include="src\FileUtil.cpp" />
+    <ClCompile Include="src\FuzzyHash.cpp" />
     <ClCompile Include="src\GuestMonitor.cpp" />
     <ClCompile Include="src\Http.cpp" />
     <ClCompile Include="src\HyperVOrchestrator.cpp" />

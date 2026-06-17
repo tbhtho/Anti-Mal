@@ -355,6 +355,7 @@ ScanResult ParseScan(const JsonValue *value) {
   scan.sha1 = StringValue(Member(*value, "sha1"));
   scan.md5 = StringValue(Member(*value, "md5"));
   scan.imphash = StringValue(Member(*value, "imphash"));
+  scan.ctph = StringValue(Member(*value, "ctph"));
   scan.detectedType = StringValue(Member(*value, "detectedType"));
   scan.entropy = DoubleValue(Member(*value, "entropy"));
   scan.isPe = BoolValue(Member(*value, "isPe"));
@@ -1554,6 +1555,9 @@ std::string BuildHtmlReportWithFrames(const AnalysisReport &report,
   }
   if (!scan.imphash.empty()) {
     html << " &nbsp;&middot;&nbsp; imphash " << HtmlEscape(scan.imphash);
+  }
+  if (!scan.ctph.empty()) {
+    html << " &nbsp;&middot;&nbsp; ctph " << HtmlEscape(scan.ctph);
   }
   html << " &nbsp;&middot;&nbsp; run " << HtmlEscape(report.runId) << "</div></div>";
   html << "<div class=\"tags\">";

@@ -494,6 +494,7 @@ std::string ToJson(const ScanResult &scan) {
   obj.AddString("sha1", scan.sha1);
   obj.AddString("md5", scan.md5);
   obj.AddString("imphash", scan.imphash);
+  obj.AddString("ctph", scan.ctph);
   obj.AddString("detectedType", scan.detectedType);
   obj.AddDouble("entropy", scan.entropy);
   obj.AddBool("isPe", scan.isPe);

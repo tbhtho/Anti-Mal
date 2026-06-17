@@ -127,6 +127,7 @@ struct ScanResult {
   std::string sha1;    // triage cross-reference hash (identification only)
   std::string md5;     // triage cross-reference hash (identification only)
   std::string imphash; // pefile-compatible import hash; empty for non-PE / no imports
+  std::string ctph;    // context-triggered piecewise (fuzzy) hash for similarity
   double entropy = 0.0;
   bool isPe = false;
   bool isDll = false;                // IMAGE_FILE_DLL in the file header

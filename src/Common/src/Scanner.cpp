@@ -3,6 +3,7 @@
 #include "antimal/Crypto.h"
 #include "antimal/ExternalTools.h"
 #include "antimal/FileUtil.h"
+#include "antimal/FuzzyHash.h"
 #include "antimal/IntelLookup.h"
 #include "antimal/ConfigExtractor.h"
 #include "antimal/ContainerAnalyzer.h"
@@ -482,6 +483,7 @@ ScanResult ScanFile(const std::filesystem::path &path,
     result.sha1 = Sha1Hex(data);
     result.md5 = Md5Hex(data);
     result.detectedType = IdentifyFileType(data);
+    result.ctph = ComputeCtph(data);
     result.entropy = CalculateEntropy(data);
 
     // Embedded executables (any host type): a dropper/installer carrying one or
@@ -867,6 +869,9 @@ std::string FormatScanText(const ScanResult &result) {
   }
   if (!result.imphash.empty()) {
     out << "  imphash: " << result.imphash << "\n";
+  }
+  if (!result.ctph.empty()) {
+    out << "  ctph: " << result.ctph << "\n";
   }
   out << "  score: " << result.score << " (" << ToString(result.verdict) << ")\n";
   out << "  entropy: " << result.entropy << "\n";

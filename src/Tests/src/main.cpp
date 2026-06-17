@@ -6,6 +6,7 @@
 #include "antimal/ConfigExtractor.h"
 #include "antimal/ContainerAnalyzer.h"
 #include "antimal/Crypto.h"
+#include "antimal/FuzzyHash.h"
 #include "antimal/DetonationProtocol.h"
 #include "antimal/EventJournal.h"
 #include "antimal/ExternalTools.h"
@@ -3404,6 +3405,77 @@ void TestMd5AndImphash() {
   Expect(ComputeImphash({{"loader.exe", "Run"}}) ==
              antimal::Md5Hex(bytes("loader.exe.run")),
          "imphash does not strip non-.dll/.ocx/.sys extensions");
+}
+
+// Context-triggered piecewise (fuzzy) hash. CTPH is not a cryptographic hash:
+// identical inputs match 100, a small localized change stays highly similar, and
+// unrelated inputs score low (the common-substring gate + block-size cap keep
+// unrelated digests from scoring spuriously high). Verified on those PROPERTIES;
+// the construction is self-consistent (cross-tool compatibility is not asserted).
+void TestFuzzyHash() {
+  using antimal::CompareCtph;
+  using antimal::ComputeCtph;
+
+  Expect(ComputeCtph({}).empty(), "ctph of empty input is empty");
+
+  // A deterministic, content-rich buffer (a small LCG, no host dependency).
+  auto makeBuf = [](uint32_t seed, size_t n) {
+    std::vector<uint8_t> v(n);
+    uint32_t s = seed;
+    for (size_t i = 0; i < n; ++i) {
+      s = s * 1664525u + 1013904223u;
+      v[i] = static_cast<uint8_t>((s >> 24) & 0xFF);
+    }
+    return v;
+  };
+
+  const std::vector<uint8_t> a = makeBuf(0xC0FFEEu, 16384);
+  const std::string ha = ComputeCtph(a);
+
+  // Well-formed digest: "blocksize:sig1:sig2", blocksize a positive integer.
+  {
+    const size_t c1 = ha.find(':');
+    const size_t c2 = (c1 == std::string::npos) ? std::string::npos
+                                                : ha.find(':', c1 + 1);
+    Expect(c1 != std::string::npos && c2 != std::string::npos,
+           "ctph digest has the blocksize:sig1:sig2 shape");
+    Expect(c1 > 0 && std::stoul(ha.substr(0, c1)) > 0,
+           "ctph blocksize parses as a positive integer");
+  }
+
+  // Identical input -> identical digest -> 100.
+  Expect(ComputeCtph(makeBuf(0xC0FFEEu, 16384)) == ha,
+         "ctph is deterministic for identical input");
+  Expect(CompareCtph(ha, ha) == 100, "ctph self-compare is 100");
+
+  // A small localized change (32 appended bytes) stays highly similar.
+  std::vector<uint8_t> aPlus = a;
+  for (int i = 0; i < 32; ++i) aPlus.push_back(static_cast<uint8_t>(i));
+  const int simAppend = CompareCtph(ha, ComputeCtph(aPlus));
+  Expect(simAppend >= 50, "ctph stays similar after a small append");
+
+  // A handful of flipped bytes in the middle stays similar.
+  std::vector<uint8_t> aFlip = a;
+  for (int i = 0; i < 16; ++i) aFlip[8000 + i] ^= 0xFFu;
+  const int simFlip = CompareCtph(ha, ComputeCtph(aFlip));
+  Expect(simFlip >= 50, "ctph stays similar after a small middle edit");
+
+  // An unrelated buffer scores low and clearly below the similar cases.
+  const int simUnrelated = CompareCtph(ha, ComputeCtph(makeBuf(0xBADF00Du, 16384)));
+  Expect(simUnrelated < 30, "ctph of unrelated data scores low");
+  Expect(simUnrelated < simFlip && simUnrelated < simAppend,
+         "ctph ranks similar above unrelated");
+
+  // Symmetry.
+  const std::string hb = ComputeCtph(makeBuf(0xBADF00Du, 16384));
+  Expect(CompareCtph(ha, hb) == CompareCtph(hb, ha),
+         "ctph compare is symmetric");
+
+  // Malformed digests -> -1 (parse error), distinct from 0 (incomparable).
+  Expect(CompareCtph("not-a-digest", ha) == -1,
+         "ctph compare flags a malformed lhs");
+  Expect(CompareCtph(ha, "12:") == -1,
+         "ctph compare flags a malformed rhs (missing sig2 colon)");
 }
 
 // Magic-byte file-type identification (extension-independent), the basis for
@@ -8110,6 +8182,7 @@ int main() {
     TestExternalToolParsers();
     TestSelectRunsToReclaim();
     TestMd5AndImphash();
+    TestFuzzyHash();
     TestFileTypeId();
     TestShellLinkParser();
     TestScriptAnalyzer();
