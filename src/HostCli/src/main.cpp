@@ -33,6 +33,7 @@
 #include <limits>
 #include <map>
 #include <optional>
+#include <set>
 #include <sstream>
 #include <string>
 #include <vector>
@@ -199,6 +200,7 @@ void PrintUsage() {
       << "                       [--dump-bcd <out.bcd>] [--dump-system <out.hive>]\n"
       << "  antimal fs-ls  [--vhdx <d.vhdx>] [--overlay <o.cow>] <guest\\path>   (offline guest dir listing)\n"
       << "  antimal fs-cat [--vhdx <d.vhdx>] [--overlay <o.cow>] <guest\\path> [--out <file>]\n"
+      << "  antimal fs-find [--vhdx <d.vhdx>] [--overlay <o.cow>] <name-substring>   (offline recursive search)\n"
       << "  antimal report <run-id-or-report.json> [--html] [--detections|--usability [--json]]\n"
       << "  antimal browser-impact <run-id-or-report.json> --decrypt-browser-secrets\n"
       << "  antimal export <run-id-or-report.json> --format stix|misp|csv [--out <file>]\n"
@@ -914,6 +916,48 @@ public:
       out.push_back({e.name, e.size, e.directory});
     }
     return out;
+  }
+
+  // Recursive case-insensitive name search from the volume root. Bounded by
+  // depth, result count, AND a hard directory-visit cap so it always terminates
+  // quickly on a large NTFS volume (a from-scratch reader is not fast). A
+  // visited-set breaks any hardlink/junction cycles.
+  struct FindHit {
+    std::string path;
+    uint64_t size = 0;
+    bool directory = false;
+  };
+  std::vector<FindHit> Find(const std::string &needleLower, int maxDepth,
+                            size_t maxResults, size_t maxDirs, bool &truncated) {
+    std::vector<FindHit> results;
+    std::set<uint64_t> visited;
+    size_t dirsVisited = 0;
+    truncated = false;
+    std::function<void(uint64_t, const std::string &, int)> walk =
+        [&](uint64_t rec, const std::string &prefix, int depth) {
+          if (results.size() >= maxResults) return;
+          if (dirsVisited >= maxDirs) {
+            truncated = true;
+            return;
+          }
+          if (depth > maxDepth || !visited.insert(rec).second) return;
+          ++dirsVisited;
+          for (const auto &e : ReadDirectory(rec)) {
+            if (e.nameSpace == 2 || e.name == "." || e.name == "..") continue;
+            std::string nl = e.name;
+            for (char &c : nl) {
+              c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+            }
+            const std::string full = prefix + "\\" + e.name;
+            if (nl.find(needleLower) != std::string::npos) {
+              results.push_back({full, e.size, e.directory});
+              if (results.size() >= maxResults) return;
+            }
+            if (e.directory) walk(e.fileRecord, full, depth + 1);
+          }
+        };
+    walk(5, "", 0);
+    return results;
   }
 
   uint16_t BytesPerSector() const noexcept { return bytesPerSector_; }
@@ -3231,10 +3275,15 @@ int CommandFs(int argc, wchar_t **argv) {
     break;
   }
   if (guestPath.empty()) {
-    std::cerr << "usage: antimal " << sub
-              << " [--vhdx <d.vhdx>] [--overlay <o.cow>] <guest\\path>"
-              << (sub == "fs-cat" ? " [--out <file>] [--max-bytes N]" : "")
-              << "\n";
+    if (sub == "fs-find") {
+      std::cerr << "usage: antimal fs-find [--vhdx <d.vhdx>] [--overlay <o.cow>] "
+                   "<name-substring> [--max-depth N] [--max-results N]\n";
+    } else {
+      std::cerr << "usage: antimal " << sub
+                << " [--vhdx <d.vhdx>] [--overlay <o.cow>] <guest\\path>"
+                << (sub == "fs-cat" ? " [--out <file>] [--max-bytes N]" : "")
+                << "\n";
+    }
     return 2;
   }
 
@@ -3268,6 +3317,40 @@ int CommandFs(int argc, wchar_t **argv) {
   if (!ntfs.Init()) {
     std::cerr << "fs: Windows partition is not a readable NTFS volume.\n";
     return 1;
+  }
+
+  if (sub == "fs-find") {
+    std::string needle = guestPath;
+    for (char &c : needle) {
+      c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    }
+    int maxDepth = 10;
+    if (const auto md = OptionValue(argc, argv, "--max-depth")) {
+      try {
+        maxDepth = std::stoi(*md);
+      } catch (...) {
+      }
+    }
+    size_t maxResults = 300;
+    if (const auto mr = OptionValue(argc, argv, "--max-results")) {
+      try {
+        maxResults = static_cast<size_t>(std::stoul(*mr));
+      } catch (...) {
+      }
+    }
+    bool truncated = false;
+    const auto hits =
+        ntfs.Find(needle, maxDepth, maxResults, 60000, truncated);
+    for (const auto &h : hits) {
+      std::cout << (h.directory ? "  <DIR>  " : "         ") << h.path;
+      if (!h.directory) std::cout << "  (" << h.size << ")";
+      std::cout << "\n";
+    }
+    std::cout << hits.size() << " match(es) for \"" << guestPath << "\""
+              << (truncated ? " (search truncated -- raise --max-depth or narrow)"
+                            : "")
+              << "\n";
+    return 0;
   }
 
   const auto entry = ntfs.FindPath(guestPath);
@@ -3617,7 +3700,7 @@ int wmain(int argc, wchar_t **argv) {
     if (command == "boot-report") {
       return CommandBootReport(argc, argv);
     }
-    if (command == "fs-ls" || command == "fs-cat") {
+    if (command == "fs-ls" || command == "fs-cat" || command == "fs-find") {
       return CommandFs(argc, argv);
     }
     PrintUsage();
