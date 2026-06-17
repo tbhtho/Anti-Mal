@@ -1,6 +1,7 @@
 #include "antimal/BootDiagnostics.h"
 #include "antimal/BrowserImpact.h"
 #include "antimal/Config.h"
+#include "antimal/DetectionSummary.h"
 #include "antimal/EventJournal.h"
 #include "antimal/FileUtil.h"
 #include "antimal/FuzzyHash.h"
@@ -194,7 +195,7 @@ void PrintUsage() {
       << "  antimal base convert --vhdx <base.vhdx> --raw <AntiMalBase.raw> [--force]\n"
       << "  antimal base inspect --vhdx <base.vhdx> [--overlay <overlay.cow>]\n"
       << "                       [--dump-bcd <out.bcd>] [--dump-system <out.hive>]\n"
-      << "  antimal report <run-id-or-report.json> --html\n"
+      << "  antimal report <run-id-or-report.json> [--html] [--detections [--json]]\n"
       << "  antimal browser-impact <run-id-or-report.json> --decrypt-browser-secrets\n"
       << "  antimal export <run-id-or-report.json> --format stix|misp|csv [--out <file>]\n"
       << "  antimal similarity <fileA> <fileB> [--json]   (fuzzy-hash similarity 0..100)\n"
@@ -2896,6 +2897,39 @@ int CommandReport(int argc, wchar_t **argv) {
   const auto config = antimal::LoadConfig(antimal::DefaultConfigPath());
   const auto reportPath = ResolveReportPath(config, std::filesystem::path(argv[2]));
   auto report = antimal::LoadReportBestEffort(reportPath);
+  if (HasFlag(argc, argv, "--detections")) {
+    // The severity-ranked behavior summary (boot outcome + verdict + ranked
+    // detections). A quick terminal triage view without opening the HTML.
+    const antimal::BootOutcome bo =
+        antimal::ClassifyBootOutcome(report.dynamicSummary);
+    const auto dets = antimal::BuildDetections(report);
+    if (HasFlag(argc, argv, "--json")) {
+      std::cout << "{\"verdict\":"
+                << JsonQuote(antimal::ToString(report.sandboxVerdict))
+                << ",\"verdictScore\":" << report.verdictScore
+                << ",\"bootStage\":" << JsonQuote(bo.stage)
+                << ",\"detections\":[";
+      for (size_t i = 0; i < dets.size(); ++i) {
+        const auto &d = dets[i];
+        std::cout << (i ? "," : "") << "{\"severity\":" << JsonQuote(d.severityLabel)
+                  << ",\"category\":" << JsonQuote(d.category)
+                  << ",\"title\":" << JsonQuote(d.title)
+                  << ",\"mitre\":" << JsonQuote(d.mitre) << "}";
+      }
+      std::cout << "]}\n";
+      return 0;
+    }
+    std::cout << "Verdict: " << antimal::ToString(report.sandboxVerdict) << " (score "
+              << report.verdictScore << ")\n";
+    std::cout << "Boot: " << bo.stage << " -- " << bo.detail << "\n";
+    std::cout << "Detections (" << dets.size() << "):\n";
+    for (const auto &d : dets) {
+      std::cout << "  [" << d.severityLabel << "] " << d.category << ": " << d.title;
+      if (!d.mitre.empty()) std::cout << "  (" << d.mitre << ")";
+      std::cout << "\n";
+    }
+    return 0;
+  }
   if (HasFlag(argc, argv, "--html")) {
     const auto htmlPath = reportPath.parent_path() / "report.html";
     antimal::WriteReportHtml(htmlPath, report);
