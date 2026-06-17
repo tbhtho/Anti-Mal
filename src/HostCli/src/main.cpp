@@ -202,6 +202,7 @@ void PrintUsage() {
       << "  antimal fs-cat [--vhdx <d.vhdx>] [--overlay <o.cow>] <guest\\path> [--out <file>]\n"
       << "  antimal fs-find [--vhdx <d.vhdx>] [--overlay <o.cow>] <name-substring>   (offline recursive search)\n"
       << "  antimal fs-scan [--vhdx <d.vhdx>] [--overlay <o.cow>] <guest\\path>   (extract + static-scan a guest file)\n"
+      << "  antimal reg-ls [--hive software|system|sam|...] [--overlay <o.cow>] <reg\\key> [--values] [--depth N]\n"
       << "  antimal report <run-id-or-report.json> [--html] [--detections|--usability [--json]]\n"
       << "  antimal browser-impact <run-id-or-report.json> --decrypt-browser-secrets\n"
       << "  antimal export <run-id-or-report.json> --format stix|misp|csv [--out <file>]\n"
@@ -3275,7 +3276,7 @@ int CommandFs(int argc, wchar_t **argv) {
     guestPath = a;
     break;
   }
-  if (guestPath.empty()) {
+  if (guestPath.empty() && sub != "reg-ls") { // reg-ls can list the hive root
     if (sub == "fs-find") {
       std::cerr << "usage: antimal fs-find [--vhdx <d.vhdx>] [--overlay <o.cow>] "
                    "<name-substring> [--max-depth N] [--max-results N]\n";
@@ -3318,6 +3319,58 @@ int CommandFs(int argc, wchar_t **argv) {
   if (!ntfs.Init()) {
     std::cerr << "fs: Windows partition is not a readable NTFS volume.\n";
     return 1;
+  }
+
+  if (sub == "reg-ls") {
+    // Browse a guest registry hive OFFLINE: extract it from the disk image and
+    // list a key's subkeys (+ values with --values). Inspect Run keys / Services
+    // / persistence without booting. The positional arg is the registry subpath.
+    std::string hiveSel = OptionValue(argc, argv, "--hive").value_or("software");
+    std::string hl = hiveSel;
+    for (char &c : hl)
+      c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    std::string hivePath;
+    if (hl == "software")
+      hivePath = "\\Windows\\System32\\config\\SOFTWARE";
+    else if (hl == "system")
+      hivePath = "\\Windows\\System32\\config\\SYSTEM";
+    else if (hl == "default")
+      hivePath = "\\Windows\\System32\\config\\DEFAULT";
+    else if (hl == "security")
+      hivePath = "\\Windows\\System32\\config\\SECURITY";
+    else if (hl == "sam")
+      hivePath = "\\Windows\\System32\\config\\SAM";
+    else
+      hivePath = hiveSel; // treat as an explicit guest path
+    const auto hiveEntry = ntfs.FindPath(hivePath);
+    if (!hiveEntry || hiveEntry->directory) {
+      std::cerr << "reg: hive not found in image: " << hivePath << "\n";
+      return 2;
+    }
+    const auto bytes = ntfs.ReadFile(*hiveEntry, 256ull * 1024 * 1024);
+    const auto tmp = std::filesystem::temp_directory_path() /
+                     ("antimal-hive-" + hl + ".bin");
+    {
+      std::ofstream f(tmp, std::ios::binary);
+      f.write(reinterpret_cast<const char *>(bytes.data()),
+              static_cast<std::streamsize>(bytes.size()));
+    }
+    int depth = 1;
+    if (const auto d = OptionValue(argc, argv, "--depth")) {
+      try {
+        depth = std::stoi(*d);
+      } catch (...) {
+      }
+    }
+    const std::string dump = antimal::DebugDumpHiveFile(
+        antimal::PathToUtf8(tmp), guestPath, "", HasFlag(argc, argv, "--values"),
+        depth);
+    std::cout << "[" << hl << "] " << (guestPath.empty() ? "(root)" : guestPath)
+              << "\n"
+              << dump;
+    std::error_code ec;
+    std::filesystem::remove(tmp, ec);
+    return 0;
   }
 
   if (sub == "fs-find") {
@@ -3730,7 +3783,7 @@ int wmain(int argc, wchar_t **argv) {
       return CommandBootReport(argc, argv);
     }
     if (command == "fs-ls" || command == "fs-cat" || command == "fs-find" ||
-        command == "fs-scan") {
+        command == "fs-scan" || command == "reg-ls") {
       return CommandFs(argc, argv);
     }
     PrintUsage();
