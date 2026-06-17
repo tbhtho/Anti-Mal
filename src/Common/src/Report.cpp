@@ -1718,6 +1718,21 @@ std::string BuildHtmlReportWithFrames(const AnalysisReport &report,
            << HtmlEscape(report.dynamicSummary.liveFramePacingSummary)
            << "</div>";
     }
+    {
+      // Honest network-mode note: hostonly/nat are not yet wired to real egress,
+      // so don't let an analyst assume traffic was captured (network visibility
+      // here comes from in-guest TCP-table telemetry, not packet capture).
+      const NetworkMode nm = report.dynamicSummary.networkMode;
+      html << "<div class=\"k\">network mode</div><div>" << HtmlEscape(ToString(nm));
+      if (nm == NetworkMode::HostOnly || nm == NetworkMode::Nat) {
+        html << " <span style=\"color:var(--warn)\">&#9888; not wired to real "
+                "egress yet — visibility is in-guest TCP-table telemetry, not "
+                "packet capture</span>";
+      } else {
+        html << " <span style=\"opacity:.7\">(no guest network)</span>";
+      }
+      html << "</div>";
+    }
     if (!report.dynamicSummary.windowsKernelReadGateStatus.empty()) {
       html << "<div class=\"k\">kernel gate</div><div class=\"mono\">"
            << HtmlEscape(report.dynamicSummary.windowsKernelReadGateStatus)
