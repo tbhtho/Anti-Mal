@@ -9,6 +9,7 @@
 #include "antimal/Crypto.h"
 #include "antimal/DetectionSummary.h"
 #include "antimal/EventTime.h"
+#include "antimal/UsabilityDiagnostics.h"
 #include "antimal/FuzzyHash.h"
 #include "antimal/hv/FramePacing.h"
 #include "antimal/DetonationProtocol.h"
@@ -3909,6 +3910,68 @@ void TestPackerDetection() {
              .empty(),
          "packer: an ordinary section layout is not a packer");
   Expect(DetectPackerFromSections({}).empty(), "packer: no sections -> none");
+}
+
+// Desktop-usability classifier: measures which usability goals a run achieved
+// and detects the Win11 modern-shell crash-loop with the cmd-shell remediation.
+void TestUsabilityDiagnostics() {
+  using antimal::ClassifyUsability;
+  using antimal::DynamicRunSummary;
+  using antimal::EventRecord;
+
+  // A healthy interactive run: desktop, input, disk, exec, telemetry.
+  {
+    DynamicRunSummary s;
+    s.screenStateReached = 3;
+    s.keyboardScancodesInjected = 50;
+    s.ideReadCommands = 10;
+    s.sampleExecuted = true;
+    s.guestAgentConnected = true;
+    s.eventsCaptured = 100;
+    std::vector<EventRecord> ev;
+    EventRecord br;
+    br.category = "process";
+    br.action = "process.start";
+    br.imagePath = "msedge.exe";
+    ev.push_back(br);
+    const auto u = ClassifyUsability(s, ev);
+    Expect(u.overall == "usable", "usability: healthy run is usable");
+    Expect(!u.shellCrashLoop, "usability: no crash-loop on a healthy run");
+    bool browserOk = false;
+    for (const auto &d : u.dimensions) {
+      if (d.name.find("Browser") != std::string::npos && d.status == "ok") {
+        browserOk = true;
+      }
+    }
+    Expect(browserOk, "usability: browser launch detected");
+  }
+
+  // The modern-shell crash-loop is detected from repeated explorer crashes.
+  {
+    DynamicRunSummary s;
+    s.screenStateReached = 3;
+    s.framesCaptured = 5;
+    std::vector<EventRecord> ev;
+    for (int i = 0; i < 6; ++i) {
+      EventRecord c;
+      c.category = "process";
+      c.action = "process.crash";
+      c.imagePath = (i % 2) ? "explorer.exe" : "ShellHost.exe";
+      ev.push_back(c);
+    }
+    const auto u = ClassifyUsability(s, ev);
+    Expect(u.shellCrashLoop && u.overall == "shell-degraded",
+           "usability: repeated shell crashes -> crash-loop / shell-degraded");
+    Expect(u.remediation.find("cmd-shell") != std::string::npos,
+           "usability: remediation points to the cmd-shell sidestep");
+  }
+
+  // A run that never booted is classified no-boot.
+  {
+    DynamicRunSummary s;
+    const auto u = ClassifyUsability(s, {});
+    Expect(u.overall == "no-boot", "usability: an unbooted run is no-boot");
+  }
 }
 
 // Boot-outcome classifier: collapses the scattered boot signals into a single
@@ -8823,6 +8886,7 @@ int main() {
     TestFramePacingStats();
     TestSimulatedReport();
     TestBootDiagnostics();
+    TestUsabilityDiagnostics();
     TestPackerDetection();
     TestMalformedInputRobustness();
     TestReportHtmlStructure();

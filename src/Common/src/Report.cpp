@@ -3,6 +3,7 @@
 #include "antimal/BootDiagnostics.h"
 #include "antimal/DetectionSummary.h"
 #include "antimal/EventTime.h"
+#include "antimal/UsabilityDiagnostics.h"
 #include "antimal/FileUtil.h"
 #include "antimal/Json.h"
 #include "antimal/MitreCatalog.h"
@@ -1683,6 +1684,28 @@ std::string BuildHtmlReportWithFrames(const AnalysisReport &report,
     if (!report.dynamicSummary.bootStage.empty()) {
       html << "<div class=\"k\">boot stage</div><div class=\"mono\">"
            << HtmlEscape(report.dynamicSummary.bootStage) << "</div>";
+    }
+    {
+      const UsabilityReport u =
+          ClassifyUsability(report.dynamicSummary, report.events);
+      html << "<div class=\"k\">desktop usability</div><div>" << HtmlEscape(u.overall);
+      html << "<div class=\"mono\" style=\"color:var(--muted);margin-top:2px\">";
+      for (size_t i = 0; i < u.dimensions.size(); ++i) {
+        const auto &d = u.dimensions[i];
+        const char *color = d.status == "ok"
+                                ? "var(--good)"
+                                : (d.status == "crash-loop" ? "var(--bad)"
+                                   : d.status == "degraded" ? "var(--warn)"
+                                                            : "var(--muted)");
+        html << (i ? " &middot; " : "") << HtmlEscape(d.name) << ":<span style=\"color:"
+             << color << "\">" << HtmlEscape(d.status) << "</span>";
+      }
+      html << "</div>";
+      if (!u.remediation.empty()) {
+        html << "<div class=\"mono\" style=\"color:var(--muted);margin-top:2px\">"
+             << HtmlEscape(u.remediation) << "</div>";
+      }
+      html << "</div>";
     }
     if (!report.dynamicSummary.liveFramePacingSummary.empty()) {
       html << "<div class=\"k\">live display</div><div class=\"mono\">"

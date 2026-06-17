@@ -79,6 +79,7 @@
     <ClInclude Include="include\antimal\Subprocess.h" />
     <ClInclude Include="include\antimal\Tagger.h" />
     <ClInclude Include="include\antimal\Types.h" />
+    <ClInclude Include="include\antimal\UsabilityDiagnostics.h" />
     <ClInclude Include="include\antimal\WerReport.h" />
   </ItemGroup>
   <ItemGroup>
@@ -126,6 +127,7 @@
     <ClCompile Include="src\Strings.cpp" />
     <ClCompile Include="src\Subprocess.cpp" />
     <ClCompile Include="src\Tagger.cpp" />
+    <ClCompile Include="src\UsabilityDiagnostics.cpp" />
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
 </Project>

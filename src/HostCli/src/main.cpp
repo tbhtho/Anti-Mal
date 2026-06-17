@@ -2,6 +2,7 @@
 #include "antimal/BrowserImpact.h"
 #include "antimal/Config.h"
 #include "antimal/DetectionSummary.h"
+#include "antimal/UsabilityDiagnostics.h"
 #include "antimal/EventJournal.h"
 #include "antimal/FileUtil.h"
 #include "antimal/FuzzyHash.h"
@@ -196,7 +197,7 @@ void PrintUsage() {
       << "  antimal base convert --vhdx <base.vhdx> --raw <AntiMalBase.raw> [--force]\n"
       << "  antimal base inspect --vhdx <base.vhdx> [--overlay <overlay.cow>]\n"
       << "                       [--dump-bcd <out.bcd>] [--dump-system <out.hive>]\n"
-      << "  antimal report <run-id-or-report.json> [--html] [--detections [--json]]\n"
+      << "  antimal report <run-id-or-report.json> [--html] [--detections|--usability [--json]]\n"
       << "  antimal browser-impact <run-id-or-report.json> --decrypt-browser-secrets\n"
       << "  antimal export <run-id-or-report.json> --format stix|misp|csv [--out <file>]\n"
       << "  antimal similarity <fileA> <fileB> [--json]   (fuzzy-hash similarity 0..100)\n"
@@ -2930,6 +2931,32 @@ int CommandReport(int argc, wchar_t **argv) {
       if (!d.mitre.empty()) std::cout << "  (" << d.mitre << ")";
       std::cout << "\n";
     }
+    return 0;
+  }
+  if (HasFlag(argc, argv, "--usability")) {
+    // Measured desktop-usability read: which usability goals the run achieved,
+    // with the modern-shell crash-loop detected + the cmd-shell remediation.
+    const antimal::UsabilityReport u =
+        antimal::ClassifyUsability(report.dynamicSummary, report.events);
+    if (HasFlag(argc, argv, "--json")) {
+      std::cout << "{\"overall\":" << JsonQuote(u.overall)
+                << ",\"shellCrashLoop\":" << (u.shellCrashLoop ? "true" : "false")
+                << ",\"dimensions\":[";
+      for (size_t i = 0; i < u.dimensions.size(); ++i) {
+        const auto &d = u.dimensions[i];
+        std::cout << (i ? "," : "") << "{\"name\":" << JsonQuote(d.name)
+                  << ",\"status\":" << JsonQuote(d.status) << "}";
+      }
+      std::cout << "]}\n";
+      return 0;
+    }
+    std::cout << "Desktop usability: " << u.overall << "\n";
+    for (const auto &d : u.dimensions) {
+      std::cout << "  [" << d.status << "] " << d.name;
+      if (!d.detail.empty()) std::cout << " -- " << d.detail;
+      std::cout << "\n";
+    }
+    if (!u.remediation.empty()) std::cout << "next: " << u.remediation << "\n";
     return 0;
   }
   if (HasFlag(argc, argv, "--html")) {
