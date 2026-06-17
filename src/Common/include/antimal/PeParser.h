@@ -92,6 +92,14 @@ PeInfo ParsePe(const std::vector<uint8_t> &data);
 PeInfo ParsePeFile(const std::filesystem::path &path);
 bool HasAuthenticodeSignature(const std::filesystem::path &path);
 
+// The Authenticode signer's display name (the leaf signing certificate's subject
+// CN, e.g. "Microsoft Windows" / "Microsoft Corporation"). Triage depth beyond a
+// signed/unsigned bool: a Microsoft-signed binary reads very differently from one
+// signed by an unknown or throwaway publisher. Returns "" when the file is
+// unsigned or the signer cannot be extracted. Does NOT itself verify trust (use
+// HasAuthenticodeSignature for that) — it only names who signed it.
+std::string AuthenticodeSignerName(const std::filesystem::path &path);
+
 // Pure imphash core, exposed for testing. `imports` is the ordered list of
 // (dllName, importName) exactly as they appear in the import table; importName
 // must be "ordN" for ordinal imports. Applies the canonical pefile rules

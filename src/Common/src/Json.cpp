@@ -500,6 +500,7 @@ std::string ToJson(const ScanResult &scan) {
   obj.AddDouble("entropy", scan.entropy);
   obj.AddBool("isPe", scan.isPe);
   obj.AddBool("authenticodeSigned", scan.authenticodeSigned);
+  obj.AddString("signerName", scan.signerName);
   obj.AddNumber("peTimestamp", scan.peTimestamp);
   obj.AddNumber("peOverlaySize", static_cast<int64_t>(scan.peOverlaySize));
   obj.AddDouble("peOverlayEntropy", scan.peOverlayEntropy);

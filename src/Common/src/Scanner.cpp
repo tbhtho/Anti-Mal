@@ -645,6 +645,9 @@ ScanResult ScanFile(const std::filesystem::path &path,
 
     if (pe.isPe) {
       result.authenticodeSigned = HasAuthenticodeSignature(path);
+      // Name the signer (triage depth): a Microsoft-signed binary reads very
+      // differently from one signed by an unknown/throwaway publisher.
+      result.signerName = AuthenticodeSignerName(path);
       if (!result.authenticodeSigned && IsUnusualExecutionPath(path)) {
         AddFinding(result, "signature.unsigned_unusual_path",
                    "Unsigned PE from a user-writable or transient path", 20);
@@ -879,7 +882,11 @@ std::string FormatScanText(const ScanResult &result) {
     out << "  type: " << result.detectedType << " (detected by content)\n";
   }
   out << "  pe: " << (result.isPe ? "yes" : "no")
-      << ", signed: " << (result.authenticodeSigned ? "yes" : "no") << "\n";
+      << ", signed: " << (result.authenticodeSigned ? "yes" : "no");
+  if (!result.signerName.empty()) {
+    out << " (signer: " << result.signerName << ")";
+  }
+  out << "\n";
   for (const auto &sec : result.peSections) {
     out << "  section " << sec.name << ": entropy " << sec.entropy
         << (sec.executable ? " X" : "") << (sec.writable ? " W" : "") << "\n";

@@ -360,6 +360,7 @@ ScanResult ParseScan(const JsonValue *value) {
   scan.entropy = DoubleValue(Member(*value, "entropy"));
   scan.isPe = BoolValue(Member(*value, "isPe"));
   scan.authenticodeSigned = BoolValue(Member(*value, "authenticodeSigned"));
+  scan.signerName = StringValue(Member(*value, "signerName"));
   scan.imports = StringArrayValue(Member(*value, "imports"));
   scan.peTimestamp = static_cast<uint32_t>(DoubleValue(Member(*value, "peTimestamp")));
   scan.peOverlaySize =
@@ -1846,7 +1847,11 @@ std::string BuildHtmlReportWithFrames(const AnalysisReport &report,
   html << "<div class=\"k\">entropy</div><div class=\"mono\">"
        << scan.entropy << "</div>";
   html << "<div class=\"k\">PE</div><div>" << (scan.isPe ? "yes" : "no")
-       << ", signed " << (scan.authenticodeSigned ? "yes" : "no") << "</div>";
+       << ", signed " << (scan.authenticodeSigned ? "yes" : "no");
+  if (!scan.signerName.empty()) {
+    html << " &middot; signer " << HtmlEscape(scan.signerName);
+  }
+  html << "</div>";
   html << "</div>";
 
   // Tracker tags

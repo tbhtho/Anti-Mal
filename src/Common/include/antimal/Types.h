@@ -132,6 +132,7 @@ struct ScanResult {
   bool isPe = false;
   bool isDll = false;                // IMAGE_FILE_DLL in the file header
   bool authenticodeSigned = false;
+  std::string signerName; // Authenticode signer display name (CN); "" if unsigned
   uint32_t peTimestamp = 0;          // PE compile timestamp (unix epoch secs)
   std::vector<PeSection> peSections; // section table + per-section entropy
   uint64_t peOverlaySize = 0;        // bytes appended after the last section

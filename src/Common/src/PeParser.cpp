@@ -720,4 +720,50 @@ bool HasAuthenticodeSignature(const std::filesystem::path &path) {
   return status == ERROR_SUCCESS;
 }
 
+std::string AuthenticodeSignerName(const std::filesystem::path &path) {
+  HCERTSTORE store = nullptr;
+  HCRYPTMSG msg = nullptr;
+  const std::wstring wide = path.wstring();
+  // Pull the embedded PKCS#7 signature blob (cert store + signed message).
+  if (!CryptQueryObject(CERT_QUERY_OBJECT_FILE, wide.c_str(),
+                        CERT_QUERY_CONTENT_FLAG_PKCS7_SIGNED_EMBED,
+                        CERT_QUERY_FORMAT_FLAG_BINARY, 0, nullptr, nullptr,
+                        nullptr, &store, &msg, nullptr)) {
+    return {};
+  }
+
+  std::string result;
+  // The signer's cert is identified by (Issuer, SerialNumber); use that to find
+  // the leaf cert in the message's store, then read its display name.
+  DWORD infoSize = 0;
+  if (msg &&
+      CryptMsgGetParam(msg, CMSG_SIGNER_CERT_INFO_PARAM, 0, nullptr, &infoSize) &&
+      infoSize >= sizeof(CERT_INFO)) {
+    std::vector<BYTE> buf(infoSize);
+    if (CryptMsgGetParam(msg, CMSG_SIGNER_CERT_INFO_PARAM, 0, buf.data(),
+                         &infoSize)) {
+      auto *certInfo = reinterpret_cast<CERT_INFO *>(buf.data());
+      PCCERT_CONTEXT cert = CertFindCertificateInStore(
+          store, X509_ASN_ENCODING | PKCS_7_ASN_ENCODING, 0,
+          CERT_FIND_SUBJECT_CERT, certInfo, nullptr);
+      if (cert) {
+        const DWORD n = CertGetNameStringW(
+            cert, CERT_NAME_SIMPLE_DISPLAY_TYPE, 0, nullptr, nullptr, 0);
+        if (n > 1) { // n counts the trailing NUL; >1 means at least one char
+          std::wstring name(n, L'\0');
+          CertGetNameStringW(cert, CERT_NAME_SIMPLE_DISPLAY_TYPE, 0, nullptr,
+                             name.data(), n);
+          while (!name.empty() && name.back() == L'\0') name.pop_back();
+          result = WideToUtf8(name);
+        }
+        CertFreeCertificateContext(cert);
+      }
+    }
+  }
+
+  if (msg) CryptMsgClose(msg);
+  if (store) CertCloseStore(store, 0);
+  return result;
+}
+
 } // namespace antimal

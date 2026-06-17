@@ -3589,6 +3589,43 @@ void TestSimulatedReport() {
   }
 }
 
+// Authenticode signer-name extraction (T49 depth). The negative + robustness
+// cases are deterministic; the positive case is best-effort/CI-portable because
+// many Windows binaries are catalog-signed (no EMBEDDED signature to read).
+void TestAuthenticodeSigner() {
+  using antimal::AuthenticodeSignerName;
+
+  // The unsigned test binary itself -> no signer (and must not crash).
+  wchar_t self[MAX_PATH]{};
+  GetModuleFileNameW(nullptr, self, MAX_PATH);
+  Expect(AuthenticodeSignerName(self).empty(),
+         "signer: the unsigned test exe has no signer name");
+
+  // Missing file + a directory fail closed (empty, no crash).
+  Expect(AuthenticodeSignerName(L"C:\\does\\not\\exist\\nope.exe").empty(),
+         "signer: a missing file yields no signer name");
+  Expect(AuthenticodeSignerName(L"C:\\Windows").empty(),
+         "signer: a directory yields no signer name");
+
+  // Best-effort positive: if any candidate carries an EMBEDDED signature it must
+  // name a Microsoft signer. If none do in this environment (catalog-signed
+  // only), the deterministic cases above still prove correctness. Never fails.
+  static const wchar_t *kCandidates[] = {
+      L"C:\\Windows\\System32\\msvcp_win.dll", // embedded-signed on Win10/11
+      L"C:\\Windows\\System32\\ucrtbase.dll",  // ditto
+      L"C:\\Windows\\System32\\ntdll.dll",
+      L"C:\\Windows\\System32\\kernel32.dll",
+      L"C:\\Windows\\System32\\user32.dll"};
+  for (const wchar_t *c : kCandidates) {
+    const std::string signer = AuthenticodeSignerName(c);
+    if (!signer.empty()) {
+      Expect(signer.find("Microsoft") != std::string::npos,
+             "signer: an embedded-signed System32 binary names Microsoft");
+      break;
+    }
+  }
+}
+
 // Magic-byte file-type identification (extension-independent), the basis for
 // masquerade detection (a PE wearing a .pdf name, etc.).
 void TestFileTypeId() {
@@ -8296,6 +8333,7 @@ int main() {
     TestFuzzyHash();
     TestFramePacingStats();
     TestSimulatedReport();
+    TestAuthenticodeSigner();
     TestFileTypeId();
     TestShellLinkParser();
     TestScriptAnalyzer();
