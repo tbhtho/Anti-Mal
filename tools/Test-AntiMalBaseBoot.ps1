@@ -394,8 +394,16 @@ try {
 } finally {
   foreach ($letter in $assignedLetters) {
     try {
-      if ($disk) {
-        Remove-PartitionAccessPath -DiskNumber $disk.Number -AccessPath "$letter`:\" -ErrorAction SilentlyContinue
+      # Resolve the partition by drive letter so Remove-PartitionAccessPath gets
+      # a COMPLETE parameter set. Calling it with -DiskNumber + -AccessPath but
+      # no -PartitionNumber leaves that mandatory parameter unbound, so PowerShell
+      # INTERACTIVELY PROMPTS ("PartitionNumber[0]:") -- which -ErrorAction
+      # SilentlyContinue does NOT suppress -- hanging an unattended/elevated run
+      # forever. (The Dismount-DiskImage below also clears the letters, but do it
+      # cleanly here too.)
+      $part = Get-Partition -DriveLetter $letter -ErrorAction SilentlyContinue
+      if ($part) {
+        Remove-PartitionAccessPath -DiskNumber $part.DiskNumber -PartitionNumber $part.PartitionNumber -AccessPath "$letter`:\" -ErrorAction SilentlyContinue
       }
     } catch {
     }

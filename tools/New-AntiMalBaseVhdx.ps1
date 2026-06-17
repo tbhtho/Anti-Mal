@@ -23,7 +23,14 @@ param(
   # in-OOBE skip for the forced network/MSA screen with networking disabled.
   # Creates a local admin 'antimal' / 'AntiMal!23' with auto-logon. Default
   # off = vanilla interactive OOBE.
-  [switch]$Unattend
+  [switch]$Unattend,
+
+  # When >0, bake a FirstLogonCommands entry that schedules a clean
+  # `shutdown /s` this many seconds after the first logon. This lets the first
+  # boot auto-complete OOBE + first-logon, settle, then cleanly power off --
+  # leaving a CONSISTENT overlay to promote into the seed snapshot (no dirty
+  # mid-run kill, which produces an unbootable image). 0 = off (stay running).
+  [int]$FirstLogonShutdownSec = 0
 )
 
 $ErrorActionPreference = "Stop"
@@ -235,12 +242,42 @@ function Write-UnattendXml([string]$WindowsRoot) {
   $pantherDir = Join-Path $WindowsRoot "Windows\Panther"
   New-Item -ItemType Directory -Force -Path $pantherDir | Out-Null
   $unattendPath = Join-Path $pantherDir "unattend.xml"
-  $xml = @'
+
+  # Optional: schedule a clean shutdown a fixed delay after first logon, so the
+  # first boot self-completes OOBE + first-logon, settles, then powers off
+  # cleanly -- leaving a consistent overlay to promote into the seed snapshot
+  # (a mid-run kill leaves dirty NTFS -> the seed boot hangs/spins).
+  $firstLogonBlock = ""
+  if ($FirstLogonShutdownSec -gt 0) {
+    $firstLogonBlock = @"
+      <FirstLogonCommands>
+        <SynchronousCommand wcm:action="add">
+          <Order>1</Order>
+          <CommandLine>cmd /c shutdown /s /f /t $FirstLogonShutdownSec</CommandLine>
+          <Description>AntiMal: clean power-off after first-logon settle (for snapshot capture)</Description>
+        </SynchronousCommand>
+      </FirstLogonCommands>
+"@
+  }
+
+  # NOTE: @"..."@ (interpolating here-string) so $firstLogonBlock is substituted.
+  # The XML itself contains no literal '$'. BypassNRO is set in specialize so
+  # OOBE skips the forced "connect to a network" screen (the sandbox has no NIC).
+  $xml = @"
 <?xml version="1.0" encoding="utf-8"?>
 <unattend xmlns="urn:schemas-microsoft-com:unattend">
   <settings pass="specialize">
     <component name="Microsoft-Windows-Shell-Setup" processorArchitecture="amd64" publicKeyToken="31bf3856ad364e35" language="neutral" versionScope="nonSxS">
       <ComputerName>ANTIMAL-VM</ComputerName>
+    </component>
+    <component name="Microsoft-Windows-Deployment" processorArchitecture="amd64" publicKeyToken="31bf3856ad364e35" language="neutral" versionScope="nonSxS" xmlns:wcm="http://schemas.microsoft.com/WMIConfig/2002/State">
+      <RunSynchronous>
+        <RunSynchronousCommand wcm:action="add">
+          <Order>1</Order>
+          <Path>reg add "HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\OOBE" /v BypassNRO /t REG_DWORD /d 1 /f</Path>
+          <Description>Bypass OOBE network requirement (sandbox networking is disabled)</Description>
+        </RunSynchronousCommand>
+      </RunSynchronous>
     </component>
   </settings>
   <settings pass="oobeSystem">
@@ -283,12 +320,13 @@ function Write-UnattendXml([string]$WindowsRoot) {
           <PlainText>true</PlainText>
         </Password>
       </AutoLogon>
+$firstLogonBlock
     </component>
   </settings>
 </unattend>
-'@
-  Set-Content -LiteralPath $unattendPath -Value $xml -Encoding utf8
-  Write-Host "OK: wrote autounattend (auto-logon 'antimal') -> $unattendPath"
+"@
+  [System.IO.File]::WriteAllText($unattendPath, $xml, (New-Object System.Text.UTF8Encoding $false))
+  Write-Host "OK: wrote autounattend (auto-logon 'antimal'; BypassNRO; firstLogonShutdown=${FirstLogonShutdownSec}s) -> $unattendPath"
 }
 
 function Resolve-GuestAgentPath {
