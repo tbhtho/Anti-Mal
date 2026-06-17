@@ -1,6 +1,7 @@
 #include "antimal/Report.h"
 
 #include "antimal/BootDiagnostics.h"
+#include "antimal/CommandLineClassifier.h"
 #include "antimal/DetectionSummary.h"
 #include "antimal/EventTime.h"
 #include "antimal/UsabilityDiagnostics.h"
@@ -996,8 +997,13 @@ bool EmitProcessTreeSection(std::ostringstream &html,
     }
     if (!node.commandLine.empty()) {
       html << "<div class=\"cmd mono\" title=\"" << HtmlEscape(node.commandLine)
-           << "\">" << HtmlEscape(TruncateForCell(node.commandLine))
-           << "</div>";
+           << "\">" << HtmlEscape(TruncateForCell(node.commandLine));
+      const CommandLineThreat clt = ClassifyCommandLine(node.commandLine);
+      if (clt.suspicious) {
+        html << " <span style=\"color:var(--bad)\">&#9888; " << HtmlEscape(clt.reason)
+             << " (" << HtmlEscape(clt.technique) << ")</span>";
+      }
+      html << "</div>";
     }
     html << "</li>";
   }
