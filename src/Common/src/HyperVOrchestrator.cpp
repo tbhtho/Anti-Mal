@@ -7882,6 +7882,24 @@ bool PatchOverlaySetShellCmd(hv::IBlockDevice &disk,
       }
     }
   }
+  // Quiet the crash-storm so the cmd console stays responsive (the AppX
+  // provisioning + AutoRestartShell otherwise churn the single emulated vCPU):
+  //   AutoRestartShell=0 -> Winlogon launches the shell ONCE and never re-spawns
+  //     a crashed shell/host into a storm (default is 1; never written elsewhere).
+  //   Policies\Explorer\DisableLocalMachineRunOnce=1 -> suppress HKLM RunOnce at
+  //     first interactive logon, a provisioning spawn trigger.
+  // Both are bundled with the Shell->cmd swap (we want exactly one shell, no AppX).
+  if (UpsertHiveDword(hive, *cur, "AutoRestartShell", 0) && result) {
+    result->notes.push_back("shell-cmd: Winlogon AutoRestartShell -> 0");
+  }
+  if (const auto pol = EnsureHivePath(
+          hive, {std::string("Microsoft"), std::string("Windows"),
+                 std::string("CurrentVersion"), std::string("Policies"),
+                 std::string("Explorer")})) {
+    if (UpsertHiveDword(hive, *pol, "DisableLocalMachineRunOnce", 1) && result) {
+      result->notes.push_back("shell-cmd: DisableLocalMachineRunOnce -> 1");
+    }
+  }
   RefreshRegistryHiveHeader(bytes);
   if (!ntfs.WriteFileSameSize(*entry, bytes)) {
     if (result) result->notes.push_back("shell-cmd: SOFTWARE write-back failed");
@@ -7889,6 +7907,36 @@ bool PatchOverlaySetShellCmd(hv::IBlockDevice &disk,
   }
   if (result)
     result->notes.push_back("shell-cmd: Winlogon Shell -> cmd.exe (overlay only)");
+  // Disable the AppReadiness service (the per-user AppX *staging* pass) in the
+  // SYSTEM hive. It repeatedly fails to register the inbox shell packages against
+  // the base's signed WDAC policy and is the spawn-trigger for the crashing shell
+  // hosts (ShellExperienceHost/StartMenuExperienceHost/ShellHost). With cmd as
+  // the shell no AppX is needed, so disabling its staging service is safe and
+  // targeted (distinct from the AppLocker appid/AppIDSvc disable, which had no
+  // effect). Separate same-size SYSTEM-hive write.
+  if (const auto sysEntry = ntfs.FindPath("Windows\\System32\\config\\SYSTEM")) {
+    auto sysBytes = ntfs.ReadFile(*sysEntry, 256u * 1024u * 1024u);
+    MutableHiveView sysHive(sysBytes);
+    if (sysHive.IsValid()) {
+      if (const auto cs = SelectOfflineControlSet(sysHive)) {
+        bool changed = false;
+        if (const auto k =
+                EnsureHivePath(sysHive, {*cs, std::string("Services"),
+                                         std::string("AppReadiness")})) {
+          changed = UpsertHiveDword(sysHive, *k, "Start", 4); // 4 = disabled
+        }
+        if (changed) {
+          RefreshRegistryHiveHeader(sysBytes);
+          if (ntfs.WriteFileSameSize(*sysEntry, sysBytes)) {
+            if (result)
+              result->notes.push_back("shell-cmd: AppReadiness service disabled (overlay)");
+          } else if (result) {
+            result->notes.push_back("shell-cmd: SYSTEM write-back failed");
+          }
+        }
+      }
+    }
+  }
   return true;
 }
 
@@ -11644,7 +11692,15 @@ DetonationResult InHouseOrchestrator::PrepareAndRun(
       if (effectiveNoPassword) {
         using namespace std::chrono;
         const std::vector<uint8_t> enter = {0x1C, 0x9C};
-        for (int off : {30, 50, 70, 90, 110, 140, 170, 200, 240}) {
+        // With Shell=cmd the console comes up early, so any later login Enters land
+        // in it as a wall of empty prompts. The blank account needs only one or two
+        // Enters, so cap the volley to two early pairs when SHELL_CMD is on; keep
+        // the wide window otherwise (a real lock screen, no console to spam).
+        static const std::vector<int> kWide = {30, 50, 70, 90, 110, 140, 170, 200, 240};
+        static const std::vector<int> kQuiet = {30, 50};
+        const std::vector<int> &offsets =
+            EnvFlagEnabled("ANTIMAL_PROBE_SHELL_CMD") ? kQuiet : kWide;
+        for (int off : offsets) {
           request.keyboardBursts.push_back(
               {milliseconds{static_cast<int64_t>(off) * 1000}, enter}); // dismiss
           request.keyboardBursts.push_back(

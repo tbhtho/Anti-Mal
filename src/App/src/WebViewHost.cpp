@@ -1312,14 +1312,14 @@ void WebViewHost::RegisterHandlers() {
       SetEnvironmentVariableW(L"ANTIMAL_PROBE_LOGIN_PASSWORD", nullptr);
       SetEnvironmentVariableW(L"ANTIMAL_PROBE_OOBE_AUTOLOGON", nullptr);
       SetEnvironmentVariableW(L"ANTIMAL_PROBE_PRESS_ENTER_SEC", nullptr);
-      // Escape the "Preparing Windows" hang: the seed snapshot was captured
-      // mid-first-logon, so every boot re-runs first-logon AppX provisioning,
-      // which crash-loops ShellHost (ucrtbase 0xC0000409) and wedges for 10-15+
-      // min. COMPLETE_OOBE marks Windows setup done so first-logon doesn't re-run,
-      // and SHELL_CMD swaps the crashing explorer shell for a stable cmd console
-      // so the session is actually usable. Overlay-only; applies to the plain
-      // "Boot VM (live)" session, NOT detonation (which keeps the authentic shell).
-      SetEnvironmentVariableW(L"ANTIMAL_PROBE_COMPLETE_OOBE", L"1");
+      // Usable live session despite the broken modern shell: SHELL_CMD swaps the
+      // crash-looping explorer shell for a stable cmd console AND quiets the
+      // crash-storm (AutoRestartShell=0 + AppReadiness service off + RunOnce off)
+      // so the console stays responsive on the single vCPU. COMPLETE_OOBE was
+      // tried and had NO effect on the crash-loop (the base's signed WDAC policy
+      // blocks AppX regardless), so it is dropped. Overlay-only; applies to the
+      // plain "Boot VM (live)" session, NOT detonation (which keeps the real shell).
+      SetEnvironmentVariableW(L"ANTIMAL_PROBE_COMPLETE_OOBE", nullptr);
       SetEnvironmentVariableW(L"ANTIMAL_PROBE_SHELL_CMD", L"1");
       SetEnvironmentVariableW(L"ANTIMAL_PROBE_RUN_CMD", nullptr); // plain session: no auto-launch
     } else {

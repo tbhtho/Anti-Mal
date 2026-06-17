@@ -663,10 +663,10 @@
         var ctx = cv.getContext('2d');
         if (ctx) {
           try { ctx.putImageData(new ImageData(new Uint8ClampedArray(liveFrameBuffer, 0, need), curFrameW, curFrameH), 0, 0); } catch (e) { }
-          if (liveCursor.valid && document.pointerLockElement &&
-              document.pointerLockElement.id === 'live-frame') {
-            drawLiveCursor(ctx, liveCursor.x, liveCursor.y);
-          }
+          // No synthetic cursor: the guest renders its own pointer into the
+          // captured framebuffer, so drawing a second one here just produced the
+          // "two cursors" artifact. The host cursor is hidden on capture
+          // (cursor:none), leaving only the guest's real cursor.
         }
       }
     }
