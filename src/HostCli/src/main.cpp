@@ -3049,8 +3049,11 @@ int CommandReport(int argc, wchar_t **argv) {
       ++shown;
       const std::string rel = antimal::RelativeTimeLabel(
           antimal::ParseIso8601ToEpochSeconds(e.timestampUtc), anchor);
+      // e.action already carries the category prefix ("process.running",
+      // "registry.value", ...), so print it alone -- "category.action" would
+      // double it ("process.process.running").
       std::cout << "  " << (rel.empty() ? e.timestampUtc : rel) << "  "
-                << e.category << "." << e.action;
+                << e.action;
       const std::string what = !e.commandLine.empty() ? e.commandLine : e.target;
       if (!what.empty()) std::cout << "  " << what;
       if (!e.mitre.empty()) std::cout << "  [" << e.mitre << "]";

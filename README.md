@@ -194,6 +194,7 @@ boot reliability across every run:
 ```powershell
 bin\x64\Release\AntiMal.HostCli.exe report <run> --detections
 bin\x64\Release\AntiMal.HostCli.exe report <run> --usability
+bin\x64\Release\AntiMal.HostCli.exe report <run> --timeline [--category process|registry|file|network|image] [--mitre] [--limit N]
 bin\x64\Release\AntiMal.HostCli.exe boot-report
 ```
 

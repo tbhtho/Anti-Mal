@@ -37,6 +37,12 @@ unit-tested. A living `private development documentation` tracks done/remaining 
   the user-mode gate only when GuestAgent telemetry is present (honest: OS-up, not desktop). Refuses
   to clobber an existing report without `--force`. Turns orphaned telemetry runs into navigable
   Any.Run-style reports.
+- **`boot-report` failure breakdown:** `--json` now emits `byCategory`, `byRemediation`, and the
+  `incomplete` count; text mode prints the single most common actionable remediation across runs
+  (the highest-leverage fix for the dominant failure mode).
+- **Filterable `report --timeline`:** `--category <c>`, `--mitre` (only events carrying a technique),
+  and `--limit N` make a large telemetry stream triageable; the header shows matched/total. Also
+  fixed a redundant `category.action` render (e.g. `process.process.running` → `process.running`).
 - **Severity-ranked Detections summary (`DetectionSummary`):** unifies static findings + persistence
   + suspicious network into one ranked behavior list; in the report + `report --detections [--json]`.
 - **Desktop-usability classifier (`UsabilityDiagnostics`):** measures which usability goals a run
