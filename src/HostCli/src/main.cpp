@@ -197,6 +197,8 @@ void PrintUsage() {
       << "  antimal base convert --vhdx <base.vhdx> --raw <AntiMalBase.raw> [--force]\n"
       << "  antimal base inspect --vhdx <base.vhdx> [--overlay <overlay.cow>]\n"
       << "                       [--dump-bcd <out.bcd>] [--dump-system <out.hive>]\n"
+      << "  antimal fs-ls  [--vhdx <d.vhdx>] [--overlay <o.cow>] <guest\\path>   (offline guest dir listing)\n"
+      << "  antimal fs-cat [--vhdx <d.vhdx>] [--overlay <o.cow>] <guest\\path> [--out <file>]\n"
       << "  antimal report <run-id-or-report.json> [--html] [--detections|--usability [--json]]\n"
       << "  antimal browser-impact <run-id-or-report.json> --decrypt-browser-secrets\n"
       << "  antimal export <run-id-or-report.json> --format stix|misp|csv [--out <file>]\n"
@@ -861,13 +863,13 @@ public:
 
   std::optional<Entry> FindPath(std::string path) {
     auto components = SplitPathComponents(std::move(path));
-    if (components.empty()) {
-      return std::nullopt;
-    }
 
     Entry current;
     current.fileRecord = 5; // NTFS root directory.
     current.directory = true;
+    if (components.empty()) {
+      return current; // an empty path ("\" or "") is the volume root itself
+    }
     for (size_t i = 0; i < components.size(); ++i) {
       if (!current.directory) {
         return std::nullopt;
@@ -3204,6 +3206,141 @@ int CommandBootReport(int argc, wchar_t **argv) {
   return 0;
 }
 
+// `fs-ls` / `fs-cat` — browse the guest filesystem OFFLINE from the disk image
+// (base VHDX + optional run overlay), no boot required. Gives the analyst
+// File-Explorer-style access to the guest's files -- including exactly what a
+// detonation changed in its overlay -- WITHOUT the in-guest modern shell (which
+// crash-loops). Reuses the same NtfsReader that powers `base inspect`.
+int CommandFs(int argc, wchar_t **argv) {
+  const std::string sub = Arg(argc, argv, 1); // "fs-ls" | "fs-cat"
+  const auto config = antimal::LoadConfig(antimal::DefaultConfigPath());
+  const auto vhdxText = OptionValue(argc, argv, "--vhdx");
+  const std::filesystem::path vhdx =
+      vhdxText ? std::filesystem::path(antimal::Utf8ToWide(*vhdxText))
+               : config.baseVhdxPath;
+  if (vhdx.empty() || !std::filesystem::exists(vhdx)) {
+    std::cerr << "fs: base VHDX not found (" << antimal::PathToUtf8(vhdx)
+              << "); pass --vhdx or set base_vhdx_path.\n";
+    return 2;
+  }
+  std::string guestPath; // first positional (non-flag, not a flag value)
+  for (int i = 2; i < argc; ++i) {
+    const std::string a = Arg(argc, argv, i);
+    if (a.rfind("--", 0) == 0) { ++i; continue; } // skip flag + its value
+    guestPath = a;
+    break;
+  }
+  if (guestPath.empty()) {
+    std::cerr << "usage: antimal " << sub
+              << " [--vhdx <d.vhdx>] [--overlay <o.cow>] <guest\\path>"
+              << (sub == "fs-cat" ? " [--out <file>] [--max-bytes N]" : "")
+              << "\n";
+    return 2;
+  }
+
+  antimal::hv::VhdxBlockDevice disk = antimal::hv::VhdxBlockDevice::Open(vhdx);
+  std::optional<antimal::hv::CowOverlayBlockDevice> overlayDevice;
+  antimal::hv::IBlockDevice *activeDisk = &disk;
+  if (const auto ov = OptionValue(argc, argv, "--overlay")) {
+    try {
+      overlayDevice.emplace(antimal::hv::CowOverlayBlockDevice::Open(
+          &disk, std::filesystem::path(antimal::Utf8ToWide(*ov))));
+      activeDisk = &*overlayDevice;
+    } catch (const std::exception &ex) {
+      std::cerr << "fs: failed to open overlay: " << ex.what() << "\n";
+      return 1;
+    }
+  }
+
+  const auto partitions = ReadGptPartitions(*activeDisk);
+  const GptPartitionInfo *windows = nullptr;
+  for (const auto &p : partitions) {
+    if (PartitionKind(p.typeGuid) == "Windows/basic-data") {
+      windows = &p;
+      break;
+    }
+  }
+  if (!windows) {
+    std::cerr << "fs: no Windows/basic-data partition found in the image.\n";
+    return 1;
+  }
+  NtfsReader ntfs(*activeDisk, windows->firstLba);
+  if (!ntfs.Init()) {
+    std::cerr << "fs: Windows partition is not a readable NTFS volume.\n";
+    return 1;
+  }
+
+  const auto entry = ntfs.FindPath(guestPath);
+  if (!entry) {
+    std::cerr << "fs: path not found: " << guestPath << "\n";
+    return 2;
+  }
+
+  if (sub == "fs-ls") {
+    if (!entry->directory) {
+      std::cout << "(file) " << guestPath << "  " << entry->size << " bytes\n";
+      return 0;
+    }
+    auto kids = ntfs.ListDir(guestPath);
+    std::vector<NtfsReader::DirChild> dirs, files;
+    for (const auto &k : kids) (k.directory ? dirs : files).push_back(k);
+    auto byName = [](const NtfsReader::DirChild &a,
+                     const NtfsReader::DirChild &b) { return a.name < b.name; };
+    std::sort(dirs.begin(), dirs.end(), byName);
+    std::sort(files.begin(), files.end(), byName);
+    std::cout << guestPath << "  (" << dirs.size() << " dirs, " << files.size()
+              << " files)\n";
+    for (const auto &d : dirs) std::cout << "  <DIR>        " << d.name << "\n";
+    for (const auto &f : files)
+      std::cout << "  " << std::setw(11) << f.size << "  " << f.name << "\n";
+    return 0;
+  }
+
+  // fs-cat
+  if (entry->directory) {
+    std::cerr << "fs: " << guestPath << " is a directory (use fs-ls).\n";
+    return 2;
+  }
+  uint64_t maxBytes = 1ull * 1024 * 1024; // 1 MiB default cap
+  if (const auto mb = OptionValue(argc, argv, "--max-bytes")) {
+    try {
+      const unsigned long long v = std::stoull(*mb);
+      if (v > 0) maxBytes = v;
+    } catch (...) {
+    }
+  }
+  const auto bytes = ntfs.ReadFile(*entry, maxBytes);
+  if (const auto out = OptionValue(argc, argv, "--out")) {
+    const std::filesystem::path outPath(antimal::Utf8ToWide(*out));
+    std::ofstream f(outPath, std::ios::binary);
+    f.write(reinterpret_cast<const char *>(bytes.data()),
+            static_cast<std::streamsize>(bytes.size()));
+    std::cout << "Wrote " << bytes.size() << " bytes -> "
+              << antimal::PathToUtf8(outPath) << "\n";
+    return 0;
+  }
+  // No --out: size + a compact hex+ascii preview of the first 256 bytes.
+  const size_t preview = std::min<size_t>(bytes.size(), 256);
+  std::cout << guestPath << "  " << entry->size << " bytes (showing first "
+            << preview << ")\n";
+  for (size_t off = 0; off < preview; off += 16) {
+    std::cout << "  ";
+    std::string ascii;
+    for (size_t j = 0; j < 16; ++j) {
+      if (off + j < preview) {
+        static const char *kHex = "0123456789abcdef";
+        const uint8_t b = bytes[off + j];
+        std::cout << kHex[b >> 4] << kHex[b & 0xF] << ' ';
+        ascii += (b >= 0x20 && b < 0x7F) ? static_cast<char>(b) : '.';
+      } else {
+        std::cout << "   ";
+      }
+    }
+    std::cout << " " << ascii << "\n";
+  }
+  return 0;
+}
+
 // `doctor` — host + workflow readiness preflight. Reports, line by line, whether
 // AntiMal can boot a guest and run the scan/report workflow on THIS machine, with
 // an actionable hint per failure. Exit 0 when boot-ready, 1 when a hard blocker
@@ -3479,6 +3616,9 @@ int wmain(int argc, wchar_t **argv) {
     }
     if (command == "boot-report") {
       return CommandBootReport(argc, argv);
+    }
+    if (command == "fs-ls" || command == "fs-cat") {
+      return CommandFs(argc, argv);
     }
     PrintUsage();
     return 2;
