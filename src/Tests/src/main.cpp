@@ -3576,6 +3576,37 @@ void TestSimulatedReport() {
              r2.events.size() == r.events.size(),
          "sim: deterministic");
 
+  // Every scenario produces a coherent, labeled, malicious report with a nested
+  // process tree, real hashes, MITRE techniques, and distinct static hashes.
+  for (auto scenario : {antimal::SimScenario::Stealer,
+                        antimal::SimScenario::Ransomware,
+                        antimal::SimScenario::Loader}) {
+    const auto s = antimal::BuildSimulatedReport("sc", scenario);
+    const std::string which = antimal::SimScenarioName(scenario);
+    Expect(s.sandboxVerdict == antimal::Verdict::Malicious,
+           ("sim: scenario " + which + " is malicious").c_str());
+    Expect(!s.events.empty() && !s.mitreTechniques.empty(),
+           ("sim: scenario " + which + " has events + MITRE").c_str());
+    Expect(s.scannerVerdict.sha256.size() == 64,
+           ("sim: scenario " + which + " has a real sha256").c_str());
+    Expect(s.dynamicSummary.status.find("SIMULATION") != std::string::npos,
+           ("sim: scenario " + which + " is labeled SIMULATION").c_str());
+    bool nested = false;
+    for (const auto &n : antimal::BuildProcessTree(s.events)) {
+      if (n.depth > 0) nested = true;
+    }
+    Expect(nested, ("sim: scenario " + which + " has a nested process tree").c_str());
+  }
+  // Distinct scenarios -> distinct samples -> distinct static hashes.
+  Expect(antimal::BuildSimulatedReport("a", antimal::SimScenario::Ransomware)
+                 .scannerVerdict.sha256 !=
+             antimal::BuildSimulatedReport("a", antimal::SimScenario::Loader)
+                 .scannerVerdict.sha256,
+         "sim: different scenarios have different static hashes");
+  Expect(antimal::ParseSimScenario("ransomware").has_value() &&
+             !antimal::ParseSimScenario("nope").has_value(),
+         "sim: scenario name parsing");
+
   // The pacing summary must be serialized and survive a write -> load round-trip.
   Expect(antimal::ToJson(r).find("liveFramePacingSummary") != std::string::npos,
          "sim: pacing summary is serialized to report JSON");

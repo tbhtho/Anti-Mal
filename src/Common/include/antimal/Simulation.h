@@ -2,23 +2,34 @@
 
 #include "antimal/Types.h"
 
+#include <optional>
 #include <string>
 
 namespace antimal {
 
-// Build a deterministic, clearly-labeled SYNTHETIC AnalysisReport that models a
-// credential-stealer detonation: an explorer -> sample.exe -> cmd -> powershell
-// process subtree, a Run-key persistence write, two dropped files, a C2 egress,
-// tags / IOCs / MITRE techniques, a scored behavioral verdict + rationale, and a
-// populated DynamicRunSummary. The static hashes (sha256/sha1/md5/ctph) are REAL
-// (computed over a fixed in-memory buffer) so the static half is exercised too.
+// The synthetic-detonation scenarios the simulator can model. Each produces a
+// distinct, behavior-appropriate process tree, IOC/tag/finding set, MITRE
+// technique list, and verdict — so the report renderer is exercised across the
+// major malware behavior classes, and report-diff has cross-behavior fixtures.
+enum class SimScenario {
+  Stealer,    // credential theft: subtree + Run-key persistence + C2 egress
+  Ransomware, // shadow-copy deletion + mass file encryption + ransom note
+  Loader,     // stage download + process injection / hollowing
+};
+
+std::optional<SimScenario> ParseSimScenario(const std::string &name);
+const char *SimScenarioName(SimScenario scenario);
+
+// Build a deterministic, clearly-labeled SYNTHETIC AnalysisReport for the given
+// scenario. The static hashes (sha256/sha1/md5/ctph) are REAL (computed over a
+// fixed per-scenario buffer) so the static half is exercised too.
 //
 // Purpose: drive the events -> report.json -> report.html (+ filmstrip) pipeline
 // end-to-end with NO VM / firmware / hardware dependency — the documented local
 // simulation for environments where a live boot isn't available, and a stable
-// fixture for report work. It is unmistakably labeled as a simulation
-// (dynamicSummary.status + the leading verdictRationale line) so it can never be
-// confused with a real detonation. Pure + deterministic -> unit-tested.
-AnalysisReport BuildSimulatedReport(const std::string &runId);
+// fixture for report work. Unmistakably labeled as a simulation
+// (dynamicSummary.status + the leading verdictRationale line). Pure + deterministic.
+AnalysisReport BuildSimulatedReport(const std::string &runId,
+                                    SimScenario scenario = SimScenario::Stealer);
 
 } // namespace antimal

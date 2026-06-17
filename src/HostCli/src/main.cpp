@@ -171,7 +171,7 @@ void PrintUsage() {
       << "  antimal similarity <fileA> <fileB>   (fuzzy-hash similarity 0..100)\n"
       << "  antimal similarity <file> --to <ctph-digest>\n"
       << "  antimal doctor [--json]              (host & workflow readiness check)\n"
-      << "  antimal simulate [--out <dir>] [--run-id <id>]  (synthetic end-to-end report)\n"
+      << "  antimal simulate [--scenario stealer|ransomware|loader] [--out <dir>] [--run-id <id>]\n"
       << "  antimal report-diff <run-or-report-A> <run-or-report-B>  (what changed)\n";
 }
 
@@ -3146,6 +3146,16 @@ int CommandSimulate(int argc, wchar_t **argv) {
   const auto config = antimal::LoadConfig(antimal::DefaultConfigPath());
   const std::string runId =
       OptionValue(argc, argv, "--run-id").value_or("sim-detonation");
+  antimal::SimScenario scenario = antimal::SimScenario::Stealer;
+  if (const auto s = OptionValue(argc, argv, "--scenario")) {
+    const auto parsed = antimal::ParseSimScenario(*s);
+    if (!parsed) {
+      std::cerr << "Unknown --scenario '" << *s
+                << "' (expected stealer|ransomware|loader).\n";
+      return 2;
+    }
+    scenario = *parsed;
+  }
   std::filesystem::path outDir;
   if (const auto out = OptionValue(argc, argv, "--out")) {
     outDir = std::filesystem::path(antimal::Utf8ToWide(*out));
@@ -3156,7 +3166,8 @@ int CommandSimulate(int argc, wchar_t **argv) {
   std::filesystem::create_directories(outDir, ec);
   std::filesystem::create_directories(outDir / "screenshots", ec);
 
-  antimal::AnalysisReport report = antimal::BuildSimulatedReport(runId);
+  antimal::AnalysisReport report = antimal::BuildSimulatedReport(runId, scenario);
+  const std::string sampleName = antimal::PathToUtf8(report.samplePath.filename());
 
   // events.jsonl (the live-tail artifact).
   {
@@ -3169,17 +3180,22 @@ int CommandSimulate(int argc, wchar_t **argv) {
   // Synthetic filmstrip: one labeled frame per detonation stage. RenderTextToPng
   // is the same GDI+ encoder the live orchestrator uses, so this is the real
   // screenshot path, just fed synthetic captions.
-  static const char *kStages[] = {
-      "OVMF firmware init",      "Windows 11 boot",
-      "login -> desktop",        "stealer.exe launched",
-      "powershell download cradle", "C2 beacon -> 185.220.101.5:443",
-      "Run-key persistence written", "process exit (0x0)"};
+  const std::vector<std::string> kStages = {
+      "OVMF firmware init",
+      "Windows 11 boot",
+      "login -> desktop",
+      sampleName + " launched",
+      "behavior captured",
+      "C2 / impact",
+      "artifacts written",
+      "process exit (0x0)"};
   uint32_t frames = 0;
-  for (const char *stage : kStages) {
+  for (const std::string &stage : kStages) {
     char name[64];
     std::snprintf(name, sizeof(name), "frame-%06u.png", frames);
-    const std::string caption =
-        std::string("AntiMal SIMULATION (synthetic)\n\n") + stage;
+    const std::string caption = std::string("AntiMal SIMULATION (synthetic, ") +
+                                antimal::SimScenarioName(scenario) + ")\n\n" +
+                                stage;
     if (antimal::RenderTextToPng(outDir / "screenshots" / name, caption)) {
       ++frames;
     }
