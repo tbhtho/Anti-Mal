@@ -39,6 +39,9 @@ All increments TDD; build + `AntiMal.Tests` green.
 - **`report-diff` command (T78):** `antimal report-diff <A> <B>` shows verdict/score changes +
   added/removed IOCs/findings/MITRE/tags between two reports (determinism check / variant
   comparison; pairs with `similarity`). Pure `DiffReports` core, unit-tested.
+- **Shellcode / PIC detection (T93):** `DetectShellcode` flags position-independent shellcode by
+  its anchored low-FP tells (GetPC `E8 00000000`+pop, PEB-walk `fs:[0x30]`/`gs:[0x60]`) in the
+  places a PE parse never looks — non-PE payloads and PE overlays — with conservative FP gating.
 - **Adversarial review hardening:** a multi-pass find→verify review of the session's new
   untrusted-input code confirmed + fixed 3 defense-in-depth issues — a CTPH block-size overflow /
   potential infinite loop on >64 GiB input, and an Authenticode handle leak on an allocation
