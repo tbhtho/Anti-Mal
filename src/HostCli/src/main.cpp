@@ -3223,7 +3223,7 @@ int CommandBootReport(int argc, wchar_t **argv) {
     return 2;
   }
 
-  int total = 0, reachedDesktop = 0, reachedUserMode = 0;
+  int total = 0, reachedDesktop = 0, reachedUserMode = 0, incomplete = 0;
   std::map<std::string, int> byStage;     // stage -> count
   std::map<std::string, int> byCategory;  // category -> count
   std::error_code ec;
@@ -3231,8 +3231,18 @@ int CommandBootReport(int argc, wchar_t **argv) {
     if (!entry.is_directory()) continue;
     const std::string name = antimal::PathToUtf8(entry.path().filename());
     if (!name.empty() && name[0] == '_') continue; // _base, _intel_cache, ...
+    // A run dir with a job.json but no report.json is an attempted-but-incomplete
+    // run (crashed/killed before the report was written) -- count it as a failure
+    // so reliability isn't silently inflated by ignoring it.
     const auto rpt = entry.path() / "report.json";
-    if (!std::filesystem::exists(rpt)) continue;
+    if (!std::filesystem::exists(rpt)) {
+      if (std::filesystem::exists(entry.path() / "job.json")) {
+        ++total;
+        ++incomplete;
+        ++byStage["incomplete (no report)"];
+      }
+      continue;
+    }
     const auto report = antimal::LoadReportBestEffort(rpt);
     const antimal::BootOutcome bo =
         antimal::ClassifyBootOutcome(report.dynamicSummary);
