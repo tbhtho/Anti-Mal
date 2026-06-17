@@ -62,6 +62,7 @@
     <ClInclude Include="include\antimal\PeParser.h" />
     <ClInclude Include="include\antimal\ProcessTelemetry.h" />
     <ClInclude Include="include\antimal\Report.h" />
+    <ClInclude Include="include\antimal\ReportDiff.h" />
     <ClInclude Include="include\antimal\Scanner.h" />
     <ClInclude Include="include\antimal\ScriptAnalyzer.h" />
     <ClInclude Include="include\antimal\Simulation.h" />
@@ -102,6 +103,7 @@
     <ClCompile Include="src\PeParser.cpp" />
     <ClCompile Include="src\ProcessTelemetry.cpp" />
     <ClCompile Include="src\Report.cpp" />
+    <ClCompile Include="src\ReportDiff.cpp" />
     <ClCompile Include="src\Scanner.cpp" />
     <ClCompile Include="src\ScriptAnalyzer.cpp" />
     <ClCompile Include="src\Simulation.cpp" />

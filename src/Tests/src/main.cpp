@@ -27,6 +27,7 @@
 #include "antimal/RegistryTelemetry.h"
 #include "antimal/ProcessTelemetry.h"
 #include "antimal/Report.h"
+#include "antimal/ReportDiff.h"
 #include "antimal/Simulation.h"
 #include "antimal/Scanner.h"
 #include "antimal/ScriptAnalyzer.h"
@@ -3587,6 +3588,46 @@ void TestSimulatedReport() {
     std::error_code ec;
     std::filesystem::remove(tmp, ec);
   }
+}
+
+// Report-to-report diff (T78): a report vs itself is materially identical; a
+// mutated copy surfaces the verdict change + added IOCs/findings/MITRE/tags, and
+// the reverse direction reports them as removed.
+void TestReportDiff() {
+  auto has = [](const std::vector<std::string> &v, const std::string &s) {
+    return std::find(v.begin(), v.end(), s) != v.end();
+  };
+  const auto base = antimal::BuildSimulatedReport("diff-a");
+
+  const auto same = antimal::DiffReports(base, base);
+  Expect(same.Identical(), "diff: a report vs itself is materially identical");
+  Expect(same.addedIocs.empty() && same.removedIocs.empty(),
+         "diff: no IOC delta vs self");
+  Expect(!same.sandboxVerdictChanged, "diff: no verdict change vs self");
+
+  auto b = base;
+  b.sandboxVerdict = antimal::Verdict::Clean;
+  b.scannerVerdict.score += 5;
+  b.scannerVerdict.iocs.domains.push_back("new-c2.example");
+  b.scannerVerdict.findings.push_back({"new.finding", "msg", 10});
+  b.mitreTechniques.push_back("T9999");
+  b.scannerVerdict.tags.push_back({"newtag", "capability", 50, {}});
+
+  const auto d = antimal::DiffReports(base, b);
+  Expect(!d.Identical(), "diff: a mutated report is not identical");
+  Expect(d.sandboxVerdictChanged &&
+             d.newSandboxVerdict == antimal::Verdict::Clean,
+         "diff: detects the sandbox verdict change");
+  Expect(d.newScannerScore == base.scannerVerdict.score + 5,
+         "diff: tracks the scanner score delta");
+  Expect(has(d.addedIocs, "domain:new-c2.example"), "diff: detects an added IOC");
+  Expect(has(d.addedFindings, "new.finding"), "diff: detects an added finding");
+  Expect(has(d.addedMitre, "T9999"), "diff: detects an added MITRE technique");
+  Expect(has(d.addedTags, "newtag"), "diff: detects an added tag");
+
+  const auto rev = antimal::DiffReports(b, base);
+  Expect(has(rev.removedIocs, "domain:new-c2.example"),
+         "diff: reverse direction reports the IOC as removed");
 }
 
 // Authenticode signer-name extraction (T49 depth). The negative + robustness
@@ -8333,6 +8374,7 @@ int main() {
     TestFuzzyHash();
     TestFramePacingStats();
     TestSimulatedReport();
+    TestReportDiff();
     TestAuthenticodeSigner();
     TestFileTypeId();
     TestShellLinkParser();
