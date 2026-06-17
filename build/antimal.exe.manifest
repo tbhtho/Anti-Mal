@@ -1,15 +1,10 @@
 <?xml version="1.0" encoding="utf-8" standalone="yes"?>
 <assembly xmlns="urn:schemas-microsoft-com:asm.v1" manifestVersion="1.0">
   <assemblyIdentity type="win32" name="AntiMal" version="0.9.0.0" processorArchitecture="amd64"/>
-  <trustInfo xmlns="urn:schemas-microsoft-com:asm.v3">
-    <security>
-      <requestedPrivileges>
-        <!-- Run as the invoker; the CLI deliberately operates as a standard user
-             (the in-house VM boots via the privilege-free VHDX-direct path). -->
-        <requestedExecutionLevel level="asInvoker" uiAccess="false"/>
-      </requestedPrivileges>
-    </security>
-  </trustInfo>
+  <!-- The requestedExecutionLevel is set by the linker's UACExecutionLevel
+       property (Directory.Build.targets), NOT here, so the GUI app can be
+       requireAdministrator while the CLI/agent/tests stay asInvoker without an
+       mt.exe "level not equal" merge conflict against the auto-UAC fragment. -->
   <compatibility xmlns="urn:schemas-microsoft-com:compatibility.v1">
     <application>
       <!-- Windows 10 and Windows 11 -->

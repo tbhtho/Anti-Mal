@@ -1,9 +1,20 @@
 <Project>
-  <!-- Embed the shared application manifest into every .exe output (long-path
-       aware, UTF-8 active codepage, asInvoker, Win10/11). Imported AFTER each
-       project sets ConfigurationType, so the condition resolves correctly.
-       Static libs are skipped. -->
+  <!-- Embed the application manifest into every .exe output (long-path aware,
+       UTF-8 active codepage, Win10/11). The GUI app (AntiMal.App -> AntiMal.exe)
+       requires Administrator so it can mount/service the base VHDX, edit offline
+       hives, and drive the VM; the CLI/agent/tests stay asInvoker (HostCli
+       inherits the App's elevation when spawned, so standalone CLI scans don't
+       force a UAC prompt and CI can run Tests.exe unelevated). Imported AFTER each
+       project sets ConfigurationType so the condition resolves. Static libs skipped. -->
   <ItemGroup Condition="'$(ConfigurationType)' == 'Application'">
     <Manifest Include="$(MSBuildThisFileDirectory)build\antimal.exe.manifest" />
   </ItemGroup>
+  <!-- The GUI app requires elevation; the level comes from the linker (not the
+       manifest) so there is no mt.exe merge conflict. CLI/agent/tests keep the
+       default AsInvoker. -->
+  <ItemDefinitionGroup Condition="'$(MSBuildProjectName)' == 'AntiMal.App'">
+    <Link>
+      <UACExecutionLevel>RequireAdministrator</UACExecutionLevel>
+    </Link>
+  </ItemDefinitionGroup>
 </Project>
