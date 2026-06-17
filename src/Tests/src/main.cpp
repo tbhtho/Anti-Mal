@@ -3827,6 +3827,63 @@ void TestReportHtmlStructure() {
   Expect(!has("<script>alert"), "html: no obvious injection");
 }
 
+// Robustness: every untrusted-byte analyzer must survive fully malformed input
+// (truncated magic, bogus length fields, all-0xFF, random) without an OOB crash.
+// The test passing == no analyzer crashed/overran on adversarial bytes -- it
+// locks in the bounds-safety the adversarial reviews established.
+void TestMalformedInputRobustness() {
+  using namespace antimal;
+  auto B = [](std::initializer_list<int> v) {
+    std::vector<uint8_t> o;
+    for (int x : v) o.push_back(static_cast<uint8_t>(x));
+    return o;
+  };
+  std::vector<std::vector<uint8_t>> inputs;
+  inputs.push_back({});                                    // empty
+  inputs.push_back(B({0x00}));                             // 1 byte
+  inputs.push_back(B({'%', 'P', 'D', 'F'}));               // PDF magic only
+  inputs.push_back(B({'%', 'P', 'D', 'F', '-', '1', '.', '7'})); // header, no body
+  inputs.push_back(B({'P', 'K', 0x03, 0x04}));             // zip local magic only
+  inputs.push_back(B({'P', 'K', 0x05, 0x06}));             // zip EOCD magic only
+  inputs.push_back(B({0xD0, 0xCF, 0x11, 0xE0, 0xA1, 0xB1, 0x1A, 0xE1})); // OLE only
+  inputs.push_back(B({'L', 0, 0, 0, 1, 0x14, 2, 0}));      // lnk header, truncated
+  inputs.push_back(B({'M', 'Z', 0x90, 0x00}));             // MZ stub only
+  inputs.push_back(std::vector<uint8_t>(4096, 0xFF));      // claims max lengths
+  inputs.push_back(std::vector<uint8_t>(4096, 0x00));      // all zero
+  { // zip EOCD magic + a bogus oversized central-directory record
+    std::vector<uint8_t> z = B({'P', 'K', 0x05, 0x06});
+    z.insert(z.end(), 18, 0xFF);
+    inputs.push_back(z);
+  }
+  { // deterministic pseudo-random bytes
+    std::vector<uint8_t> r(2048);
+    uint32_t s = 1;
+    for (auto &b : r) {
+      s = s * 1103515245u + 12345u;
+      b = static_cast<uint8_t>(s >> 16);
+    }
+    inputs.push_back(r);
+  }
+
+  for (const auto &in : inputs) {
+    // The contract is "robust to fully untrusted bytes" -- not specific output.
+    (void)AnalyzePdf(in);
+    (void)AnalyzeContainer(in, ".zip");
+    (void)AnalyzeContainer(in, ".docx");
+    (void)AnalyzeContainer(in, "");
+    (void)AnalyzeScript(in, ".ps1");
+    (void)AnalyzeScript(in, "");
+    (void)ParseShellLink(in);
+    (void)ExtractCobaltStrikeConfig(in);
+    (void)DetectShellcode(in);
+    (void)ComputeCtph(in);
+  }
+  // The deobfuscator over garbage base64 must also not crash.
+  (void)DecodePowerShellEncodedCommand("!!!not base64!!!");
+  (void)DecodePowerShellEncodedCommand(std::string(10000, 'A'));
+  Expect(true, "robustness: analyzers survive malformed/untrusted inputs");
+}
+
 // Packer identification from PE section-name signatures (no external tool).
 void TestPackerDetection() {
   using antimal::DetectPackerFromSections;
@@ -8767,6 +8824,7 @@ int main() {
     TestSimulatedReport();
     TestBootDiagnostics();
     TestPackerDetection();
+    TestMalformedInputRobustness();
     TestReportHtmlStructure();
     TestPersistenceClassifier();
     TestNetworkClassifier();
