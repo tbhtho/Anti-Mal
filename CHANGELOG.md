@@ -30,6 +30,9 @@ All increments TDD; build + `AntiMal.Tests` green.
   clearly-labeled SYNTHETIC stealer run (`Simulation.{h,cpp}`) and writes report.json +
   report.html + events.jsonl + a screenshot filmstrip — exercising the events → report → HTML
   pipeline end-to-end with no VM/firmware/hardware dependency. Real static hashes; deterministic.
+  `--scenario stealer|ransomware|loader` covers the major behavior classes (e.g. ransomware:
+  vssadmin shadow-delete + bulk .locked encryption + ransom note → T1486; loader: stage download
+  + svchost hollowing → T1055.012), giving cross-behavior report + report-diff fixtures.
 - **Authenticode signer name (T49):** `AuthenticodeSignerName` extracts the embedded PKCS#7
   signer's display name (e.g. "Microsoft Windows"); surfaced in `ScanResult.signerName` and the
   report/CLI. A Microsoft-signed binary reads very differently from one signed by an unknown
