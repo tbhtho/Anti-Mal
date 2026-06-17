@@ -244,8 +244,12 @@
     var detail = kv([
       ['Path', last.path || '—'], ['File type', last.detectedType || '—'],
       ['SHA-256', last.sha256 || '—'],
+      ['SHA-1', last.sha1 || '—'], ['MD5', last.md5 || '—'],
+      ['imphash', last.imphash || '—'], ['CTPH (fuzzy)', last.ctph || '—'],
       ['Entropy', last.entropy != null ? Number(last.entropy).toFixed(3) : '—'],
-      ['PE file', last.isPe ? 'yes' : 'no'], ['Authenticode signed', last.authenticodeSigned ? 'yes' : 'no'],
+      ['PE file', last.isPe ? 'yes' : 'no'],
+      ['Authenticode signed', last.authenticodeSigned ? 'yes' : 'no'],
+      ['Signer', last.signerName || '—'],
       ['Imports', n(last.imports)], ['Findings', n(last.findings)],
       ['Score', last.score | 0], ['Verdict', last.verdict || '—'],
       ['URLs', n(io.urls)], ['IPs', n(io.ips)], ['Domains', n(io.domains)],
