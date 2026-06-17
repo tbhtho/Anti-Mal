@@ -2129,7 +2129,7 @@ std::string BuildHtmlReportWithFrames(const AnalysisReport &report,
   }
   if (!report.mitreTechniques.empty()) {
     html << "<h2>MITRE ATT&amp;CK</h2>";
-    EmitIocList(html, report.mitreTechniques, "");
+    EmitMitreChips(html, report.mitreTechniques); // ID + name, consistent with the panel
   }
   if (!report.browserImpact.empty()) {
     html << "<h2>Browser risk</h2><table><thead><tr><th>Domain</th><th>Creds</th><th>Cookies</th></tr></thead><tbody>";
