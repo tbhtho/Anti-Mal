@@ -1,3 +1,4 @@
+#include "antimal/BehaviorScore.h"
 #include "antimal/BootDiagnostics.h"
 #include "antimal/BrowserImpact.h"
 #include "antimal/Config.h"
@@ -211,6 +212,7 @@ void PrintUsage() {
       << "  antimal similarity <file> --to <ctph-digest>\n"
       << "  antimal doctor [--json]              (host & workflow readiness check)\n"
       << "  antimal boot-report [--workspace <dir>] [--json]  (boot reliability over all runs)\n"
+      << "  antimal rebuild-report <run-id-or-dir> [--html] [--force]  (recover report.json from events.jsonl)\n"
       << "  antimal simulate [--scenario stealer|ransomware|loader|coinminer|wiper] [--out <dir>] [--run-id <id>]\n"
       << "  antimal report-diff <run-or-report-A> <run-or-report-B> [--json]  (what changed)\n";
 }
@@ -3301,6 +3303,97 @@ int CommandBootReport(int argc, wchar_t **argv) {
   return 0;
 }
 
+// `rebuild-report` — reconstruct report.json + report.html from a run's live
+// events.jsonl when the run ended before the host finalized its report (host
+// killed/crashed). boot-report shows these as "user-mode (telemetry, no report)":
+// the guest booted and streamed telemetry, but the analyst had no navigable
+// report for it. This recovers one from the journal using the same pure builders
+// the orchestrator uses (process tree, MITRE, network, behavior score), so an
+// orphaned run becomes a real Any.Run-style report. Refuses to clobber an
+// existing report.json unless --force.
+int CommandRebuildReport(int argc, wchar_t **argv) {
+  if (argc < 3) {
+    std::cerr << "usage: antimal rebuild-report <run-id-or-dir> [--html] [--force]\n";
+    return 2;
+  }
+  const auto config = antimal::LoadConfig(antimal::DefaultConfigPath());
+  std::filesystem::path runDir(argv[2]);
+  if (!std::filesystem::is_directory(runDir)) {
+    runDir = config.workspaceRoot / argv[2];
+  }
+  if (!std::filesystem::is_directory(runDir)) {
+    std::cerr << "run directory not found: " << antimal::PathToUtf8(runDir) << "\n";
+    return 2;
+  }
+  const auto reportPath = runDir / "report.json";
+  if (std::filesystem::exists(reportPath) && !HasFlag(argc, argv, "--force")) {
+    std::cerr << "report.json already exists (pass --force to overwrite): "
+              << antimal::PathToUtf8(reportPath) << "\n";
+    return 2;
+  }
+  const auto journalPath = runDir / "events.jsonl";
+  if (!std::filesystem::exists(journalPath)) {
+    std::cerr << "no events.jsonl in " << antimal::PathToUtf8(runDir)
+              << " -- nothing to rebuild from\n";
+    return 2;
+  }
+  const auto events = antimal::EventJournalTailer(journalPath).ReadAll();
+  if (events.empty()) {
+    std::cerr << "events.jsonl is empty -- nothing to rebuild from\n";
+    return 2;
+  }
+
+  antimal::AnalysisReport report;
+  report.runId = antimal::PathToUtf8(runDir.filename());
+  // The detonated sample, if the run kept it, so static enrichment still appears.
+  std::error_code sec;
+  for (const auto &e : std::filesystem::directory_iterator(runDir / "sample", sec)) {
+    if (e.is_regular_file()) {
+      report.samplePath = e.path();
+      break;
+    }
+  }
+  report.events = events;
+  report.mitreTechniques =
+      antimal::AggregateMitreTechniques(events, report.scannerVerdict);
+  report.networkDomains = antimal::AggregateNetworkDomains(events);
+  report.dynamicSummary.started = true;
+  report.dynamicSummary.eventsCaptured = static_cast<uint32_t>(events.size());
+  report.dynamicSummary.status = "recovered (rebuilt from events.jsonl)";
+  report.dynamicSummary.networkMode = config.networkMode;
+  // GuestAgent telemetry proves OS-up (session-0 service), so mark the gate the
+  // journal actually evidences -- honest, not inflated to "desktop".
+  for (const auto &e : events) {
+    if (e.source == "GuestAgent") {
+      report.dynamicSummary.windowsUserModeGateReached = true;
+      break;
+    }
+  }
+  const antimal::BehaviorScore bs =
+      antimal::ScoreSandboxBehavior(report.dynamicSummary, events);
+  report.sandboxVerdict = bs.verdict;
+  report.verdictScore = bs.score;
+  report.verdictRationale = bs.rationale;
+  report.errors.push_back(
+      "Report reconstructed from events.jsonl after the run ended without a "
+      "finalized report.json; boot-stage/usability detail is limited to what the "
+      "telemetry journal preserved.");
+
+  antimal::WriteReportJson(reportPath, report);
+  std::cout << "rebuilt " << antimal::PathToUtf8(reportPath) << " from "
+            << events.size() << " event(s)\n";
+  std::cout << "  verdict: " << antimal::ToString(report.sandboxVerdict)
+            << " (score " << report.verdictScore << ")\n";
+  const auto tree = antimal::BuildProcessTree(events);
+  std::cout << "  processes: " << tree.size()
+            << ", mitre: " << report.mitreTechniques.size() << "\n";
+  if (HasFlag(argc, argv, "--html")) {
+    antimal::WriteReportHtml(runDir / "report.html", report);
+    std::cout << "  wrote " << antimal::PathToUtf8(runDir / "report.html") << "\n";
+  }
+  return 0;
+}
+
 // `fs-ls` / `fs-cat` — browse the guest filesystem OFFLINE from the disk image
 // (base VHDX + optional run overlay), no boot required. Gives the analyst
 // File-Explorer-style access to the guest's files -- including exactly what a
@@ -3831,6 +3924,9 @@ int wmain(int argc, wchar_t **argv) {
     }
     if (command == "boot-report") {
       return CommandBootReport(argc, argv);
+    }
+    if (command == "rebuild-report") {
+      return CommandRebuildReport(argc, argv);
     }
     if (command == "fs-ls" || command == "fs-cat" || command == "fs-find" ||
         command == "fs-scan" || command == "reg-ls") {
