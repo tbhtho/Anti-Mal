@@ -14,6 +14,7 @@
 
 #include <windows.h>
 
+#include <bcrypt.h>
 #include <commctrl.h>
 
 #include <string>
@@ -107,6 +108,48 @@ void Populate(std::wstring dir) {
   }
 }
 
+// SHA-256 of a file via BCrypt (the agent already links bcrypt.lib). Returns ""
+// on any error. Capped so a huge file never hangs the UI.
+std::wstring Sha256OfFile(const std::wstring &path, unsigned long long size) {
+  if (size > (256ull << 20)) return L"(file > 256 MB, skipped)";
+  HANDLE f = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr,
+                         OPEN_EXISTING, FILE_FLAG_SEQUENTIAL_SCAN, nullptr);
+  if (f == INVALID_HANDLE_VALUE) return L"";
+  BCRYPT_ALG_HANDLE alg = nullptr;
+  BCRYPT_HASH_HANDLE hash = nullptr;
+  std::wstring result;
+  if (BCryptOpenAlgorithmProvider(&alg, BCRYPT_SHA256_ALGORITHM, nullptr, 0) ==
+      0) {
+    if (BCryptCreateHash(alg, &hash, nullptr, 0, nullptr, 0, 0) == 0) {
+      std::vector<unsigned char> buf(1 << 16);
+      DWORD got = 0;
+      bool ok = true;
+      while (ReadFile(f, buf.data(), static_cast<DWORD>(buf.size()), &got,
+                      nullptr) &&
+             got > 0) {
+        if (BCryptHashData(hash, buf.data(), got, 0) != 0) {
+          ok = false;
+          break;
+        }
+      }
+      if (ok) {
+        unsigned char digest[32]{};
+        if (BCryptFinishHash(hash, digest, sizeof(digest), 0) == 0) {
+          static const wchar_t *kHex = L"0123456789abcdef";
+          for (unsigned char b : digest) {
+            result.push_back(kHex[b >> 4]);
+            result.push_back(kHex[b & 0xF]);
+          }
+        }
+      }
+      BCryptDestroyHash(hash);
+    }
+    BCryptCloseAlgorithmProvider(alg, 0);
+  }
+  CloseHandle(f);
+  return result;
+}
+
 void OnActivate() {
   const int sel = ListView_GetNextItem(g_list, -1, LVNI_SELECTED);
   if (sel < 0) return;
@@ -114,10 +157,25 @@ void OnActivate() {
   it.mask = LVIF_PARAM;
   it.iItem = sel;
   ListView_GetItem(g_list, &it);
-  if (!it.lParam) return; // a file -- nothing to navigate into
-
   wchar_t name[MAX_PATH]{};
   ListView_GetItemText(g_list, sel, 0, name, MAX_PATH);
+  if (!it.lParam) {
+    // A file: show a quick triage card (full path, size, SHA-256).
+    const std::wstring full = g_dir + name;
+    WIN32_FILE_ATTRIBUTE_DATA fa{};
+    unsigned long long size = 0;
+    if (GetFileAttributesExW(full.c_str(), GetFileExInfoStandard, &fa)) {
+      size = (static_cast<unsigned long long>(fa.nFileSizeHigh) << 32) |
+             fa.nFileSizeLow;
+    }
+    const std::wstring sha = Sha256OfFile(full, size);
+    std::wstring msg = full + L"\n\nSize: " + FormatSize(size) +
+                       L"\nSHA-256: " + (sha.empty() ? L"(unavailable)" : sha);
+    MessageBoxW(nullptr, msg.c_str(), L"AntiMal Files - file info",
+                MB_OK | MB_ICONINFORMATION);
+    return;
+  }
+
   if (wcscmp(name, L"..") == 0) {
     std::wstring d = g_dir;
     if (!d.empty() && d.back() == L'\\') d.pop_back();
