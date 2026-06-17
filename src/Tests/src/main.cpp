@@ -7,6 +7,7 @@
 #include "antimal/ContainerAnalyzer.h"
 #include "antimal/BootDiagnostics.h"
 #include "antimal/Crypto.h"
+#include "antimal/DetectionSummary.h"
 #include "antimal/EventTime.h"
 #include "antimal/FuzzyHash.h"
 #include "antimal/hv/FramePacing.h"
@@ -3625,6 +3626,60 @@ void TestSimulatedReport() {
     std::error_code ec;
     std::filesystem::remove(tmp, ec);
   }
+}
+
+// Detections summary: aggregates static findings + persistence + suspicious
+// network into one severity-ranked list (high -> info), de-duplicated.
+void TestDetectionSummary() {
+  using namespace antimal;
+  // The simulated stealer report should yield detections, ranked, with the C2
+  // egress and persistence surfaced.
+  const auto r = BuildSimulatedReport("det-x");
+  const auto dets = BuildDetections(r);
+  Expect(!dets.empty(), "detections: simulated report yields detections");
+  // Sorted high -> info (non-increasing severity).
+  bool sorted = true;
+  for (size_t i = 1; i < dets.size(); ++i) {
+    if (dets[i].severity > dets[i - 1].severity) sorted = false;
+  }
+  Expect(sorted, "detections: ranked by descending severity");
+  bool hasPersistence = false;
+  for (const auto &d : dets) {
+    if (d.category == "persistence") hasPersistence = true;
+  }
+  Expect(hasPersistence, "detections: persistence write surfaced");
+
+  // A network detection fires only for a genuinely suspicious endpoint -- the
+  // simulated scenarios use realistic C2 on 443/80, which is correctly NOT
+  // port-suspicious, so drive the network path with an explicit odd port.
+  {
+    AnalysisReport net;
+    EventRecord ne;
+    ne.category = "network";
+    ne.action = "network.connection";
+    ne.target = "45.13.37.7:4444";
+    net.events.push_back(ne);
+    bool hasNetwork = false;
+    for (const auto &d : BuildDetections(net)) {
+      if (d.category == "network") hasNetwork = true;
+    }
+    Expect(hasNetwork, "detections: a suspicious-port C2 egress surfaces");
+  }
+
+  // A clean report (no findings, no events) yields no detections.
+  AnalysisReport empty;
+  Expect(BuildDetections(empty).empty(),
+         "detections: an empty report yields none");
+
+  // Static-finding score maps to a severity band.
+  AnalysisReport rep;
+  rep.scannerVerdict.findings = {{"r.high", "high sig", 70},
+                                 {"r.low", "low sig", 12},
+                                 {"r.zero", "intel only", 0}};
+  const auto sd = BuildDetections(rep);
+  Expect(sd.size() == 2, "detections: score-0 findings are excluded");
+  Expect(sd[0].severity == 3 && sd[1].severity == 1,
+         "detections: score maps to high/low and is sorted");
 }
 
 // ISO-8601 epoch parsing + relative-time labels for the report timeline (T52).
@@ -8646,6 +8701,7 @@ int main() {
     TestPersistenceClassifier();
     TestNetworkClassifier();
     TestEventTime();
+    TestDetectionSummary();
     TestShellcodeDetector();
     TestMitreCatalog();
     TestReportDiff();

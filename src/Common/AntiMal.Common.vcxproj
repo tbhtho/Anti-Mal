@@ -42,6 +42,7 @@
     <ClInclude Include="include\antimal\BehaviorScore.h" />
     <ClInclude Include="include\antimal\BootDiagnostics.h" />
     <ClInclude Include="include\antimal\Crypto.h" />
+    <ClInclude Include="include\antimal\DetectionSummary.h" />
     <ClInclude Include="include\antimal\EventJournal.h" />
     <ClInclude Include="include\antimal\EventTime.h" />
     <ClInclude Include="include\antimal\ExternalTools.h" />
@@ -89,6 +90,7 @@
     <ClCompile Include="src\ConfigExtractor.cpp" />
     <ClCompile Include="src\ContainerAnalyzer.cpp" />
     <ClCompile Include="src\Crypto.cpp" />
+    <ClCompile Include="src\DetectionSummary.cpp" />
     <ClCompile Include="src\EventJournal.cpp" />
     <ClCompile Include="src\EventTime.cpp" />
     <ClCompile Include="src\ExternalTools.cpp" />

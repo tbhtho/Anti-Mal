@@ -1,6 +1,7 @@
 #include "antimal/Report.h"
 
 #include "antimal/BootDiagnostics.h"
+#include "antimal/DetectionSummary.h"
 #include "antimal/EventTime.h"
 #include "antimal/FileUtil.h"
 #include "antimal/Json.h"
@@ -1921,6 +1922,39 @@ std::string BuildHtmlReportWithFrames(const AnalysisReport &report,
   }
   html << "</div>";
   html << "</div>";
+
+  // Detections — the severity-ranked behavior summary an analyst reads first.
+  {
+    const auto dets = BuildDetections(report);
+    if (!dets.empty()) {
+      auto sevColor = [](int s) {
+        return s >= 3 ? "var(--bad)"
+                      : s == 2 ? "var(--warn)" : s == 1 ? "var(--accent)"
+                                                        : "var(--muted)";
+      };
+      html << "<h2 style=\"margin-top:14px\">Detections (" << dets.size()
+           << ")</h2><table><thead><tr><th>Severity</th><th>Category</th>"
+              "<th>Detection</th><th>MITRE</th></tr></thead><tbody>";
+      for (const auto &d : dets) {
+        std::string mitreCell = HtmlEscape(d.mitre);
+        if (!d.mitre.empty()) {
+          const std::string nm = MitreTechniqueName(d.mitre);
+          if (!nm.empty()) {
+            const auto pos = nm.rfind(": ");
+            mitreCell +=
+                " <span style=\"opacity:.7\">" +
+                HtmlEscape(pos == std::string::npos ? nm : nm.substr(pos + 2)) +
+                "</span>";
+          }
+        }
+        html << "<tr><td><span class=\"mono\" style=\"color:" << sevColor(d.severity)
+             << "\">" << HtmlEscape(d.severityLabel) << "</span></td><td class=\"mono\">"
+             << HtmlEscape(d.category) << "</td><td>" << HtmlEscape(d.title)
+             << "</td><td class=\"mono\">" << mitreCell << "</td></tr>";
+      }
+      html << "</tbody></table>";
+    }
+  }
 
   // Tracker tags
   if (!scan.tags.empty()) {
