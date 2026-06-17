@@ -779,4 +779,33 @@ std::string AuthenticodeSignerName(const std::filesystem::path &path) {
   return result;
 }
 
+std::string DetectPackerFromSections(const std::vector<PeSection> &sections) {
+  auto lower = [](std::string s) {
+    for (char &c : s) {
+      if (c >= 'A' && c <= 'Z') c = static_cast<char>(c + 32);
+    }
+    return s;
+  };
+  auto starts = [](const std::string &s, const char *p) {
+    return s.rfind(p, 0) == 0;
+  };
+  for (const auto &sec : sections) {
+    const std::string n = lower(sec.name);
+    if (starts(n, "upx")) return "UPX";                 // UPX0/UPX1/UPX2/UPX!
+    if (n == ".aspack" || n == ".adata") return "ASPack";
+    if (starts(n, ".themida") || starts(n, ".winlice")) return "Themida/WinLicense";
+    if (starts(n, ".mpress")) return "MPRESS";
+    if (n == ".pec" || starts(n, "pec")) return "PECompact";
+    if (starts(n, ".nsp") || starts(n, "nsp")) return "NsPack";
+    if (starts(n, ".vmp")) return "VMProtect";
+    if (n == ".petite") return "Petite";
+    if (starts(n, ".enigma")) return "Enigma";
+    if (starts(n, ".y0da")) return "yoda Crypter";
+    if (n == ".upack" || starts(n, ".by_dwing")) return "Upack";
+    if (starts(n, ".rlpack")) return "RLPack";
+    if (starts(n, ".gentee")) return "Gentee";
+  }
+  return "";
+}
+
 } // namespace antimal

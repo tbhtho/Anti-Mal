@@ -3786,6 +3786,33 @@ void TestPersistenceClassifier() {
          "persist: an ordinary temp-file drop is not persistence");
 }
 
+// Packer identification from PE section-name signatures (no external tool).
+void TestPackerDetection() {
+  using antimal::DetectPackerFromSections;
+  using antimal::PeSection;
+  auto sec = [](const char *n) {
+    PeSection s;
+    s.name = n;
+    return s;
+  };
+  Expect(DetectPackerFromSections({sec("UPX0"), sec("UPX1"), sec(".rsrc")}) == "UPX",
+         "packer: UPX0/UPX1 -> UPX");
+  Expect(DetectPackerFromSections({sec(".text"), sec(".aspack")}) == "ASPack",
+         "packer: .aspack -> ASPack");
+  Expect(DetectPackerFromSections({sec(".themida")}) == "Themida/WinLicense",
+         "packer: .themida -> Themida/WinLicense");
+  Expect(DetectPackerFromSections({sec(".vmp0"), sec(".vmp1")}) == "VMProtect",
+         "packer: .vmp0 -> VMProtect");
+  Expect(DetectPackerFromSections({sec(".MPRESS1")}) == "MPRESS",
+         "packer: .MPRESS1 (case-insensitive) -> MPRESS");
+  // A normal PE layout is not flagged.
+  Expect(DetectPackerFromSections({sec(".text"), sec(".rdata"), sec(".data"),
+                                   sec(".rsrc"), sec(".reloc")})
+             .empty(),
+         "packer: an ordinary section layout is not a packer");
+  Expect(DetectPackerFromSections({}).empty(), "packer: no sections -> none");
+}
+
 // Boot-outcome classifier: collapses the scattered boot signals into a single
 // furthest-stage read with an actionable remediation. Picks the most-progressed
 // stage the evidence supports.
@@ -8698,6 +8725,7 @@ int main() {
     TestFramePacingStats();
     TestSimulatedReport();
     TestBootDiagnostics();
+    TestPackerDetection();
     TestPersistenceClassifier();
     TestNetworkClassifier();
     TestEventTime();

@@ -92,6 +92,13 @@ PeInfo ParsePe(const std::vector<uint8_t> &data);
 PeInfo ParsePeFile(const std::filesystem::path &path);
 bool HasAuthenticodeSignature(const std::filesystem::path &path);
 
+// Identify a known packer/protector from the PE section-name signatures it leaves
+// behind (UPX0/UPX1, .aspack, .themida, .MPRESS1, PEC2/.pec, .nsp0, .vmp0, ...).
+// Returns the packer name (e.g. "UPX") or "" when no signature matches. This is
+// the no-external-tool packer ID; Detect It Easy (when present) goes deeper.
+// Section names are distinctive, so this is near-zero false positive.
+std::string DetectPackerFromSections(const std::vector<PeSection> &sections);
+
 // The Authenticode signer's display name (the leaf signing certificate's subject
 // CN, e.g. "Microsoft Windows" / "Microsoft Corporation"). Triage depth beyond a
 // signed/unsigned bool: a Microsoft-signed binary reads very differently from one

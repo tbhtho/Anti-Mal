@@ -631,6 +631,14 @@ ScanResult ScanFile(const std::filesystem::path &path,
       AddFinding(result, "entropy.high", "File entropy is above packed/encrypted threshold", 25);
     }
 
+    // Named packer/protector ID from section-name signatures (no external tool).
+    // Distinctive section names -> near-zero FP; deeper ID comes from DIE.
+    if (const std::string packer = DetectPackerFromSections(pe.sections);
+        !packer.empty()) {
+      AddFinding(result, "packer.identified",
+                 packer + " packer/protector (section-name signature)", 25);
+    }
+
     // Evidence-backed packer tell: an executable section whose raw bytes are
     // near-random. Far more specific than whole-file entropy (which a large
     // embedded resource can inflate on a perfectly benign binary).
