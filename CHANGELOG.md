@@ -27,7 +27,16 @@ unit-tested. A living `private development documentation` tracks done/remaining 
   `report --detections [--json]`.
 - **Boot-reliability aggregator (`boot-report`, T05):** scans every run's report.json and reports a
   per-stage histogram + desktop/user-mode reach rates — boot reliability is now measurable from the
-  user's runs without this tool launching a boot.
+  user's runs without this tool launching a boot. Now also counts attempted-but-incomplete runs (a
+  `job.json` with no finalized `report.json`) instead of silently dropping them, and recovers their
+  real reach from `events.jsonl` (GuestAgent telemetry = OS-up) — correcting an inflated success rate
+  (on the dev workspace: 35 of 45 report-less runs were actually user-mode boots, not failures).
+- **`rebuild-report` command:** reconstructs `report.json` (+ `report.html` with `--html`) from a
+  run's `events.jsonl` when the host died before finalizing it. Uses the same pure builders the live
+  run uses (process tree / MITRE / network / behavior score), marks the summary `recovered`, and sets
+  the user-mode gate only when GuestAgent telemetry is present (honest: OS-up, not desktop). Refuses
+  to clobber an existing report without `--force`. Turns orphaned telemetry runs into navigable
+  Any.Run-style reports.
 - **Severity-ranked Detections summary (`DetectionSummary`):** unifies static findings + persistence
   + suspicious network into one ranked behavior list; in the report + `report --detections [--json]`.
 - **Desktop-usability classifier (`UsabilityDiagnostics`):** measures which usability goals a run

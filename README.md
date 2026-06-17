@@ -197,6 +197,22 @@ bin\x64\Release\AntiMal.HostCli.exe report <run> --usability
 bin\x64\Release\AntiMal.HostCli.exe boot-report
 ```
 
+`boot-report` counts every attempted run — including ones that crashed/were
+killed before a `report.json` was written — and, for those, falls back to the
+live `events.jsonl` to recover how far the boot actually got (GuestAgent
+telemetry proves OS-up). If such an orphaned run has useful telemetry, rebuild a
+navigable report from its journal:
+
+```powershell
+bin\x64\Release\AntiMal.HostCli.exe rebuild-report <run-id-or-dir> --html
+```
+
+This reconstructs `report.json` (+ `report.html` with `--html`) from
+`events.jsonl` using the same process-tree / MITRE / network / behavior-score
+builders the live run uses, so a run whose report was never finalized still
+yields an Any.Run-style report. It refuses to overwrite an existing
+`report.json` unless `--force`.
+
 Stage and boot-probe a sample through the in-house VM path:
 
 ```powershell
