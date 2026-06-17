@@ -6343,7 +6343,11 @@ BootOverlayPatchResult ApplyEphemeralBootOverlay(hv::IBlockDevice &disk) {
   // STABLE console shell we can drive (type `start msedge` etc.) regardless of
   // the broken modern-shell/AppX provisioning. Pairs with ANTIMAL_PROBE_RUN_CMD.
   // Overlay-only; base untouched.
-  if (EnvFlagEnabled("ANTIMAL_PROBE_SHELL_CMD")) {
+  // ANTIMAL_PROBE_FILE_BROWSER implies the cmd-shell swap (cmd is what reads the
+  // AutoRun that launches the file browser), so a single flag gives live
+  // file-browsing on logon.
+  if (EnvFlagEnabled("ANTIMAL_PROBE_SHELL_CMD") ||
+      EnvFlagEnabled("ANTIMAL_PROBE_FILE_BROWSER")) {
     PatchOverlaySetShellCmd(disk, &result);
   }
   // ROOT-CAUSE FIX for the interactive-shell crash-loop: the base image's
@@ -7861,13 +7865,24 @@ bool PatchOverlaySetShellCmd(hv::IBlockDevice &disk,
   {
     char cmdEnv[256]{};
     size_t cmdNeeded = 0;
+    std::string runCmd;
     if (getenv_s(&cmdNeeded, cmdEnv, sizeof(cmdEnv), "ANTIMAL_PROBE_RUN_CMD") == 0 &&
         cmdNeeded > 1 && cmdEnv[0] != '\0') {
+      runCmd = cmdEnv;
+    }
+    // Convenience: ANTIMAL_PROBE_FILE_BROWSER auto-launches AntiMal's own in-guest
+    // file browser (usable File Explorer WITHOUT the crash-looping modern shell)
+    // from the cmd-shell on logon, when no explicit RUN_CMD was given. So a single
+    // flag yields live file-browsing on a seed boot.
+    if (runCmd.empty() && EnvFlagEnabled("ANTIMAL_PROBE_FILE_BROWSER")) {
+      runCmd = "start \"\" C:\\AntiMal\\AntiMal.GuestAgent.exe --file-browser";
+    }
+    if (!runCmd.empty()) {
       const auto cmdProc = EnsureHivePath(hive, {"Microsoft", "Command Processor"});
       if (cmdProc) {
         std::vector<uint8_t> sz; // REG_SZ as UTF-16LE + terminator
-        for (const char *p = cmdEnv; *p; ++p) {
-          sz.push_back(static_cast<uint8_t>(*p));
+        for (char ch : runCmd) {
+          sz.push_back(static_cast<uint8_t>(ch));
           sz.push_back(0);
         }
         sz.push_back(0);
@@ -7875,7 +7890,7 @@ bool PatchOverlaySetShellCmd(hv::IBlockDevice &disk,
         if (hive.UpsertBinaryValueSameSize(*cmdProc, "AutoRun", REG_SZ, sz)) {
           if (result)
             result->notes.push_back(std::string("shell-cmd: AutoRun -> '") +
-                                    cmdEnv + "'");
+                                    runCmd + "'");
         } else if (result) {
           result->notes.push_back("shell-cmd: AutoRun write failed");
         }
