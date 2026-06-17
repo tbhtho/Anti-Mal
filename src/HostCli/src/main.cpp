@@ -202,7 +202,7 @@ void PrintUsage() {
       << "  antimal fs-cat [--vhdx <d.vhdx>] [--overlay <o.cow>] <guest\\path> [--out <file>]\n"
       << "  antimal fs-find [--vhdx <d.vhdx>] [--overlay <o.cow>] <name-substring>   (offline recursive search)\n"
       << "  antimal fs-scan [--vhdx <d.vhdx>] [--overlay <o.cow>] <guest\\path>   (extract + static-scan a guest file)\n"
-      << "  antimal reg-ls [--hive software|system|sam|...] [--overlay <o.cow>] <reg\\key> [--values] [--depth N]\n"
+      << "  antimal reg-ls [--hive software|system|sam|...] [--overlay <o.cow>] <reg\\key> [--values] [--depth N] [--filter <s>]\n"
       << "  antimal report <run-id-or-report.json> [--html] [--detections|--usability [--json]]\n"
       << "  antimal browser-impact <run-id-or-report.json> --decrypt-browser-secrets\n"
       << "  antimal export <run-id-or-report.json> --format stix|misp|csv [--out <file>]\n"
@@ -3362,9 +3362,10 @@ int CommandFs(int argc, wchar_t **argv) {
       } catch (...) {
       }
     }
+    const std::string filter = OptionValue(argc, argv, "--filter").value_or("");
     const std::string dump = antimal::DebugDumpHiveFile(
-        antimal::PathToUtf8(tmp), guestPath, "", HasFlag(argc, argv, "--values"),
-        depth);
+        antimal::PathToUtf8(tmp), guestPath, filter,
+        HasFlag(argc, argv, "--values"), depth);
     std::cout << "[" << hl << "] " << (guestPath.empty() ? "(root)" : guestPath)
               << "\n"
               << dump;
