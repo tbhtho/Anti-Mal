@@ -8,6 +8,27 @@ that landed on `main`.
 
 ## [Unreleased]
 
+### 2026-06-17 — boot diagnostics, behavioral classifiers, Any.Run-style report depth
+A continued autonomous drive toward the complete in-house VM + sandbox. With the live-boot
+desktop-reach frontier user-gated (see CURRENT_STATE.md), this advanced every other priority area —
+diagnostics, telemetry classification, report depth, and reliability measurement — all pure +
+unit-tested. A living `private development documentation` tracks done/remaining vs. the goal's priorities.
+- **Boot-outcome classifier (`BootDiagnostics`, priority 3):** collapses a run's scattered boot
+  signals into one stage (not-started / firmware / kernel / user-mode / desktop) + detail +
+  remediation; surfaced in the report and `detonate` output.
+- **Persistence classifier (`PersistenceClassifier`, T72):** names the autostart mechanism + MITRE
+  from raw registry/file targets (Run/RunOnce/Services/IFEO/COM/AppInit/Winlogon/Scheduled-Task/
+  Startup) — the report persistence panel gains a Mechanism column and classifies file events too.
+- **Network classifier (`NetworkClassifier`):** port→service + private/public + known-C2/Tor/IRC/
+  cleartext/exposed-service flags, shown in the report network panel.
+- **Behavioral-timeline relative time (`EventTime`, T52):** "T+8s" offsets per event.
+- **Detections summary (`DetectionSummary`):** a severity-ranked behavior list unifying static
+  findings + persistence + suspicious network, rendered at the top of the report and via
+  `report --detections [--json]`.
+- **Boot-reliability aggregator (`boot-report`, T05):** scans every run's report.json and reports a
+  per-stage histogram + desktop/user-mode reach rates — boot reliability is now measurable from the
+  user's runs without this tool launching a boot.
+
 ### 2026-06-17 — static-triage depth, analyst workflow CLIs, FPS instrumentation, local simulation
 An autonomous no-boot sweep that broadens the static engine, adds analyst-workflow CLIs,
 instruments the live display, and makes the report pipeline runnable end-to-end with no VM.
