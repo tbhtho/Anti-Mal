@@ -9,6 +9,7 @@
 #include "antimal/IocExport.h"
 #include "antimal/Json.h"
 #include "antimal/Report.h"
+#include "antimal/ReportDiff.h"
 #include "antimal/Scanner.h"
 #include "antimal/Subprocess.h"
 #include "antimal/Version.h"
@@ -170,7 +171,8 @@ void PrintUsage() {
       << "  antimal similarity <fileA> <fileB>   (fuzzy-hash similarity 0..100)\n"
       << "  antimal similarity <file> --to <ctph-digest>\n"
       << "  antimal doctor [--json]              (host & workflow readiness check)\n"
-      << "  antimal simulate [--out <dir>] [--run-id <id>]  (synthetic end-to-end report)\n";
+      << "  antimal simulate [--out <dir>] [--run-id <id>]  (synthetic end-to-end report)\n"
+      << "  antimal report-diff <run-or-report-A> <run-or-report-B>  (what changed)\n";
 }
 
 antimal::ScannerOptions BuildScannerOptions(int argc, wchar_t **argv,
@@ -2978,6 +2980,35 @@ int CommandSimilarity(int argc, wchar_t **argv) {
   return 0;
 }
 
+// `report-diff` — show what changed between two analysis reports (T78). Pairs
+// with `similarity`: compare the same sample run twice (a determinism check) or
+// two related variants. Exit 1 when material differences exist (so a
+// determinism/regression gate can branch on it), 0 when materially identical.
+int CommandReportDiff(int argc, wchar_t **argv) {
+  if (argc < 4) {
+    std::cerr << "usage: antimal report-diff <run-or-report-A> <run-or-report-B>\n";
+    return 2;
+  }
+  const auto config = antimal::LoadConfig(antimal::DefaultConfigPath());
+  const auto pathA = ResolveReportPath(config, std::filesystem::path(argv[2]));
+  const auto pathB = ResolveReportPath(config, std::filesystem::path(argv[3]));
+  if (!std::filesystem::exists(pathA)) {
+    std::cerr << "No such report: " << antimal::PathToUtf8(pathA) << "\n";
+    return 2;
+  }
+  if (!std::filesystem::exists(pathB)) {
+    std::cerr << "No such report: " << antimal::PathToUtf8(pathB) << "\n";
+    return 2;
+  }
+  const auto a = antimal::LoadReportBestEffort(pathA);
+  const auto b = antimal::LoadReportBestEffort(pathB);
+  const auto diff = antimal::DiffReports(a, b);
+  std::cout << "A: " << antimal::PathToUtf8(pathA) << "\n";
+  std::cout << "B: " << antimal::PathToUtf8(pathB) << "\n\n";
+  std::cout << antimal::FormatReportDiff(diff);
+  return diff.Identical() ? 0 : 1;
+}
+
 // `doctor` — host + workflow readiness preflight. Reports, line by line, whether
 // AntiMal can boot a guest and run the scan/report workflow on THIS machine, with
 // an actionable hint per failure. Exit 0 when boot-ready, 1 when a hard blocker
@@ -3239,6 +3270,9 @@ int wmain(int argc, wchar_t **argv) {
     }
     if (command == "simulate") {
       return CommandSimulate(argc, argv);
+    }
+    if (command == "report-diff") {
+      return CommandReportDiff(argc, argv);
     }
     PrintUsage();
     return 2;
