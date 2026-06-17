@@ -10,6 +10,7 @@
 #include "antimal/PdfAnalyzer.h"
 #include "antimal/PeParser.h"
 #include "antimal/ScriptAnalyzer.h"
+#include "antimal/ShellcodeDetector.h"
 #include "antimal/ShellLinkParser.h"
 #include "antimal/Strings.h"
 #include "antimal/Tagger.h"
@@ -753,6 +754,47 @@ ScanResult ScanFile(const std::filesystem::path &path,
                          pe.versionInfo.originalFilename +
                          "' (possible rename/masquerade)",
                      15);
+        }
+      }
+    }
+
+    // Shellcode / position-independent code (any file type). Conservative gating
+    // keeps false positives near zero: the GetPC call/pop stub is so specific it
+    // fires anywhere; the (legit-in-PE) PEB-walk fires only where executable code
+    // does not belong -- a non-PE payload or a PE overlay -- never the PE body.
+    {
+      auto joinReasons = [](const std::vector<std::string> &r) {
+        std::string s;
+        for (size_t i = 0; i < r.size(); ++i) {
+          if (i) s += "; ";
+          s += r[i];
+        }
+        return s;
+      };
+      const ShellcodeIndicators sc = DetectShellcode(data);
+      if (result.detectedType != "pe") {
+        if (sc.getPcCallPop) {
+          AddFinding(result, "shellcode.getpc_stub",
+                     "Position-independent shellcode stub in a non-PE file: " +
+                         joinReasons(sc.reasons),
+                     45);
+        } else if (sc.pebWalk) {
+          AddFinding(result, "shellcode.peb_walk",
+                     "Shellcode PEB-walk signature in a non-PE file: " +
+                         joinReasons(sc.reasons),
+                     40);
+        }
+      } else if (result.peOverlaySize > 0 &&
+                 result.peOverlaySize <= data.size()) {
+        const size_t start =
+            data.size() - static_cast<size_t>(result.peOverlaySize);
+        const std::vector<uint8_t> overlay(data.begin() + start, data.end());
+        const ShellcodeIndicators ov = DetectShellcode(overlay);
+        if (ov.Any()) {
+          AddFinding(result, "shellcode.in_overlay",
+                     "Shellcode signatures in the PE overlay: " +
+                         joinReasons(ov.reasons),
+                     35);
         }
       }
     }

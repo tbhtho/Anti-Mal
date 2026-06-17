@@ -28,6 +28,7 @@
 #include "antimal/ProcessTelemetry.h"
 #include "antimal/MitreCatalog.h"
 #include "antimal/Report.h"
+#include "antimal/ShellcodeDetector.h"
 #include "antimal/ReportDiff.h"
 #include "antimal/Simulation.h"
 #include "antimal/Scanner.h"
@@ -3589,6 +3590,48 @@ void TestSimulatedReport() {
     std::error_code ec;
     std::filesystem::remove(tmp, ec);
   }
+}
+
+// Shellcode detection: the anchored GetPC and PEB-walk stubs are found in raw
+// bytes; benign text/data does NOT trip the detector (near-zero false positives).
+void TestShellcodeDetector() {
+  using antimal::DetectShellcode;
+
+  // x86 GetPC call/pop: E8 00 00 00 00 (call $+5) + 58 (pop eax).
+  {
+    std::vector<uint8_t> sc = {0xE8, 0x00, 0x00, 0x00, 0x00, 0x58, 0x90, 0x90};
+    const auto ind = DetectShellcode(sc);
+    Expect(ind.getPcCallPop && ind.Any(), "shellcode: detects GetPC call/pop");
+  }
+  // x86 PEB walk: mov eax, fs:[0x30] -> 64 A1 30 00 00 00.
+  {
+    std::vector<uint8_t> sc = {0x64, 0xA1, 0x30, 0x00, 0x00, 0x00, 0xC3};
+    const auto ind = DetectShellcode(sc);
+    Expect(ind.pebWalk && ind.Any(), "shellcode: detects x86 PEB walk");
+  }
+  // x64 PEB walk: mov rax, gs:[0x60] -> 65 48 8B 04 25 60 00 00 00.
+  {
+    std::vector<uint8_t> sc = {0x65, 0x48, 0x8B, 0x04, 0x25,
+                               0x60, 0x00, 0x00, 0x00, 0xC3};
+    const auto ind = DetectShellcode(sc);
+    Expect(ind.pebWalk && ind.Any(), "shellcode: detects x64 PEB walk");
+  }
+  // Benign ASCII text must NOT trip the detector.
+  {
+    const std::string text =
+        "This is a perfectly benign document with no shellcode. The quick brown "
+        "fox jumps over the lazy dog 0123456789. E8 is just a hex pair in prose.";
+    std::vector<uint8_t> data(text.begin(), text.end());
+    const auto ind = DetectShellcode(data);
+    Expect(!ind.Any(), "shellcode: benign text has no shellcode signatures");
+  }
+  // An E8 NOT followed by a zero rel32 + pop must NOT match (specificity check).
+  {
+    std::vector<uint8_t> notSc = {0xE8, 0x11, 0x22, 0x33, 0x44, 0x58};
+    Expect(!DetectShellcode(notSc).getPcCallPop,
+           "shellcode: a normal relative call is not a GetPC stub");
+  }
+  Expect(!DetectShellcode({}).Any(), "shellcode: empty input is clean");
 }
 
 // MITRE catalog: known IDs (base + sub-technique) resolve to names; unknown IDs
@@ -8391,6 +8434,7 @@ int main() {
     TestFuzzyHash();
     TestFramePacingStats();
     TestSimulatedReport();
+    TestShellcodeDetector();
     TestMitreCatalog();
     TestReportDiff();
     TestAuthenticodeSigner();
