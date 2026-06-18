@@ -4,6 +4,7 @@
 #include "antimal/DetonationProtocol.h"
 #include "antimal/EventJournal.h"
 #include "antimal/PacketInspector.h"
+#include "antimal/PcapWriter.h"
 #include "antimal/FileUtil.h"
 #include "antimal/HostChannel.h"
 #include "antimal/Json.h"
@@ -12590,6 +12591,19 @@ DetonationResult InHouseOrchestrator::PrepareAndRun(
                             overlaySystemBootSecurityInspection) +
                         overlayBcdSummary +
                         FormatAcpiPciContractDiagnostics());
+      // Write a Wireshark-openable network.pcap of the guest's captured TX
+      // frames (only populated when ANTIMAL_ENABLE_NIC and the driver bound).
+      // The VMM doesn't timestamp per frame yet, so we stamp a synthetic
+      // monotonic order (1 ms apart) — the capture renders in transmit order.
+      if (!vmSummary.capturedNetworkFrames.empty()) {
+        PcapWriter pcap;
+        uint32_t idx = 0;
+        for (const auto &f : vmSummary.capturedNetworkFrames) {
+          pcap.Append(f.data(), f.size(), idx / 1000u, (idx % 1000u) * 1000u);
+          ++idx;
+        }
+        pcap.WriteFile(PathToUtf8(result.runDir / "network.pcap"));
+      }
       result.dynamicSummary =
           ToDynamicSummary(vmSummary, networkMode, serialLogPath, kdLogPath,
                            kdPacketsPath, vmSummaryPath);

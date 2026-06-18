@@ -30,6 +30,7 @@
 #include "antimal/JsonValue.h"
 #include "antimal/NetworkTelemetry.h"
 #include "antimal/PacketInspector.h"
+#include "antimal/PcapWriter.h"
 #include "antimal/IsoAnalyzer.h"
 #include "antimal/OneNoteAnalyzer.h"
 #include "antimal/PdfAnalyzer.h"
@@ -8775,6 +8776,52 @@ void TestE1000RxRing() {
   }
 }
 
+// PcapWriter: the network.pcap capture artifact. Verifies the libpcap global
+// header, per-record headers (ts + incl/orig length), frame payloads, and
+// snaplen truncation.
+void TestPcapWriter() {
+  using antimal::PcapWriter;
+  std::vector<uint8_t> f1 = {0xAA, 0xBB, 0xCC, 0xDD};
+  std::vector<uint8_t> f2(100, 0x5A);
+  PcapWriter w;
+  w.Append(f1.data(), f1.size(), 0x11223344u, 0x000186A0u);  // ts 100000us
+  w.Append(f2.data(), f2.size(), 0x11223345u, 1u);
+  const auto &b = w.Bytes();
+  Expect(w.FrameCount() == 2, "pcap: two frames appended");
+  // Global header: 24 bytes, magic 0xA1B2C3D4 little-endian.
+  Expect(b.size() == 24 + (16 + 4) + (16 + 100), "pcap: total byte length");
+  Expect(b[0] == 0xD4 && b[1] == 0xC3 && b[2] == 0xB2 && b[3] == 0xA1,
+         "pcap: magic 0xA1B2C3D4 (LE)");
+  Expect(b[4] == 2 && b[5] == 0 && b[6] == 4 && b[7] == 0,
+         "pcap: version 2.4");
+  // network (LINKTYPE) at offset 20 == 1 (Ethernet).
+  Expect(b[20] == 1 && b[21] == 0 && b[22] == 0 && b[23] == 0,
+         "pcap: link type Ethernet (1)");
+  // Record 1 header at offset 24: ts_sec, ts_usec, incl_len=4, orig_len=4.
+  auto rd32 = [](const std::vector<uint8_t> &v, size_t o) {
+    return static_cast<uint32_t>(v[o] | (v[o + 1] << 8) | (v[o + 2] << 16) |
+                                 (static_cast<uint32_t>(v[o + 3]) << 24));
+  };
+  Expect(rd32(b, 24) == 0x11223344u, "pcap: record1 ts_sec");
+  Expect(rd32(b, 28) == 0x000186A0u, "pcap: record1 ts_usec");
+  Expect(rd32(b, 32) == 4 && rd32(b, 36) == 4, "pcap: record1 incl/orig len = 4");
+  Expect(b[40] == 0xAA && b[43] == 0xDD, "pcap: record1 payload bytes");
+  // Record 2 starts at 24 + 16 + 4 = 44; payload 100 bytes of 0x5A.
+  Expect(rd32(b, 44) == 0x11223345u, "pcap: record2 ts_sec");
+  Expect(rd32(b, 52) == 100 && rd32(b, 56) == 100, "pcap: record2 incl/orig len = 100");
+  Expect(b[60] == 0x5A && b[60 + 99] == 0x5A, "pcap: record2 payload");
+
+  // snaplen truncation: a frame longer than snaplen is captured truncated, but
+  // orig_len records the full length.
+  PcapWriter small(16);
+  std::vector<uint8_t> big(64, 0x7E);
+  small.Append(big.data(), big.size(), 5, 6);
+  const auto &sb = small.Bytes();
+  Expect(rd32(sb, 24 + 8) == 16, "pcap: incl_len clamped to snaplen");
+  Expect(rd32(sb, 24 + 12) == 64, "pcap: orig_len is the full length");
+  Expect(sb.size() == 24 + 16 + 16, "pcap: truncated record stores only snaplen bytes");
+}
+
 void TestNicPciConfig() {
   antimal::hv::PcIoDevices pc;
   pc.SetNicPresent(true);
@@ -9876,6 +9923,7 @@ int main() {
     TestPacketInspector();
     TestE1000Device();
     TestE1000RxRing();
+    TestPcapWriter();
     TestNicPciConfig();
     TestHttpUrlEncode();
     TestFramebufferVisiblePixels();
