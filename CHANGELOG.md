@@ -40,6 +40,9 @@ unit-tested. A living `private development documentation` tracks done/remaining 
 - **`boot-report` failure breakdown:** `--json` now emits `byCategory`, `byRemediation`, and the
   `incomplete` count; text mode prints the single most common actionable remediation across runs
   (the highest-leverage fix for the dominant failure mode).
+- **GUI "Recover config / C2" (`scan.config` bridge):** the scan panel gains a button that runs the
+  config/C2 extractors (Cobalt Strike + XOR + base64-wrapped RC4) on the worker and lists the recovered
+  Malware Configuration inline — GUI parity for the CLI `config` command (mirrors the `scan.yara` path).
 - **`config` command — the "Malware Configuration" view:** runs every static config/C2 extractor
   (Cobalt Strike beacon + single/multi-byte XOR + base64-wrapped + base64-wrapped RC4) on a sample and
   presents only the recovered configuration in one focused, analyst-facing place (text + `--json`).

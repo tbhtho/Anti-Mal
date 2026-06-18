@@ -24,8 +24,10 @@
 #include "antimal/FileUtil.h"
 #include "antimal/Json.h"
 #include "antimal/JsonValue.h"
+#include "antimal/ConfigExtractor.h"
 #include "antimal/Report.h"
 #include "antimal/Scanner.h"
+#include "antimal/Strings.h"
 #include "antimal/YaraGen.h"
 
 // CLSID_FileOpenDialog lives in uuid.lib; CoCreateInstance/CoInitializeEx in
@@ -747,6 +749,52 @@ void WebViewHost::RegisterHandlers() {
       } catch (...) {
         WebViewHost::Emit(h, "scan.yara",
                           "{\"error\":\"yara generation failed\"}");
+      }
+      CoUninitialize();
+    }).detach();
+    return std::string(R"({"started":true})");
+  });
+
+  // P3: the "Malware Configuration" view -- run the static config/C2 extractors
+  // (Cobalt Strike beacon + XOR + base64-wrapped RC4) on the scanned file and
+  // Emit the recovered C2 as one focused list, GUI parity for the CLI `config`
+  // command. On a worker so a large file can't hang the UI.
+  router_.Register("scan.config", [this](const JsonValue &args) -> std::string {
+    const std::string path = args.At("path").AsString();
+    if (path.empty()) throw std::runtime_error("missing path");
+    const HWND h = hwnd_;
+    std::thread([h, path]() {
+      CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+      try {
+        const auto bytes = ReadAllBytes(std::filesystem::path(Widen(path)));
+        std::vector<std::string> lines; // human-readable "kind: value" entries
+        const auto cs = ExtractCobaltStrikeConfig(bytes);
+        if (cs.found) {
+          for (const auto &s : cs.c2Servers)
+            lines.push_back("Cobalt Strike C2: " + s +
+                            (cs.port ? ":" + std::to_string(cs.port) : ""));
+          if (!cs.userAgent.empty())
+            lines.push_back("Cobalt Strike UA: " + cs.userAgent);
+        }
+        for (const auto &x : MineXorObfuscatedUrls(bytes))
+          lines.push_back("XOR C2: " + x.value);
+        for (const auto &x : MineMultiByteXorObfuscatedUrls(bytes))
+          lines.push_back("multibyte-XOR C2: " + x.value);
+        for (const auto &r : MineRc4WrappedConfig(bytes))
+          lines.push_back("RC4 " + r.kind + " (key \"" + r.key + "\"): " + r.value);
+        const auto b64 = MineBase64WrappedIocs(bytes);
+        for (const auto &u : b64.urls) lines.push_back("base64 URL: " + u);
+        for (const auto &ip : b64.ips) lines.push_back("base64 IP: " + ip);
+        std::string arr = "[";
+        for (size_t i = 0; i < lines.size(); ++i)
+          arr += (i ? "," : "") + JsonQuote(lines[i]);
+        arr += "]";
+        WebViewHost::Emit(h, "scan.config",
+                          "{\"path\":" + JsonQuote(path) +
+                              ",\"config\":" + arr + "}");
+      } catch (...) {
+        WebViewHost::Emit(h, "scan.config",
+                          "{\"error\":\"config extraction failed\"}");
       }
       CoUninitialize();
     }).detach();
