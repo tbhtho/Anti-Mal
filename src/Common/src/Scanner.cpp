@@ -8,6 +8,7 @@
 #include "antimal/ConfigExtractor.h"
 #include "antimal/ContainerAnalyzer.h"
 #include "antimal/IsoAnalyzer.h"
+#include "antimal/OneNoteAnalyzer.h"
 #include "antimal/PdfAnalyzer.h"
 #include "antimal/RtfAnalyzer.h"
 #include "antimal/PeParser.h"
@@ -385,6 +386,12 @@ std::string IdentifyFileType(const std::vector<uint8_t> &data) {
   if (has({'C', 'D', '0', '0', '1'}, 0x8001)) {
     return "iso";
   }
+  // OneNote section file ([MS-ONESTORE] guidFileType) -- the dominant 2023-24
+  // malspam carrier (embedded attachments launched on click).
+  if (has({0xE4, 0x52, 0x5C, 0x7B, 0x8C, 0xD8, 0xA7, 0x4D, 0xAE, 0xB1, 0x53,
+           0x78, 0xD0, 0x29, 0x96, 0xD3})) {
+    return "onenote";
+  }
   if (has({0x4C, 0x00, 0x00, 0x00, 0x01, 0x14, 0x02, 0x00})) {
     return "lnk"; // Windows shell link header GUID
   }
@@ -637,6 +644,14 @@ ScanResult ScanFile(const std::filesystem::path &path,
     if (result.detectedType == "iso") {
       const IsoAnalysis iso = AnalyzeIso(data);
       for (const auto &f : iso.findings) {
+        AddFinding(result, f.ruleId, f.message, f.score);
+      }
+    }
+
+    // OneNote click-to-run lure (embedded attachment launched on click).
+    if (result.detectedType == "onenote") {
+      const OneNoteAnalysis one = AnalyzeOneNote(data);
+      for (const auto &f : one.findings) {
         AddFinding(result, f.ruleId, f.message, f.score);
       }
     }

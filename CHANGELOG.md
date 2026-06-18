@@ -44,6 +44,12 @@ unit-tested. A living `private development documentation` tracks done/remaining 
   TLS C2, an interactive remote shell (T1219), keylogging (T1056.001), screen capture (T1113), and
   exfil over C2 (T1041) — spanning Execution→Persistence→Credential Access→Collection→C2→Exfil. Adds
   the ATT&CK techniques T1219/T1113 to the catalog (name + tactic).
+- **OneNote (.one) maldoc analyzer (`OneNoteAnalyzer`):** OneNote was the dominant malspam carrier of
+  2023-24 (a "double-click to view" graphic over an embedded attachment OneNote runs with no macro
+  warning). `ScanFile` now detects the [MS-ONESTORE] file GUID and routes to a heuristic analyzer
+  flagging an embedded FileDataStore attachment, an embedded PE (DOS-stub anchor), and embedded script
+  payloads (powershell/wsh/bat/html) — a bounded content sweep, not a full ONESTORE parse. Unit-tested
+  + malformed corpus; verified end-to-end (synthetic lure → 85/malicious).
 - **ISO/IMG disk-image analyzer (`IsoAnalyzer`):** mounting a downloaded `.iso` bypasses
   Mark-of-the-Web, so ISO images became a top delivery vector (lure `.lnk` → hidden payload).
   `ScanFile` now detects ISO9660 (`CD001` at 0x8001) and routes to a heuristic analyzer that flags an

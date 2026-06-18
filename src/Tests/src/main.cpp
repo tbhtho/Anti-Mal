@@ -30,6 +30,7 @@
 #include "antimal/NetworkTelemetry.h"
 #include "antimal/PacketInspector.h"
 #include "antimal/IsoAnalyzer.h"
+#include "antimal/OneNoteAnalyzer.h"
 #include "antimal/PdfAnalyzer.h"
 #include "antimal/RtfAnalyzer.h"
 #include "antimal/PeParser.h"
@@ -4243,6 +4244,7 @@ void TestMalformedInputRobustness() {
     (void)AnalyzePdf(in);
     (void)AnalyzeRtf(in);
     (void)AnalyzeIso(in);
+    (void)AnalyzeOneNote(in);
     (void)AnalyzeContainer(in, ".zip");
     (void)AnalyzeContainer(in, ".docx");
     (void)AnalyzeContainer(in, "");
@@ -5482,6 +5484,43 @@ void TestIsoAnalyzer() {
   // Too-small buffer doesn't over-read.
   Expect(!AnalyzeIso({'C', 'D', '0', '0', '1'}).isIso,
          "ISO: a tiny buffer doesn't over-read");
+}
+
+void TestOneNoteAnalyzer() {
+  using antimal::AnalyzeOneNote;
+  using antimal::OneNoteAnalysis;
+  auto has = [](const OneNoteAnalysis &a, const char *id) {
+    for (const auto &f : a.findings)
+      if (f.ruleId == id) return true;
+    return false;
+  };
+  const uint8_t magic[] = {0xE4, 0x52, 0x5C, 0x7B, 0x8C, 0xD8, 0xA7, 0x4D,
+                           0xAE, 0xB1, 0x53, 0x78, 0xD0, 0x29, 0x96, 0xD3};
+  const uint8_t fds[] = {0xE7, 0x16, 0xE3, 0xBD, 0x65, 0x26, 0x11, 0x45,
+                         0xA4, 0xC8, 0x3D, 0x87, 0x08, 0x0A, 0x65, 0xC9};
+  std::vector<uint8_t> one(magic, magic + sizeof(magic));
+  one.insert(one.end(), fds, fds + sizeof(fds)); // a FileDataStore attachment
+  const char *dos = "This program cannot be run in DOS mode";
+  one.insert(one.end(), dos, dos + std::strlen(dos)); // embedded PE
+
+  const auto a = AnalyzeOneNote(one);
+  Expect(a.isOneNote, "OneNote: file GUID recognized");
+  Expect(a.hasEmbeddedFile && has(a, "onenote.embedded_file"),
+         "OneNote: FileDataStore attachment flagged");
+  Expect(a.embeddedExecutable && has(a, "onenote.embedded_exe"),
+         "OneNote: embedded PE flagged");
+
+  // An embedded script is detected too.
+  std::vector<uint8_t> sc(magic, magic + sizeof(magic));
+  const char *ps = "powershell -enc ZQBjAGgAbwA=";
+  sc.insert(sc.end(), ps, ps + std::strlen(ps));
+  Expect(AnalyzeOneNote(sc).embeddedScript, "OneNote: embedded script flagged");
+
+  // Non-OneNote input rejected, no over-read on a tiny buffer.
+  Expect(!AnalyzeOneNote({0xE4, 0x52}).isOneNote,
+         "OneNote: a tiny buffer doesn't over-read");
+  Expect(!AnalyzeOneNote(std::vector<uint8_t>(64, 0x41)).isOneNote,
+         "OneNote: non-OneNote rejected");
 }
 
 // Cobalt Strike beacon-config extraction: build a synthetic XOR-encoded TLV
@@ -9527,6 +9566,7 @@ int main() {
     TestPdfAnalyzer();
     TestRtfAnalyzer();
     TestIsoAnalyzer();
+    TestOneNoteAnalyzer();
     TestCobaltStrikeConfig();
     TestImportCapabilities();
     TestBrowserRisk();
