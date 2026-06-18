@@ -206,7 +206,7 @@ void PrintUsage() {
       << "  antimal fs-find [--vhdx <d.vhdx>] [--overlay <o.cow>] <name-substring>   (offline recursive search)\n"
       << "  antimal fs-scan [--vhdx <d.vhdx>] [--overlay <o.cow>] <guest\\path>   (extract + static-scan a guest file)\n"
       << "  antimal reg-ls [--hive software|system|sam|...] [--overlay <o.cow>] <reg\\key> [--values] [--depth N] [--filter <s>]\n"
-      << "  antimal report <run-id-or-report.json> [--html] [--detections|--usability|--timeline [--json]]\n"
+      << "  antimal report <run-id-or-report.json> [--html] [--summary|--detections|--usability|--timeline [--json]]\n"
       << "  antimal browser-impact <run-id-or-report.json> --decrypt-browser-secrets\n"
       << "  antimal export <run-id-or-report.json> --format stix|misp|csv|yara [--out <file>]\n"
       << "  antimal similarity <fileA> <fileB> [--json]   (fuzzy-hash similarity 0..100)\n"
@@ -2953,6 +2953,63 @@ int CommandReport(int argc, wchar_t **argv) {
   const auto config = antimal::LoadConfig(antimal::DefaultConfigPath());
   const auto reportPath = ResolveReportPath(config, std::filesystem::path(argv[2]));
   auto report = antimal::LoadReportBestEffort(reportPath);
+  if (HasFlag(argc, argv, "--summary")) {
+    // A compact, at-a-glance triage view: verdict + boot stage + the counts an
+    // analyst (or a dashboard/CI job) wants without parsing the full report or
+    // opening the HTML. --json emits a stable, versioned summary object.
+    const antimal::BootOutcome bo =
+        antimal::ClassifyBootOutcome(report.dynamicSummary);
+    const auto tree = antimal::BuildProcessTree(report.events);
+    const auto dets = antimal::BuildDetections(report);
+    std::map<std::string, int> byCat; // event category -> count
+    for (const auto &e : report.events) ++byCat[e.category];
+    int high = 0, med = 0;
+    for (const auto &d : dets) {
+      if (d.severityLabel == "high") ++high;
+      else if (d.severityLabel == "medium") ++med;
+    }
+    if (HasFlag(argc, argv, "--json")) {
+      std::cout << "{\"schemaVersion\":1"
+                << ",\"runId\":" << JsonQuote(report.runId)
+                << ",\"verdict\":" << JsonQuote(antimal::ToString(report.sandboxVerdict))
+                << ",\"verdictScore\":" << report.verdictScore
+                << ",\"bootStage\":" << JsonQuote(bo.stage)
+                << ",\"sampleExecuted\":"
+                << (report.dynamicSummary.sampleExecuted ? "true" : "false")
+                << ",\"events\":" << report.events.size()
+                << ",\"processes\":" << tree.size()
+                << ",\"mitreTechniques\":" << report.mitreTechniques.size()
+                << ",\"networkDomains\":" << report.networkDomains.size()
+                << ",\"detections\":" << dets.size()
+                << ",\"detectionsHigh\":" << high
+                << ",\"detectionsMedium\":" << med
+                << ",\"eventsByCategory\":{";
+      bool first = true;
+      for (const auto &kv : byCat) {
+        std::cout << (first ? "" : ",") << JsonQuote(kv.first) << ":" << kv.second;
+        first = false;
+      }
+      std::cout << "}}\n";
+      return 0;
+    }
+    std::cout << "Run " << report.runId << "\n";
+    std::cout << "  verdict:    " << antimal::ToString(report.sandboxVerdict)
+              << " (score " << report.verdictScore << ")\n";
+    std::cout << "  boot:       " << bo.stage << " -- " << bo.detail << "\n";
+    std::cout << "  sample run: "
+              << (report.dynamicSummary.sampleExecuted ? "yes" : "no") << "\n";
+    std::cout << "  events:     " << report.events.size() << " ("
+              << tree.size() << " processes)\n";
+    for (const auto &kv : byCat) {
+      std::cout << "    - " << kv.first << ": " << kv.second << "\n";
+    }
+    std::cout << "  mitre:      " << report.mitreTechniques.size()
+              << " techniques\n";
+    std::cout << "  network:    " << report.networkDomains.size() << " domain(s)\n";
+    std::cout << "  detections: " << dets.size() << " (" << high << " high, "
+              << med << " medium)\n";
+    return 0;
+  }
   if (HasFlag(argc, argv, "--detections")) {
     // The severity-ranked behavior summary (boot outcome + verdict + ranked
     // detections). A quick terminal triage view without opening the HTML.

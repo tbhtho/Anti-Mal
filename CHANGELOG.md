@@ -40,6 +40,10 @@ unit-tested. A living `private development documentation` tracks done/remaining 
 - **`boot-report` failure breakdown:** `--json` now emits `byCategory`, `byRemediation`, and the
   `incomplete` count; text mode prints the single most common actionable remediation across runs
   (the highest-leverage fix for the dominant failure mode).
+- **`report --summary` (T53-adjacent):** a compact at-a-glance triage view — verdict/score, boot
+  stage, sample-executed, event count + per-category breakdown, process/MITRE/network/detection
+  counts — without parsing the full report. `--json` emits a stable versioned (`schemaVersion:1`)
+  summary object for dashboards/CI.
 - **Filterable `report --timeline`:** `--category <c>`, `--mitre` (only events carrying a technique),
   and `--limit N` make a large telemetry stream triageable; the header shows matched/total. Also
   fixed a redundant `category.action` render (e.g. `process.process.running` → `process.running`).
