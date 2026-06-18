@@ -42,6 +42,7 @@
     <ClInclude Include="include\antimal\ContainerAnalyzer.h" />
     <ClInclude Include="include\antimal\BehaviorScore.h" />
     <ClInclude Include="include\antimal\BootDiagnostics.h" />
+    <ClInclude Include="include\antimal\BootReliability.h" />
     <ClInclude Include="include\antimal\CrashSummary.h" />
     <ClInclude Include="include\antimal\Crypto.h" />
     <ClInclude Include="include\antimal\DetectionSummary.h" />
@@ -88,6 +89,7 @@
   <ItemGroup>
     <ClCompile Include="src\BehaviorScore.cpp" />
     <ClCompile Include="src\BootDiagnostics.cpp" />
+    <ClCompile Include="src\BootReliability.cpp" />
     <ClCompile Include="src\BridgeRouter.cpp" />
     <ClCompile Include="src\CommandLineClassifier.cpp" />
     <ClCompile Include="src\BrowserImpact.cpp" />

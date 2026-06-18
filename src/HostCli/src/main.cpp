@@ -1,5 +1,6 @@
 #include "antimal/BehaviorScore.h"
 #include "antimal/BootDiagnostics.h"
+#include "antimal/BootReliability.h"
 #include "antimal/ConfigExtractor.h"
 #include "antimal/CrashSummary.h"
 #include "antimal/BrowserImpact.h"
@@ -3627,56 +3628,13 @@ int CommandBootReport(int argc, wchar_t **argv) {
     return 2;
   }
 
-  int total = 0, reachedDesktop = 0, reachedUserMode = 0, incomplete = 0;
-  std::map<std::string, int> byStage;        // stage -> count
-  std::map<std::string, int> byCategory;     // category -> count
-  std::map<std::string, int> byRemediation;  // remediation hint -> count
-  std::error_code ec;
-  for (const auto &entry : std::filesystem::directory_iterator(ws, ec)) {
-    if (!entry.is_directory()) continue;
-    const std::string name = antimal::PathToUtf8(entry.path().filename());
-    if (!name.empty() && name[0] == '_') continue; // _base, _intel_cache, ...
-    // A run dir with a job.json but no report.json is an attempted-but-incomplete
-    // run (the host was killed/crashed before the final report was written).
-    // Don't silently drop it -- that would inflate the reliability numbers. But
-    // don't flatly call it a failure either: the live events.jsonl journal often
-    // proves the guest actually booted. GuestAgent telemetry comes from the
-    // session-0 service, so its presence proves OS-up / user-mode (NOT desktop --
-    // same rule as hostChannelBytes>0), letting us recover the real reach of a
-    // run whose report was never finalized.
-    const auto rpt = entry.path() / "report.json";
-    if (!std::filesystem::exists(rpt)) {
-      if (!std::filesystem::exists(entry.path() / "job.json")) continue;
-      ++total;
-      ++incomplete;
-      bool guestTelemetry = false;
-      std::ifstream ev(entry.path() / "events.jsonl");
-      for (std::string line; std::getline(ev, line);) {
-        if (line.find("\"source\":\"GuestAgent\"") != std::string::npos) {
-          guestTelemetry = true;
-          break;
-        }
-      }
-      if (guestTelemetry) {
-        ++reachedUserMode;
-        ++byStage["user-mode (telemetry, no report)"];
-        ++byCategory["user-mode-no-desktop"];
-      } else {
-        ++byStage["incomplete (no report)"];
-        ++byCategory["incomplete"];
-      }
-      continue;
-    }
-    const auto report = antimal::LoadReportBestEffort(rpt);
-    const antimal::BootOutcome bo =
-        antimal::ClassifyBootOutcome(report.dynamicSummary);
-    ++total;
-    ++byStage[bo.stage];
-    ++byCategory[bo.category];
-    if (!bo.remediation.empty()) ++byRemediation[bo.remediation];
-    if (bo.reachedDesktop) ++reachedDesktop;
-    if (bo.reachedUserMode) ++reachedUserMode;
-  }
+  // Shared, unit-tested aggregation (Common) -- the CLI is a thin view over it.
+  const antimal::BootReliability rel = antimal::AggregateBootReliability(ws);
+  const int total = rel.runs, reachedDesktop = rel.reachedDesktop,
+            reachedUserMode = rel.reachedUserMode, incomplete = rel.incomplete;
+  const auto &byStage = rel.byStage;
+  const auto &byCategory = rel.byCategory;
+  const auto &byRemediation = rel.byRemediation;
 
   auto pct = [](int n, int d) {
     return d > 0 ? (100.0 * n / d) : 0.0;

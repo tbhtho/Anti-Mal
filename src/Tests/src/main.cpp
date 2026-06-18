@@ -6,6 +6,7 @@
 #include "antimal/ConfigExtractor.h"
 #include "antimal/ContainerAnalyzer.h"
 #include "antimal/BootDiagnostics.h"
+#include "antimal/BootReliability.h"
 #include "antimal/CommandLineClassifier.h"
 #include "antimal/Crypto.h"
 #include "antimal/CrashSummary.h"
@@ -4405,6 +4406,62 @@ void TestBootDiagnostics() {
     Expect(!o.stage.empty() && !o.detail.empty() && !o.remediation.empty(),
            "boot: every outcome has stage + detail + remediation");
   }
+}
+
+// Workspace boot-reliability aggregation: builds a temp workspace of fake run
+// dirs (a desktop report, a telemetry-bearing incomplete run, a truly-incomplete
+// run, and a skipped _-prefixed dir) and asserts the rollup counts.
+void TestBootReliability() {
+  namespace fs = std::filesystem;
+  const fs::path ws = fs::temp_directory_path() /
+                      ("antimal-reltest-" + std::to_string(
+                          std::hash<std::string>{}("relfixture")));
+  std::error_code ec;
+  fs::remove_all(ws, ec);
+  fs::create_directories(ws, ec);
+  auto write = [](const fs::path &p, const std::string &s) {
+    std::ofstream f(p, std::ios::binary);
+    f << s;
+  };
+
+  // 1) A completed run: a valid report.json (goes through the report/classify
+  //    branch, NOT the incomplete branch). Exact stage is the classifier's call;
+  //    we only assert it's counted as a run with a report.
+  {
+    fs::create_directories(ws / "run-report", ec);
+    const auto r = antimal::BuildSimulatedReport("run-report");
+    antimal::WriteReportJson(ws / "run-report" / "report.json", r);
+  }
+  // 2) Incomplete run WITH GuestAgent telemetry -> recovered as user-mode.
+  {
+    fs::create_directories(ws / "run-telemetry", ec);
+    write(ws / "run-telemetry" / "job.json", "{}");
+    write(ws / "run-telemetry" / "events.jsonl",
+          "{\"source\":\"GuestAgent\",\"category\":\"process\"}\n");
+  }
+  // 3) Incomplete run with NO telemetry -> truly incomplete.
+  {
+    fs::create_directories(ws / "run-dead", ec);
+    write(ws / "run-dead" / "job.json", "{}");
+    write(ws / "run-dead" / "events.jsonl", "\n");
+  }
+  // 4) A _-prefixed dir must be skipped entirely.
+  { fs::create_directories(ws / "_base", ec); write(ws / "_base" / "job.json", "{}"); }
+
+  const auto rel = antimal::AggregateBootReliability(ws);
+  Expect(rel.runs == 3, "reliability: counts the 3 run dirs, skips _base");
+  Expect(rel.incomplete == 2, "reliability: 2 runs lacked a finalized report");
+  Expect(rel.reachedUserMode >= 1,
+         "reliability: the telemetry-recovered run counts as user-mode");
+  Expect(rel.byStage.count("user-mode (telemetry, no report)") == 1 &&
+             rel.byStage.at("user-mode (telemetry, no report)") == 1,
+         "reliability: telemetry-bearing incomplete run is recovered, not dropped");
+  Expect(rel.byStage.count("incomplete (no report)") == 1,
+         "reliability: the no-telemetry run is the only truly-incomplete one");
+  // Missing workspace -> all-zero, no throw.
+  const auto empty = antimal::AggregateBootReliability(ws / "does-not-exist");
+  Expect(empty.runs == 0, "reliability: missing workspace yields zero, no throw");
+  fs::remove_all(ws, ec);
 }
 
 // Shellcode detection: the anchored GetPC and PEB-walk stubs are found in raw
@@ -9283,6 +9340,7 @@ int main() {
     TestRc4WrappedConfig();
     TestCrashSummary();
     TestBootDiagnostics();
+    TestBootReliability();
     TestCommandLineClassifier();
     TestUsabilityDiagnostics();
     TestPackerDetection();
