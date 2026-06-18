@@ -32,7 +32,11 @@ param(
   [switch]$Interactive,
   # NoPassword: patch the overlay for AutoAdminLogon (built-in Administrator, blank password)
   # instead of typing a password -- the hands-free "no password" path.
-  [switch]$NoPassword
+  [switch]$NoPassword,
+  # When set, also write a machine-readable JSON summary (run count, desktop/os-up
+  # rates, per-stage histogram, per-boot details) to this path. Feed it to
+  # Validate-DesktopReach.ps1 to gate a reliability SLA in CI/automation.
+  [string]$Json = ""
 )
 $ws  = "C:\AntiMalRuns"
 $bin = "bin\x64\Release"
@@ -160,3 +164,24 @@ if (-not $Interactive) {
   Write-Host ("`nNOTE: not -Interactive -> the VM is auto-stopped after the agent probe, BEFORE the 120-360s login window, so 'os-up/lockscreen' is expected. Re-run with -Interactive to measure the actual desktop-reach.")
 }
 Write-Host ("`nFor any DESKTOP run, inspect screenshots\guest-*.png (largest) to visually confirm the desktop, and events.jsonl for process.* telemetry.")
+
+# Machine-readable summary for the SLA gate (Validate-DesktopReach.ps1).
+if ($Json -ne "") {
+  $total = [Math]::Max($rows.Count, 1)
+  $byStage = @{}
+  foreach ($r in $rows) { if ($byStage.ContainsKey($r.stage)) { $byStage[$r.stage]++ } else { $byStage[$r.stage] = 1 } }
+  $summary = [PSCustomObject]@{
+    schemaVersion    = 1
+    mode             = $mode
+    runs             = $rows.Count
+    desktopReached   = $desktop
+    osUp             = $osUpCount
+    desktopReachRate = [Math]::Round(100.0 * $desktop / $total, 1)
+    osUpRate         = [Math]::Round(100.0 * $osUpCount / $total, 1)
+    interactive      = [bool]$Interactive
+    byStage          = $byStage
+    details          = $rows
+  }
+  $summary | ConvertTo-Json -Depth 5 | Out-File -FilePath $Json -Encoding utf8
+  Write-Host ("`nWrote desktop-reach JSON summary: {0}" -f $Json)
+}
