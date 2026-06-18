@@ -289,12 +289,30 @@
       appendLog('INFO', 'No config recovered.');
       return;
     }
-    // textContent per row => injection-safe
-    var html = '<h2 style="margin:8px 0">Malware Configuration (' + items.length + ')</h2><ul class="why">';
-    out.innerHTML = html + items.map(function () { return '<li></li>'; }).join('') + '</ul>';
-    var lis = out.querySelectorAll('li');
-    for (var i = 0; i < lis.length && i < items.length; i++) lis[i].textContent = items[i];
+    // textContent per row => injection-safe. A defang toggle renders the C2 safe
+    // to copy/share (hxxp://, 1[.]2[.]3[.]4) without re-querying the host.
+    out.innerHTML = '<h2 style="margin:8px 0">Malware Configuration (' + items.length + ')</h2>' +
+      '<label style="font-size:12px;display:block;margin-bottom:6px"><input type="checkbox" id="cfg-defang"> defang (safe to copy)</label>' +
+      '<ul class="why">' + items.map(function () { return '<li></li>'; }).join('') + '</ul>';
+    var render = function () {
+      var dfg = $('#cfg-defang') && $('#cfg-defang').checked;
+      var lis = out.querySelectorAll('li');
+      for (var i = 0; i < lis.length && i < items.length; i++) {
+        lis[i].textContent = dfg ? defangIoc(items[i]) : items[i];
+      }
+    };
+    var box = $('#cfg-defang'); if (box) box.onchange = render;
+    render();
     appendLog('WARN', 'Recovered ' + items.length + ' config/C2 indicator(s).');
+  }
+  // Client-side IOC defang, mirroring the C++ antimal::Defang (display-only).
+  function defangIoc(s) {
+    return String(s)
+      .replace(/https:\/\//g, 'hxxps://')
+      .replace(/http:\/\//g, 'hxxp://')
+      .replace(/ftp:\/\//g, 'fxp://')
+      .replace(/\./g, '[.]')
+      .replace(/@/g, '[@]');
   }
   function onYaraResult(d) {
     var yb = $('#yara-gen-btn'); if (yb) { yb.disabled = false; yb.textContent = 'Generate YARA rule'; }
