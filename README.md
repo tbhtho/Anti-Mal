@@ -308,6 +308,16 @@ bin\x64\Release\AntiMal.HostCli.exe base inspect `
 
 This reads the VHDX through AntiMal's block device layer, parses GPT, parses the FAT32 ESP, checks the UEFI boot files, decodes the BCD registry hive, verifies the boot manager/default loader contract, parses the NTFS Windows partition, prints NTFS data-run/LBA ranges for boot files, verifies `winload.efi`, and decodes SYSTEM hive boot-storage service state. `base inspect --overlay <overlay.cow>` chains a copy-on-write overlay on top of the base (read-only) to show the post-patch view.
 
+For a **pass/fail readiness verdict** (e.g. before spending a 15-minute cold boot on a freshly rebuilt base), use `base validate` — it runs the same offline reads but returns a structured result: *critical* checks (ESP/FAT32, UEFI boot files, BCD→winload/\Windows, NTFS, `winload.efi`/`ntoskrnl.exe`/`hal.dll`/`ci.dll`, SYSTEM hive) gate the exit code, while *advisory* checks (the `{60FD87F8-…}.cip` CI anchor, deployed GuestAgent + service `ImagePath`, `AutoAdminLogon`, `SetupComplete.cmd`, unattend) are reported as warnings:
+
+```powershell
+bin\x64\Release\AntiMal.HostCli.exe base validate `
+  --vhdx C:\AntiMalRuns\_base\AntiMalBase.vhdx --json
+#   -> exit 0 = bootable; nonzero = a critical prerequisite is missing (named in the output).
+```
+
+See private development documentation (private documentation) for the full unblock plan this gates.
+
 ## Repository Layout
 
 ```text

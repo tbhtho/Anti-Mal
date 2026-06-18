@@ -222,6 +222,7 @@ void PrintUsage() {
       << "  antimal base convert --vhdx <base.vhdx> --raw <AntiMalBase.raw> [--force]\n"
       << "  antimal base inspect --vhdx <base.vhdx> [--overlay <overlay.cow>]\n"
       << "                       [--dump-bcd <out.bcd>] [--dump-system <out.hive>]\n"
+      << "  antimal base validate --vhdx <base.vhdx> [--overlay <o.cow>] [--json]   (offline boot-readiness pass/fail)\n"
       << "  antimal fs-ls  [--vhdx <d.vhdx>] [--overlay <o.cow>] <guest\\path>   (offline guest dir listing)\n"
       << "  antimal fs-cat [--vhdx <d.vhdx>] [--overlay <o.cow>] <guest\\path> [--out <file>]\n"
       << "  antimal fs-find [--vhdx <d.vhdx>] [--overlay <o.cow>] <name-substring>   (offline recursive search)\n"
@@ -2966,6 +2967,219 @@ int CommandBaseInspect(int argc, wchar_t **argv,
   return ok ? 0 : 1;
 }
 
+// `base validate` — offline pass/fail readiness check of a base image (or
+// base+overlay) BEFORE spending a live boot. Reuses the same offline readers as
+// `base inspect` (Fat32Reader/NtfsReader/RegistryHiveReader) but turns the
+// inspection into a structured verdict: CRITICAL checks (is it bootable?) gate
+// the exit code; ADVISORY checks (agent deployed? auto-logon? unattend?) are
+// reported but don't fail. This is the Criterion-9 unblock tool: validate a
+// freshly-rebuilt base in seconds instead of discovering a missing prerequisite
+// 15 minutes into a cold boot.
+int CommandBaseValidate(int argc, wchar_t **argv,
+                        const antimal::AppConfig &config) {
+  const bool json = HasFlag(argc, argv, "--json");
+  const auto vhdxText = OptionValue(argc, argv, "--vhdx");
+  const auto overlayText = OptionValue(argc, argv, "--overlay");
+  const std::filesystem::path vhdx =
+      vhdxText ? std::filesystem::path(Utf8ToWide(*vhdxText)) : config.baseVhdxPath;
+  if (vhdx.empty()) {
+    std::cerr << "base validate needs --vhdx, or a configured base_vhdx_path.\n";
+    return 2;
+  }
+
+  struct Check {
+    std::string id;
+    std::string status; // "pass" | "fail" | "warn" | "skip"
+    bool critical = false;
+    std::string detail;
+  };
+  std::vector<Check> checks;
+  auto add = [&](const std::string &id, bool critical, bool pass,
+                 const std::string &detail) {
+    checks.push_back({id, pass ? "pass" : "fail", critical, detail});
+  };
+  auto advise = [&](const std::string &id, bool present,
+                    const std::string &detail) {
+    checks.push_back({id, present ? "pass" : "warn", false, detail});
+  };
+
+  try {
+    antimal::hv::VhdxBlockDevice disk = antimal::hv::VhdxBlockDevice::Open(vhdx);
+    std::optional<antimal::hv::CowOverlayBlockDevice> overlayDevice;
+    antimal::hv::IBlockDevice *activeDisk = &disk;
+    if (overlayText) {
+      overlayDevice.emplace(antimal::hv::CowOverlayBlockDevice::Open(
+          &disk, std::filesystem::path(Utf8ToWide(*overlayText))));
+      activeDisk = &*overlayDevice;
+    }
+
+    const auto partitions = ReadGptPartitions(*activeDisk);
+    const GptPartitionInfo *esp = nullptr;
+    const GptPartitionInfo *windows = nullptr;
+    for (const auto &part : partitions) {
+      const auto kind = PartitionKind(part.typeGuid);
+      if (!esp && kind == "ESP") esp = &part;
+      if (!windows && kind == "Windows/basic-data") windows = &part;
+    }
+
+    // --- ESP / FAT32 / EFI boot files (CRITICAL) ---
+    if (!esp) {
+      add("esp.present", true, false, "no EFI System Partition in the GPT");
+    } else {
+      Fat32Reader fat(*activeDisk, esp->firstLba);
+      const bool fatOk = fat.Init();
+      add("esp.fat32", true, fatOk, fatOk ? "ESP is a readable FAT32 volume"
+                                          : "ESP is not a readable FAT32 volume");
+      if (fatOk) {
+        const auto bootx64 = fat.FindPath("EFI\\BOOT\\BOOTX64.EFI");
+        add("boot.bootx64", true, bootx64.has_value(),
+            "EFI\\BOOT\\BOOTX64.EFI");
+        const auto mgfw = fat.FindPath("EFI\\Microsoft\\Boot\\bootmgfw.efi");
+        add("boot.bootmgfw", true, mgfw.has_value(),
+            "EFI\\Microsoft\\Boot\\bootmgfw.efi");
+        const auto bcd = fat.FindPath("EFI\\Microsoft\\Boot\\BCD");
+        add("boot.bcd", true, bcd.has_value(), "EFI\\Microsoft\\Boot\\BCD");
+        if (bcd) {
+          const auto bytes = fat.ReadFile(*bcd, 4ull * 1024ull * 1024ull);
+          const bool refsWinload =
+              ContainsUtf16AsciiNoCase(bytes, "winload.efi") ||
+              ContainsAsciiNoCase(bytes, "winload.efi");
+          const bool refsWindows =
+              ContainsUtf16AsciiNoCase(bytes, "\\Windows") ||
+              ContainsAsciiNoCase(bytes, "\\Windows");
+          add("bcd.references", true, refsWinload && refsWindows,
+              "BCD references winload.efi + \\Windows");
+        }
+      }
+    }
+
+    // --- Windows partition / NTFS / kernel boot files (CRITICAL) ---
+    if (!windows) {
+      add("windows.partition", true, false,
+          "no Windows/basic-data partition in the GPT");
+    } else {
+      NtfsReader ntfs(*activeDisk, windows->firstLba);
+      const bool ntfsOk = ntfs.Init();
+      add("windows.ntfs", true, ntfsOk,
+          ntfsOk ? "Windows partition is readable NTFS"
+                 : "Windows partition is not readable NTFS");
+      if (ntfsOk) {
+        struct WinFile { const char *id; const char *path; bool critical; };
+        const WinFile winFiles[] = {
+            {"win.winload", "Windows\\System32\\winload.efi", true},
+            {"win.ntoskrnl", "Windows\\System32\\ntoskrnl.exe", true},
+            {"win.hal", "Windows\\System32\\hal.dll", true},
+            {"win.ci", "Windows\\System32\\ci.dll", true},
+        };
+        for (const auto &wf : winFiles) {
+          add(wf.id, wf.critical, ntfs.FindPath(wf.path).has_value(), wf.path);
+        }
+        // SYSTEM hive readable (CRITICAL) + service/control-set advisory checks.
+        const auto sysEntry = ntfs.FindPath("Windows\\System32\\config\\SYSTEM");
+        std::vector<uint8_t> sysBytes;
+        if (sysEntry) sysBytes = ntfs.ReadFile(*sysEntry, 64ull * 1024ull * 1024ull);
+        add("system.hive", true, !sysBytes.empty(),
+            "Windows\\System32\\config\\SYSTEM readable");
+        if (!sysBytes.empty()) {
+          RegistryHiveReader sys(sysBytes);
+          const auto csNum = SelectOfflineControlSet(sys);
+          const std::string cs = FormatControlSetName(csNum.value_or(1));
+          const auto svc = ReadServiceBootState(sys, cs, "AntiMalGuestAgent");
+          advise("agent.service",
+                 svc.present && !svc.imagePath.empty(),
+                 svc.present ? ("AntiMalGuestAgent service ImagePath=" +
+                                svc.imagePath + " Start=" +
+                                FormatHiveDword(svc.start))
+                             : "AntiMalGuestAgent service not registered (deploy "
+                               "is overlay-based / opt-in)");
+        }
+        // CI policy anchor (load-bearing for OslpProcessSIPolicy on this base).
+        advise("ci.anchor",
+               ntfs.FindPath("Windows\\System32\\CodeIntegrity\\CiPolicies\\"
+                             "Active\\{60FD87F8-4593-44A0-91B0-2E0DA022F248}.cip")
+                   .has_value(),
+               "{60FD87F8-...}.cip vulnerable-driver-blocklist policy (removing "
+               "it breaks winload)");
+        // Deployed GuestAgent binary (present in an agent overlay, not the clean base).
+        advise("agent.exe",
+               ntfs.FindPath("AntiMal\\AntiMal.GuestAgent.exe").has_value(),
+               "C:\\AntiMal\\AntiMal.GuestAgent.exe");
+        // SetupComplete (clean-shutdown hook) + unattend presence.
+        advise("setup.complete",
+               ntfs.FindPath("Windows\\Setup\\Scripts\\SetupComplete.cmd")
+                   .has_value(),
+               "Windows\\Setup\\Scripts\\SetupComplete.cmd (clean-shutdown hook)");
+        advise("unattend",
+               ntfs.FindPath("Windows\\Panther\\unattend.xml").has_value() ||
+                   ntfs.FindPath("Windows\\System32\\Sysprep\\unattend.xml")
+                       .has_value(),
+               "Windows\\Panther\\unattend.xml or Sysprep\\unattend.xml");
+        // AutoAdminLogon (SOFTWARE hive) — advisory (login mode is configurable).
+        const auto softEntry =
+            ntfs.FindPath("Windows\\System32\\config\\SOFTWARE");
+        if (softEntry) {
+          const auto softBytes =
+              ntfs.ReadFile(*softEntry, 64ull * 1024ull * 1024ull);
+          if (!softBytes.empty()) {
+            RegistryHiveReader soft(softBytes);
+            const auto winlogon = FindHivePath(
+                soft, {"Microsoft", "Windows NT", "CurrentVersion", "Winlogon"});
+            const std::string aal =
+                winlogon ? HiveStringValue(soft, *winlogon, "AutoAdminLogon")
+                         : std::string();
+            advise("autologon", aal == "1",
+                   "HKLM\\SOFTWARE\\...\\Winlogon\\AutoAdminLogon=" +
+                       (aal.empty() ? std::string("(unset)") : aal));
+          }
+        }
+      }
+    }
+  } catch (const std::exception &ex) {
+    add("disk.open", true, false,
+        std::string("failed to open disk: ") + ex.what());
+  }
+
+  // Report.
+  int criticalFails = 0, warns = 0;
+  for (const auto &c : checks) {
+    if (c.status == "fail" && c.critical) ++criticalFails;
+    if (c.status == "warn") ++warns;
+  }
+  const bool bootable = (criticalFails == 0);
+  if (json) {
+    std::cout << "{\"vhdx\":" << JsonQuote(antimal::PathToUtf8(vhdx))
+              << ",\"bootable\":" << (bootable ? "true" : "false")
+              << ",\"criticalFailures\":" << criticalFails
+              << ",\"warnings\":" << warns << ",\"checks\":[";
+    for (size_t i = 0; i < checks.size(); ++i) {
+      const auto &c = checks[i];
+      std::cout << (i ? "," : "") << "{\"id\":" << JsonQuote(c.id)
+                << ",\"status\":" << JsonQuote(c.status)
+                << ",\"critical\":" << (c.critical ? "true" : "false")
+                << ",\"detail\":" << JsonQuote(c.detail) << "}";
+    }
+    std::cout << "]}\n";
+    return bootable ? 0 : 1;
+  }
+  std::cout << "Base validation: " << antimal::PathToUtf8(vhdx) << "\n";
+  for (const auto &c : checks) {
+    const char *tag = c.status == "pass"   ? "PASS"
+                      : c.status == "fail" ? "FAIL"
+                      : c.status == "warn" ? "warn"
+                                           : "skip";
+    std::cout << "  [" << tag << "] " << (c.critical ? "(critical) " : "")
+              << c.id << " — " << c.detail << "\n";
+  }
+  std::cout << (bootable ? "BOOTABLE: yes" : "BOOTABLE: NO")
+            << " (" << criticalFails << " critical failure(s), " << warns
+            << " advisory warning(s))\n";
+  if (!bootable) {
+    std::cout << "  -> fix the base build before spending a boot; review VM "
+                 "readiness and containment before continuing.\n";
+  }
+  return bootable ? 0 : 1;
+}
+
 int CommandBase(int argc, wchar_t **argv) {
   if (argc < 3) {
     PrintUsage();
@@ -2976,6 +3190,9 @@ int CommandBase(int argc, wchar_t **argv) {
   const auto subcommand = Arg(argc, argv, 2);
   if (subcommand == "inspect") {
     return CommandBaseInspect(argc, argv, config);
+  }
+  if (subcommand == "validate") {
+    return CommandBaseValidate(argc, argv, config);
   }
   if (subcommand == "deploy-agent") {
     return CommandBaseDeployAgent(argc, argv, config);

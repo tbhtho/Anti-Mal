@@ -8,6 +8,25 @@ that landed on `main`.
 
 ## [Unreleased]
 
+### 2026-06-18 — VM frontier: readiness checklist, fast-fail subcode capture, offline base validation
+Pivot to proving/hardening the in-house VM. Grounded in a multi-pass parallel investigation of every
+blocker dimension (`private development documentation`).
+- **VM readiness checklist + user-run unblock plan (`private development documentation`):** per-criterion
+  (repeatable desktop, File Explorer, browser, networking, display/input, 25–30 FPS, boot reliability)
+  status / exact blocker / user-run commands / artifacts / pass-fail / diagnostics, plus the master
+  base-rebuild→convert→validate→boot→snapshot→measure sequence.
+- **`__fastfail` subcode capture + decode (the decisive shell-wall diagnostic):** `FastFailName()`
+  maps the FAST_FAIL_* enum; `ParseWerReport` extracts the WER exception-information block (BEX64
+  "Data" Sig or explicit `Param[N]`, by name — never positionally) so the agent emits the subcode;
+  `SummarizeCrashes`/`report --crashes` surface `[fast-fail #7 FATAL_APP_EXIT]`. Names *why* the
+  modern shell fast-fails. Unit-tested; only confirmation on a live fast-fail is boot-gated.
+- **`base validate` — offline boot-readiness pass/fail:** reuses the `base inspect` offline readers
+  to return a structured verdict — *critical* checks (ESP/FAT32, UEFI boot files, BCD, NTFS, kernel
+  boot files, SYSTEM hive) gate the exit code; *advisory* checks (CI anchor, GuestAgent + service,
+  AutoAdminLogon, SetupComplete, unattend) warn. `--json` for CI. Verify a rebuilt base in seconds
+  before spending a cold boot. Live-verified against the dev base (BOOTABLE: yes; correctly flagged
+  the missing SetupComplete/unattend/AutoAdminLogon prerequisites).
+
 ### 2026-06-17 — boot diagnostics, behavioral classifiers, Any.Run-style report depth
 A continued autonomous drive toward the complete in-house VM + sandbox. With the live-boot
 desktop-reach frontier user-gated (see CURRENT_STATE.md), this advanced every other priority area —
