@@ -512,6 +512,20 @@ void VirtualMachine::MaybeAttachNic() {
     if (len > 0 && capturedNetworkFrames_.size() < kMaxCapturedFrames) {
       capturedNetworkFrames_.emplace_back(frame, frame + len);
     }
+    // Route through the contained fake-internet sink (if wired): synthesize
+    // replies, inject each into the guest RX ring, and capture it too so the
+    // PCAP shows both directions. Reentrancy-safe: we're inside a TX MMIO exit
+    // on the vCPU thread; DeliverRxFrame only touches the RX ring + raises the
+    // RXT0 interrupt, which the run loop's InterruptPending poll delivers.
+    if (networkReplyFn_ && len > 0) {
+      for (auto &reply : networkReplyFn_(frame, len)) {
+        if (reply.empty()) continue;
+        nic_->DeliverRxFrame(reply.data(), reply.size());
+        if (capturedNetworkFrames_.size() < kMaxCapturedFrames) {
+          capturedNetworkFrames_.push_back(std::move(reply));
+        }
+      }
+    }
   });
   nic_->SetMmioBase(pcIo_.NicBar0Base());
   mmioBus_.Attach(nic_.get());

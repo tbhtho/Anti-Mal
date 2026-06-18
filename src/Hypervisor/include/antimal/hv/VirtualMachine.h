@@ -622,6 +622,14 @@ public:
     pacedCom2Payload_ = std::move(bytes);
     pacedCom2Cursor_ = 0;
   }
+  // Wire the contained fake-internet sink (Common-side): given a guest TX frame,
+  // returns reply frames the VM injects into the guest RX ring (DeliverRxFrame)
+  // and also captures (so the PCAP shows both directions). Kept as a plain
+  // std::function so the Hypervisor layer stays independent of Common. Only used
+  // when a NIC is attached (ANTIMAL_ENABLE_NIC); a no-op otherwise.
+  using NetworkReplyFn = std::function<std::vector<std::vector<uint8_t>>(
+      const uint8_t *frame, std::size_t len)>;
+  void SetNetworkReplyFn(NetworkReplyFn fn) { networkReplyFn_ = std::move(fn); }
   std::string PullCom2Output() { return com2_.PullNew(); }
   void InjectKeyboardScancode(uint8_t scancode) {
     ps2_.InjectKeyboardScancode(scancode);
@@ -701,6 +709,7 @@ private:
   std::unique_ptr<IdeController> secondaryIde_;
   std::unique_ptr<AhciController> ahci_;
   std::unique_ptr<E1000Device> nic_;
+  NetworkReplyFn networkReplyFn_;
   std::vector<std::vector<uint8_t>> capturedNetworkFrames_;
   static constexpr size_t kMaxCapturedFrames = 8192;
   uint64_t pageTableAssistBase_ = 0;

@@ -3,6 +3,7 @@
 #include "antimal/BehaviorScore.h"
 #include "antimal/DetonationProtocol.h"
 #include "antimal/EventJournal.h"
+#include "antimal/FakeInternet.h"
 #include "antimal/PacketInspector.h"
 #include "antimal/PcapWriter.h"
 #include "antimal/FileUtil.h"
@@ -12416,6 +12417,25 @@ DetonationResult InHouseOrchestrator::PrepareAndRun(
             optsLocal.processorCount = postRebootVcpuCount;
           }
           hv::VirtualMachine vm(preflight.firmwarePath, disk, optsLocal);
+          // Contained fake-internet: when a NIC is attached, route the guest's
+          // TX frames through an in-process ARP/ICMP/DNS/TCP responder (zero
+          // egress) and inject the replies into the RX ring so a sample's
+          // network behavior plays out + is captured (both directions) in
+          // network.pcap. The sink lives for this vm.Run() (same scope,
+          // synchronous), and answers as gateway 10.0.2.3.
+          antimal::net::FakeInternet netSink(
+              {0x02, 0x53, 0x49, 0x4E, 0x4B, 0x01}, 0x0A000203u);
+          {
+            const char *nicEnv = std::getenv("ANTIMAL_ENABLE_NIC");
+            if (nicEnv && nicEnv[0] == '1') {
+              vm.SetNetworkReplyFn(
+                  [&netSink](const uint8_t *frame, std::size_t len) {
+                    std::vector<std::vector<uint8_t>> replies;
+                    netSink.OnGuestFrame(frame, len, replies);
+                    return replies;
+                  });
+            }
+          }
           if (executionAuthorized) {
             // The execute payload (~100 KB) is delivered PACED + post-handshake
             // (see SetPacedCom2Payload): a one-shot queue overruns the guest
