@@ -8977,6 +8977,56 @@ void TestFakeInternet() {
     Expect(sink.DnsReplies() == 1, "sink DNS: counter advanced");
   }
 
+  // --- TCP SYN -> SYN-ACK (connection establishes) ---
+  {
+    std::vector<uint8_t> tcp;
+    be16(tcp, 49152); be16(tcp, 443);  // src port, dst port (HTTPS C2)
+    const uint32_t cseq = 0xAABBCCDD;
+    for (int i = 0; i < 4; ++i) tcp.push_back(static_cast<uint8_t>((cseq >> (24 - i * 8)) & 0xFF));
+    for (int i = 0; i < 4; ++i) tcp.push_back(0);  // ack = 0
+    tcp.push_back(0x50);  // data offset 5
+    tcp.push_back(0x02);  // flags = SYN
+    be16(tcp, 0xFFFF);    // window
+    be16(tcp, 0);         // checksum (test doesn't validate the request's)
+    be16(tcp, 0);         // urgent
+
+    std::vector<uint8_t> ip;
+    ip.push_back(0x45); ip.push_back(0x00);
+    be16(ip, static_cast<uint16_t>(20 + tcp.size()));
+    be16(ip, 0x0002); be16(ip, 0x4000); ip.push_back(64); ip.push_back(6);  // proto TCP
+    be16(ip, 0x0000);
+    const uint8_t gIp[4] = {0x0A, 0x00, 0x02, 0x64};   // guest
+    const uint8_t cIp[4] = {0x5D, 0xB8, 0xD8, 0x22};   // a "C2" 93.184.216.34
+    for (int i = 0; i < 4; ++i) ip.push_back(gIp[i]);
+    for (int i = 0; i < 4; ++i) ip.push_back(cIp[i]);
+
+    std::vector<uint8_t> f;
+    for (int i = 0; i < 6; ++i) f.push_back(sinkMac[i]);
+    for (int i = 0; i < 6; ++i) f.push_back(guestMac[i]);
+    be16(f, 0x0800);
+    f.insert(f.end(), ip.begin(), ip.end());
+    f.insert(f.end(), tcp.begin(), tcp.end());
+
+    std::vector<Frame> out;
+    Expect(sink.OnGuestFrame(f.data(), f.size(), out) == 1,
+           "sink TCP: one SYN-ACK synthesized");
+    const Frame &r = out[0];
+    Expect(r[14 + 9] == 6, "sink TCP: reply is IPv4/TCP");
+    // TCP at +34: src port 443 (echoes the contacted server port), flags SYN|ACK.
+    Expect(r[34] == 0x01 && r[35] == 0xBB, "sink TCP: reply src port = 443");
+    Expect(r[34 + 2] == 0xC0 && r[34 + 3] == 0x00, "sink TCP: reply dst port = client");
+    Expect(r[34 + 13] == 0x12, "sink TCP: flags = SYN|ACK");
+    // ack = client seq + 1.
+    const uint32_t ackNum = (static_cast<uint32_t>(r[34 + 8]) << 24) |
+                            (r[34 + 9] << 16) | (r[34 + 10] << 8) | r[34 + 11];
+    Expect(ackNum == 0xAABBCCDEu, "sink TCP: ack = client seq + 1");
+    // IP src = the contacted C2 (reply comes 'from' the server).
+    Expect(r[14 + 12] == 0x5D && r[14 + 15] == 0x22, "sink TCP: reply src = C2 IP");
+    Expect(antimal::net::InternetChecksum(r.data() + 14, 20) == 0,
+           "sink TCP: IP checksum valid");
+    Expect(sink.TcpReplies() == 1, "sink TCP: counter advanced");
+  }
+
   // --- bounds / fuzz: malformed frames yield no reply and never read OOB ---
   {
     std::vector<Frame> out;

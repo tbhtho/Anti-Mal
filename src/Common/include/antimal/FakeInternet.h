@@ -42,6 +42,7 @@ class FakeInternet {
   uint64_t ArpReplies() const noexcept { return arpReplies_; }
   uint64_t IcmpReplies() const noexcept { return icmpReplies_; }
   uint64_t DnsReplies() const noexcept { return dnsReplies_; }
+  uint64_t TcpReplies() const noexcept { return tcpReplies_; }
   uint64_t FramesSeen() const noexcept { return framesSeen_; }
   uint64_t FramesDropped() const noexcept { return framesDropped_; }
 
@@ -55,12 +56,18 @@ class FakeInternet {
   // is the IPv4 header length; `udpOff`/`udpLen` bound the UDP datagram.
   bool HandleDns(const uint8_t *f, std::size_t ihl, std::size_t udpOff,
                  std::size_t udpLen, std::vector<Frame> &out);
+  // TCP SYN -> SYN-ACK so the guest's connection to the contacted endpoint
+  // establishes (and it sends its first data payload). `ihl` is the IPv4 header
+  // length; `tcpOff`/`tcpLen` bound the TCP segment.
+  bool HandleTcp(const uint8_t *f, std::size_t ihl, std::size_t tcpOff,
+                 std::size_t tcpLen, std::vector<Frame> &out);
 
   Mac mac_;
   uint32_t ip_;  // big-endian
   uint64_t arpReplies_ = 0;
   uint64_t icmpReplies_ = 0;
   uint64_t dnsReplies_ = 0;
+  uint64_t tcpReplies_ = 0;
   uint64_t framesSeen_ = 0;
   uint64_t framesDropped_ = 0;
 };

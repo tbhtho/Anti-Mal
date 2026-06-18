@@ -9,6 +9,7 @@ namespace {
 constexpr uint16_t kEthArp = 0x0806;
 constexpr uint16_t kEthIpv4 = 0x0800;
 constexpr uint8_t kIpProtoIcmp = 1;
+constexpr uint8_t kIpProtoTcp = 6;
 constexpr uint8_t kIpProtoUdp = 17;
 
 constexpr std::size_t kEthHdr = 14;   // dst[6] src[6] type[2]
@@ -17,11 +18,12 @@ constexpr std::size_t kIpMinHdr = 20; // IPv4 header (no options)
 constexpr std::size_t kIcmpHdr = 8;   // type code cksum id seq
 constexpr std::size_t kUdpHdr = 8;    // srcPort dstPort length checksum
 constexpr std::size_t kDnsHdr = 12;   // id flags qd an ns ar
+constexpr std::size_t kTcpHdr = 20;   // TCP header without options
 
-// IPv4 UDP checksum over the pseudo-header (srcIP, dstIP, 0, proto, udpLen) +
-// the UDP header & data. `udp` points at the UDP header (checksum field 0).
-uint16_t UdpChecksum(const uint8_t *srcIp, const uint8_t *dstIp,
-                     const uint8_t *udp, std::size_t udpLen) {
+// IPv4 transport checksum over the pseudo-header (srcIP, dstIP, 0, proto, len) +
+// the L4 header & data. `seg` points at the L4 header (checksum field zeroed).
+uint16_t L4Checksum(const uint8_t *srcIp, const uint8_t *dstIp, uint8_t proto,
+                    const uint8_t *seg, std::size_t segLen) {
   uint32_t sum = 0;
   auto add = [&](const uint8_t *p, std::size_t n) {
     for (std::size_t i = 0; i + 1 < n; i += 2)
@@ -30,12 +32,18 @@ uint16_t UdpChecksum(const uint8_t *srcIp, const uint8_t *dstIp,
   };
   add(srcIp, 4);
   add(dstIp, 4);
-  sum += kIpProtoUdp;          // zero byte + proto
-  sum += static_cast<uint32_t>(udpLen & 0xFFFF);
-  add(udp, udpLen);
+  sum += proto;  // leading zero byte + protocol
+  sum += static_cast<uint32_t>(segLen & 0xFFFF);
+  add(seg, segLen);
   while (sum >> 16) sum = (sum & 0xFFFF) + (sum >> 16);
-  const uint16_t c = static_cast<uint16_t>(~sum & 0xFFFF);
-  return c == 0 ? 0xFFFF : c;  // 0 means "no checksum"; use 0xFFFF instead
+  return static_cast<uint16_t>(~sum & 0xFFFF);
+}
+
+// UDP: a computed checksum of 0 is transmitted as 0xFFFF (0 means "none").
+uint16_t UdpChecksum(const uint8_t *srcIp, const uint8_t *dstIp,
+                     const uint8_t *udp, std::size_t udpLen) {
+  const uint16_t c = L4Checksum(srcIp, dstIp, kIpProtoUdp, udp, udpLen);
+  return c == 0 ? 0xFFFF : c;
 }
 
 uint16_t RdBE16(const uint8_t *p) {
@@ -147,7 +155,10 @@ bool FakeInternet::HandleIpv4(const uint8_t *f, std::size_t len,
     }
     return false;  // other UDP ports: no reply (yet)
   }
-  if (ip[9] != kIpProtoIcmp) return false;  // TCP handshake in a later slice
+  if (ip[9] == kIpProtoTcp) {
+    return HandleTcp(f, ihl, l4Off, l4Len, out);
+  }
+  if (ip[9] != kIpProtoIcmp) return false;  // unsupported L4 protocol
 
   const std::size_t icmpOff = l4Off;
   const std::size_t icmpLen = l4Len;
@@ -285,6 +296,71 @@ bool FakeInternet::HandleDns(const uint8_t *f, std::size_t ihl,
 
   out.push_back(std::move(r));
   ++dnsReplies_;
+  return true;
+}
+
+bool FakeInternet::HandleTcp(const uint8_t *f, std::size_t ihl,
+                             std::size_t tcpOff, std::size_t tcpLen,
+                             std::vector<Frame> &out) {
+  if (tcpLen < kTcpHdr || tcpOff + tcpLen > 0xFFFFFFFFu) {
+    ++framesDropped_;
+    return false;
+  }
+  const uint8_t *tcp = f + tcpOff;
+  const uint8_t flags = tcp[13];
+  const bool syn = (flags & 0x02) != 0;
+  const bool ack = (flags & 0x10) != 0;
+  // Only complete the handshake on a bare SYN (SYN, no ACK). A SYN-ACK back lets
+  // the guest's connection to the (resolved) C2 establish so it sends its first
+  // data payload — the high-value capture. Subsequent data is captured on TX;
+  // an application responder (HTTP/etc.) is a later slice.
+  if (!syn || ack) return false;
+
+  const uint16_t srcPort = RdBE16(tcp);      // client's source port
+  const uint16_t dstPort = RdBE16(tcp + 2);  // server port (the contacted port)
+  uint32_t clientSeq = 0;
+  for (int i = 0; i < 4; ++i) clientSeq = (clientSeq << 8) | tcp[4 + i];
+
+  // Build a 20-byte (no options) SYN-ACK over a fresh IPv4 datagram.
+  const std::size_t synAckTcp = kTcpHdr;
+  const std::size_t ipTotal = ihl + synAckTcp;
+  Frame r(kEthHdr + ipTotal, 0);
+  std::memcpy(r.data(), f + 6, 6);            // Ethernet dst = guest src
+  std::memcpy(r.data() + 6, mac_.data(), 6);  // Ethernet src = sink
+  WrBE16(r.data() + 12, kEthIpv4);
+
+  uint8_t *rip = r.data() + kEthHdr;
+  std::memcpy(rip, f + kEthHdr, ihl);  // copy the request IP header (keeps IHL)
+  WrBE16(rip + 2, static_cast<uint16_t>(ipTotal));
+  WrBE16(rip + 4, 0);
+  WrBE16(rip + 6, 0x4000);  // DF
+  rip[8] = 64;
+  rip[9] = kIpProtoTcp;
+  uint8_t reqSrcIp[4], reqDstIp[4];
+  std::memcpy(reqSrcIp, f + kEthHdr + 12, 4);
+  std::memcpy(reqDstIp, f + kEthHdr + 16, 4);
+  std::memcpy(rip + 12, reqDstIp, 4);  // src = the server the guest dialed
+  std::memcpy(rip + 16, reqSrcIp, 4);  // dst = the guest
+  rip[10] = rip[11] = 0;
+  WrBE16(rip + 10, InternetChecksum(rip, ihl));
+
+  uint8_t *rtcp = rip + ihl;
+  WrBE16(rtcp, dstPort);      // src port = the contacted server port
+  WrBE16(rtcp + 2, srcPort);  // dst port = the client's source port
+  // Server ISN (deterministic; arbitrary). ack = client seq + 1 (SYN consumes 1).
+  const uint32_t serverIsn = 0x10000000u;
+  const uint32_t ackNum = clientSeq + 1u;
+  for (int i = 0; i < 4; ++i) rtcp[4 + i] = static_cast<uint8_t>((serverIsn >> (24 - i * 8)) & 0xFF);
+  for (int i = 0; i < 4; ++i) rtcp[8 + i] = static_cast<uint8_t>((ackNum >> (24 - i * 8)) & 0xFF);
+  rtcp[12] = 0x50;  // data offset = 5 (20 bytes), no options
+  rtcp[13] = 0x12;  // flags = SYN | ACK
+  WrBE16(rtcp + 14, 0xFFFF);  // window
+  rtcp[16] = rtcp[17] = 0;    // checksum (zeroed before recompute)
+  rtcp[18] = rtcp[19] = 0;    // urgent pointer
+  WrBE16(rtcp + 16, L4Checksum(rip + 12, rip + 16, kIpProtoTcp, rtcp, synAckTcp));
+
+  out.push_back(std::move(r));
+  ++tcpReplies_;
   return true;
 }
 
