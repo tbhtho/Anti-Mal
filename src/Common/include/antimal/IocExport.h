@@ -42,6 +42,15 @@ std::string ExportIocsStix(const AnalysisReport &report);
 std::string ExportIocsMisp(const AnalysisReport &report);
 
 // Flat CSV (RFC 4180): header row + one `type,value,context` row per indicator.
-std::string ExportIocsCsv(const AnalysisReport &report);
+// When `defang` is true the value column is defanged (safe to share); default
+// keeps live IOCs.
+std::string ExportIocsCsv(const AnalysisReport &report, bool defang = false);
+
+// Defang an indicator so it's safe to paste/share without an accidental click:
+// http(s)://->hxxp(s)://, ftp://->fxp://, "."->"[.]", "@"->"[@]". The standard
+// threat-intel convention. Pure + idempotent-enough for display. Used by the
+// human-facing CLI views (`config --defang`, `export --format csv --defang`);
+// the machine formats (STIX/MISP) intentionally keep live IOCs.
+std::string Defang(const std::string &indicator);
 
 } // namespace antimal

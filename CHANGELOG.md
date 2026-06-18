@@ -53,6 +53,10 @@ unit-tested. A living `private development documentation` tracks done/remaining 
   regression of the CLI glue unit tests can't reach — simulate → report --summary/--why/--crashes/
   --detections → export stix/misp/csv → yara-gen → config (synthetic RC4 round-trip) → triage, with
   14 asserted checks; CI-gateable. Verified all-green.
+- **IOC defanging (`Defang`, `--defang`):** the standard threat-intel safe-share rendering
+  (`hxxp://`, `1[.]2[.]3[.]4`, `[@]`) for recovered C2. Opt-in on the human-facing views — `config
+  --defang` and `export --format csv --defang` — while STIX/MISP/`--json` keep live IOCs for machine
+  ingestion. Pure + unit-tested.
 - **GUI boot-reliability panel (`reliability.get` bridge):** the Reports page now shows a "Boot
   reliability" rollup (reach rates + per-stage histogram) computed by the shared `BootReliability`
   Common module — GUI parity for `boot-report`.

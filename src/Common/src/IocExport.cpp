@@ -416,7 +416,7 @@ std::string ExportIocsMisp(const AnalysisReport &report) {
   return event.str();
 }
 
-std::string ExportIocsCsv(const AnalysisReport &report) {
+std::string ExportIocsCsv(const AnalysisReport &report, bool defang) {
   const auto indicators = CollectIndicators(report);
 
   // RFC 4180: quote a field iff it contains comma, quote, CR or LF; double any
@@ -442,10 +442,36 @@ std::string ExportIocsCsv(const AnalysisReport &report) {
   std::ostringstream csv;
   csv << "type,value,context\r\n";
   for (const auto &ioc : indicators) {
-    csv << field(ioc.type) << "," << field(ioc.value) << ","
+    csv << field(ioc.type) << ","
+        << field(defang ? Defang(ioc.value) : ioc.value) << ","
         << field(ioc.context) << "\r\n";
   }
   return csv.str();
+}
+
+std::string Defang(const std::string &indicator) {
+  std::string s = indicator;
+  auto replaceAll = [](std::string &str, const std::string &from,
+                       const std::string &to) {
+    if (from.empty()) return;
+    size_t pos = 0;
+    while ((pos = str.find(from, pos)) != std::string::npos) {
+      str.replace(pos, from.size(), to);
+      pos += to.size();
+    }
+  };
+  // Scheme first (no dots inside the part we rewrite), then dots/@.
+  replaceAll(s, "https://", "hxxps://");
+  replaceAll(s, "http://", "hxxp://");
+  replaceAll(s, "ftp://", "fxp://");
+  std::string out;
+  out.reserve(s.size() + 8);
+  for (char c : s) {
+    if (c == '.') out += "[.]";
+    else if (c == '@') out += "[@]";
+    else out += c;
+  }
+  return out;
 }
 
 } // namespace antimal

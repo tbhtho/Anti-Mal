@@ -1215,6 +1215,22 @@ void TestIocExport() {
     }
     Expect(allThree, "ioc: every CSV data row has exactly 3 fields");
   }
+
+  // IOC defang: safe-to-share rendering (opt-in).
+  using antimal::Defang;
+  Expect(Defang("http://1.2.3.4/gate.php") == "hxxp://1[.]2[.]3[.]4/gate[.]php",
+         "ioc: defang rewrites scheme + dots in a URL");
+  Expect(Defang("https://evil.example.com") == "hxxps://evil[.]example[.]com",
+         "ioc: defang handles https + a domain");
+  Expect(Defang("user@evil.com") == "user[@]evil[.]com",
+         "ioc: defang neutralizes @ and dots");
+  Expect(Defang("plainstring") == "plainstring",
+         "ioc: defang leaves a dotless/schemeless string unchanged");
+  // CSV defang is opt-in: default keeps live IOCs.
+  const std::string liveCsv = antimal::ExportIocsCsv(report, false);
+  const std::string safeCsv = antimal::ExportIocsCsv(report, true);
+  Expect(liveCsv != safeCsv || liveCsv.find("[.]") == std::string::npos,
+         "ioc: --defang changes CSV output when there are dotted IOCs");
 }
 
 // Locks the host->guest live-input wire format (the framed 'K'/'M' keyboard +

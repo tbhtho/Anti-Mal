@@ -214,7 +214,7 @@ void PrintUsage() {
       << "  antimal reg-ls [--hive software|system|sam|...] [--overlay <o.cow>] <reg\\key> [--values] [--depth N] [--filter <s>]\n"
       << "  antimal report <run-id-or-report.json> [--html] [--summary|--why|--detections|--crashes|--mitre|--usability|--timeline [--json]]\n"
       << "  antimal browser-impact <run-id-or-report.json> --decrypt-browser-secrets\n"
-      << "  antimal export <run-id-or-report.json> --format stix|misp|csv|yara [--out <file>]\n"
+      << "  antimal export <run-id-or-report.json> --format stix|misp|csv|yara [--out <file>] [--defang]\n"
       << "  antimal similarity <fileA> <fileB> [--json]   (fuzzy-hash similarity 0..100)\n"
       << "  antimal similarity <file> --to <ctph-digest>\n"
       << "  antimal doctor [--json]              (host & workflow readiness check)\n"
@@ -223,7 +223,7 @@ void PrintUsage() {
       << "  antimal simulate [--scenario stealer|ransomware|loader|coinminer|wiper|rat] [--out <dir>] [--run-id <id>]\n"
       << "  antimal report-diff <run-or-report-A> <run-or-report-B> [--json]  (what changed)\n"
       << "  antimal yara-gen <sample> [--out rule.yar] [--name R] [--max-strings N]  (auto YARA rule)\n"
-      << "  antimal config <sample> [--json]     (recovered malware config / C2)\n";
+      << "  antimal config <sample> [--json] [--defang]  (recovered malware config / C2)\n";
 }
 
 antimal::ScannerOptions BuildScannerOptions(int argc, wchar_t **argv,
@@ -3352,7 +3352,7 @@ int CommandExport(int argc, wchar_t **argv) {
     } else if (format == "misp") {
       body = antimal::ExportIocsMisp(report);
     } else if (format == "csv") {
-      body = antimal::ExportIocsCsv(report);
+      body = antimal::ExportIocsCsv(report, HasFlag(argc, argv, "--defang"));
     } else {
       // yara: a hunt rule from the run's sample. The report already holds the
       // static analysis (scannerVerdict); we only re-read the bytes for the
@@ -3534,6 +3534,12 @@ int CommandConfig(int argc, wchar_t **argv) {
     return any ? 0 : 1;
   }
 
+  // --defang renders C2 safe to copy/paste (hxxp://, 1[.]2[.]3[.]4) in the
+  // human view; the --json output keeps live IOCs for machine ingestion.
+  const bool defang = HasFlag(argc, argv, "--defang");
+  auto df = [&](const std::string &v) {
+    return defang ? antimal::Defang(v) : v;
+  };
   std::cout << "Malware configuration for " << antimal::PathToUtf8(sample) << "\n";
   if (!any) {
     std::cout << "  (no embedded config/C2 recovered statically)\n";
@@ -3545,19 +3551,19 @@ int CommandConfig(int argc, wchar_t **argv) {
     std::cout << "    beacon type: " << cs.beaconType << "  port: " << cs.port
               << "  sleep: " << cs.sleepMs << "ms  jitter: " << cs.jitter << "%\n";
     if (!cs.userAgent.empty()) std::cout << "    user-agent: " << cs.userAgent << "\n";
-    for (const auto &s : cs.c2Servers) std::cout << "    C2: " << s << "\n";
-    for (const auto &u : cs.uris) std::cout << "    URI: " << u << "\n";
+    for (const auto &s : cs.c2Servers) std::cout << "    C2: " << df(s) << "\n";
+    for (const auto &u : cs.uris) std::cout << "    URI: " << df(u) << "\n";
   }
   for (const auto &x : xor1)
     std::cout << "  XOR C2 (key 0x" << std::hex << static_cast<int>(x.xorKey)
-              << std::dec << "): " << x.value << "\n";
-  for (const auto &x : xorN) std::cout << "  multi-byte-XOR C2: " << x.value << "\n";
+              << std::dec << "): " << df(x.value) << "\n";
+  for (const auto &x : xorN) std::cout << "  multi-byte-XOR C2: " << df(x.value) << "\n";
   for (const auto &h : rc4)
-    std::cout << "  RC4 C2 " << h.kind << " (key \"" << h.key << "\"): " << h.value
+    std::cout << "  RC4 C2 " << h.kind << " (key \"" << h.key << "\"): " << df(h.value)
               << "\n";
-  for (const auto &u : b64.urls) std::cout << "  base64-wrapped URL: " << u << "\n";
-  for (const auto &ip : b64.ips) std::cout << "  base64-wrapped IP: " << ip << "\n";
-  for (const auto &d : b64.domains) std::cout << "  base64-wrapped domain: " << d << "\n";
+  for (const auto &u : b64.urls) std::cout << "  base64-wrapped URL: " << df(u) << "\n";
+  for (const auto &ip : b64.ips) std::cout << "  base64-wrapped IP: " << df(ip) << "\n";
+  for (const auto &d : b64.domains) std::cout << "  base64-wrapped domain: " << df(d) << "\n";
   return 0;
 }
 
