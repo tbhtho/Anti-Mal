@@ -56,6 +56,7 @@
     <ClInclude Include="include\antimal\Http.h" />
     <ClInclude Include="include\antimal\HyperVOrchestrator.h" />
     <ClInclude Include="include\antimal\IocExport.h" />
+    <ClInclude Include="include\antimal\IsoAnalyzer.h" />
     <ClInclude Include="include\antimal\ImageLoadTelemetry.h" />
     <ClInclude Include="include\antimal\IntelLookup.h" />
     <ClInclude Include="include\antimal\MitreCatalog.h" />
@@ -109,6 +110,7 @@
     <ClCompile Include="src\Http.cpp" />
     <ClCompile Include="src\HyperVOrchestrator.cpp" />
     <ClCompile Include="src\IocExport.cpp" />
+    <ClCompile Include="src\IsoAnalyzer.cpp" />
     <ClCompile Include="src\ImageLoadTelemetry.cpp" />
     <ClCompile Include="src\IntelLookup.cpp" />
     <ClCompile Include="src\MitreCatalog.cpp" />

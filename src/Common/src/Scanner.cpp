@@ -7,6 +7,7 @@
 #include "antimal/IntelLookup.h"
 #include "antimal/ConfigExtractor.h"
 #include "antimal/ContainerAnalyzer.h"
+#include "antimal/IsoAnalyzer.h"
 #include "antimal/PdfAnalyzer.h"
 #include "antimal/RtfAnalyzer.h"
 #include "antimal/PeParser.h"
@@ -379,6 +380,11 @@ std::string IdentifyFileType(const std::vector<uint8_t> &data) {
   if (has({'M', 'S', 'C', 'F'})) {
     return "cab";
   }
+  // ISO9660: the Primary Volume Descriptor's "CD001" identifier sits at sector 16
+  // (offset 0x8001). A top current delivery vector (mount -> .lnk + hidden EXE).
+  if (has({'C', 'D', '0', '0', '1'}, 0x8001)) {
+    return "iso";
+  }
   if (has({0x4C, 0x00, 0x00, 0x00, 0x01, 0x14, 0x02, 0x00})) {
     return "lnk"; // Windows shell link header GUID
   }
@@ -625,6 +631,14 @@ ScanResult ScanFile(const std::filesystem::path &path,
       // A remote-object URL is a real C2/staging IOC. Stash it; merge into
       // result.iocs AFTER Enrich() (which reassigns iocs), like scriptRecoveredUrls.
       for (const auto &u : rtf.urls) rtfRemoteUrls.push_back(u);
+    }
+
+    // ISO/IMG disk-image lure (mount -> .lnk + hidden EXE, MOTW bypass).
+    if (result.detectedType == "iso") {
+      const IsoAnalysis iso = AnalyzeIso(data);
+      for (const auto &f : iso.findings) {
+        AddFinding(result, f.ruleId, f.message, f.score);
+      }
     }
 
     // Config / C2 extraction (any file type): recover an embedded Cobalt Strike

@@ -29,6 +29,7 @@
 #include "antimal/JsonValue.h"
 #include "antimal/NetworkTelemetry.h"
 #include "antimal/PacketInspector.h"
+#include "antimal/IsoAnalyzer.h"
 #include "antimal/PdfAnalyzer.h"
 #include "antimal/RtfAnalyzer.h"
 #include "antimal/PeParser.h"
@@ -4241,6 +4242,7 @@ void TestMalformedInputRobustness() {
     // The contract is "robust to fully untrusted bytes" -- not specific output.
     (void)AnalyzePdf(in);
     (void)AnalyzeRtf(in);
+    (void)AnalyzeIso(in);
     (void)AnalyzeContainer(in, ".zip");
     (void)AnalyzeContainer(in, ".docx");
     (void)AnalyzeContainer(in, "");
@@ -5445,6 +5447,41 @@ void TestRtfAnalyzer() {
          "RTF: a plain document yields no findings");
   // Non-RTF input rejected.
   Expect(!AnalyzeRtf(bytes("%PDF-1.7 not rtf")).isRtf, "RTF: non-RTF rejected");
+}
+
+void TestIsoAnalyzer() {
+  using antimal::AnalyzeIso;
+  using antimal::IsoAnalysis;
+  auto has = [](const IsoAnalysis &a, const char *id) {
+    for (const auto &f : a.findings)
+      if (f.ruleId == id) return true;
+    return false;
+  };
+  // Build a minimal ISO9660: "CD001" at offset 0x8001, plus an embedded shell-
+  // link header and a PE (DOS stub) -- the classic small-image lure.
+  std::vector<uint8_t> img(0x8800, 0);
+  const char *cd = "CD001";
+  std::memcpy(img.data() + 0x8001, cd, 5);
+  const uint8_t lnk[] = {0x4C, 0x00, 0x00, 0x00, 0x01, 0x14, 0x02, 0x00};
+  std::memcpy(img.data() + 0x8100, lnk, sizeof(lnk));
+  const char *dos = "This program cannot be run in DOS mode";
+  std::memcpy(img.data() + 0x8200, dos, std::strlen(dos));
+
+  const auto a = AnalyzeIso(img);
+  Expect(a.isIso, "ISO: CD001 magic at 0x8001 recognized");
+  Expect(a.containsLnk && a.containsExecutable,
+         "ISO: embedded .lnk + PE detected");
+  Expect(has(a, "iso.lnk_plus_exe"), "ISO: lnk+exe lure finding");
+  Expect(a.smallLure && has(a, "iso.small_payload_image"),
+         "ISO: small-image lure flagged");
+
+  // Non-ISO input (no CD001) is rejected, no findings.
+  std::vector<uint8_t> notIso(0x9000, 0x41);
+  Expect(!AnalyzeIso(notIso).isIso && AnalyzeIso(notIso).findings.empty(),
+         "ISO: a non-ISO buffer is rejected");
+  // Too-small buffer doesn't over-read.
+  Expect(!AnalyzeIso({'C', 'D', '0', '0', '1'}).isIso,
+         "ISO: a tiny buffer doesn't over-read");
 }
 
 // Cobalt Strike beacon-config extraction: build a synthetic XOR-encoded TLV
@@ -9489,6 +9526,7 @@ int main() {
     TestContainerAnalyzer();
     TestPdfAnalyzer();
     TestRtfAnalyzer();
+    TestIsoAnalyzer();
     TestCobaltStrikeConfig();
     TestImportCapabilities();
     TestBrowserRisk();
