@@ -51,6 +51,9 @@ unit-tested. A living `private development documentation` tracks done/remaining 
   key against each base64 blob and keeps a result ONLY when the decryption yields a valid http(s) URL
   (same known-plaintext anchor as the XOR recovery → near-zero false positives, verified clean on a
   real benign PE). Bounded work; surfaced in scan findings + IOCs. Round-trip + negative unit tests.
+- **`report --why` — explainable verdict in the terminal:** prints the per-signal "why this verdict"
+  rationale (the `BehaviorScore` headline feature, previously only in the HTML report + raw JSON), so
+  CLI/automation users get the same explainability. `--json` supported.
 - **`triage <dir>` — risk-ranked bulk scan:** scans a folder and prints one compact line per file
   sorted by score (rank / score / verdict / sha256 / top-tag / file), the "which of these do I look at
   first?" workflow. `--json` for automation; exit 10 if any file is flagged.

@@ -210,7 +210,7 @@ void PrintUsage() {
       << "  antimal fs-find [--vhdx <d.vhdx>] [--overlay <o.cow>] <name-substring>   (offline recursive search)\n"
       << "  antimal fs-scan [--vhdx <d.vhdx>] [--overlay <o.cow>] <guest\\path>   (extract + static-scan a guest file)\n"
       << "  antimal reg-ls [--hive software|system|sam|...] [--overlay <o.cow>] <reg\\key> [--values] [--depth N] [--filter <s>]\n"
-      << "  antimal report <run-id-or-report.json> [--html] [--summary|--detections|--crashes|--usability|--timeline [--json]]\n"
+      << "  antimal report <run-id-or-report.json> [--html] [--summary|--why|--detections|--crashes|--usability|--timeline [--json]]\n"
       << "  antimal browser-impact <run-id-or-report.json> --decrypt-browser-secrets\n"
       << "  antimal export <run-id-or-report.json> --format stix|misp|csv|yara [--out <file>]\n"
       << "  antimal similarity <fileA> <fileB> [--json]   (fuzzy-hash similarity 0..100)\n"
@@ -3023,6 +3023,31 @@ int CommandReport(int argc, wchar_t **argv) {
   const auto config = antimal::LoadConfig(antimal::DefaultConfigPath());
   const auto reportPath = ResolveReportPath(config, std::filesystem::path(argv[2]));
   auto report = antimal::LoadReportBestEffort(reportPath);
+  if (HasFlag(argc, argv, "--why")) {
+    // Explainable verdict: the per-signal "why this verdict" rationale that the
+    // HTML report shows (T07), but in the terminal / for automation. The
+    // rationale is the headline feature -- an analyst should reconstruct the
+    // verdict from these lines alone.
+    if (HasFlag(argc, argv, "--json")) {
+      std::cout << "{\"verdict\":"
+                << JsonQuote(antimal::ToString(report.sandboxVerdict))
+                << ",\"verdictScore\":" << report.verdictScore
+                << ",\"rationale\":" << JsonStrArray(report.verdictRationale)
+                << "}\n";
+      return 0;
+    }
+    std::cout << "Verdict: " << antimal::ToString(report.sandboxVerdict)
+              << " (score " << report.verdictScore << ")\n";
+    if (report.verdictRationale.empty()) {
+      std::cout << "  (no rationale recorded -- sample may not have executed)\n";
+    } else {
+      std::cout << "Why:\n";
+      for (const auto &line : report.verdictRationale) {
+        std::cout << "  - " << line << "\n";
+      }
+    }
+    return 0;
+  }
   if (HasFlag(argc, argv, "--summary")) {
     // A compact, at-a-glance triage view: verdict + boot stage + the counts an
     // analyst (or a dashboard/CI job) wants without parsing the full report or
