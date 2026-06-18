@@ -1413,10 +1413,24 @@ const AntiMal = {
     document.getElementById("frame-index").textContent =
       (i + 1) + " / " + frames.length;
   },
+  // Defang IOCs so the (shareable) report is safe to forward without an
+  // accidental click. Display-only; textContent keeps it injection-safe.
+  defang(s){
+    return String(s).replace(/https:\/\//g,"hxxps://").replace(/http:\/\//g,"hxxp://")
+      .replace(/ftp:\/\//g,"fxp://").replace(/\./g,"[.]").replace(/@/g,"[@]");
+  },
+  setDefang(on){
+    document.querySelectorAll(".ioc-list li").forEach(li => {
+      if (li.dataset.live === undefined) li.dataset.live = li.textContent;
+      li.textContent = on ? AntiMal.defang(li.dataset.live) : li.dataset.live;
+    });
+  },
 };
 document.addEventListener("DOMContentLoaded", () => {
   const search = document.getElementById("event-search");
   if (search) search.addEventListener("input", e => AntiMal.search(e.target.value));
+  const dfg = document.getElementById("defang-toggle");
+  if (dfg) dfg.addEventListener("change", e => AntiMal.setDefang(e.target.checked));
   const filmstrip = document.getElementById("filmstrip");
   if (filmstrip) {
     filmstrip.addEventListener("mousemove", e => {
@@ -2260,6 +2274,9 @@ std::string BuildHtmlReportWithFrames(const AnalysisReport &report,
 
   // Right rail: IOCs + network + browser impact
   html << "<section class=\"panel\"><h2>Indicators</h2>";
+  html << "<label style=\"font-size:12px;display:block;margin:-4px 0 8px;"
+          "color:var(--muted)\"><input type=\"checkbox\" id=\"defang-toggle\"> "
+          "defang IOCs (safe to share)</label>";
   html << "<div class=\"detail-grid\">";
   html << "<div><h2 style=\"margin-top:0\">URLs</h2>";
   EmitIocList(html, scan.iocs.urls, "no urls");

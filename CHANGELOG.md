@@ -56,7 +56,9 @@ unit-tested. A living `private development documentation` tracks done/remaining 
 - **IOC defanging (`Defang`, `--defang`):** the standard threat-intel safe-share rendering
   (`hxxp://`, `1[.]2[.]3[.]4`, `[@]`) for recovered C2. Opt-in on the human-facing views — `config
   --defang` and `export --format csv --defang` — while STIX/MISP/`--json` keep live IOCs for machine
-  ingestion. Pure + unit-tested.
+  ingestion. Pure + unit-tested. Reachable across **all surfaces**: the GUI config panel has a defang
+  checkbox, and the self-contained **report HTML** has a "defang IOCs (safe to share)" toggle so a
+  forwarded report can't trigger an accidental click.
 - **GUI boot-reliability panel (`reliability.get` bridge):** the Reports page now shows a "Boot
   reliability" rollup (reach rates + per-stage histogram) computed by the shared `BootReliability`
   Common module — GUI parity for `boot-report`.
