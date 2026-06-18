@@ -557,13 +557,16 @@ bool FakeInternet::HandleNbns(const uint8_t *f, std::size_t ihl,
     return false;
   }
   const std::size_t nameEnd = p;  // [kDnsHdr, nameEnd) = the encoded name + terminator
-  if (RdBE16(nb + p) != 0x0020) return false;  // only NB name queries (not NBSTAT)
+  const uint16_t qtype = RdBE16(nb + p);
+  // NB (0x0020) = name->address resolution; NBSTAT (0x0021) = node-status
+  // (NetBIOS name-table enumeration, e.g. `nbtstat -A` / worm recon). Answer both.
+  if (qtype != 0x0020 && qtype != 0x0021) return false;
+  const bool nbstat = (qtype == 0x0021);
 
-  // Positive name-query response: header (qd=0, an=1) + an NB RR echoing the
-  // queried name and resolving to the sink IP.
+  // Response: header (qd=0, an=1) + an RR echoing the queried name.
   std::vector<uint8_t> resp(kDnsHdr, 0);
   WrBE16(resp.data(), RdBE16(nb));   // transaction id (echo)
-  WrBE16(resp.data() + 2, 0x8500);   // response, authoritative, recursion available
+  WrBE16(resp.data() + 2, nbstat ? 0x8400 : 0x8500);  // response + AA (+RA for NB)
   WrBE16(resp.data() + 4, 0);        // qdcount
   WrBE16(resp.data() + 6, 1);        // ancount
   resp.insert(resp.end(), nb + kDnsHdr, nb + nameEnd);  // answer NAME = the query name
@@ -571,15 +574,35 @@ bool FakeInternet::HandleNbns(const uint8_t *f, std::size_t ihl,
     resp.push_back(static_cast<uint8_t>(v >> 8));
     resp.push_back(static_cast<uint8_t>(v & 0xFF));
   };
-  push16(0x0020);  // TYPE NB
+  push16(qtype);   // TYPE (NB or NBSTAT)
   push16(0x0001);  // CLASS IN
-  push16(0x0000); push16(0x0708);  // TTL = 1800s
-  push16(6);       // RDLENGTH
-  push16(0x0000);  // NB_FLAGS (B-node, unique)
-  resp.push_back(static_cast<uint8_t>((ip_ >> 24) & 0xFF));
-  resp.push_back(static_cast<uint8_t>((ip_ >> 16) & 0xFF));
-  resp.push_back(static_cast<uint8_t>((ip_ >> 8) & 0xFF));
-  resp.push_back(static_cast<uint8_t>(ip_ & 0xFF));
+  if (!nbstat) {
+    // NB positive name-query response: TTL + NB_FLAGS + the sink IP.
+    push16(0x0000); push16(0x0708);  // TTL = 1800s
+    push16(6);                       // RDLENGTH
+    push16(0x0000);                  // NB_FLAGS (B-node, unique)
+    resp.push_back(static_cast<uint8_t>((ip_ >> 24) & 0xFF));
+    resp.push_back(static_cast<uint8_t>((ip_ >> 16) & 0xFF));
+    resp.push_back(static_cast<uint8_t>((ip_ >> 8) & 0xFF));
+    resp.push_back(static_cast<uint8_t>(ip_ & 0xFF));
+  } else {
+    // NBSTAT node-status: TTL 0, RDATA = NUM_NAMES(1) + one name entry
+    // (16-byte name + 2-byte NAME_FLAGS) + UNIT_ID (the adapter MAC) + a
+    // 46-byte statistics block (zeroed). RDLENGTH = 1 + 18 + 6 + 46 = 71.
+    push16(0x0000); push16(0x0000);  // TTL = 0 (node status is not cached)
+    push16(71);                      // RDLENGTH
+    resp.push_back(1);               // NUM_NAMES
+    static const char kNbName[] = "AMALSINK";
+    for (int i = 0; i < 15; ++i) {
+      resp.push_back(i < static_cast<int>(sizeof(kNbName) - 1)
+                         ? static_cast<uint8_t>(kNbName[i])
+                         : 0x20);  // space-padded to 15 chars
+    }
+    resp.push_back(0x20);           // 16th byte = NetBIOS suffix (file server)
+    push16(0x0400);                 // NAME_FLAGS: active (ACT), unique
+    for (int i = 0; i < 6; ++i) resp.push_back(mac_[i]);  // UNIT_ID = adapter MAC
+    for (int i = 0; i < 46; ++i) resp.push_back(0);       // statistics (zeroed)
+  }
 
   // Wrap: Ethernet (to client) + IPv4 (sink -> guest) + UDP (137 -> client port).
   const std::size_t udpTotal = kUdpHdr + resp.size();

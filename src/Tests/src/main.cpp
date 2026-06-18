@@ -9630,6 +9630,62 @@ void TestFakeInternet() {
     Expect(sink.NbnsReplies() == 1, "sink NBNS: counter advanced");
   }
 
+  // --- NBSTAT node-status query (UDP/137, QTYPE 0x0021) -> name-table response ---
+  {
+    std::vector<uint8_t> nb;
+    be16(nb, 0x6BCD);   // transaction id
+    be16(nb, 0x0010);   // flags: broadcast query
+    be16(nb, 1); be16(nb, 0); be16(nb, 0); be16(nb, 0);
+    nb.push_back(0x20);
+    for (int i = 0; i < 32; ++i) nb.push_back(0x43);  // encoded name (the "*" wildcard form)
+    nb.push_back(0x00);
+    be16(nb, 0x0021);   // QTYPE NBSTAT (node status)
+    be16(nb, 0x0001);   // QCLASS IN
+
+    std::vector<uint8_t> udp;
+    be16(udp, 52001); be16(udp, 137);
+    be16(udp, static_cast<uint16_t>(8 + nb.size()));
+    be16(udp, 0);
+    udp.insert(udp.end(), nb.begin(), nb.end());
+
+    std::vector<uint8_t> ip;
+    ip.push_back(0x45); ip.push_back(0x00);
+    be16(ip, static_cast<uint16_t>(20 + udp.size()));
+    be16(ip, 0x000B); be16(ip, 0x0000); ip.push_back(64); ip.push_back(17);
+    be16(ip, 0x0000);
+    const uint8_t gIp[4] = {0x0A, 0x00, 0x02, 0x64};
+    const uint8_t sIp[4] = {0x0A, 0x00, 0x02, 0x03};
+    for (int i = 0; i < 4; ++i) ip.push_back(gIp[i]);
+    for (int i = 0; i < 4; ++i) ip.push_back(sIp[i]);
+
+    std::vector<uint8_t> f;
+    for (int i = 0; i < 6; ++i) f.push_back(sinkMac[i]);
+    for (int i = 0; i < 6; ++i) f.push_back(guestMac[i]);
+    be16(f, 0x0800);
+    f.insert(f.end(), ip.begin(), ip.end());
+    f.insert(f.end(), udp.begin(), udp.end());
+
+    std::vector<Frame> out;
+    Expect(sink.OnGuestFrame(f.data(), f.size(), out) == 1,
+           "sink NBSTAT: one node-status reply synthesized");
+    const Frame &r = out[0];
+    Expect(r[34] == 0x00 && r[35] == 0x89, "sink NBSTAT: reply UDP src port 137");
+    // Answer TYPE at +88 (eth14+ip20+udp8+nbnsHdr12+name34) must be NBSTAT 0x0021.
+    Expect(r[88] == 0x00 && r[89] == 0x21, "sink NBSTAT: answer TYPE = NBSTAT");
+    // The node name table + the adapter MAC must appear in the RDATA.
+    auto contains = [&](const std::vector<uint8_t> &hay, const uint8_t *ndl, size_t n) {
+      if (hay.size() < n) return false;
+      for (size_t i = 0; i + n <= hay.size(); ++i)
+        if (std::memcmp(hay.data() + i, ndl, n) == 0) return true;
+      return false;
+    };
+    const uint8_t nbName[8] = {'A','M','A','L','S','I','N','K'};
+    Expect(contains(r, nbName, 8), "sink NBSTAT: name table includes the sink name");
+    Expect(contains(r, sinkMac.data(), 6),
+           "sink NBSTAT: node status reports the adapter MAC (UNIT_ID)");
+    Expect(sink.NbnsReplies() == 2, "sink NBSTAT: handled via the NBNS responder");
+  }
+
   // --- bounds / fuzz: malformed frames yield no reply and never read OOB ---
   {
     std::vector<Frame> out;
