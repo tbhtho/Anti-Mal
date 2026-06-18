@@ -170,10 +170,24 @@ std::string JsonQuote(const std::string &s) {
     switch (c) {
       case '\\': o += "\\\\"; break;
       case '"': o += "\\\""; break;
+      case '\b': o += "\\b"; break;
+      case '\f': o += "\\f"; break;
       case '\n': o += "\\n"; break;
       case '\r': o += "\\r"; break;
       case '\t': o += "\\t"; break;
-      default: o += c; break;
+      default:
+        // Any remaining control byte (< 0x20) must be \u-escaped or the JSON is
+        // malformed -- matches the hardened Common JsonEscape. Most CLI values
+        // are printable, but never emit invalid JSON on a hostile/odd input.
+        if (static_cast<unsigned char>(c) < 0x20) {
+          char buf[8];
+          std::snprintf(buf, sizeof(buf), "\\u%04x",
+                        static_cast<unsigned int>(static_cast<unsigned char>(c)));
+          o += buf;
+        } else {
+          o += c;
+        }
+        break;
     }
   }
   return o + "\"";
