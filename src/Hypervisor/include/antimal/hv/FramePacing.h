@@ -96,6 +96,33 @@ public:
     }
     return n;
   }
+  // A "hitch" is a perceptible stutter shorter than a full stall: an interval in
+  // (2x, 3x] the target frame time. These don't show as a freeze but make the
+  // cadence feel uneven, and the average FPS hides them.
+  uint64_t HitchCount() const {
+    const double base = 1.0e6 / static_cast<double>(targetFps_);
+    uint64_t n = 0;
+    for (uint64_t v : intervalsMicros_) {
+      const double d = static_cast<double>(v);
+      if (d > base * 2.0 && d <= base * 3.0) ++n;
+    }
+    return n;
+  }
+  // An evidence-based verdict on the 25-30 FPS goal from the measured cadence:
+  //   "good"     -> measured FPS >= 80% of target, on-target >= 85%, no stalls.
+  //   "marginal" -> measured FPS >= 50% of target (usable but below goal).
+  //   "poor"     -> below that / stalling.
+  //   "no-data"  -> too few samples to judge (needs a longer live session).
+  std::string QualityGrade() const {
+    if (intervalsMicros_.size() < 5) return "no-data";
+    const double fps = MeasuredFps();
+    const double t = static_cast<double>(targetFps_);
+    if (fps >= t * 0.8 && OnTargetRatio() >= 0.85 && StallCount() == 0) {
+      return "good";
+    }
+    if (fps >= t * 0.5) return "marginal";
+    return "poor";
+  }
 
   // Fraction (0..1) of inter-frame intervals at/under the target frame time (with
   // 20% slack) -- frames that kept pace with the target rate.
@@ -115,8 +142,9 @@ public:
       << targetFps_ << ") p50 " << PercentileIntervalMs(0.50) << "ms p95 "
       << PercentileIntervalMs(0.95) << "ms min " << MinIntervalMs() << "ms max "
       << MaxIntervalMs() << "ms" << std::setprecision(0) << " on-target "
-      << (OnTargetRatio() * 100.0) << "% stalls " << StallCount() << " frames "
-      << framesPublished_ << " blank-skips " << blankSkips_;
+      << (OnTargetRatio() * 100.0) << "% stalls " << StallCount() << " hitches "
+      << HitchCount() << " frames " << framesPublished_ << " blank-skips "
+      << blankSkips_ << " grade " << QualityGrade();
     return o.str();
   }
 

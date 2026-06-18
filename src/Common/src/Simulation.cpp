@@ -415,7 +415,7 @@ AnalysisReport BuildSimulatedReport(const std::string &runId,
   d.screenStateReached = 3; // rich (a real desktop)
   d.liveFramePacingSummary =
       "28.6fps (target 30) p50 34.9ms p95 41.2ms min 31.0ms max 58.0ms "
-      "on-target 86% frames 540 blank-skips 7";
+      "on-target 86% stalls 0 hitches 3 frames 540 blank-skips 7 grade good";
 
   return report;
 }

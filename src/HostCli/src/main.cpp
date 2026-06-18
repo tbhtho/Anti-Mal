@@ -3510,6 +3510,12 @@ int CommandReport(int argc, wchar_t **argv) {
     if (!pacing.empty()) {
       try { measuredFps = std::stod(pacing); } catch (...) { measuredFps = -1.0; }
     }
+    // The evidence-based pacing grade ("good"/"marginal"/"poor"), parsed from the
+    // trailing "grade <X>" token of the pacing summary (FramePacingStats).
+    std::string fpsGrade;
+    if (const auto g = pacing.rfind("grade "); g != std::string::npos) {
+      fpsGrade = pacing.substr(g + 6);
+    }
     if (HasFlag(argc, argv, "--json")) {
       std::cout << "{\"schemaVersion\":1"
                 << ",\"runId\":" << JsonQuote(report.runId)
@@ -3526,6 +3532,7 @@ int CommandReport(int argc, wchar_t **argv) {
                 << ",\"detectionsHigh\":" << high
                 << ",\"detectionsMedium\":" << med
                 << ",\"measuredFps\":" << measuredFps
+                << ",\"fpsGrade\":" << JsonQuote(fpsGrade)
                 << ",\"liveFramePacing\":" << JsonQuote(pacing)
                 << ",\"eventsByCategory\":{";
       bool first = true;
@@ -3553,8 +3560,10 @@ int CommandReport(int argc, wchar_t **argv) {
     std::cout << "  detections: " << dets.size() << " (" << high << " high, "
               << med << " medium)\n";
     if (measuredFps >= 0) {
-      std::cout << "  display:    " << measuredFps << " fps measured (target 25-30)"
-                << (measuredFps < 25 ? "  [below target]" : "") << "\n";
+      std::cout << "  display:    " << measuredFps << " fps measured (target 25-30)";
+      if (!fpsGrade.empty()) std::cout << " [grade: " << fpsGrade << "]";
+      else if (measuredFps < 25) std::cout << "  [below target]";
+      std::cout << "\n";
     }
     const auto crashes = antimal::SummarizeCrashes(report.events);
     if (crashes.totalCrashes > 0 && !crashes.signatures.empty()) {

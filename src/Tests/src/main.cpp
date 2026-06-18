@@ -3600,6 +3600,24 @@ void TestFramePacingStats() {
     w += 33333;
   }
   Expect(win.SampleCount() == 10, "pacing: window caps retained intervals");
+
+  // Quality grade: a steady 30fps stream grades "good"; the 10fps stream "poor".
+  Expect(s.QualityGrade() == "good", "pacing: 30fps stream grades good");
+  Expect(slow.QualityGrade() == "poor", "pacing: 10fps stream grades poor");
+  FramePacingStats few(30);
+  few.RecordPublish(0); few.RecordPublish(33333);  // <5 samples
+  Expect(few.QualityGrade() == "no-data",
+         "pacing: too few samples -> no-data grade");
+  Expect(s.Summary().find("grade good") != std::string::npos,
+         "pacing: summary reports the quality grade");
+
+  // Hitch detection: intervals in (2x, 3x] target are hitches, not full stalls.
+  FramePacingStats h(30);  // target frame = 33.3ms; hitch window (66.7, 100]ms
+  uint64_t hv = 0, hlast = 0;
+  for (int i = 0; i < 10; ++i) { hlast = hv; h.RecordPublish(hv); hv += 33333; }
+  h.RecordPublish(hlast + 80000);  // 80ms after the LAST frame -> a hitch (2.4x)
+  Expect(h.HitchCount() == 1, "pacing: an 80ms gap at 30fps counts as one hitch");
+  Expect(h.StallCount() == 0, "pacing: an 80ms gap is below the stall threshold");
 }
 
 // The synthetic local-simulation report: it must be a coherent, clearly-labeled
