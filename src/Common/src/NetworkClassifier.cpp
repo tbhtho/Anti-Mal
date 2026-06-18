@@ -28,6 +28,40 @@ bool IsPrivateHost(const std::string &h) {
   return false;
 }
 
+// Reserved / non-routable IPv4 that a real C2 should never be (excludes the
+// RFC1918 private ranges, which IsPrivateHost handles): 0.0.0.0/8, 100.64/10
+// (CGNAT), the RFC5737 TEST-NET blocks, 198.18/15 (benchmark), 224/4 (multicast)
+// and 240/4 (reserved/broadcast). A C2 pointing here is anomalous -- a sinkhole,
+// a doc/placeholder address, or misconfiguration.
+bool IsBogonHost(const std::string &h) {
+  size_t dot = h.find('.');
+  if (dot == std::string::npos || dot == 0) return false; // hostname, not a quad
+  int o1 = 0;
+  for (size_t i = 0; i < dot; ++i) {
+    if (h[i] < '0' || h[i] > '9') return false;
+    o1 = o1 * 10 + (h[i] - '0');
+  }
+  if (o1 == 0) return true;     // 0.0.0.0/8
+  if (o1 >= 224) return true;   // 224/4 multicast + 240/4 reserved/broadcast
+  if (StartsWith(h, "192.0.2.")) return true;    // TEST-NET-1
+  if (StartsWith(h, "198.51.100.")) return true; // TEST-NET-2
+  if (StartsWith(h, "203.0.113.")) return true;  // TEST-NET-3
+  if (StartsWith(h, "198.18.") || StartsWith(h, "198.19.")) return true; // RFC2544
+  if (StartsWith(h, "100.")) { // 100.64.0.0/10 CGNAT (second octet 64..127)
+    const size_t d2 = h.find('.', dot + 1);
+    if (d2 != std::string::npos) {
+      int o2 = 0;
+      bool ok = d2 > dot + 1;
+      for (size_t i = dot + 1; i < d2 && ok; ++i) {
+        if (h[i] < '0' || h[i] > '9') ok = false;
+        else o2 = o2 * 10 + (h[i] - '0');
+      }
+      if (ok && o2 >= 64 && o2 <= 127) return true;
+    }
+  }
+  return false;
+}
+
 const char *ServiceForPort(uint16_t p) {
   switch (p) {
     case 20: case 21: return "FTP";
@@ -106,6 +140,13 @@ NetworkIndicator ClassifyEndpoint(const std::string &remote) {
   } else if (!ind.privateAddr && p == 3389) {
     ind.suspicious = true;
     ind.note = "RDP to a public host";
+  }
+  // A non-routable/reserved C2 endpoint is anomalous regardless of port.
+  ind.bogon = !ind.privateAddr && IsBogonHost(host);
+  if (ind.bogon) {
+    ind.suspicious = true;
+    const std::string b = "non-routable/reserved C2 address (bogon)";
+    ind.note = ind.note.empty() ? b : ind.note + "; " + b;
   }
   return ind;
 }

@@ -4115,6 +4115,25 @@ void TestNetworkClassifier() {
   // A bare IP (no port) parses without crashing.
   Expect(ClassifyEndpoint("1.2.3.4").port == 0,
          "net: a bare IP yields port 0");
+
+  // Bogon / non-routable C2: anomalous regardless of port; a normal public IP
+  // and a hostname are not bogons.
+  Expect(ClassifyEndpoint("192.0.2.5:443").bogon &&
+             ClassifyEndpoint("192.0.2.5:443").suspicious &&
+             ClassifyEndpoint("192.0.2.5:443").note.find("bogon") != std::string::npos,
+         "net: TEST-NET C2 on a benign port is flagged bogon + suspicious");
+  Expect(ClassifyEndpoint("0.0.0.0:80").bogon, "net: 0/8 is a bogon");
+  Expect(ClassifyEndpoint("239.1.2.3:1234").bogon, "net: 224/4 multicast is a bogon");
+  Expect(ClassifyEndpoint("240.0.0.1:1").bogon, "net: 240/4 reserved is a bogon");
+  Expect(ClassifyEndpoint("100.64.5.5:443").bogon, "net: 100.64/10 CGNAT is a bogon");
+  Expect(!ClassifyEndpoint("100.63.5.5:443").bogon &&
+             !ClassifyEndpoint("100.128.5.5:443").bogon,
+         "net: 100.63 and 100.128 are outside CGNAT (not bogons)");
+  Expect(!ClassifyEndpoint("8.8.8.8:53").bogon &&
+             !ClassifyEndpoint("185.220.101.5:443").bogon,
+         "net: real public IPs are not bogons");
+  Expect(!ClassifyEndpoint("evil.example.com:443").bogon,
+         "net: a hostname is not classified as a bogon");
 }
 
 // Persistence classifier: names the autostart mechanism + MITRE from a raw

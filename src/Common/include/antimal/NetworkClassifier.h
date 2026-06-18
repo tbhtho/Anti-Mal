@@ -13,7 +13,8 @@ struct NetworkIndicator {
   uint16_t port = 0;
   std::string service;   // "HTTPS", "DNS", "SMB", "" if unknown
   bool privateAddr = false; // RFC1918 / loopback / link-local remote
-  bool suspicious = false;  // known-C2 / Tor / IRC / cleartext-cred / odd-public
+  bool bogon = false;       // reserved / non-routable (TEST-NET, CGNAT, 0/8, 224+/4)
+  bool suspicious = false;  // known-C2 / Tor / IRC / cleartext-cred / odd-public / bogon
   std::string note;         // why it's suspicious ("" otherwise)
 };
 

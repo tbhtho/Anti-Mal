@@ -44,6 +44,11 @@ unit-tested. A living `private development documentation` tracks done/remaining 
   TLS C2, an interactive remote shell (T1219), keylogging (T1056.001), screen capture (T1113), and
   exfil over C2 (T1041) — spanning Execution→Persistence→Credential Access→Collection→C2→Exfil. Adds
   the ATT&CK techniques T1219/T1113 to the catalog (name + tactic).
+- **Bogon / non-routable C2 detection (`NetworkClassifier`):** a C2 endpoint in a reserved/
+  non-routable range (0/8, 100.64/10 CGNAT, the RFC5737 TEST-NET blocks, 198.18/15, 224/4 multicast,
+  240/4 reserved) is now flagged `bogon` + suspicious with a note — a real anomaly signal (sinkhole /
+  placeholder / misconfig) the port-only classifier missed. Unit-tested across the ranges + negatives
+  (real public IPs and hostnames are not bogons).
 - **MITRE ATT&CK tactic grouping (kill-chain view):** `MitreCatalog` gains `MitreTechniqueTactic`
   (technique→tactic, with sub-technique→parent fallback and an "Other" catch-all so nothing is
   dropped). The report's MITRE panel now groups techniques by tactic in canonical kill-chain order
