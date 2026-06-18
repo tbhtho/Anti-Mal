@@ -8980,6 +8980,70 @@ void TestE1000RxRing() {
   }
 }
 
+// RX ring buffer reuse / starvation / wraparound: the driver re-posts buffers by
+// advancing RDT, RDH wraps past the last descriptor, and a reused descriptor's
+// buffer is overwritten by the newer frame. Covers the ring lifecycle the
+// single-delivery RX test doesn't.
+void TestE1000RxRingReuse() {
+  using antimal::hv::E1000Device;
+  E1000Device nic;
+  const uint64_t kMmio = 0xF0000000ull;
+  nic.SetMmioBase(kMmio);
+  const uint64_t base = 0x40000ull;
+  std::vector<uint8_t> mem(64 * 1024, 0);
+  nic.SetDmaMemory([&](uint64_t gpa, std::size_t len) -> uint8_t * {
+    if (gpa < base || gpa + len > base + mem.size()) return nullptr;
+    return mem.data() + static_cast<size_t>(gpa - base);
+  });
+  auto w = [&](uint32_t reg, uint32_t v) { nic.OnWrite(kMmio + reg, 4, v); };
+
+  // 8-descriptor RX ring at base+0; 2 KiB buffers at base+0x1000 + d*0x800.
+  const uint32_t descCount = 8;
+  auto bufGpa = [&](uint32_t d) { return base + 0x1000 + static_cast<uint64_t>(d) * 0x800; };
+  auto bufOff = [&](uint32_t d) -> size_t { return 0x1000 + static_cast<size_t>(d) * 0x800; };
+  for (uint32_t d = 0; d < descCount; ++d) {
+    uint8_t *desc = mem.data() + d * 16;
+    const uint64_t b = bufGpa(d);
+    for (int i = 0; i < 8; ++i) desc[i] = static_cast<uint8_t>((b >> (i * 8)) & 0xFF);
+  }
+  w(0x2800, static_cast<uint32_t>(base & 0xFFFFFFFF));  // RDBAL
+  w(0x2804, static_cast<uint32_t>(base >> 32));         // RDBAH
+  w(0x2808, 16 * descCount);                            // RDLEN = 128
+  w(0x2810, 0);                                         // RDH = 0
+  w(0x0100, 0x2);                                       // RCTL.EN
+  w(0x2818, 7);                                         // RDT = 7 (post desc 0..6)
+
+  // deliver(idx): a 4-byte frame whose bytes all encode idx (so we can tell which
+  // delivery landed in which descriptor buffer).
+  uint64_t delivered = 0;
+  auto deliver = [&](uint8_t idx) {
+    std::vector<uint8_t> fr(4, idx);
+    if (nic.DeliverRxFrame(fr.data(), fr.size())) ++delivered;
+  };
+
+  for (uint8_t i = 1; i <= 7; ++i) deliver(i);  // fill desc 0..6, RDH -> 7
+  Expect(delivered == 7, "e1000e RX reuse: 7 posted buffers all filled");
+  deliver(99);  // RDH(7) == RDT(7): no free buffer -> drop
+  Expect(delivered == 7 && nic.FramesDropped() >= 1,
+         "e1000e RX reuse: delivery drops when the ring is starved");
+
+  // Driver re-posts: advance RDT past the wrap to 2 -> desc 7, 0, 1 free again.
+  w(0x2818, 2);
+  deliver(8);   // -> desc 7, RDH wraps 7 -> 0
+  deliver(9);   // -> desc 0 (REUSE: overwrites frame #1)
+  deliver(10);  // -> desc 1 (reuse)
+  Expect(delivered == 10, "e1000e RX reuse: 3 more delivered after re-posting RDT");
+  deliver(98);  // RDH(2) == RDT(2): starved again
+  Expect(delivered == 10, "e1000e RX reuse: starved again at the new tail");
+
+  Expect(nic.FramesReceived() == 10, "e1000e RX reuse: 10 total frames received");
+  // Wraparound + reuse evidence: desc 7 holds frame #8; desc 0 was REUSED and
+  // now holds frame #9 (not the original #1); desc 1 holds #10.
+  Expect(mem[bufOff(7)] == 8, "e1000e RX reuse: desc 7 filled after RDH wrapped 7->0");
+  Expect(mem[bufOff(0)] == 9, "e1000e RX reuse: desc 0 buffer reused (overwritten)");
+  Expect(mem[bufOff(1)] == 10, "e1000e RX reuse: desc 1 holds the latest frame");
+}
+
 // PcapWriter: the network.pcap capture artifact. Verifies the libpcap global
 // header, per-record headers (ts + incl/orig length), frame payloads, and
 // snaplen truncation.
@@ -10643,6 +10707,7 @@ int main() {
     TestE1000Device();
     TestE1000TxMultiDescriptor();
     TestE1000RxRing();
+    TestE1000RxRingReuse();
     TestPcapWriter();
     TestFakeInternet();
     TestContainedNetworkPath();
