@@ -23,6 +23,9 @@ tools/KdDrive.exe
 config/*.prevbase*
 config/*.presession
 
+# Scratch commit-message file (used by the PowerShell `git commit -F` workflow)
+_commitmsg.txt
+
 /docs/
 
 /ARCHITECTURE.md
