@@ -26,6 +26,7 @@
 #include "antimal/JsonValue.h"
 #include "antimal/Report.h"
 #include "antimal/Scanner.h"
+#include "antimal/YaraGen.h"
 
 // CLSID_FileOpenDialog lives in uuid.lib; CoCreateInstance/CoInitializeEx in
 // ole32.lib. Both are MSVC default libs, but pin them so the native picker
@@ -721,6 +722,36 @@ void WebViewHost::RegisterHandlers() {
   // "Scan Computer" sweeps a chosen root recursively (same engine as folder).
   router_.Register("scan.computer",
                    [runScan](const JsonValue &) { return runScan(true); });
+
+  // P3: generate a YARA rule from an already-scanned file. The scan result the
+  // page holds already carries sha256/imphash/type/isPe, so we don't re-scan --
+  // we only re-read the bytes (for the distinctive-string mining) on a worker so
+  // a large file can't hang the UI thread, then Emit the rule text back.
+  router_.Register("scan.yara", [this](const JsonValue &args) -> std::string {
+    const std::string path = args.At("path").AsString();
+    if (path.empty()) throw std::runtime_error("missing path");
+    ScanResult meta;
+    meta.sha256 = args.At("sha256").AsString();
+    meta.imphash = args.At("imphash").AsString();
+    meta.detectedType = args.At("detectedType").AsString();
+    meta.isPe = args.At("isPe").AsBool();
+    const HWND h = hwnd_;
+    std::thread([h, path, meta]() {
+      CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+      try {
+        const auto bytes = ReadAllBytes(std::filesystem::path(Widen(path)));
+        const std::string rule = GenerateYaraRule(meta, bytes);
+        WebViewHost::Emit(h, "scan.yara",
+                          "{\"path\":" + JsonQuote(path) +
+                              ",\"rule\":" + JsonQuote(rule) + "}");
+      } catch (...) {
+        WebViewHost::Emit(h, "scan.yara",
+                          "{\"error\":\"yara generation failed\"}");
+      }
+      CoUninitialize();
+    }).detach();
+    return std::string(R"({"started":true})");
+  });
 
   // P3: reports list. Enumerates run dirs under workspace_root that hold a
   // report.json, sorts by mtime, and surfaces the most recent kMax (a workspace

@@ -77,6 +77,7 @@
       if (m.evt === 'log' && m.data) appendLog(m.data.level || 'INFO', m.data.msg || '');
       if (m.evt === 'scan.result' && m.data) onScanResult(m.data);
       if (m.evt === 'scan.progress' && m.data) onScanProgress(m.data);
+      if (m.evt === 'scan.yara' && m.data) onYaraResult(m.data);
       if (m.evt === 'reports.data' && m.data) onReportsData(m.data);
       if (m.evt === 'dashboard.data' && m.data) onDashboardData(m.data);
       if (m.evt === 'run.status' && m.data) onRunStatus(m.data);
@@ -259,7 +260,30 @@
     ]);
     box.innerHTML = '<table class="grid"><thead><tr><th>Score</th><th>Verdict</th><th>Tags</th><th>Path</th><th>SHA-256</th></tr></thead><tbody>' + rows + '</tbody></table>' +
       '<h2 style="margin:16px 0 8px">Latest Result Detail</h2>' + detail +
+      '<div class="actions" style="margin:10px 0"><button class="btn" id="yara-gen-btn">Generate YARA rule</button><button class="btn" id="yara-copy-btn" style="display:none">Copy</button></div>' +
+      '<pre id="yara-out" class="mono" style="display:none;white-space:pre-wrap;background:var(--panel-2,#11151c);padding:10px;border-radius:6px;overflow:auto;max-height:340px"></pre>' +
       '<h2 style="margin:16px 0 8px">Findings</h2>' + findingsBlock(last.findings);
+    var yb = $('#yara-gen-btn');
+    if (yb) yb.onclick = function () {
+      yb.disabled = true; yb.textContent = 'Generating…';
+      send('scan.yara', { path: last.path || '', sha256: last.sha256 || '', imphash: last.imphash || '', detectedType: last.detectedType || '', isPe: !!last.isPe });
+    };
+  }
+  function onYaraResult(d) {
+    var yb = $('#yara-gen-btn'); if (yb) { yb.disabled = false; yb.textContent = 'Generate YARA rule'; }
+    var out = $('#yara-out'); if (!out) return;
+    if (d && d.error) { appendLog('ERROR', 'YARA generation failed.'); return; }
+    out.style.display = 'block';
+    out.textContent = (d && d.rule) || '';  // textContent => injection-safe
+    var cb = $('#yara-copy-btn');
+    if (cb) {
+      cb.style.display = '';
+      cb.onclick = function () {
+        try { navigator.clipboard.writeText(out.textContent); appendLog('INFO', 'YARA rule copied.'); }
+        catch (e) { appendLog('WARN', 'Clipboard unavailable.'); }
+      };
+    }
+    appendLog('INFO', 'YARA rule generated.');
   }
   function onScanResult(d) {
     state.scans.push(d);

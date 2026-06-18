@@ -48,6 +48,8 @@ unit-tested. A living `private development documentation` tracks done/remaining 
   and import-table DLL names filtered) plus sha256/imphash/filetype meta and a PE-magic + filesize +
   `N of ($s*)` condition. Falls back to a magic/size/sha256 rule when no distinctive strings survive.
   Pure + deterministic + unit-tested; `antimal yara-gen <sample> [--out rule.yar] [--name R]`.
+  Also reachable from the GUI: the scan panel gains a **Generate YARA rule** button (`scan.yara`
+  bridge method, generated on a worker so a large file can't hang the UI) with copy-to-clipboard.
 - **Severity-ranked Detections summary (`DetectionSummary`):** unifies static findings + persistence
   + suspicious network into one ranked behavior list; in the report + `report --detections [--json]`.
 - **Desktop-usability classifier (`UsabilityDiagnostics`):** measures which usability goals a run
