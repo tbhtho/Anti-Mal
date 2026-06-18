@@ -9027,6 +9027,59 @@ void TestFakeInternet() {
     Expect(sink.TcpReplies() == 1, "sink TCP: counter advanced");
   }
 
+  // --- HTTP request on an established connection -> 200 OK ---
+  {
+    const std::string http = "GET /gate.php HTTP/1.1\r\nHost: evil.example\r\n\r\n";
+    std::vector<uint8_t> tcp;
+    be16(tcp, 49152); be16(tcp, 80);  // src, dst (HTTP)
+    const uint32_t cseq = 0x00001000, cack = 0x10000001;  // established: ack = server ISN+1
+    for (int i = 0; i < 4; ++i) tcp.push_back(static_cast<uint8_t>((cseq >> (24 - i * 8)) & 0xFF));
+    for (int i = 0; i < 4; ++i) tcp.push_back(static_cast<uint8_t>((cack >> (24 - i * 8)) & 0xFF));
+    tcp.push_back(0x50); tcp.push_back(0x18);  // data offset 5, flags PSH|ACK
+    be16(tcp, 0xFFFF); be16(tcp, 0); be16(tcp, 0);
+    for (char c : http) tcp.push_back(static_cast<uint8_t>(c));
+
+    std::vector<uint8_t> ip;
+    ip.push_back(0x45); ip.push_back(0x00);
+    be16(ip, static_cast<uint16_t>(20 + tcp.size()));
+    be16(ip, 0x0003); be16(ip, 0x4000); ip.push_back(64); ip.push_back(6);
+    be16(ip, 0x0000);
+    const uint8_t gIp[4] = {0x0A, 0x00, 0x02, 0x64};
+    const uint8_t cIp[4] = {0x5D, 0xB8, 0xD8, 0x22};
+    for (int i = 0; i < 4; ++i) ip.push_back(gIp[i]);
+    for (int i = 0; i < 4; ++i) ip.push_back(cIp[i]);
+
+    std::vector<uint8_t> f;
+    for (int i = 0; i < 6; ++i) f.push_back(sinkMac[i]);
+    for (int i = 0; i < 6; ++i) f.push_back(guestMac[i]);
+    be16(f, 0x0800);
+    f.insert(f.end(), ip.begin(), ip.end());
+    f.insert(f.end(), tcp.begin(), tcp.end());
+
+    std::vector<Frame> out;
+    Expect(sink.OnGuestFrame(f.data(), f.size(), out) == 1,
+           "sink HTTP: one 200 OK synthesized");
+    const Frame &r = out[0];
+    Expect(r[14 + 9] == 6, "sink HTTP: reply is IPv4/TCP");
+    Expect(r[34] == 0 && r[35] == 80, "sink HTTP: reply src port 80");
+    Expect(r[34 + 13] == 0x18, "sink HTTP: flags PSH|ACK");
+    // TCP payload starts at +34+20 = +54: "HTTP/1.1 200".
+    const char *expect200 = "HTTP/1.1 200";
+    Expect(r.size() > 54 + 12 &&
+               std::memcmp(r.data() + 54, expect200, 12) == 0,
+           "sink HTTP: payload is an HTTP 200 OK response");
+    // seq = the request's ack (what the client expects from us).
+    const uint32_t rseq = (static_cast<uint32_t>(r[34 + 4]) << 24) |
+                          (r[34 + 5] << 16) | (r[34 + 6] << 8) | r[34 + 7];
+    Expect(rseq == 0x10000001u, "sink HTTP: response seq = client's ack");
+    // ack = client data seq + request length.
+    const uint32_t rack = (static_cast<uint32_t>(r[34 + 8]) << 24) |
+                          (r[34 + 9] << 16) | (r[34 + 10] << 8) | r[34 + 11];
+    Expect(rack == 0x00001000u + static_cast<uint32_t>(http.size()),
+           "sink HTTP: response ack = client seq + request length");
+    Expect(sink.HttpReplies() == 1, "sink HTTP: counter advanced");
+  }
+
   // --- DHCP DISCOVER -> OFFER (the guest auto-configures to the sink) ---
   {
     std::vector<uint8_t> dh(236, 0);

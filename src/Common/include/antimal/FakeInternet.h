@@ -43,6 +43,7 @@ class FakeInternet {
   uint64_t IcmpReplies() const noexcept { return icmpReplies_; }
   uint64_t DnsReplies() const noexcept { return dnsReplies_; }
   uint64_t TcpReplies() const noexcept { return tcpReplies_; }
+  uint64_t HttpReplies() const noexcept { return httpReplies_; }
   uint64_t DhcpReplies() const noexcept { return dhcpReplies_; }
   uint64_t FramesSeen() const noexcept { return framesSeen_; }
   uint64_t FramesDropped() const noexcept { return framesDropped_; }
@@ -74,6 +75,7 @@ class FakeInternet {
   uint64_t icmpReplies_ = 0;
   uint64_t dnsReplies_ = 0;
   uint64_t tcpReplies_ = 0;
+  uint64_t httpReplies_ = 0;
   uint64_t dhcpReplies_ = 0;
   uint64_t framesSeen_ = 0;
   uint64_t framesDropped_ = 0;

@@ -21,6 +21,14 @@ constexpr std::size_t kUdpHdr = 8;    // srcPort dstPort length checksum
 constexpr std::size_t kDnsHdr = 12;   // id flags qd an ns ar
 constexpr std::size_t kTcpHdr = 20;   // TCP header without options
 
+uint16_t RdBE16(const uint8_t *p) {
+  return static_cast<uint16_t>((static_cast<uint16_t>(p[0]) << 8) | p[1]);
+}
+void WrBE16(uint8_t *p, uint16_t v) {
+  p[0] = static_cast<uint8_t>(v >> 8);
+  p[1] = static_cast<uint8_t>(v & 0xFF);
+}
+
 // IPv4 transport checksum over the pseudo-header (srcIP, dstIP, 0, proto, len) +
 // the L4 header & data. `seg` points at the L4 header (checksum field zeroed).
 uint16_t L4Checksum(const uint8_t *srcIp, const uint8_t *dstIp, uint8_t proto,
@@ -47,12 +55,58 @@ uint16_t UdpChecksum(const uint8_t *srcIp, const uint8_t *dstIp,
   return c == 0 ? 0xFFFF : c;
 }
 
-uint16_t RdBE16(const uint8_t *p) {
-  return static_cast<uint16_t>((static_cast<uint16_t>(p[0]) << 8) | p[1]);
+bool LooksHttp(const uint8_t *p, std::size_t n) {
+  static const char *kMethods[] = {"GET ",     "POST ",   "HEAD ",  "PUT ",
+                                    "DELETE ",  "OPTIONS ", "PATCH ", "CONNECT "};
+  for (const char *m : kMethods) {
+    const std::size_t ml = std::strlen(m);
+    if (n >= ml && std::memcmp(p, m, ml) == 0) return true;
+  }
+  return false;
 }
-void WrBE16(uint8_t *p, uint16_t v) {
-  p[0] = static_cast<uint8_t>(v >> 8);
-  p[1] = static_cast<uint8_t>(v & 0xFF);
+
+// Emit a server->client TCP segment (Ethernet + IPv4 + TCP [+ payload]) built
+// from the request frame `f` (whose IP header is `ihl` bytes), swapping the
+// endpoints. Used for both the SYN-ACK and the HTTP response.
+void EmitTcpReply(const Mac &mac, const uint8_t *f, std::size_t ihl,
+                  uint16_t serverPort, uint16_t clientPort, uint32_t seq,
+                  uint32_t ackv, uint8_t flags, const uint8_t *payload,
+                  std::size_t payloadLen, std::vector<Frame> &out) {
+  const std::size_t seg = kTcpHdr + payloadLen;
+  const std::size_t ipTotal = ihl + seg;
+  Frame r(kEthHdr + ipTotal, 0);
+  std::memcpy(r.data(), f + 6, 6);            // Ethernet dst = guest src
+  std::memcpy(r.data() + 6, mac.data(), 6);   // Ethernet src = sink
+  WrBE16(r.data() + 12, kEthIpv4);
+
+  uint8_t *rip = r.data() + kEthHdr;
+  std::memcpy(rip, f + kEthHdr, ihl);  // copy request IP header (keeps IHL)
+  WrBE16(rip + 2, static_cast<uint16_t>(ipTotal));
+  WrBE16(rip + 4, 0);
+  WrBE16(rip + 6, 0x4000);  // DF
+  rip[8] = 64;
+  rip[9] = kIpProtoTcp;
+  uint8_t reqSrc[4], reqDst[4];
+  std::memcpy(reqSrc, f + kEthHdr + 12, 4);
+  std::memcpy(reqDst, f + kEthHdr + 16, 4);
+  std::memcpy(rip + 12, reqDst, 4);  // src = the server the guest dialed
+  std::memcpy(rip + 16, reqSrc, 4);  // dst = the guest
+  rip[10] = rip[11] = 0;
+  WrBE16(rip + 10, InternetChecksum(rip, ihl));
+
+  uint8_t *rtcp = rip + ihl;
+  WrBE16(rtcp, serverPort);
+  WrBE16(rtcp + 2, clientPort);
+  for (int i = 0; i < 4; ++i) rtcp[4 + i] = static_cast<uint8_t>((seq >> (24 - i * 8)) & 0xFF);
+  for (int i = 0; i < 4; ++i) rtcp[8 + i] = static_cast<uint8_t>((ackv >> (24 - i * 8)) & 0xFF);
+  rtcp[12] = 0x50;  // data offset = 5 (20-byte header, no options)
+  rtcp[13] = flags;
+  WrBE16(rtcp + 14, 0xFFFF);  // window
+  rtcp[16] = rtcp[17] = 0;    // checksum (zeroed before recompute)
+  rtcp[18] = rtcp[19] = 0;    // urgent pointer
+  if (payload && payloadLen) std::memcpy(rtcp + kTcpHdr, payload, payloadLen);
+  WrBE16(rtcp + 16, L4Checksum(rip + 12, rip + 16, kIpProtoTcp, rtcp, seg));
+  out.push_back(std::move(r));
 }
 
 }  // namespace
@@ -414,58 +468,46 @@ bool FakeInternet::HandleTcp(const uint8_t *f, std::size_t ihl,
   const uint8_t flags = tcp[13];
   const bool syn = (flags & 0x02) != 0;
   const bool ack = (flags & 0x10) != 0;
-  // Only complete the handshake on a bare SYN (SYN, no ACK). A SYN-ACK back lets
-  // the guest's connection to the (resolved) C2 establish so it sends its first
-  // data payload — the high-value capture. Subsequent data is captured on TX;
-  // an application responder (HTTP/etc.) is a later slice.
-  if (!syn || ack) return false;
+  const bool rst = (flags & 0x04) != 0;
+  if (rst) return false;  // never reply to a reset
 
   const uint16_t srcPort = RdBE16(tcp);      // client's source port
   const uint16_t dstPort = RdBE16(tcp + 2);  // server port (the contacted port)
-  uint32_t clientSeq = 0;
-  for (int i = 0; i < 4; ++i) clientSeq = (clientSeq << 8) | tcp[4 + i];
+  uint32_t segSeq = 0, segAck = 0;
+  for (int i = 0; i < 4; ++i) segSeq = (segSeq << 8) | tcp[4 + i];
+  for (int i = 0; i < 4; ++i) segAck = (segAck << 8) | tcp[8 + i];
+  const std::size_t dataOff = static_cast<std::size_t>(tcp[12] >> 4) * 4;
+  if (dataOff < kTcpHdr || dataOff > tcpLen) {
+    ++framesDropped_;
+    return false;
+  }
+  const std::size_t payloadLen = tcpLen - dataOff;
+  const uint8_t *payload = tcp + dataOff;
 
-  // Build a 20-byte (no options) SYN-ACK over a fresh IPv4 datagram.
-  const std::size_t synAckTcp = kTcpHdr;
-  const std::size_t ipTotal = ihl + synAckTcp;
-  Frame r(kEthHdr + ipTotal, 0);
-  std::memcpy(r.data(), f + 6, 6);            // Ethernet dst = guest src
-  std::memcpy(r.data() + 6, mac_.data(), 6);  // Ethernet src = sink
-  WrBE16(r.data() + 12, kEthIpv4);
-
-  uint8_t *rip = r.data() + kEthHdr;
-  std::memcpy(rip, f + kEthHdr, ihl);  // copy the request IP header (keeps IHL)
-  WrBE16(rip + 2, static_cast<uint16_t>(ipTotal));
-  WrBE16(rip + 4, 0);
-  WrBE16(rip + 6, 0x4000);  // DF
-  rip[8] = 64;
-  rip[9] = kIpProtoTcp;
-  uint8_t reqSrcIp[4], reqDstIp[4];
-  std::memcpy(reqSrcIp, f + kEthHdr + 12, 4);
-  std::memcpy(reqDstIp, f + kEthHdr + 16, 4);
-  std::memcpy(rip + 12, reqDstIp, 4);  // src = the server the guest dialed
-  std::memcpy(rip + 16, reqSrcIp, 4);  // dst = the guest
-  rip[10] = rip[11] = 0;
-  WrBE16(rip + 10, InternetChecksum(rip, ihl));
-
-  uint8_t *rtcp = rip + ihl;
-  WrBE16(rtcp, dstPort);      // src port = the contacted server port
-  WrBE16(rtcp + 2, srcPort);  // dst port = the client's source port
-  // Server ISN (deterministic; arbitrary). ack = client seq + 1 (SYN consumes 1).
-  const uint32_t serverIsn = 0x10000000u;
-  const uint32_t ackNum = clientSeq + 1u;
-  for (int i = 0; i < 4; ++i) rtcp[4 + i] = static_cast<uint8_t>((serverIsn >> (24 - i * 8)) & 0xFF);
-  for (int i = 0; i < 4; ++i) rtcp[8 + i] = static_cast<uint8_t>((ackNum >> (24 - i * 8)) & 0xFF);
-  rtcp[12] = 0x50;  // data offset = 5 (20 bytes), no options
-  rtcp[13] = 0x12;  // flags = SYN | ACK
-  WrBE16(rtcp + 14, 0xFFFF);  // window
-  rtcp[16] = rtcp[17] = 0;    // checksum (zeroed before recompute)
-  rtcp[18] = rtcp[19] = 0;    // urgent pointer
-  WrBE16(rtcp + 16, L4Checksum(rip + 12, rip + 16, kIpProtoTcp, rtcp, synAckTcp));
-
-  out.push_back(std::move(r));
-  ++tcpReplies_;
-  return true;
+  // SYN (no ACK): complete the handshake so the connection establishes and the
+  // sample sends its first data payload. Server ISN is fixed; ack = seq+1.
+  if (syn && !ack) {
+    EmitTcpReply(mac_, f, ihl, dstPort, srcPort, 0x10000000u, segSeq + 1u, 0x12,
+                 nullptr, 0, out);
+    ++tcpReplies_;
+    return true;
+  }
+  // Established data segment carrying an HTTP request -> answer 200 OK so the
+  // full exchange plays out (the sample may then send more / fetch a stage).
+  // Stateless: response seq = the seq the client expects from us (its ack), and
+  // we acknowledge its data (its seq + payload length).
+  if (ack && payloadLen > 0 && LooksHttp(payload, payloadLen)) {
+    static const char kResp[] =
+        "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: "
+        "0\r\nConnection: close\r\n\r\n";
+    EmitTcpReply(mac_, f, ihl, dstPort, srcPort, segAck,
+                 segSeq + static_cast<uint32_t>(payloadLen), 0x18 /*PSH|ACK*/,
+                 reinterpret_cast<const uint8_t *>(kResp),
+                 sizeof(kResp) - 1, out);
+    ++httpReplies_;
+    return true;
+  }
+  return false;
 }
 
 }  // namespace antimal::net
