@@ -37,3 +37,9 @@ jobs:
           & $exe
           if ($LASTEXITCODE -ne 0) { Write-Error "AntiMal.Tests.exe reported $LASTEXITCODE failure(s)"; exit 1 }
           Write-Host "All tests passed."
+
+      - name: Analyst-workflow smoke test (CLI glue, no VM)
+        shell: pwsh
+        run: |
+          ./tools/Smoke-AnalystWorkflow.ps1
+          if ($LASTEXITCODE -ne 0) { Write-Error "analyst-workflow smoke test failed"; exit 1 }
