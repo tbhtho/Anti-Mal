@@ -189,6 +189,31 @@
       "strings": ["User-Agent", "POST /", "GET /"],
       "yara": ["c2", "command-and-control"],
       "capa": ["T1071"]
+    },
+    {
+      "tag": "maldoc",
+      "category": "family",
+      "weight": 45,
+      "findings": [
+        "rtf.ole_object",
+        "rtf.objupdate",
+        "rtf.embedded_pe",
+        "rtf.remote_object_load",
+        "onenote.embedded_file",
+        "onenote.embedded_exe",
+        "onenote.embedded_script",
+        "iso.lnk_plus_exe",
+        "iso.embedded_exe"
+      ],
+      "yara": ["maldoc", "macro"]
+    },
+    {
+      "tag": "exploit",
+      "category": "capability",
+      "weight": 55,
+      "findings": ["rtf.equation_editor", "rtf.remote_object_load"],
+      "yara": ["exploit", "cve"],
+      "capa": ["T1203"]
     }
   ]
 }

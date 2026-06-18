@@ -264,6 +264,16 @@ void Tagger::LoadBuiltinRules() {
       {"connect", "send", "recv"}, {},
       {"User-Agent", "POST /", "GET /"},
       {"c2", "command-and-control"}, {"T1071"}, {});
+  // Malicious-document / delivery-lure family (RTF / OneNote / ISO analyzers).
+  add("maldoc", "family", 45, {},
+      {"rtf.ole_object", "rtf.objupdate", "rtf.embedded_pe",
+       "rtf.remote_object_load", "onenote.embedded_file", "onenote.embedded_exe",
+       "onenote.embedded_script", "iso.lnk_plus_exe", "iso.embedded_exe"},
+      {}, {"maldoc", "macro"}, {}, {});
+  // Client-side exploit document (Equation Editor / template-injection).
+  add("exploit", "capability", 55, {},
+      {"rtf.equation_editor", "rtf.remote_object_load"}, {},
+      {"exploit", "cve"}, {"T1203"}, {});
 }
 
 std::vector<TagResult> Tagger::Evaluate(const TagInputs &inputs,
