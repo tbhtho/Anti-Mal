@@ -40,6 +40,10 @@ unit-tested. A living `private development documentation` tracks done/remaining 
 - **`boot-report` failure breakdown:** `--json` now emits `byCategory`, `byRemediation`, and the
   `incomplete` count; text mode prints the single most common actionable remediation across runs
   (the highest-leverage fix for the dominant failure mode).
+- **Analyst-workflow smoke test (`tools/Smoke-AnalystWorkflow.ps1`):** an end-to-end, no-VM
+  regression of the CLI glue unit tests can't reach — simulate → report --summary/--why/--crashes/
+  --detections → export stix/misp/csv → yara-gen → config (synthetic RC4 round-trip) → triage, with
+  14 asserted checks; CI-gateable. Verified all-green.
 - **GUI "Recover config / C2" (`scan.config` bridge):** the scan panel gains a button that runs the
   config/C2 extractors (Cobalt Strike + XOR + base64-wrapped RC4) on the worker and lists the recovered
   Malware Configuration inline — GUI parity for the CLI `config` command (mirrors the `scan.yara` path).
