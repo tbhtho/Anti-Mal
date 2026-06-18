@@ -3178,9 +3178,25 @@ int CommandBaseValidate(int argc, wchar_t **argv,
             const std::string aal =
                 winlogon ? HiveStringValue(soft, *winlogon, "AutoAdminLogon")
                          : std::string();
+            const std::string defPw =
+                winlogon ? HiveStringValue(soft, *winlogon, "DefaultPassword")
+                         : std::string();
             advise("autologon", aal == "1",
                    "HKLM\\SOFTWARE\\...\\Winlogon\\AutoAdminLogon=" +
                        (aal.empty() ? std::string("(unset)") : aal));
+            // A stale, non-empty DefaultPassword breaks a no-password AutoLogon
+            // (the orchestrator disables the baked one for exactly this reason):
+            // Winlogon tries the wrong password, the auto-login fails, and the VM
+            // sits at the lock screen. Flag it when AutoAdminLogon is on.
+            if (aal == "1") {
+              advise("autologon.password-clean", defPw.empty(),
+                     defPw.empty()
+                         ? "DefaultPassword is empty (no-password AutoLogon will "
+                           "proceed)"
+                         : "DefaultPassword is SET -> a stale value will fail the "
+                           "no-password AutoLogon and stall at the lock screen; "
+                           "clear it or set vm_login_password to match");
+            }
           }
         }
       }
