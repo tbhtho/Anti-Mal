@@ -109,11 +109,24 @@ for ($i = 1; $i -le $Boots; $i++) {
   $c = Get-Content $diag
 
   # Frame evidence (a rendered desktop is a large late frame).
-  $frameCount = 0; $maxFrameKB = 0
+  $frameCount = 0; $maxFrameKB = 0; $largestPng = ""
   if (Test-Path $shots) {
     $pngs = Get-ChildItem $shots -Filter "guest-*.png" -ErrorAction SilentlyContinue
     $frameCount = ($pngs | Measure-Object).Count
-    if ($frameCount -gt 0) { $maxFrameKB = [int](($pngs | Measure-Object Length -Maximum).Maximum / 1024) }
+    if ($frameCount -gt 0) {
+      $largest = $pngs | Sort-Object Length -Descending | Select-Object -First 1
+      $maxFrameKB = [int]($largest.Length / 1024)
+      $largestPng = $largest.FullName
+    }
+  }
+  # Objective desktop verdict: run the real ScreenState pixel classifier on the
+  # largest frame (classify-frame) instead of trusting the empirical size cutoff.
+  $frameState = ""
+  if ($largestPng -ne "") {
+    try {
+      $cf = & "$bin\AntiMal.HostCli.exe" classify-frame $largestPng --json 2>$null | ConvertFrom-Json
+      if ($cf) { $frameState = $cf.state }
+    } catch { }
   }
 
   # Telemetry / boot-stage evidence from the journal.
@@ -128,11 +141,12 @@ for ($i = 1; $i -le $Boots; $i++) {
   $hostChannelBytes = AsInt (Field $c "hostChannelBytes")
 
   # A session-0 agent streams telemetry from the LOCK SCREEN too, so telemetry alone is
-  # NOT proof of an interactive desktop. A rendered desktop is a distinctly large frame
-  # (~1.2 MB w/ wallpaper+icons) vs the ~745 KB lock screen -- use the frame size to tell
-  # them apart. Threshold 1000 KB sits cleanly between the two observed sizes.
+  # NOT proof of an interactive desktop. Prefer the OBJECTIVE pixel classifier (Rich =
+  # populated desktop) on the largest frame; fall back to the empirical size cutoff
+  # (~1.2 MB desktop vs ~745 KB lock screen) only when the classifier didn't run.
   $osUp = ($agentConnected -or $hostChannelBytes -gt 0 -or $procEvents -gt 0)
-  $desktopRendered = ($maxFrameKB -ge 1000)
+  if ($frameState -ne "") { $desktopRendered = ($frameState -eq "rich") }
+  else                    { $desktopRendered = ($maxFrameKB -ge 1000) }
 
   # Classify furthest stage reached (DESKTOP = telemetry AND a rendered desktop frame).
   $stage = "early"
@@ -146,7 +160,7 @@ for ($i = 1; $i -le $Boots; $i++) {
   $rows += [PSCustomObject]@{
     boot=$i; run=$run.Name.Substring(0,8); stage=$stage; bootStage=$bootStage
     agent=$agentConnected; hostCh=$hostChannelBytes; procEv=$procEvents
-    frames=$frameCount; maxKB=$maxFrameKB; reboots=(Field $c "guestReboots")
+    frames=$frameCount; maxKB=$maxFrameKB; frameState=$frameState; reboots=(Field $c "guestReboots")
     timedOut=(Field $c "timedOut"); pfA=(Field $c "pageFaultAssists")
     pfS=(Field $c "pageFaultAssistsSuppressed"); fatalRip=(Field $c "fatalRip")
     fatalCs=(Field $c "fatalCsSelector"); fatalPdb=(Field $c "fatalRipImagePdb")
@@ -155,7 +169,7 @@ for ($i = 1; $i -le $Boots; $i++) {
 }
 
 Write-Host "`n================= DESKTOP-REACH SUMMARY ================="
-$rows | Format-Table boot,run,stage,reboots,frames,maxKB,hostCh,procEv,timedOut,fatalPdb -AutoSize | Out-String | Write-Host
+$rows | Format-Table boot,run,stage,frameState,reboots,frames,maxKB,hostCh,procEv,timedOut,fatalPdb -AutoSize | Out-String | Write-Host
 $desktop = ($rows | Where-Object { $_.stage -eq "DESKTOP" }).Count
 $osUpCount = ($rows | Where-Object { $_.stage -in @("DESKTOP","os-up/lockscreen") }).Count
 Write-Host ("RENDERED INTERACTIVE DESKTOP (telemetry + >=1MB frame): {0}/{1}" -f $desktop, $rows.Count)
