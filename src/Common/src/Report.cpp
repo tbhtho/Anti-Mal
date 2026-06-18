@@ -11,6 +11,7 @@
 #include "antimal/MitreCatalog.h"
 #include "antimal/NetworkClassifier.h"
 #include "antimal/PersistenceClassifier.h"
+#include "antimal/ProcessChainClassifier.h"
 
 #include <functional>
 #include <map>
@@ -2390,6 +2391,11 @@ std::vector<std::string> AggregateMitreTechniques(
     if (it != kFindingTech.end()) {
       for (const auto &t : it->second) techniques.insert(t);
     }
+  }
+  // Techniques implied by suspicious process-ancestry chains (maldoc execution,
+  // proxy-exec, etc.) -- derived from the lineage, not present on the events.
+  for (const auto &h : ClassifyProcessChains(events)) {
+    if (!h.mitre.empty()) techniques.insert(h.mitre);
   }
   return std::vector<std::string>(techniques.begin(), techniques.end());
 }

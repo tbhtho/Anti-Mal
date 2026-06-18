@@ -71,6 +71,7 @@
     <ClInclude Include="include\antimal\PdfAnalyzer.h" />
     <ClInclude Include="include\antimal\PeParser.h" />
     <ClInclude Include="include\antimal\PersistenceClassifier.h" />
+    <ClInclude Include="include\antimal\ProcessChainClassifier.h" />
     <ClInclude Include="include\antimal\RtfAnalyzer.h" />
     <ClInclude Include="include\antimal\ProcessTelemetry.h" />
     <ClInclude Include="include\antimal\Report.h" />
@@ -128,6 +129,7 @@
     <ClCompile Include="src\PeParser.cpp" />
     <ClCompile Include="src\RtfAnalyzer.cpp" />
     <ClCompile Include="src\PersistenceClassifier.cpp" />
+    <ClCompile Include="src\ProcessChainClassifier.cpp" />
     <ClCompile Include="src\ProcessTelemetry.cpp" />
     <ClCompile Include="src\Report.cpp" />
     <ClCompile Include="src\ReportDiff.cpp" />

@@ -44,6 +44,13 @@ unit-tested. A living `private development documentation` tracks done/remaining 
   TLS C2, an interactive remote shell (T1219), keylogging (T1056.001), screen capture (T1113), and
   exfil over C2 (T1041) — spanning Execution→Persistence→Credential Access→Collection→C2→Exfil. Adds
   the ATT&CK techniques T1219/T1113 to the catalog (name + tactic).
+- **Suspicious process-ancestry detection (`ProcessChainClassifier`):** classifies the parent→child
+  *lineage* the process tree encodes (which the per-command classifier misses) — Office→script-host
+  (textbook maldoc execution, T1566.001, high), browser→script-host (drive-by), proxy-exec LOLBin→
+  shell (mshta/rundll32/regsvr32, T1218), script-host→PowerShell, and shell→script-host lures.
+  Conservative rule set (chains rarely benign — explorer→cmd is *not* flagged) so it can feed the
+  verdict without FP floods. Surfaced in `report --detections` (new `process-chain` category) and the
+  ATT&CK matrix. Pure + unit-tested.
 - **Static findings → ATT&CK matrix:** `AggregateMitreTechniques` now maps the static scanner
   findings (the file-type analyzers + obfuscation/config recovery) to ATT&CK techniques, so a report
   for a lure document/image populates the ATT&CK matrix from static analysis, not just capa/dynamic

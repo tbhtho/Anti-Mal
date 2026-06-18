@@ -3,6 +3,7 @@
 #include "antimal/CommandLineClassifier.h"
 #include "antimal/NetworkClassifier.h"
 #include "antimal/PersistenceClassifier.h"
+#include "antimal/ProcessChainClassifier.h"
 
 #include <algorithm>
 #include <set>
@@ -78,6 +79,12 @@ std::vector<Detection> BuildDetections(const AnalysisReport &report) {
     const CommandLineThreat t = ClassifyCommandLine(e.commandLine);
     if (!t.suspicious) continue;
     add(2, "command", t.reason + ": " + e.commandLine, t.technique);
+  }
+
+  // 5) Suspicious process-ancestry chains (parent->child lineage).
+  for (const auto &h : ClassifyProcessChains(report.events)) {
+    add(h.severity, "process-chain",
+        h.parent + " -> " + h.child + ": " + h.reason, h.mitre);
   }
 
   std::sort(out.begin(), out.end(), [](const Detection &a, const Detection &b) {

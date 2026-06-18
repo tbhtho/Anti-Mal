@@ -8,6 +8,7 @@
 #include "antimal/BootDiagnostics.h"
 #include "antimal/BootReliability.h"
 #include "antimal/CommandLineClassifier.h"
+#include "antimal/ProcessChainClassifier.h"
 #include "antimal/Crypto.h"
 #include "antimal/CrashSummary.h"
 #include "antimal/DetectionSummary.h"
@@ -4299,6 +4300,62 @@ void TestPackerDetection() {
 
 // Command-line / LOLBin classifier: flags abuse patterns and does NOT flag
 // ordinary command lines.
+void TestProcessChainClassifier() {
+  using antimal::ClassifyProcessChains;
+  using antimal::EventRecord;
+  auto proc = [](uint32_t pid, uint32_t ppid, const char *img) {
+    EventRecord e;
+    e.category = "process";
+    e.action = "process.start";
+    e.processId = pid;
+    e.parentProcessId = ppid;
+    e.imagePath = img;
+    return e;
+  };
+  auto hits = [](const std::vector<EventRecord> &ev) {
+    return ClassifyProcessChains(ev);
+  };
+  auto reasonHas = [](const std::vector<antimal::ProcessChainHit> &h,
+                      const char *parent, const char *child) {
+    for (const auto &x : h)
+      if (x.parent == parent && x.child == child) return true;
+    return false;
+  };
+
+  // The textbook maldoc chain: winword -> powershell.
+  {
+    std::vector<EventRecord> ev = {proc(100, 0, "explorer.exe"),
+                                   proc(200, 100, "WINWORD.EXE"),
+                                   proc(300, 200, "powershell.exe")};
+    const auto h = hits(ev);
+    Expect(reasonHas(h, "winword.exe", "powershell.exe"),
+           "chain: winword -> powershell flagged");
+    bool office = false;
+    for (const auto &x : h)
+      if (x.child == "powershell.exe" && x.severity == 3 && x.mitre == "T1566.001")
+        office = true;
+    Expect(office, "chain: Office->shell is high-severity T1566.001");
+  }
+  // Proxy-exec: mshta -> powershell.
+  {
+    std::vector<EventRecord> ev = {proc(10, 0, "mshta.exe"),
+                                   proc(11, 10, "powershell.exe")};
+    Expect(reasonHas(hits(ev), "mshta.exe", "powershell.exe"),
+           "chain: mshta -> powershell (proxy-exec) flagged");
+  }
+  // Benign lineage: explorer -> cmd is NOT flagged (too common).
+  {
+    std::vector<EventRecord> ev = {proc(1, 0, "explorer.exe"),
+                                   proc(2, 1, "cmd.exe")};
+    Expect(hits(ev).empty(), "chain: explorer -> cmd is not flagged (benign)");
+  }
+  // No parent image known -> no crash, no hit.
+  {
+    std::vector<EventRecord> ev = {proc(5, 999, "powershell.exe")};
+    Expect(hits(ev).empty(), "chain: unknown parent yields no hit");
+  }
+}
+
 void TestCommandLineClassifier() {
   using antimal::ClassifyCommandLine;
   Expect(ClassifyCommandLine(
@@ -9563,6 +9620,7 @@ int main() {
     TestBootDiagnostics();
     TestBootReliability();
     TestCommandLineClassifier();
+    TestProcessChainClassifier();
     TestUsabilityDiagnostics();
     TestPackerDetection();
     TestMalformedInputRobustness();
