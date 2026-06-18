@@ -206,7 +206,11 @@ bool FakeInternet::HandleIpv4(const uint8_t *f, std::size_t len,
       return false;
     }
     const uint16_t dport = RdBE16(f + l4Off + 2);  // UDP dst port
-    if (dport == 53) return HandleDns(f, ihl, l4Off, l4Len, out);
+    // DNS (53) and LLMNR (5355) share the DNS wire format; HandleDns answers both
+    // (resolve-all from the sink's unicast IP -- correct even for an LLMNR query
+    // sent to the 224.0.0.252 multicast group). Windows falls back to LLMNR for
+    // names DNS doesn't resolve, so a guest gets silence on those without this.
+    if (dport == 53 || dport == 5355) return HandleDns(f, ihl, l4Off, l4Len, out);
     if (dport == 67) return HandleDhcp(f, ihl, l4Off, l4Len, out);
     if (dport == 123) return HandleNtp(f, ihl, l4Off, l4Len, out);
     return false;  // other UDP ports: no reply (yet)
@@ -341,9 +345,11 @@ bool FakeInternet::HandleDns(const uint8_t *f, std::size_t ihl,
   std::memcpy(rip + 16, reqSrc, 4);
   rip[10] = rip[11] = 0;
   WrBE16(rip + 10, InternetChecksum(rip, ihl));
-  // UDP header: src port 53, dst port = the query's src port.
+  // UDP header: reply src port = the port the query was sent TO (53 for DNS,
+  // 5355 for LLMNR -- both use this DNS-format responder); dst = the query's
+  // src port.
   uint8_t *rudp = rip + ihl;
-  WrBE16(rudp, 53);
+  std::memcpy(rudp, f + udpOff + 2, 2);  // src port = request's dst port (53/5355)
   std::memcpy(rudp + 2, f + udpOff, 2);  // dst port = request's src port
   WrBE16(rudp + 4, static_cast<uint16_t>(udpTotal));
   rudp[6] = rudp[7] = 0;  // checksum 0 before recompute

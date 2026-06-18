@@ -9180,6 +9180,59 @@ void TestFakeInternet() {
     Expect(sink.DnsReplies() == 1, "sink DNS: counter advanced");
   }
 
+  // --- LLMNR query (UDP/5355, DNS wire format, sent to 224.0.0.252) -> A reply
+  //     resolving to the sink IP from the sink's UNICAST address ---
+  {
+    std::vector<uint8_t> dns;
+    be16(dns, 0x4321);  // transaction id
+    be16(dns, 0x0000);  // flags: standard query (QR=0)
+    be16(dns, 1); be16(dns, 0); be16(dns, 0); be16(dns, 0);
+    const char *lbl = "WPAD"; dns.push_back(4);  // single-label name (typical LLMNR)
+    for (const char *c = lbl; *c; ++c) dns.push_back(static_cast<uint8_t>(*c));
+    dns.push_back(0);
+    be16(dns, 1); be16(dns, 1);  // QTYPE A, QCLASS IN
+
+    std::vector<uint8_t> udp;
+    be16(udp, 51000); be16(udp, 5355);  // src, dst (LLMNR)
+    be16(udp, static_cast<uint16_t>(8 + dns.size()));
+    be16(udp, 0);
+    udp.insert(udp.end(), dns.begin(), dns.end());
+
+    std::vector<uint8_t> ip;
+    ip.push_back(0x45); ip.push_back(0x00);
+    be16(ip, static_cast<uint16_t>(20 + udp.size()));
+    be16(ip, 0x0009); be16(ip, 0x0000); ip.push_back(1); ip.push_back(17);  // TTL 1, UDP
+    be16(ip, 0x0000);
+    const uint8_t gIp[4] = {0x0A, 0x00, 0x02, 0x64};       // src guest
+    const uint8_t mcast[4] = {0xE0, 0x00, 0x00, 0xFC};     // dst 224.0.0.252 (LLMNR)
+    for (int i = 0; i < 4; ++i) ip.push_back(gIp[i]);
+    for (int i = 0; i < 4; ++i) ip.push_back(mcast[i]);
+
+    std::vector<uint8_t> f;
+    const uint8_t mcastMac[6] = {0x01, 0x00, 0x5E, 0x00, 0x00, 0xFC};
+    for (int i = 0; i < 6; ++i) f.push_back(mcastMac[i]);  // dst multicast MAC
+    for (int i = 0; i < 6; ++i) f.push_back(guestMac[i]);
+    be16(f, 0x0800);
+    f.insert(f.end(), ip.begin(), ip.end());
+    f.insert(f.end(), udp.begin(), udp.end());
+
+    std::vector<Frame> out;
+    Expect(sink.OnGuestFrame(f.data(), f.size(), out) == 1,
+           "sink LLMNR: one reply synthesized");
+    const Frame &r = out[0];
+    Expect(r[34] == (5355 >> 8) && r[35] == (5355 & 0xFF),
+           "sink LLMNR: reply UDP src port 5355");
+    // Reply src = the sink's UNICAST IP (NOT the multicast group it was sent to).
+    Expect(r[14 + 12] == 0x0A && r[14 + 15] == 0x03,
+           "sink LLMNR: reply src = sink unicast IP (not the multicast group)");
+    Expect(r[14 + 19] == 0x64, "sink LLMNR: reply dst = the querying guest");
+    Expect((r[42 + 2] & 0x80) != 0, "sink LLMNR: response QR bit set");
+    Expect(r[r.size() - 4] == 0x0A && r[r.size() - 1] == 0x03,
+           "sink LLMNR: A answer resolves to the sink IP");
+    Expect(sink.DnsReplies() == 2,
+           "sink LLMNR: handled via the shared DNS responder (count incremented)");
+  }
+
   // --- TCP SYN -> SYN-ACK (connection establishes) ---
   {
     std::vector<uint8_t> tcp;
