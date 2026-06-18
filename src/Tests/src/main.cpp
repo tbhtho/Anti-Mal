@@ -4631,25 +4631,54 @@ void TestBootReliability() {
     write(ws / "run-telemetry" / "events.jsonl",
           "{\"source\":\"GuestAgent\",\"category\":\"process\"}\n");
   }
-  // 3) Incomplete run with NO telemetry -> truly incomplete.
+  // 3) Incomplete run with NO telemetry and NO diagnostics -> truly incomplete.
   {
     fs::create_directories(ws / "run-dead", ec);
     write(ws / "run-dead" / "job.json", "{}");
     write(ws / "run-dead" / "events.jsonl", "\n");
   }
-  // 4) A _-prefixed dir must be skipped entirely.
+  // 4) Early failure: no report, no telemetry, but vm-diagnostics.txt shows a
+  //    rendered boot screen (screenStateReached 2 = sparse) -> recovered as a
+  //    boot-screen stage rather than flat "incomplete".
+  {
+    fs::create_directories(ws / "run-bootscreen", ec);
+    write(ws / "run-bootscreen" / "job.json", "{}");
+    write(ws / "run-bootscreen" / "vm-diagnostics.txt",
+          "timedOut: true\nscreenStateReached: 2 (sparse)\n");
+  }
+  // 5) Early failure with a captured fatal RIP (kernel crash before any frame).
+  {
+    fs::create_directories(ws / "run-fault", ec);
+    write(ws / "run-fault" / "job.json", "{}");
+    write(ws / "run-fault" / "vm-diagnostics.txt",
+          "screenStateReached: 1 (blank)\nfatalRip: 0xFFFFF80000ABCDEF\n");
+  }
+  // 6) A rich/desktop-class frame rendered but no report/telemetry -> user-mode.
+  {
+    fs::create_directories(ws / "run-richframe", ec);
+    write(ws / "run-richframe" / "job.json", "{}");
+    write(ws / "run-richframe" / "vm-diagnostics.txt",
+          "screenStateReached: 3 (rich)\n");
+  }
+  // 7) A _-prefixed dir must be skipped entirely.
   { fs::create_directories(ws / "_base", ec); write(ws / "_base" / "job.json", "{}"); }
 
   const auto rel = antimal::AggregateBootReliability(ws);
-  Expect(rel.runs == 3, "reliability: counts the 3 run dirs, skips _base");
-  Expect(rel.incomplete == 2, "reliability: 2 runs lacked a finalized report");
-  Expect(rel.reachedUserMode >= 1,
-         "reliability: the telemetry-recovered run counts as user-mode");
+  Expect(rel.runs == 6, "reliability: counts the 6 run dirs, skips _base");
+  Expect(rel.incomplete == 5, "reliability: 5 runs lacked a finalized report");
+  Expect(rel.reachedUserMode >= 2,
+         "reliability: telemetry-recovered + rich-frame runs count as user-mode");
   Expect(rel.byStage.count("user-mode (telemetry, no report)") == 1 &&
              rel.byStage.at("user-mode (telemetry, no report)") == 1,
          "reliability: telemetry-bearing incomplete run is recovered, not dropped");
+  Expect(rel.byStage.count("boot-screen (no report)") == 1,
+         "reliability: an early boot that rendered a screen is recovered as boot-screen");
+  Expect(rel.byStage.count("fatal-fault (no report)") == 1,
+         "reliability: an early crash with a fatalRip is recovered as fatal-fault");
+  Expect(rel.byStage.count("rich-frame (no report)") == 1,
+         "reliability: a rich-frame-only run is recovered as user-mode-class");
   Expect(rel.byStage.count("incomplete (no report)") == 1,
-         "reliability: the no-telemetry run is the only truly-incomplete one");
+         "reliability: only the no-evidence run is truly-incomplete");
   // Missing workspace -> all-zero, no throw.
   const auto empty = antimal::AggregateBootReliability(ws / "does-not-exist");
   Expect(empty.runs == 0, "reliability: missing workspace yields zero, no throw");
