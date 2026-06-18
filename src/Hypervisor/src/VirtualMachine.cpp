@@ -3128,6 +3128,8 @@ VmRunSummary VirtualMachine::RunLoop(
   collectIde(secondaryIde_);
   if (nic_) {
     summary.nicFramesTransmitted = nic_->FramesTransmitted();
+    summary.nicFramesReceived = nic_->FramesReceived();
+    summary.nicFramesDropped = nic_->FramesDropped();
     summary.nicRegisterWrites = nic_->RegisterWrites();
     summary.capturedNetworkFrames = capturedNetworkFrames_;
   }

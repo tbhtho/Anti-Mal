@@ -1,17 +1,27 @@
 #pragma once
 
-// Minimal Intel 82540EM (e1000) NIC, PCI device 8086:100E — the most broadly
-// driver-supported emulated NIC. This is the *capture* half of network-request
-// visibility (SP3): the guest's network stack transmits Ethernet frames through
-// the e1000 TX descriptor ring, and we DMA them out and hand each to a host TX
-// handler (which runs the PacketInspector + records a PCAP). Outbound capture in
-// containment is exactly what a malware sandbox wants — see the requests without
-// granting real internet.
+// Intel 82574L (e1000e) NIC, PCI device 8086:10D3. We target the e1000e family
+// (inbox `e1d*.inf`, far longer Win11 lifetime than the old `e1000`/`8086:100E`
+// whose `e1net*.inf` was dropped) so the in-guest driver actually binds, while
+// reusing the existing 82540EM-family register layout (same TX/RX descriptor
+// format + MDIC/PHY model). It presents as a real Intel desktop GbE NIC (no
+// paravirt fingerprint). See historical design notes (not distributed).
 //
-// Scope today: PCI MMIO register block + EEPROM MAC + the TX descriptor ring
-// (DMA-assemble frames -> TX handler, TXDW interrupt). RX / fake-internet
-// responses and live driver-binding validation are the remaining (live-iterated)
-// work; this TX core is unit-tested by driving the registers directly.
+// This is BOTH halves of contained network visibility:
+//   * TX (capture): the guest transmits Ethernet frames through the TX descriptor
+//     ring; we DMA them out to a host TX handler (PacketInspector + PCAP).
+//   * RX (delivery): the host sink injects reply frames via DeliverRxFrame, which
+//     fills the guest's RX descriptor ring — so DNS/TCP/HTTP replies arrive and
+//     the guest stack exhibits real behavior, all with ZERO real egress.
+//
+// Scope today: PCI MMIO register block + EEPROM MAC + TX ring (DMA-assemble ->
+// handler, TXDW int) + RX ring (host-driven DeliverRxFrame -> RXT0 int). The
+// live driver-binding acceptance gate (`nicRegisterWrites > 0` on a real boot)
+// is user-gated; the device + rings are unit-tested by driving them directly.
+//
+// SAFETY: RX descriptor parsing is untrusted-guest-pointer handling. Every
+// descriptor field (buffer GPA, length) goes through the bounds-checked
+// dmaMemory_ accessor and is length-clamped before any copy (see DeliverRxFrame).
 //
 // Register subset (BAR0 MMIO):
 //   CTRL 0x0000, STATUS 0x0008, EERD 0x0014, ICR 0x00C0, IMS 0x00D0, IMC 0x00D8,
@@ -31,7 +41,7 @@ class E1000Device final : public IMmioDevice {
  public:
   static constexpr uint64_t kBarSize = 0x20000;  // 128 KiB register space
   static constexpr uint16_t kPciVendorId = 0x8086;
-  static constexpr uint16_t kPciDeviceId = 0x100E;  // 82540EM
+  static constexpr uint16_t kPciDeviceId = 0x10D3;  // 82574L (e1000e)
 
   E1000Device();
 
@@ -43,6 +53,14 @@ class E1000Device final : public IMmioDevice {
   // Called with each fully assembled outbound Ethernet frame.
   using TxFrameFn = std::function<void(const uint8_t *frame, std::size_t len)>;
   void SetTxHandler(TxFrameFn fn) { txHandler_ = std::move(fn); }
+
+  // Deliver one inbound Ethernet frame INTO the guest by filling the next free
+  // RX descriptor (host-driven; the guest only posts empty buffers by advancing
+  // RDT). Returns true if the frame was placed in the ring, false if it was
+  // dropped (RX disabled, no ring, no free buffer, or an unbacked descriptor).
+  // Called by the host fake-internet sink — NEVER by the guest. The frame is
+  // length-clamped to the RX buffer size and a hard 16 KiB cap before any copy.
+  bool DeliverRxFrame(const uint8_t *frame, std::size_t len);
 
   // BAR0 base, latched from the guest's PCI BAR assignment (like AHCI's ABAR).
   void SetMmioBase(uint64_t base) noexcept { mmioBase_ = base & ~0xFULL; }
@@ -70,8 +88,13 @@ class E1000Device final : public IMmioDevice {
   // Diagnostics.
   uint64_t FramesTransmitted() const noexcept { return framesTransmitted_; }
   uint64_t BytesTransmitted() const noexcept { return bytesTransmitted_; }
-  // Register writes by the guest driver — >0 means the e1000 driver bound and
-  // touched the device (vs. never enumerated/bound).
+  uint64_t FramesReceived() const noexcept { return framesReceived_; }
+  uint64_t BytesReceived() const noexcept { return bytesReceived_; }
+  // Inbound frames dropped because the guest had no free RX descriptor / RX was
+  // disabled / the descriptor was unbacked.
+  uint64_t FramesDropped() const noexcept { return framesDropped_; }
+  // Register writes by the guest driver — >0 means the e1000e driver bound and
+  // touched the device (vs. never enumerated/bound). The Phase-1 acceptance gate.
   uint64_t RegisterWrites() const noexcept { return mmioWrites_; }
 
  private:
@@ -102,6 +125,9 @@ class E1000Device final : public IMmioDevice {
 
   uint64_t framesTransmitted_ = 0;
   uint64_t bytesTransmitted_ = 0;
+  uint64_t framesReceived_ = 0;
+  uint64_t bytesReceived_ = 0;
+  uint64_t framesDropped_ = 0;
   uint64_t mmioWrites_ = 0;
 };
 

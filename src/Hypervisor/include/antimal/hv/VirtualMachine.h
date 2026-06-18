@@ -462,6 +462,8 @@ struct VmRunSummary {
   // PacketInspector over them (the Hypervisor layer can't depend on Common).
   std::vector<std::vector<uint8_t>> capturedNetworkFrames;
   uint64_t nicFramesTransmitted = 0;
+  uint64_t nicFramesReceived = 0;   // frames the host sink delivered into the guest RX ring
+  uint64_t nicFramesDropped = 0;    // inbound frames dropped (no free RX buffer / RX off)
   uint64_t nicRegisterWrites = 0;
   uint64_t pitIrqsDelivered = 0;
   uint64_t rtcIrqsDelivered = 0;

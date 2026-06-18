@@ -8641,6 +8641,138 @@ void TestE1000Device() {
     Expect((mdic & (1u << 28)) != 0, "e1000: MDIC read completes (Ready set)");
     Expect((mdic & 0x04) != 0, "e1000: PHY status register reports link up");
   }
+
+  // e1000e identity: the device-ID pivoted to the 82574L (8086:10D3) so the
+  // inbox e1000e driver binds; the EEPROM device-id word matches.
+  Expect(antimal::hv::E1000Device::kPciDeviceId == 0x10D3,
+         "e1000e: device id is 82574L (0x10D3)");
+}
+
+// RX ring: the host sink delivers inbound frames into the guest via
+// DeliverRxFrame. Exercises the descriptor write-back, RDH advance, RXT0
+// interrupt, the no-free-buffer drop, RX-disabled drop, length clamping, and
+// unbacked-descriptor bounds safety (the new untrusted-guest-pointer path).
+void TestE1000RxRing() {
+  using antimal::hv::E1000Device;
+  E1000Device nic;
+  const uint64_t kMmio = 0xF0000000ull;
+  nic.SetMmioBase(kMmio);
+
+  const uint64_t baseGpa = 0x20000ull;
+  std::vector<uint8_t> mem(32768, 0);
+  nic.SetDmaMemory([&](uint64_t gpa, std::size_t len) -> uint8_t * {
+    if (gpa < baseGpa || gpa + len > baseGpa + mem.size()) return nullptr;
+    return mem.data() + static_cast<size_t>(gpa - baseGpa);
+  });
+  auto w = [&](uint32_t reg, uint32_t val) { nic.OnWrite(kMmio + reg, 4, val); };
+
+  // RX ring: 8 descriptors at baseGpa+0 (RDLEN must be 128-byte aligned -> min 8
+  // legacy descriptors); 2 KiB buffers at baseGpa+0x800, 0x1000, ...
+  const uint64_t ringGpa = baseGpa;
+  const uint32_t descCount = 8;
+  for (uint32_t d = 0; d < descCount; ++d) {
+    const uint64_t bufGpa = baseGpa + 0x800 + static_cast<uint64_t>(d) * 0x800;
+    uint8_t *desc = mem.data() + d * 16;
+    for (int i = 0; i < 8; ++i)
+      desc[i] = static_cast<uint8_t>((bufGpa >> (i * 8)) & 0xFF);
+  }
+  const uint64_t buf0Gpa = baseGpa + 0x800;  // descriptor 0's buffer
+  w(0x2800, static_cast<uint32_t>(ringGpa & 0xFFFFFFFF));  // RDBAL
+  w(0x2804, static_cast<uint32_t>(ringGpa >> 32));         // RDBAH
+  w(0x2808, 16 * descCount);                               // RDLEN = 128
+  w(0x2810, 0);                                            // RDH
+  w(0x00D0, 0x80);  // IMS: enable RXT0
+  w(0x0100, 0x2);   // RCTL.EN (receiver enabled)
+  w(0x2818, 3);     // RDT: post 3 free buffers (descriptors 0,1,2)
+
+  // Deliver a frame.
+  std::vector<uint8_t> frame;
+  for (int i = 0; i < 100; ++i) frame.push_back(static_cast<uint8_t>(0xC0 + i));
+  Expect(nic.DeliverRxFrame(frame.data(), frame.size()),
+         "e1000e RX: frame delivered into a free descriptor");
+  Expect(nic.FramesReceived() == 1 && nic.BytesReceived() == frame.size(),
+         "e1000e RX: receive counters advance");
+  Expect(nic.InterruptPending(), "e1000e RX: RXT0 interrupt latched (IMS set)");
+  // Descriptor 0 written back: length + DD|EOP status.
+  const uint16_t wbLen = static_cast<uint16_t>(mem[8] | (mem[9] << 8));
+  Expect(wbLen == frame.size(), "e1000e RX: descriptor length written back");
+  Expect((mem[12] & 0x03) == 0x03, "e1000e RX: descriptor DD|EOP set");
+  // Frame bytes landed in descriptor 0's buffer (baseGpa+0x800).
+  (void)buf0Gpa;
+  Expect(mem[0x800] == 0xC0 && mem[0x800 + 99] == static_cast<uint8_t>(0xC0 + 99),
+         "e1000e RX: frame DMA-copied into the posted buffer");
+
+  // Fill the remaining posted buffers, then the next delivery must drop
+  // (RDH catches RDT — no free buffer).
+  Expect(nic.DeliverRxFrame(frame.data(), frame.size()), "e1000e RX: 2nd ok");
+  Expect(nic.DeliverRxFrame(frame.data(), frame.size()), "e1000e RX: 3rd ok");
+  const uint64_t beforeDrop = nic.FramesDropped();
+  Expect(!nic.DeliverRxFrame(frame.data(), frame.size()),
+         "e1000e RX: delivery drops when no free buffer (RDH==RDT)");
+  Expect(nic.FramesDropped() == beforeDrop + 1, "e1000e RX: drop counter advances");
+
+  // RX disabled -> drop.
+  {
+    E1000Device off;
+    off.SetMmioBase(kMmio);
+    off.SetDmaMemory([&](uint64_t gpa, std::size_t len) -> uint8_t * {
+      if (gpa < baseGpa || gpa + len > baseGpa + mem.size()) return nullptr;
+      return mem.data() + static_cast<size_t>(gpa - baseGpa);
+    });
+    off.OnWrite(kMmio + 0x2808, 4, 16 * descCount);  // RDLEN but RCTL.EN unset
+    off.OnWrite(kMmio + 0x2818, 4, descCount - 1);
+    Expect(!off.DeliverRxFrame(frame.data(), frame.size()),
+           "e1000e RX: delivery drops while the receiver is disabled");
+  }
+
+  // Length clamp: a frame larger than the RX buffer size (default 2048) is
+  // clamped, never overrunning the posted buffer.
+  {
+    E1000Device big;
+    big.SetMmioBase(kMmio);
+    std::vector<uint8_t> bmem(64 * 1024, 0);
+    const uint64_t bbase = 0x40000ull;
+    big.SetDmaMemory([&](uint64_t gpa, std::size_t len) -> uint8_t * {
+      if (gpa < bbase || gpa + len > bbase + bmem.size()) return nullptr;
+      return bmem.data() + static_cast<size_t>(gpa - bbase);
+    });
+    const uint64_t bufGpa = bbase + 0x1000;
+    for (int i = 0; i < 8; ++i)
+      bmem[i] = static_cast<uint8_t>((bufGpa >> (i * 8)) & 0xFF);
+    big.OnWrite(kMmio + 0x2800, 4, static_cast<uint32_t>(bbase & 0xFFFFFFFF));
+    big.OnWrite(kMmio + 0x2804, 4, static_cast<uint32_t>(bbase >> 32));
+    big.OnWrite(kMmio + 0x2808, 4, 16 * 8);    // RDLEN = 128 (alignment min)
+    big.OnWrite(kMmio + 0x0100, 4, 0x2);       // RCTL.EN, BSIZE=0 -> 2048
+    big.OnWrite(kMmio + 0x2818, 4, 1);         // post 1 buffer (descriptor 0)
+    std::vector<uint8_t> huge(9000, 0xAB);
+    Expect(big.DeliverRxFrame(huge.data(), huge.size()),
+           "e1000e RX: oversize frame still delivered (clamped)");
+    Expect(big.BytesReceived() == 2048,
+           "e1000e RX: oversize frame clamped to the 2048 RX buffer size");
+  }
+
+  // Bounds safety: a descriptor whose buffer GPA is unbacked must drop, not crash.
+  {
+    E1000Device bad;
+    bad.SetMmioBase(kMmio);
+    std::vector<uint8_t> dmem(256, 0);
+    const uint64_t dbase = 0x50000ull;
+    bad.SetDmaMemory([&](uint64_t gpa, std::size_t len) -> uint8_t * {
+      if (gpa < dbase || gpa + len > dbase + dmem.size()) return nullptr;
+      return dmem.data() + static_cast<size_t>(gpa - dbase);
+    });
+    // Descriptor 0 points its buffer at a wild, unbacked GPA.
+    const uint64_t wild = 0xDEAD0000ull;
+    for (int i = 0; i < 8; ++i)
+      dmem[i] = static_cast<uint8_t>((wild >> (i * 8)) & 0xFF);
+    bad.OnWrite(kMmio + 0x2800, 4, static_cast<uint32_t>(dbase & 0xFFFFFFFF));
+    bad.OnWrite(kMmio + 0x2804, 4, static_cast<uint32_t>(dbase >> 32));
+    bad.OnWrite(kMmio + 0x2808, 4, 16 * 8);    // RDLEN = 128 (alignment min)
+    bad.OnWrite(kMmio + 0x0100, 4, 0x2);
+    bad.OnWrite(kMmio + 0x2818, 4, 1);
+    Expect(!bad.DeliverRxFrame(frame.data(), frame.size()),
+           "e1000e RX: unbacked descriptor buffer drops safely (no overrun)");
+  }
 }
 
 void TestNicPciConfig() {
@@ -8652,8 +8784,8 @@ void TestNicPciConfig() {
     pc.OnWrite(0xCF8, addr, 4);
     return pc.OnRead(0xCFC, 4);
   };
-  Expect(cfg(4, 0, 0x00) == 0x100E8086u,
-         "nic pci: device 4 is Intel 8086:100E");
+  Expect(cfg(4, 0, 0x00) == 0x10D38086u,
+         "nic pci: device 4 is Intel 8086:10D3 (82574L / e1000e)");
   Expect((cfg(4, 0, 0x08) >> 8) == 0x020000u,
          "nic pci: class 0x02 subclass 0x00 (ethernet)");
 
@@ -9743,6 +9875,7 @@ int main() {
     TestReportSections();
     TestPacketInspector();
     TestE1000Device();
+    TestE1000RxRing();
     TestNicPciConfig();
     TestHttpUrlEncode();
     TestFramebufferVisiblePixels();

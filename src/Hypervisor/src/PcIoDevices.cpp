@@ -1386,12 +1386,14 @@ uint32_t PcIoDevices::ReadPciConfigDword() const {
   }
 
   if (nicPresent_ && device == 4 && function == 0) {
-    // Intel 82540EM (8086:100E) NIC. Class 0x02 (network); a single MMIO BAR
-    // (BAR0) + a PCI INTx. The guest's e1000 driver binds 8086:100E, and its
-    // outbound frames are captured on the TX descriptor ring (E1000Device).
+    // Intel 82574L / e1000e (8086:10D3) NIC. Class 0x02 (network); a single MMIO
+    // BAR (BAR0) + a PCI INTx. The e1000e family (`e1d*.inf`) has a far longer
+    // Win11 inbox lifetime than the dropped `e1000`/8086:100E, so the in-guest
+    // driver binds; its outbound frames are captured on the TX descriptor ring
+    // (E1000Device) and replies are injected via the RX ring (DeliverRxFrame).
     switch (reg) {
     case 0x00:
-      return 0x100E8086u; // Vendor 0x8086, Device 0x100E.
+      return 0x10D38086u; // Vendor 0x8086, Device 0x10D3 (82574L).
     case 0x04:
       return 0x00000006u; // Memory Space Enable + Bus Master Enable.
     case 0x08:
@@ -1402,7 +1404,7 @@ uint32_t PcIoDevices::ReadPciConfigDword() const {
       // BAR0: 32-bit non-prefetchable memory, 128 KiB. Sizing -> size mask.
       return nicBar0Sizing_ ? 0xFFFE0000u : (nicBar0_ & 0xFFFE0000u);
     case 0x2C:
-      return 0x100E8086u; // Subsystem vendor/device.
+      return 0x10D38086u; // Subsystem vendor/device.
     case 0x3C:
       return 0x000001FFu; // Interrupt Pin INTA; line 0xFF (routed via ACPI _PRT).
     default:
