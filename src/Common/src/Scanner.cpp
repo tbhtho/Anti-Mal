@@ -8,6 +8,7 @@
 #include "antimal/ConfigExtractor.h"
 #include "antimal/ContainerAnalyzer.h"
 #include "antimal/PdfAnalyzer.h"
+#include "antimal/RtfAnalyzer.h"
 #include "antimal/PeParser.h"
 #include "antimal/ScriptAnalyzer.h"
 #include "antimal/ShellcodeDetector.h"
@@ -609,6 +610,15 @@ ScanResult ScanFile(const std::filesystem::path &path,
     if (result.detectedType == "pdf") {
       const PdfAnalysis pdf = AnalyzePdf(data);
       for (const auto &f : pdf.findings) {
+        AddFinding(result, f.ruleId, f.message, f.score);
+      }
+    }
+
+    // RTF maldoc: embedded OLE objects, \objupdate auto-run, Equation Editor
+    // exploit carrier (CVE-2017-11882), embedded PE in the \objdata hex.
+    if (result.detectedType == "rtf") {
+      const RtfAnalysis rtf = AnalyzeRtf(data);
+      for (const auto &f : rtf.findings) {
         AddFinding(result, f.ruleId, f.message, f.score);
       }
     }

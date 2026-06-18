@@ -44,6 +44,12 @@ unit-tested. A living `private development documentation` tracks done/remaining 
   TLS C2, an interactive remote shell (T1219), keylogging (T1056.001), screen capture (T1113), and
   exfil over C2 (T1041) — spanning Execution→Persistence→Credential Access→Collection→C2→Exfil. Adds
   the ATT&CK techniques T1219/T1113 to the catalog (name + tactic).
+- **RTF maldoc analyzer (`RtfAnalyzer`, T68-adjacent):** RTF was detected but not analyzed — now
+  `ScanFile` routes `rtf` to a dedicated analyzer flagging embedded OLE objects (`\objdata`),
+  `\objupdate` auto-run-on-open, the **Equation Editor** exploit carrier (CVE-2017-11882 /
+  CVE-2018-0802, via the class name / CLSID in the decoded object), and an embedded PE (DOS-stub
+  anchor in the `\objdata` hex). Heuristic + bounds-safe; unit-tested + added to the malformed-input
+  corpus; verified end-to-end (synthetic RTF → 100/malicious with all four findings).
 - **Bogon / non-routable C2 detection (`NetworkClassifier`):** a C2 endpoint in a reserved/
   non-routable range (0/8, 100.64/10 CGNAT, the RFC5737 TEST-NET blocks, 198.18/15, 224/4 multicast,
   240/4 reserved) is now flagged `bogon` + suspicious with a note — a real anomaly signal (sinkhole /

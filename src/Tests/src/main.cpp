@@ -30,6 +30,7 @@
 #include "antimal/NetworkTelemetry.h"
 #include "antimal/PacketInspector.h"
 #include "antimal/PdfAnalyzer.h"
+#include "antimal/RtfAnalyzer.h"
 #include "antimal/PeParser.h"
 #include "antimal/RegistryTelemetry.h"
 #include "antimal/ProcessTelemetry.h"
@@ -4239,6 +4240,7 @@ void TestMalformedInputRobustness() {
   for (const auto &in : inputs) {
     // The contract is "robust to fully untrusted bytes" -- not specific output.
     (void)AnalyzePdf(in);
+    (void)AnalyzeRtf(in);
     (void)AnalyzeContainer(in, ".zip");
     (void)AnalyzeContainer(in, ".docx");
     (void)AnalyzeContainer(in, "");
@@ -5371,6 +5373,60 @@ void TestPdfAnalyzer() {
     Expect(!AnalyzePdf(bytes("MZ\x90 this is not a pdf")).isPdf,
            "PDF: non-PDF input rejected");
   }
+}
+
+void TestRtfAnalyzer() {
+  using antimal::AnalyzeRtf;
+  using antimal::RtfAnalysis;
+  auto bytes = [](const std::string &s) {
+    return std::vector<uint8_t>(s.begin(), s.end());
+  };
+  auto has = [](const RtfAnalysis &a, const char *id) {
+    for (const auto &f : a.findings)
+      if (f.ruleId == id) return true;
+    return false;
+  };
+
+  // A weaponized RTF: an auto-updating OLE object whose \objdata hex decodes to
+  // an OLE header naming the Equation Editor, plus an embedded MZ.
+  // "MZ" = 4d5a; "Equation.3" in hex; lead with the OLE magic d0cf11e0.
+  std::string objHex;
+  // OLE compound magic + "Equation.3" ascii + "MZ"
+  objHex += "d0cf11e0a1b11ae1";                 // OLE magic
+  // "Equation.3" -> hex
+  const char *eq = "Equation.3";
+  for (const char *p = eq; *p; ++p) {
+    char buf[3];
+    std::snprintf(buf, sizeof(buf), "%02x", static_cast<unsigned char>(*p));
+    objHex += buf;
+  }
+  objHex += "4d5a9000"; // MZ...
+  // The universal DOS-stub string the embedded-PE detector anchors on.
+  const char *dos = "This program cannot be run in DOS mode";
+  for (const char *p = dos; *p; ++p) {
+    char buf[3];
+    std::snprintf(buf, sizeof(buf), "%02x", static_cast<unsigned char>(*p));
+    objHex += buf;
+  }
+  const std::string rtf =
+      "{\\rtf1\\ansi {\\object\\objemb\\objupdate{\\*\\objdata " + objHex +
+      "}}}";
+  const auto a = AnalyzeRtf(bytes(rtf));
+  Expect(a.isRtf, "RTF: header recognized");
+  Expect(a.hasOleObject && has(a, "rtf.ole_object"), "RTF: OLE object flagged");
+  Expect(a.hasAutoUpdate && has(a, "rtf.objupdate"),
+         "RTF: \\objupdate auto-run flagged");
+  Expect(a.equationEditor && has(a, "rtf.equation_editor"),
+         "RTF: Equation Editor exploit carrier flagged");
+  Expect(a.embeddedExecutable && has(a, "rtf.embedded_pe"),
+         "RTF: embedded PE in \\objdata flagged");
+
+  // A benign RTF (plain text, no objects) flags nothing.
+  const auto benign = AnalyzeRtf(bytes("{\\rtf1\\ansi Hello, world.}"));
+  Expect(benign.isRtf && benign.findings.empty(),
+         "RTF: a plain document yields no findings");
+  // Non-RTF input rejected.
+  Expect(!AnalyzeRtf(bytes("%PDF-1.7 not rtf")).isRtf, "RTF: non-RTF rejected");
 }
 
 // Cobalt Strike beacon-config extraction: build a synthetic XOR-encoded TLV
@@ -9414,6 +9470,7 @@ int main() {
     TestScriptAnalyzer();
     TestContainerAnalyzer();
     TestPdfAnalyzer();
+    TestRtfAnalyzer();
     TestCobaltStrikeConfig();
     TestImportCapabilities();
     TestBrowserRisk();
