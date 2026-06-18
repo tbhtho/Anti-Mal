@@ -1,6 +1,7 @@
 #include "antimal/BehaviorScore.h"
 #include "antimal/BootDiagnostics.h"
 #include "antimal/ConfigExtractor.h"
+#include "antimal/CrashSummary.h"
 #include "antimal/BrowserImpact.h"
 #include "antimal/Config.h"
 #include "antimal/DetectionSummary.h"
@@ -208,7 +209,7 @@ void PrintUsage() {
       << "  antimal fs-find [--vhdx <d.vhdx>] [--overlay <o.cow>] <name-substring>   (offline recursive search)\n"
       << "  antimal fs-scan [--vhdx <d.vhdx>] [--overlay <o.cow>] <guest\\path>   (extract + static-scan a guest file)\n"
       << "  antimal reg-ls [--hive software|system|sam|...] [--overlay <o.cow>] <reg\\key> [--values] [--depth N] [--filter <s>]\n"
-      << "  antimal report <run-id-or-report.json> [--html] [--summary|--detections|--usability|--timeline [--json]]\n"
+      << "  antimal report <run-id-or-report.json> [--html] [--summary|--detections|--crashes|--usability|--timeline [--json]]\n"
       << "  antimal browser-impact <run-id-or-report.json> --decrypt-browser-secrets\n"
       << "  antimal export <run-id-or-report.json> --format stix|misp|csv|yara [--out <file>]\n"
       << "  antimal similarity <fileA> <fileB> [--json]   (fuzzy-hash similarity 0..100)\n"
@@ -3011,6 +3012,48 @@ int CommandReport(int argc, wchar_t **argv) {
     std::cout << "  network:    " << report.networkDomains.size() << " domain(s)\n";
     std::cout << "  detections: " << dets.size() << " (" << high << " high, "
               << med << " medium)\n";
+    const auto crashes = antimal::SummarizeCrashes(report.events);
+    if (crashes.totalCrashes > 0 && !crashes.signatures.empty()) {
+      const auto &top = crashes.signatures.front();
+      std::cout << "  crashes:    " << crashes.totalCrashes << " (top: " << top.count
+                << "x " << top.image << " " << top.exceptionCode;
+      if (!top.exceptionName.empty()) std::cout << " " << top.exceptionName;
+      std::cout << ")\n";
+    }
+    return 0;
+  }
+  if (HasFlag(argc, argv, "--crashes")) {
+    // Distinct process-crash fault signatures (image + exception + module),
+    // collapsing crash spam into "what crashed, how, how often". Surfaces both
+    // the Win11 modern-shell wall and a detonated sample that crashed.
+    const auto cs = antimal::SummarizeCrashes(report.events);
+    if (HasFlag(argc, argv, "--json")) {
+      std::cout << "{\"totalCrashes\":" << cs.totalCrashes << ",\"signatures\":[";
+      for (size_t i = 0; i < cs.signatures.size(); ++i) {
+        const auto &s = cs.signatures[i];
+        std::cout << (i ? "," : "") << "{\"image\":" << JsonQuote(s.image)
+                  << ",\"count\":" << s.count
+                  << ",\"exceptionCode\":" << JsonQuote(s.exceptionCode)
+                  << ",\"exceptionName\":" << JsonQuote(s.exceptionName)
+                  << ",\"module\":" << JsonQuote(s.module)
+                  << ",\"moduleVersion\":" << JsonQuote(s.moduleVersion)
+                  << ",\"offset\":" << JsonQuote(s.offset) << "}";
+      }
+      std::cout << "]}\n";
+      return 0;
+    }
+    std::cout << "Process crashes: " << cs.totalCrashes << " total, "
+              << cs.signatures.size() << " distinct signature(s)\n";
+    for (const auto &s : cs.signatures) {
+      std::cout << "  " << s.count << "x  " << s.image << "  " << s.exceptionCode;
+      if (!s.exceptionName.empty()) std::cout << " (" << s.exceptionName << ")";
+      if (!s.module.empty()) {
+        std::cout << " in " << s.module;
+        if (!s.moduleVersion.empty()) std::cout << " v" << s.moduleVersion;
+        if (!s.offset.empty()) std::cout << " @+" << s.offset;
+      }
+      std::cout << "\n";
+    }
     return 0;
   }
   if (HasFlag(argc, argv, "--detections")) {

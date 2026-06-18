@@ -8,6 +8,7 @@
 #include "antimal/BootDiagnostics.h"
 #include "antimal/CommandLineClassifier.h"
 #include "antimal/Crypto.h"
+#include "antimal/CrashSummary.h"
 #include "antimal/DetectionSummary.h"
 #include "antimal/EventTime.h"
 #include "antimal/UsabilityDiagnostics.h"
@@ -3880,6 +3881,58 @@ void TestRc4WrappedConfig() {
                            blob, "more trailing filler content here too."});
   Expect(MineRc4WrappedConfig(buf2).empty(),
          "rc4: no key present -> no false-positive recovery");
+}
+
+// Crash-signature summary: collapse process.crash events into distinct
+// (image, code, module, offset) signatures with counts + human exception names.
+void TestCrashSummary() {
+  using namespace antimal;
+  Expect(ExceptionCodeName("c0000409").find("fastfail") != std::string::npos,
+         "crash: c0000409 named __fastfail");
+  Expect(ExceptionCodeName("0xC0000005") == "access violation",
+         "crash: case/0x-insensitive code lookup");
+  Expect(ExceptionCodeName("deadbeef").empty(), "crash: unknown code -> empty");
+
+  auto crash = [](const char *img, const char *code, const char *mod,
+                  const char *off) {
+    EventRecord e;
+    e.source = "GuestAgent";
+    e.category = "crash";
+    e.action = "process.crash";
+    e.imagePath = img;
+    e.details["exceptionCode"] = code;
+    e.details["module"] = mod;
+    e.details["moduleVersion"] = "10.0.26100.7623";
+    e.details["exceptionOffset"] = off;
+    return e;
+  };
+  std::vector<EventRecord> ev;
+  for (int i = 0; i < 5; ++i)
+    ev.push_back(crash("Explorer.EXE", "c0000409", "ucrtbase.dll", "a4ace"));
+  for (int i = 0; i < 2; ++i)
+    ev.push_back(crash("sample.exe", "c0000005", "sample.exe", "1234"));
+  { // a non-crash event must be ignored
+    EventRecord p;
+    p.category = "process";
+    p.action = "process.start";
+    ev.push_back(p);
+  }
+
+  const auto cs = SummarizeCrashes(ev);
+  Expect(cs.totalCrashes == 7, "crash: total counts only crash events");
+  Expect(cs.signatures.size() == 2, "crash: two distinct signatures");
+  // Sorted by count desc -> Explorer (5) first.
+  Expect(cs.signatures[0].image == "Explorer.EXE" && cs.signatures[0].count == 5,
+         "crash: dominant signature is the 5x Explorer crash");
+  Expect(cs.signatures[0].exceptionName.find("fastfail") != std::string::npos,
+         "crash: dominant signature carries the human exception name");
+  Expect(cs.signatures[0].module == "ucrtbase.dll" &&
+             cs.signatures[0].offset == "a4ace",
+         "crash: signature preserves module + offset");
+  Expect(cs.signatures[1].count == 2, "crash: secondary signature counted");
+  // Determinism.
+  Expect(SummarizeCrashes(ev).signatures[0].count == cs.signatures[0].count,
+         "crash: deterministic");
 }
 
 // Detections summary: aggregates static findings + persistence + suspicious
@@ -9166,6 +9219,7 @@ int main() {
     TestRebuildReportFromEvents();
     TestYaraGen();
     TestRc4WrappedConfig();
+    TestCrashSummary();
     TestBootDiagnostics();
     TestCommandLineClassifier();
     TestUsabilityDiagnostics();

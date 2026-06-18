@@ -51,6 +51,13 @@ unit-tested. A living `private development documentation` tracks done/remaining 
   key against each base64 blob and keeps a result ONLY when the decryption yields a valid http(s) URL
   (same known-plaintext anchor as the XOR recovery → near-zero false positives, verified clean on a
   real benign PE). Bounded work; surfaced in scan findings + IOCs. Round-trip + negative unit tests.
+- **Crash-signature summary (`CrashSummary`, `report --crashes`):** collapses `process.crash`
+  telemetry spam into distinct fault signatures — (image, NTSTATUS code + human name, faulting module
+  + version + offset) with counts — for both the Win11 modern-shell wall and a detonated sample that
+  crashes. Surfaced via `report --crashes [--json]` and a top-signature line in `report --summary`.
+  Immediately useful: on a real run it revealed the 51 shell crashes are *two* signatures — 40×
+  Explorer in `ucrtbase.dll` and 11× ShellHost in `ControlCenter.dll` — a distinction the prior
+  count-only detection masked. Pure + unit-tested.
 - **`report --summary` (T53-adjacent):** a compact at-a-glance triage view — verdict/score, boot
   stage, sample-executed, event count + per-category breakdown, process/MITRE/network/detection
   counts — without parsing the full report. `--json` emits a stable versioned (`schemaVersion:1`)

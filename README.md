@@ -212,6 +212,7 @@ boot reliability across every run:
 ```powershell
 bin\x64\Release\AntiMal.HostCli.exe report <run> --summary    # at-a-glance triage (+ --json for CI)
 bin\x64\Release\AntiMal.HostCli.exe report <run> --detections
+bin\x64\Release\AntiMal.HostCli.exe report <run> --crashes      # distinct process-crash fault signatures
 bin\x64\Release\AntiMal.HostCli.exe report <run> --usability
 bin\x64\Release\AntiMal.HostCli.exe report <run> --timeline [--category process|registry|file|network|image] [--mitre] [--limit N]
 bin\x64\Release\AntiMal.HostCli.exe boot-report
