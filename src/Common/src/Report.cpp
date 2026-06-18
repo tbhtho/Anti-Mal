@@ -2,6 +2,7 @@
 
 #include "antimal/BootDiagnostics.h"
 #include "antimal/CommandLineClassifier.h"
+#include "antimal/CrashSummary.h"
 #include "antimal/DetectionSummary.h"
 #include "antimal/EventTime.h"
 #include "antimal/UsabilityDiagnostics.h"
@@ -1122,24 +1123,28 @@ bool EmitNetworkSection(std::ostringstream &html,
 
 bool EmitCrashesSection(std::ostringstream &html,
                         const std::vector<EventRecord> &events) {
-  bool any = false;
-  std::ostringstream rows;
-  for (const auto &e : events) {
-    if (!ActionIs(e, "process.crash")) continue;
-    any = true;
-    std::string exception = Detail(e, "exceptionCode");
-    if (exception.empty()) exception = Detail(e, "exitCode");
-    rows << "<tr><td class=\"mono\">"
-         << HtmlEscape(e.imagePath.empty() ? e.target : e.imagePath)
-         << "</td><td class=\"mono\">" << HtmlEscape(Detail(e, "module"))
-         << "</td><td class=\"mono\">" << HtmlEscape(exception)
-         << "</td><td class=\"mono\">" << HtmlEscape(Detail(e, "offset"))
-         << "</td></tr>";
+  // Aggregate into distinct fault signatures (CrashSummary) instead of one row
+  // per event -- a shell crash-loop is dozens of identical crashes, so the raw
+  // list was pure noise. Each row is now count + app + exception (code + human
+  // name) + faulting module/version/offset.
+  const CrashSummary cs = SummarizeCrashes(events);
+  if (cs.signatures.empty()) return false;
+  html << "<p style=\"opacity:.7;margin:0 0 6px\">" << cs.totalCrashes
+       << " crash event(s), " << cs.signatures.size()
+       << " distinct signature(s)</p>";
+  html << "<table><thead><tr><th>#</th><th>App</th><th>Exception</th>"
+          "<th>Module</th><th>Offset</th></tr></thead><tbody>";
+  for (const auto &s : cs.signatures) {
+    std::string exc = s.exceptionCode;
+    if (!s.exceptionName.empty()) exc += " (" + s.exceptionName + ")";
+    std::string mod = s.module;
+    if (!s.moduleVersion.empty()) mod += " v" + s.moduleVersion;
+    html << "<tr><td class=\"mono\">" << s.count << "</td><td class=\"mono\">"
+         << HtmlEscape(s.image) << "</td><td class=\"mono\">" << HtmlEscape(exc)
+         << "</td><td class=\"mono\">" << HtmlEscape(mod)
+         << "</td><td class=\"mono\">" << HtmlEscape(s.offset) << "</td></tr>";
   }
-  if (!any) return false;
-  html << "<table><thead><tr><th>App</th><th>Module</th><th>Exception</th>"
-          "<th>Offset</th></tr></thead><tbody>"
-       << rows.str() << "</tbody></table>";
+  html << "</tbody></table>";
   return true;
 }
 

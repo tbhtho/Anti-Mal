@@ -8002,8 +8002,12 @@ void TestReportSections() {
          "report sections: dropped-file sha256 rendered (short form)");
   Expect(html.find(">pe<") != std::string::npos,
          "report sections: dropped-file type 'pe' rendered");
-  Expect(html.find("0xC0000409") != std::string::npos,
-         "report sections: crash exception code rendered");
+  // The crash section now aggregates by signature: code normalized to bare hex
+  // + a human exception name.
+  Expect(html.find("c0000409") != std::string::npos,
+         "report sections: crash exception code rendered (normalized)");
+  Expect(html.find("__fastfail") != std::string::npos,
+         "report sections: crash exception human name rendered");
   Expect(html.find("ntdll.dll") != std::string::npos,
          "report sections: crash module rendered");
 
