@@ -26,8 +26,12 @@
 #include "antimal/Version.h"
 #include "antimal/YaraGen.h"
 #include "antimal/hv/BlockDevice.h"
+#include "antimal/hv/ScreenState.h"
 
 #include <windows.h>
+// objidl.h must precede gdiplus.h under WIN32_LEAN_AND_MEAN (pulls in IStream).
+#include <objidl.h>
+#include <gdiplus.h>
 
 #include <algorithm>
 #include <array>
@@ -223,6 +227,7 @@ void PrintUsage() {
       << "  antimal base inspect --vhdx <base.vhdx> [--overlay <overlay.cow>]\n"
       << "                       [--dump-bcd <out.bcd>] [--dump-system <out.hive>]\n"
       << "  antimal base validate --vhdx <base.vhdx> [--overlay <o.cow>] [--json]   (offline boot-readiness pass/fail)\n"
+      << "  antimal classify-frame <frame.png> | --run <run-id> [--json]   (grade a frame: desktop-class? exit 0=Rich)\n"
       << "  antimal fs-ls  [--vhdx <d.vhdx>] [--overlay <o.cow>] <guest\\path>   (offline guest dir listing)\n"
       << "  antimal fs-cat [--vhdx <d.vhdx>] [--overlay <o.cow>] <guest\\path> [--out <file>]\n"
       << "  antimal fs-find [--vhdx <d.vhdx>] [--overlay <o.cow>] <name-substring>   (offline recursive search)\n"
@@ -3180,6 +3185,114 @@ int CommandBaseValidate(int argc, wchar_t **argv,
   return bootable ? 0 : 1;
 }
 
+// Decode a PNG into a tightly-packed 32bpp BGRA buffer via GDI+. Returns false on
+// any failure. `stride` is set to width*4 (the packed buffer we copy into).
+bool LoadPngAsBgra(const std::filesystem::path &path, std::vector<uint8_t> &out,
+                   uint32_t &width, uint32_t &height, uint32_t &stride) {
+  ULONG_PTR token = 0;
+  Gdiplus::GdiplusStartupInput gdiInput;
+  if (Gdiplus::GdiplusStartup(&token, &gdiInput, nullptr) != Gdiplus::Ok) {
+    return false;
+  }
+  bool ok = false;
+  {
+    Gdiplus::Bitmap bmp(path.c_str());
+    if (bmp.GetLastStatus() == Gdiplus::Ok) {
+      width = bmp.GetWidth();
+      height = bmp.GetHeight();
+      if (width >= 8 && height >= 8) {
+        Gdiplus::Rect rect(0, 0, static_cast<INT>(width),
+                           static_cast<INT>(height));
+        Gdiplus::BitmapData data{};
+        if (bmp.LockBits(&rect, Gdiplus::ImageLockModeRead,
+                         PixelFormat32bppRGB, &data) == Gdiplus::Ok) {
+          stride = width * 4;
+          out.assign(static_cast<size_t>(stride) * height, 0);
+          const auto *src = static_cast<const uint8_t *>(data.Scan0);
+          for (uint32_t y = 0; y < height; ++y) {
+            std::memcpy(out.data() + static_cast<size_t>(y) * stride,
+                        src + static_cast<size_t>(y) * data.Stride, stride);
+          }
+          bmp.UnlockBits(&data);
+          ok = true;
+        }
+      }
+    }
+  }
+  Gdiplus::GdiplusShutdown(token);
+  return ok;
+}
+
+// `classify-frame` — run the REAL framebuffer screen-state classifier (the same
+// ClassifyScreenState the VMM uses) on a captured guest PNG, to objectively
+// grade "did this frame show a desktop?" -- replacing the empirical frame-SIZE
+// threshold (>=1000 KB) that boot-reliability measurement leans on. With --run
+// <id> it grades the largest guest-*.png in a run's screenshots dir. Exit 0 when
+// the frame is Rich (desktop-class), 1 when not, 2 on error -- so it gates a
+// desktop-reach check from a single frame, no re-boot.
+int CommandClassifyFrame(int argc, wchar_t **argv) {
+  const auto config = antimal::LoadConfig(antimal::DefaultConfigPath());
+  std::filesystem::path png;
+  if (const auto runId = OptionValue(argc, argv, "--run")) {
+    // Pick the largest guest-*.png in the run's screenshots dir.
+    std::filesystem::path shots =
+        config.workspaceRoot / Utf8ToWide(*runId) / L"screenshots";
+    std::error_code ec;
+    uintmax_t best = 0;
+    for (const auto &e : std::filesystem::directory_iterator(shots, ec)) {
+      if (!e.is_regular_file()) continue;
+      const auto name = antimal::PathToUtf8(e.path().filename());
+      if (name.rfind("guest-", 0) != 0 || e.path().extension() != ".png")
+        continue;
+      const auto sz = e.file_size(ec);
+      if (sz > best) { best = sz; png = e.path(); }
+    }
+    if (png.empty()) {
+      std::cerr << "no guest-*.png frames in " << antimal::PathToUtf8(shots)
+                << "\n";
+      return 2;
+    }
+  } else if (argc >= 3 && argv[2][0] != L'-') {
+    png = std::filesystem::path(argv[2]);
+  } else {
+    std::cerr << "usage: antimal classify-frame <frame.png> | --run <run-id> "
+                 "[--json]\n";
+    return 2;
+  }
+
+  std::vector<uint8_t> px;
+  uint32_t w = 0, h = 0, stride = 0;
+  if (!LoadPngAsBgra(png, px, w, h, stride)) {
+    std::cerr << "failed to decode PNG: " << antimal::PathToUtf8(png) << "\n";
+    return 2;
+  }
+  const antimal::hv::ScreenStateResult r =
+      antimal::hv::ClassifyScreenState(px.data(), w, h, stride);
+  const char *name = antimal::hv::ScreenStateName(r.state);
+  const bool desktopClass = (r.state == antimal::hv::ScreenState::Rich);
+
+  if (HasFlag(argc, argv, "--json")) {
+    std::cout << "{\"frame\":" << JsonQuote(antimal::PathToUtf8(png))
+              << ",\"width\":" << w << ",\"height\":" << h
+              << ",\"state\":" << JsonQuote(name)
+              << ",\"desktopClass\":" << (desktopClass ? "true" : "false")
+              << ",\"lumaSpread\":" << r.lumaSpread
+              << ",\"colorBuckets\":" << r.colorBuckets
+              << ",\"detailPerMille\":" << r.detailPerMille << "}\n";
+  } else {
+    std::cout << antimal::PathToUtf8(png) << "\n";
+    std::cout << "  " << w << "x" << h << "  state=" << name
+              << (desktopClass ? "  (desktop-class)" : "  (not a desktop)")
+              << "\n";
+    std::cout << "  lumaSpread=" << r.lumaSpread
+              << " colorBuckets=" << r.colorBuckets << " (rich >= "
+              << antimal::hv::kScreenRichColorBuckets << ")"
+              << " detailPerMille=" << r.detailPerMille << " (rich >= "
+              << antimal::hv::kScreenRichDetailPerMille << ")\n";
+  }
+  return desktopClass ? 0 : 1;
+}
+
 int CommandBase(int argc, wchar_t **argv) {
   if (argc < 3) {
     PrintUsage();
@@ -4620,6 +4733,9 @@ int wmain(int argc, wchar_t **argv) {
     }
     if (command == "yara-gen") {
       return CommandYaraGen(argc, argv);
+    }
+    if (command == "classify-frame") {
+      return CommandClassifyFrame(argc, argv);
     }
     if (command == "config") {
       return CommandConfig(argc, argv);
