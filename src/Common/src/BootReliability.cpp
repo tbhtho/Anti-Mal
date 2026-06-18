@@ -11,9 +11,21 @@ namespace antimal {
 BootReliability AggregateBootReliability(const std::filesystem::path &workspaceRoot) {
   BootReliability out;
   std::error_code ec;
-  for (const auto &entry :
-       std::filesystem::directory_iterator(workspaceRoot, ec)) {
-    if (!entry.is_directory()) continue;
+  // Iterate with the error_code overloads throughout (constructor AND advance AND
+  // is_directory): the range-for form's operator++/is_directory() are the
+  // THROWING overloads, so a permission error or a dir removed mid-enumeration
+  // (TOCTOU during a live detonation writing run dirs) would throw -- violating
+  // this function's documented no-throw contract and aborting the unguarded CLI.
+  auto fexists = [](const std::filesystem::path &p) {
+    std::error_code e;
+    return std::filesystem::exists(p, e); // no-throw overload
+  };
+  auto it = std::filesystem::directory_iterator(workspaceRoot, ec);
+  const std::filesystem::directory_iterator end;
+  for (; !ec && it != end; it.increment(ec)) {
+    const auto &entry = *it;
+    std::error_code dec;
+    if (!entry.is_directory(dec) || dec) continue;
     const std::string name = PathToUtf8(entry.path().filename());
     if (!name.empty() && name[0] == '_') continue; // _base, _intel_cache, ...
 
@@ -23,8 +35,8 @@ BootReliability AggregateBootReliability(const std::filesystem::path &workspaceR
     // telemetry is the session-0 service, so it proves OS-up / user-mode (not
     // desktop, same rule as hostChannelBytes>0).
     const auto rpt = entry.path() / "report.json";
-    if (!std::filesystem::exists(rpt)) {
-      if (!std::filesystem::exists(entry.path() / "job.json")) continue;
+    if (!fexists(rpt)) {
+      if (!fexists(entry.path() / "job.json")) continue;
       ++out.runs;
       ++out.incomplete;
       bool guestTelemetry = false;

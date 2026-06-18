@@ -4489,6 +4489,14 @@ void TestBootReliability() {
   // Missing workspace -> all-zero, no throw.
   const auto empty = antimal::AggregateBootReliability(ws / "does-not-exist");
   Expect(empty.runs == 0, "reliability: missing workspace yields zero, no throw");
+  // A workspace path that is a FILE (not a directory) must also not throw
+  // (honors the documented no-throw contract; the error_code overloads swallow
+  // the iterator error rather than aborting the unguarded CLI).
+  const fs::path asFile = fs::temp_directory_path() / "antimal-rel-notadir.tmp";
+  { std::ofstream f(asFile); f << "x"; }
+  const auto fileWs = antimal::AggregateBootReliability(asFile);
+  Expect(fileWs.runs == 0, "reliability: a file-as-workspace yields zero, no throw");
+  fs::remove(asFile, ec);
   fs::remove_all(ws, ec);
 }
 
