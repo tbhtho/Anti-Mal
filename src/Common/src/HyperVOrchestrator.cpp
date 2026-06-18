@@ -10193,6 +10193,7 @@ std::string FormatVmDiagnostics(const hv::VmRunSummary &vm) {
   out << "nicFramesDropped: " << vm.nicFramesDropped << "\n";
   out << "nicCapturedFrames: " << vm.capturedNetworkFrames.size() << "\n";
   out << "nicRegisterWrites: " << vm.nicRegisterWrites << "\n";
+  out << "nicDriverProgress: " << vm.nicDriverProgress << "\n";
   out << "ahciCommandsIssued: " << vm.ahciCommandsIssued << "\n";
   out << "ahciIdentifyCommands: " << vm.ahciIdentifyCommands << "\n";
   out << "ahciReadCommands: " << vm.ahciReadCommands << "\n";

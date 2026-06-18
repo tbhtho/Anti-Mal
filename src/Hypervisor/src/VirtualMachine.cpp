@@ -3145,6 +3145,7 @@ VmRunSummary VirtualMachine::RunLoop(
     summary.nicFramesReceived = nic_->FramesReceived();
     summary.nicFramesDropped = nic_->FramesDropped();
     summary.nicRegisterWrites = nic_->RegisterWrites();
+    summary.nicDriverProgress = nic_->DriverProgress();
     summary.capturedNetworkFrames = capturedNetworkFrames_;
   }
   if (ahci_) {

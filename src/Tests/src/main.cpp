@@ -8714,6 +8714,18 @@ void TestE1000Device() {
   // inbox e1000e driver binds; the EEPROM device-id word matches.
   Expect(antimal::hv::E1000Device::kPciDeviceId == 0x10D3,
          "e1000e: device id is 82574L (0x10D3)");
+
+  // Driver-bind progress milestones: this test drove EERD (eeprom-read), the TX
+  // ring (TDBAL/TDLEN -> tx-ring), and TDT (tx-kick). Used on a live boot to see
+  // how far a partially-binding driver got.
+  const std::string prog = nic.DriverProgress();
+  Expect(prog.find("eeprom-read") != std::string::npos &&
+             prog.find("tx-ring") != std::string::npos &&
+             prog.find("tx-kick") != std::string::npos,
+         "e1000e: DriverProgress records eeprom-read + tx-ring + tx-kick");
+  // A pristine device reports no progress.
+  Expect(antimal::hv::E1000Device().DriverProgress().empty(),
+         "e1000e: untouched device reports empty DriverProgress");
 }
 
 // RX ring: the host sink delivers inbound frames into the guest via

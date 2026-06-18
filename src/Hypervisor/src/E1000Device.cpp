@@ -126,6 +126,23 @@ void E1000Device::Reset() noexcept {
   // MAC (eeprom_ / ral_ / rah_) is retained across a guest reboot.
 }
 
+std::string E1000Device::DriverProgress() const {
+  std::string s;
+  auto add = [&](bool reached, const char *name) {
+    if (!reached) return;
+    if (!s.empty()) s += ',';
+    s += name;
+  };
+  add(sawEepromRead_, "eeprom-read");
+  add(sawPhyProbe_, "phy-probe");
+  add(linkAnnounced_, "link-up");
+  add(sawRxRing_, "rx-ring");
+  add(sawRxBuffers_, "rx-buffers");
+  add(sawTxRing_, "tx-ring");
+  add(sawTxKick_, "tx-kick");
+  return s;
+}
+
 uint32_t E1000Device::ReadReg(uint32_t off) {
   switch (off) {
     case kRegCTRL:
@@ -137,6 +154,7 @@ uint32_t E1000Device::ReadReg(uint32_t off) {
       const uint16_t data =
           addr < eeprom_.size() ? eeprom_[addr] : static_cast<uint16_t>(0);
       if (eerd_ & kEerdStart) {
+        sawEepromRead_ = true;
         return (eerd_ & 0xFF00u) | kEerdDone |
                (static_cast<uint32_t>(data) << 16);
       }
@@ -193,6 +211,7 @@ void E1000Device::WriteReg(uint32_t off, uint32_t value) {
       eerd_ = value;
       break;
     case kRegMDIC: {
+      sawPhyProbe_ = true;
       // MDIC: bits16-20 = PHY reg, bits26-27 = opcode (01 write, 10 read).
       // Complete the transaction immediately with the Ready bit (28) set; for a
       // read, splice in the PHY register value so the driver's poll succeeds.
@@ -227,36 +246,42 @@ void E1000Device::WriteReg(uint32_t off, uint32_t value) {
       break;
     case kRegRDBAL:
       rdbal_ = value & ~0xFu;
+      sawRxRing_ = true;
       break;
     case kRegRDBAH:
       rdbah_ = value;
       break;
     case kRegRDLEN:
       rdlen_ = value & 0xFFF80u;
+      sawRxRing_ = true;
       break;
     case kRegRDH:
       rdh_ = value;
       break;
     case kRegRDT:
       rdt_ = value;
+      sawRxBuffers_ = true;
       break;
     case kRegTCTL:
       tctl_ = value;
       break;
     case kRegTDBAL:
       tdbal_ = value & ~0xFu;
+      sawTxRing_ = true;
       break;
     case kRegTDBAH:
       tdbah_ = value;
       break;
     case kRegTDLEN:
       tdlen_ = value & 0xFFF80u;  // 128-byte aligned
+      sawTxRing_ = true;
       break;
     case kRegTDH:
       tdh_ = value;
       break;
     case kRegTDT:
       tdt_ = value;
+      sawTxKick_ = true;
       ProcessTx();  // the tail bump is what kicks transmission
       break;
     case kRegRAL:

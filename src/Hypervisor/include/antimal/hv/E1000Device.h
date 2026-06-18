@@ -34,6 +34,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <functional>
+#include <string>
 
 namespace antimal::hv {
 
@@ -97,6 +98,13 @@ class E1000Device final : public IMmioDevice {
   // touched the device (vs. never enumerated/bound). The Phase-1 acceptance gate.
   uint64_t RegisterWrites() const noexcept { return mmioWrites_; }
 
+  // A comma-joined list of bring-up milestones the driver reached, in order:
+  // "eeprom-read,phy-probe,link-up,rx-ring,rx-buffers,tx-ring,tx-kick". Lets a
+  // live boot show HOW FAR a partially-binding driver got when the NIC is inert
+  // despite RegisterWrites()>0 (e.g. enumerated + read EEPROM but never set up
+  // the rings). Empty when the driver never touched the device.
+  std::string DriverProgress() const;
+
  private:
   void WriteReg(uint32_t off, uint32_t value);
   uint32_t ReadReg(uint32_t off);
@@ -122,6 +130,13 @@ class E1000Device final : public IMmioDevice {
   uint32_t ral_ = 0, rah_ = 0;
   bool linkAnnounced_ = false;  // raised one Link-Status-Change interrupt yet
   bool interruptPending_ = false;
+  // Driver bring-up milestones (for DriverProgress / live partial-bind diagnosis).
+  bool sawEepromRead_ = false;  // read an EERD word (MAC/EEPROM probe)
+  bool sawPhyProbe_ = false;    // issued an MDIC PHY access
+  bool sawRxRing_ = false;      // configured the RX ring base/length
+  bool sawRxBuffers_ = false;   // posted RX buffers (advanced RDT)
+  bool sawTxRing_ = false;      // configured the TX ring base/length
+  bool sawTxKick_ = false;      // bumped TDT (kicked transmission)
 
   uint64_t framesTransmitted_ = 0;
   uint64_t bytesTransmitted_ = 0;
