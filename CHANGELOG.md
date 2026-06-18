@@ -49,8 +49,9 @@ unit-tested. A living `private development documentation` tracks done/remaining 
   (textbook maldoc execution, T1566.001, high), browser→script-host (drive-by), proxy-exec LOLBin→
   shell (mshta/rundll32/regsvr32, T1218), script-host→PowerShell, and shell→script-host lures.
   Conservative rule set (chains rarely benign — explorer→cmd is *not* flagged) so it can feed the
-  verdict without FP floods. Surfaced in `report --detections` (new `process-chain` category) and the
-  ATT&CK matrix. Pure + unit-tested.
+  verdict without FP floods. Surfaced in `report --detections` (new `process-chain` category), the
+  ATT&CK matrix, AND highlighted inline in the report's **process tree** (the Any.Run "malicious
+  process" mark — a ⚠ "suspicious spawn (Txxxx)" badge on the offending child node). Pure + unit-tested.
 - **Static findings → ATT&CK matrix:** `AggregateMitreTechniques` now maps the static scanner
   findings (the file-type analyzers + obfuscation/config recovery) to ATT&CK techniques, so a report
   for a lure document/image populates the ATT&CK matrix from static analysis, not just capa/dynamic

@@ -973,6 +973,20 @@ bool EmitProcessTreeSection(std::ostringstream &html,
                             const std::vector<EventRecord> &events) {
   const auto tree = BuildProcessTree(events);
   if (tree.empty()) return false;
+  // Highlight nodes whose parent->this lineage is a suspicious chain (maldoc
+  // execution, proxy-exec, ...) -- the Any.Run "malicious process" highlight.
+  auto baseLower = [](std::string s) {
+    const size_t sl = s.find_last_of("\\/");
+    if (sl != std::string::npos) s = s.substr(sl + 1);
+    for (char &c : s) c = static_cast<char>(std::tolower((unsigned char)c));
+    return s;
+  };
+  std::map<std::string, ProcessChainHit> chainByPair;
+  for (const auto &h : ClassifyProcessChains(events)) {
+    chainByPair[h.parent + "|" + h.child] = h;
+  }
+  std::map<uint32_t, std::string> imgByPid;
+  for (const auto &n : tree) imgByPid[n.processId] = n.imagePath;
   html << "<ul class=\"proc-exec-tree\">";
   for (const auto &node : tree) {
     const int indent = node.depth * 18; // px per nesting level
@@ -984,6 +998,19 @@ bool EmitProcessTreeSection(std::ostringstream &html,
                            ? ("pid " + std::to_string(node.processId))
                            : node.imagePath)
          << "</span>";
+    {
+      const auto pit = imgByPid.find(node.parentProcessId);
+      if (pit != imgByPid.end()) {
+        const auto cit = chainByPair.find(baseLower(pit->second) + "|" +
+                                          baseLower(node.imagePath));
+        if (cit != chainByPair.end()) {
+          html << "<span class=\"chip\" style=\"background:var(--bad);color:#fff\""
+                  " title=\""
+               << HtmlEscape(cit->second.reason) << "\">&#9888; suspicious spawn ("
+               << HtmlEscape(cit->second.mitre) << ")</span>";
+        }
+      }
+    }
     if (node.exited) {
       html << "<span class=\"chip exit\">exit "
            << HtmlEscape(node.exitCode.empty() ? "?" : node.exitCode)
