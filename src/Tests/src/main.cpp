@@ -8581,6 +8581,10 @@ void TestPacketInspector() {
     for (const auto &e : tlsEvents)
       if (e.action == "network.tls" && e.target == host) sawTls = true;
     Expect(sawTls, "packet: TLS ClientHello -> network.tls with SNI");
+    // The SNI host flows into the report's contacted-domains aggregation.
+    auto doms = antimal::AggregateNetworkDomains(tlsEvents);
+    Expect(std::find(doms.begin(), doms.end(), host) != doms.end(),
+           "packet: TLS SNI host surfaces in AggregateNetworkDomains");
     // Truncated ClientHello must not over-read.
     Expect(antimal::ParseTlsClientHelloSni(ch.data(), 12).empty(),
            "packet: truncated ClientHello -> no SNI (bounds-safe)");

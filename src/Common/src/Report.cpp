@@ -2450,8 +2450,11 @@ std::vector<std::string> AggregateNetworkDomains(
   std::set<std::string> domains; // distinct + sorted
   for (const auto &e : events) {
     if (e.category != "network") continue;
-    // DNS query name: PacketInspector puts the queried hostname in target.
-    if (e.action == "network.dns" && looksLikeHostname(e.target)) {
+    // DNS query name (network.dns) / TLS SNI host (network.tls): PacketInspector
+    // puts the recovered hostname in target. The SNI is the HTTPS C2's name in
+    // plaintext, so HTTPS destinations show up here too — not just cleartext DNS.
+    if ((e.action == "network.dns" || e.action == "network.tls") &&
+        looksLikeHostname(e.target)) {
       domains.insert(e.target);
     }
     // HTTP Host header: PacketInspector records it in details["host"].
