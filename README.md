@@ -222,6 +222,8 @@ bin\x64\Release\AntiMal.HostCli.exe report <run> --summary    # at-a-glance tria
 bin\x64\Release\AntiMal.HostCli.exe report <run> --why        # explainable verdict (per-signal rationale)
 bin\x64\Release\AntiMal.HostCli.exe report <run> --detections
 bin\x64\Release\AntiMal.HostCli.exe report <run> --crashes      # distinct process-crash fault signatures
+bin\x64\Release\AntiMal.HostCli.exe report <run> --network      # contacted endpoints (service/bogon/C2 flags) + domains
+bin\x64\Release\AntiMal.HostCli.exe report <run> --mitre        # ATT&CK techniques grouped by tactic
 bin\x64\Release\AntiMal.HostCli.exe report <run> --usability
 bin\x64\Release\AntiMal.HostCli.exe report <run> --timeline [--category process|registry|file|network|image] [--mitre] [--limit N]
 bin\x64\Release\AntiMal.HostCli.exe boot-report

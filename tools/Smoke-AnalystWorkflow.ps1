@@ -58,6 +58,9 @@ try {
   $mitre = (& $Cli report $report --mitre) -join "`n"
   Check "report --mitre groups by tactic" ($mitre -match 'by tactic')
 
+  $net = (& $Cli report $report --network) -join "`n"
+  Check "report --network lists endpoints/domains" ($net -match 'Network endpoints|domains')
+
   # 2b) a second scenario (rat) must also produce a valid report.
   $sim2 = Join-Path $work "sim-rat"
   & $Cli simulate --scenario rat --out $sim2 | Out-Null

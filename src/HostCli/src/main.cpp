@@ -17,6 +17,7 @@
 #include "antimal/IocExport.h"
 #include "antimal/Json.h"
 #include "antimal/MitreCatalog.h"
+#include "antimal/NetworkClassifier.h"
 #include "antimal/Report.h"
 #include "antimal/ReportDiff.h"
 #include "antimal/Scanner.h"
@@ -226,7 +227,7 @@ void PrintUsage() {
       << "  antimal fs-find [--vhdx <d.vhdx>] [--overlay <o.cow>] <name-substring>   (offline recursive search)\n"
       << "  antimal fs-scan [--vhdx <d.vhdx>] [--overlay <o.cow>] <guest\\path>   (extract + static-scan a guest file)\n"
       << "  antimal reg-ls [--hive software|system|sam|...] [--overlay <o.cow>] <reg\\key> [--values] [--depth N] [--filter <s>]\n"
-      << "  antimal report <run-id-or-report.json> [--html] [--summary|--why|--detections|--crashes|--mitre|--usability|--timeline [--json]]\n"
+      << "  antimal report <run-id-or-report.json> [--html] [--summary|--why|--detections|--crashes|--mitre|--network|--usability|--timeline [--json]]\n"
       << "  antimal browser-impact <run-id-or-report.json> --decrypt-browser-secrets\n"
       << "  antimal export <run-id-or-report.json> --format stix|misp|csv|yara [--out <file>] [--defang]\n"
       << "  antimal similarity <fileA> <fileB> [--json]   (fuzzy-hash similarity 0..100)\n"
@@ -3172,6 +3173,48 @@ int CommandReport(int argc, wchar_t **argv) {
                 << "x " << top.image << " " << top.exceptionCode;
       if (!top.exceptionName.empty()) std::cout << " " << top.exceptionName;
       std::cout << ")\n";
+    }
+    return 0;
+  }
+  if (HasFlag(argc, argv, "--network")) {
+    // Distinct network endpoints the run contacted, each classified (service,
+    // private/bogon, suspicious + why). A focused "what did it talk to" view.
+    struct Row { std::string ep; antimal::NetworkIndicator ni; };
+    std::vector<Row> rows;
+    std::set<std::string> seenEp;
+    for (const auto &e : report.events) {
+      if (e.category != "network" || e.target.empty()) continue;
+      if (!seenEp.insert(e.target).second) continue;
+      rows.push_back({e.target, antimal::ClassifyEndpoint(e.target)});
+    }
+    if (HasFlag(argc, argv, "--json")) {
+      std::cout << "{\"endpoints\":[";
+      for (size_t i = 0; i < rows.size(); ++i) {
+        const auto &r = rows[i];
+        std::cout << (i ? "," : "") << "{\"endpoint\":" << JsonQuote(r.ep)
+                  << ",\"service\":" << JsonQuote(r.ni.service)
+                  << ",\"private\":" << (r.ni.privateAddr ? "true" : "false")
+                  << ",\"bogon\":" << (r.ni.bogon ? "true" : "false")
+                  << ",\"suspicious\":" << (r.ni.suspicious ? "true" : "false")
+                  << ",\"note\":" << JsonQuote(r.ni.note) << "}";
+      }
+      std::cout << "],\"domains\":" << JsonStrArray(report.networkDomains) << "}\n";
+      return 0;
+    }
+    std::cout << "Network endpoints (" << rows.size() << "):\n";
+    for (const auto &r : rows) {
+      std::cout << "  " << r.ep;
+      if (!r.ni.service.empty()) std::cout << "  [" << r.ni.service << "]";
+      if (r.ni.privateAddr) std::cout << "  (private)";
+      if (r.ni.suspicious) std::cout << "  ⚠ " << r.ni.note;
+      std::cout << "\n";
+    }
+    if (!report.networkDomains.empty()) {
+      std::cout << "Resolved domains (" << report.networkDomains.size() << "):\n";
+      for (const auto &d : report.networkDomains) std::cout << "  " << d << "\n";
+    }
+    if (rows.empty() && report.networkDomains.empty()) {
+      std::cout << "  (no network activity recorded)\n";
     }
     return 0;
   }
