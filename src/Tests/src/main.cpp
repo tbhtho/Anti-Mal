@@ -8746,6 +8746,57 @@ void TestE1000Device() {
          "e1000e: untouched device reports empty DriverProgress");
 }
 
+// TX ring: a frame split across MULTIPLE descriptors (EOP only on the last) is
+// assembled into one outbound frame. Covers ProcessTx's cross-descriptor
+// accumulation path that the single-descriptor TX test doesn't exercise.
+void TestE1000TxMultiDescriptor() {
+  antimal::hv::E1000Device nic;
+  const uint64_t kMmio = 0xF0000000ull;
+  nic.SetMmioBase(kMmio);
+  const uint64_t base = 0x10000ull;
+  std::vector<uint8_t> mem(4096, 0);
+  nic.SetDmaMemory([&](uint64_t gpa, std::size_t len) -> uint8_t * {
+    if (gpa < base || gpa + len > base + mem.size()) return nullptr;
+    return mem.data() + static_cast<size_t>(gpa - base);
+  });
+  std::vector<uint8_t> captured;
+  int txCallbacks = 0;
+  nic.SetTxHandler([&](const uint8_t *f, std::size_t len) {
+    captured.assign(f, f + len);
+    ++txCallbacks;
+  });
+
+  // Two payload halves: [0x10..0x2F] at base+0x200, [0x30..0x4F] at base+0x300.
+  for (int i = 0; i < 32; ++i) mem[0x200 + i] = static_cast<uint8_t>(0x10 + i);
+  for (int i = 0; i < 32; ++i) mem[0x300 + i] = static_cast<uint8_t>(0x30 + i);
+  const uint64_t buf0 = base + 0x200, buf1 = base + 0x300;
+  // Descriptor 0: buf0, len 32, CMD=0 (no EOP, no RS) -> mid-frame fragment.
+  for (int i = 0; i < 8; ++i) mem[i] = static_cast<uint8_t>((buf0 >> (i * 8)) & 0xFF);
+  mem[8] = 32; mem[9] = 0; mem[11] = 0x00;
+  // Descriptor 1: buf1, len 32, CMD=EOP|RS -> ends the frame.
+  for (int i = 0; i < 8; ++i) mem[16 + i] = static_cast<uint8_t>((buf1 >> (i * 8)) & 0xFF);
+  mem[16 + 8] = 32; mem[16 + 9] = 0; mem[16 + 11] = 0x09;
+
+  auto w = [&](uint32_t reg, uint32_t v) { nic.OnWrite(kMmio + reg, 4, v); };
+  w(0x3800, static_cast<uint32_t>(base & 0xFFFFFFFF));  // TDBAL
+  w(0x3804, static_cast<uint32_t>(base >> 32));         // TDBAH
+  w(0x3808, 16 * 8);  // TDLEN
+  w(0x3810, 0);       // TDH
+  w(0x3818, 2);       // TDT = 2 -> transmit descriptors 0 and 1
+
+  Expect(txCallbacks == 1,
+         "e1000 TX multi-desc: one frame emitted on EOP (not per descriptor)");
+  Expect(captured.size() == 64,
+         "e1000 TX multi-desc: two 32-byte fragments assembled into 64 bytes");
+  bool concatenated = captured.size() == 64;
+  for (int i = 0; i < 32 && concatenated; ++i)
+    if (captured[i] != 0x10 + i || captured[32 + i] != 0x30 + i) concatenated = false;
+  Expect(concatenated,
+         "e1000 TX multi-desc: fragments concatenated in descriptor order");
+  Expect(nic.FramesTransmitted() == 1 && nic.BytesTransmitted() == 64,
+         "e1000 TX multi-desc: counters reflect one 64-byte frame");
+}
+
 // RX ring: the host sink delivers inbound frames into the guest via
 // DeliverRxFrame. Exercises the descriptor write-back, RDH advance, RXT0
 // interrupt, the no-free-buffer drop, RX-disabled drop, length clamping, and
@@ -10480,6 +10531,7 @@ int main() {
     TestReportSections();
     TestPacketInspector();
     TestE1000Device();
+    TestE1000TxMultiDescriptor();
     TestE1000RxRing();
     TestPcapWriter();
     TestFakeInternet();
