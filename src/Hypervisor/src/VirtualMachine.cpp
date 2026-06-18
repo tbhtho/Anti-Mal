@@ -2661,6 +2661,9 @@ VmRunSummary VirtualMachine::RunLoop(
     if (nic_ && nic_->InterruptPending()) {
       if (tryRaiseLegacyIrq(kAhciGsi) != IrqDeliveryBackend::Failed) {
         nic_->ConsumeInterrupt();
+        ++summary.nicInterruptsInjected;
+      } else {
+        ++summary.nicInterruptsFailed;
       }
     }
 

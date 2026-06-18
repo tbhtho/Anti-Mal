@@ -464,6 +464,8 @@ struct VmRunSummary {
   uint64_t nicFramesTransmitted = 0;
   uint64_t nicFramesReceived = 0;   // frames the host sink delivered into the guest RX ring
   uint64_t nicFramesDropped = 0;    // inbound frames dropped (no free RX buffer / RX off)
+  uint64_t nicInterruptsInjected = 0;  // NIC INTx (GSI 11) interrupts delivered to the guest
+  uint64_t nicInterruptsFailed = 0;    // NIC interrupt delivery attempts that failed
   uint64_t nicRegisterWrites = 0;
   std::string nicDriverProgress;    // bring-up milestones the guest driver reached
   uint64_t pitIrqsDelivered = 0;

@@ -10191,6 +10191,8 @@ std::string FormatVmDiagnostics(const hv::VmRunSummary &vm) {
   out << "nicFramesTransmitted: " << vm.nicFramesTransmitted << "\n";
   out << "nicFramesReceived: " << vm.nicFramesReceived << "\n";
   out << "nicFramesDropped: " << vm.nicFramesDropped << "\n";
+  out << "nicInterruptsInjected: " << vm.nicInterruptsInjected << "\n";
+  out << "nicInterruptsFailed: " << vm.nicInterruptsFailed << "\n";
   out << "nicCapturedFrames: " << vm.capturedNetworkFrames.size() << "\n";
   out << "nicRegisterWrites: " << vm.nicRegisterWrites << "\n";
   out << "nicDriverProgress: " << vm.nicDriverProgress << "\n";
