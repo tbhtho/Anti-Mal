@@ -3948,6 +3948,23 @@ void TestCrashSummary() {
   // Determinism.
   Expect(SummarizeCrashes(ev).signatures[0].count == cs.signatures[0].count,
          "crash: deterministic");
+
+  // Regression for the sort-determinism fix: two signatures that differ ONLY by
+  // faulting module (same image/code/offset, equal counts) must order stably --
+  // the dedup key includes module, so the comparator must tiebreak on it too
+  // (std::sort isn't stable). Build them in BOTH insertion orders and require the
+  // same emitted order.
+  auto byModule = [&](const char *m1, const char *m2) {
+    std::vector<EventRecord> v;
+    v.push_back(crash("p.exe", "c0000005", m1, "100"));
+    v.push_back(crash("p.exe", "c0000005", m2, "100"));
+    const auto s = SummarizeCrashes(v).signatures;
+    return s.size() == 2 ? s[0].module : std::string();
+  };
+  Expect(byModule("aaa.dll", "bbb.dll") == byModule("bbb.dll", "aaa.dll"),
+         "crash: signatures differing only by module sort deterministically");
+  Expect(byModule("aaa.dll", "bbb.dll") == "aaa.dll",
+         "crash: module tiebreak orders ascending");
 }
 
 // Detections summary: aggregates static findings + persistence + suspicious
