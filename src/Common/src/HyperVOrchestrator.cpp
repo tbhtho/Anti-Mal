@@ -12270,6 +12270,10 @@ DetonationResult InHouseOrchestrator::PrepareAndRun(
         };
       fireProgress("booting", "Booting VM (firmware -> guest)");
       hv::VmRunSummary vmSummary;
+      // Per-protocol fake-internet sink reply counts, captured from the run loop
+      // for the vm-diagnostics.txt (shows which network protocols the guest
+      // actually exercised on a NIC-enabled boot). "" when no NIC/sink.
+      std::string networkSinkStats;
       std::vector<BootReadTarget> bootReadTargets;
       IdeReadAttributionCatalog readAttributionCatalog;
       BootOverlayPatchResult lastOverlayPatch;
@@ -12396,6 +12400,15 @@ DetonationResult InHouseOrchestrator::PrepareAndRun(
             result.dynamicSummary.status = "execution-skipped";
           }
         }
+        // One contained fake-internet sink for all boot generations (answers as
+        // gateway 10.0.2.3). Hoisted out of the reboot loop so its per-protocol
+        // reply counts accumulate across reboots and survive to the diagnostics.
+        antimal::net::FakeInternet netSink(
+            {0x02, 0x53, 0x49, 0x4E, 0x4B, 0x01}, 0x0A000203u);
+        const bool nicSinkEnabled = [] {
+          const char *e = std::getenv("ANTIMAL_ENABLE_NIC");
+          return e && e[0] == '1';
+        }();
         for (int reboot = 0; reboot <= kMaxReboots; ++reboot) {
           const auto elapsed =
               std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -12418,24 +12431,17 @@ DetonationResult InHouseOrchestrator::PrepareAndRun(
             optsLocal.processorCount = postRebootVcpuCount;
           }
           hv::VirtualMachine vm(preflight.firmwarePath, disk, optsLocal);
-          // Contained fake-internet: when a NIC is attached, route the guest's
-          // TX frames through an in-process ARP/ICMP/DNS/TCP responder (zero
-          // egress) and inject the replies into the RX ring so a sample's
-          // network behavior plays out + is captured (both directions) in
-          // network.pcap. The sink lives for this vm.Run() (same scope,
-          // synchronous), and answers as gateway 10.0.2.3.
-          antimal::net::FakeInternet netSink(
-              {0x02, 0x53, 0x49, 0x4E, 0x4B, 0x01}, 0x0A000203u);
-          {
-            const char *nicEnv = std::getenv("ANTIMAL_ENABLE_NIC");
-            if (nicEnv && nicEnv[0] == '1') {
-              vm.SetNetworkReplyFn(
-                  [&netSink](const uint8_t *frame, std::size_t len) {
-                    std::vector<std::vector<uint8_t>> replies;
-                    netSink.OnGuestFrame(frame, len, replies);
-                    return replies;
-                  });
-            }
+          // When a NIC is attached, route the guest's TX frames through the
+          // contained sink (zero egress) and inject the replies into the RX ring
+          // so a sample's network behavior plays out + is captured (both
+          // directions) in network.pcap.
+          if (nicSinkEnabled) {
+            vm.SetNetworkReplyFn(
+                [&netSink](const uint8_t *frame, std::size_t len) {
+                  std::vector<std::vector<uint8_t>> replies;
+                  netSink.OnGuestFrame(frame, len, replies);
+                  return replies;
+                });
           }
           if (executionAuthorized) {
             // The execute payload (~100 KB) is delivered PACED + post-handshake
@@ -12460,6 +12466,17 @@ DetonationResult InHouseOrchestrator::PrepareAndRun(
           }
           s = vm.Run(reqLocal);
           s.guestReboots = reboot;
+          if (nicSinkEnabled) {
+            networkSinkStats =
+                "networkSinkReplies: dhcp=" + std::to_string(netSink.DhcpReplies()) +
+                " arp=" + std::to_string(netSink.ArpReplies()) +
+                " icmp=" + std::to_string(netSink.IcmpReplies()) +
+                " dns=" + std::to_string(netSink.DnsReplies()) +
+                " ntp=" + std::to_string(netSink.NtpReplies()) +
+                " tcp=" + std::to_string(netSink.TcpReplies()) +
+                " http=" + std::to_string(netSink.HttpReplies()) +
+                " framesSeen=" + std::to_string(netSink.FramesSeen());
+          }
           if (!s.rebootRequested) {
             break;
           }
@@ -12611,7 +12628,9 @@ DetonationResult InHouseOrchestrator::PrepareAndRun(
                         FormatOverlaySystemBootSecurityInspection(
                             overlaySystemBootSecurityInspection) +
                         overlayBcdSummary +
-                        FormatAcpiPciContractDiagnostics());
+                        FormatAcpiPciContractDiagnostics() +
+                        (networkSinkStats.empty() ? std::string()
+                                                   : networkSinkStats + "\n"));
       // Write a Wireshark-openable network.pcap of the guest's captured TX
       // frames (only populated when ANTIMAL_ENABLE_NIC and the driver bound).
       // The VMM doesn't timestamp per frame yet, so we stamp a synthetic
