@@ -46,6 +46,7 @@ class FakeInternet {
   uint64_t HttpReplies() const noexcept { return httpReplies_; }
   uint64_t DhcpReplies() const noexcept { return dhcpReplies_; }
   uint64_t NtpReplies() const noexcept { return ntpReplies_; }
+  uint64_t NbnsReplies() const noexcept { return nbnsReplies_; }
   uint64_t FramesSeen() const noexcept { return framesSeen_; }
   uint64_t FramesDropped() const noexcept { return framesDropped_; }
 
@@ -64,6 +65,11 @@ class FakeInternet {
   // hanging on a timeout (a common early network behavior).
   bool HandleNtp(const uint8_t *f, std::size_t ihl, std::size_t udpOff,
                  std::size_t udpLen, std::vector<Frame> &out);
+  // NBNS (NetBIOS Name Service, UDP/137) name query -> positive name-query
+  // response resolving to the sink IP. Shares the DNS header layout but uses
+  // NetBIOS-encoded names + an NB resource record, so it's a distinct handler.
+  bool HandleNbns(const uint8_t *f, std::size_t ihl, std::size_t udpOff,
+                  std::size_t udpLen, std::vector<Frame> &out);
   // TCP SYN -> SYN-ACK so the guest's connection to the contacted endpoint
   // establishes (and it sends its first data payload). `ihl` is the IPv4 header
   // length; `tcpOff`/`tcpLen` bound the TCP segment.
@@ -84,6 +90,7 @@ class FakeInternet {
   uint64_t httpReplies_ = 0;
   uint64_t dhcpReplies_ = 0;
   uint64_t ntpReplies_ = 0;
+  uint64_t nbnsReplies_ = 0;
   uint64_t framesSeen_ = 0;
   uint64_t framesDropped_ = 0;
 };

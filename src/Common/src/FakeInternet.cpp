@@ -213,6 +213,7 @@ bool FakeInternet::HandleIpv4(const uint8_t *f, std::size_t len,
     if (dport == 53 || dport == 5355) return HandleDns(f, ihl, l4Off, l4Len, out);
     if (dport == 67) return HandleDhcp(f, ihl, l4Off, l4Len, out);
     if (dport == 123) return HandleNtp(f, ihl, l4Off, l4Len, out);
+    if (dport == 137) return HandleNbns(f, ihl, l4Off, l4Len, out);
     return false;  // other UDP ports: no reply (yet)
   }
   if (ip[9] == kIpProtoTcp) {
@@ -524,6 +525,95 @@ bool FakeInternet::HandleNtp(const uint8_t *f, std::size_t ihl,
 
   out.push_back(std::move(r));
   ++ntpReplies_;
+  return true;
+}
+
+bool FakeInternet::HandleNbns(const uint8_t *f, std::size_t ihl,
+                              std::size_t udpOff, std::size_t udpLen,
+                              std::vector<Frame> &out) {
+  // NBNS shares the 12-byte DNS header layout; the question name is NetBIOS
+  // first-level-encoded (one 0x20-length label) optionally followed by a scope.
+  const std::size_t nbOff = udpOff + kUdpHdr;
+  const std::size_t nbLen = udpLen - kUdpHdr;
+  if (nbLen < kDnsHdr + 4) {
+    ++framesDropped_;
+    return false;
+  }
+  const uint8_t *nb = f + nbOff;
+  if (RdBE16(nb + 4) != 1) return false;  // single-question queries only
+  if (nb[2] & 0x80) return false;         // already a response (QR set)
+
+  // Walk the question name (label list ending in a 0 byte), strictly bounded.
+  std::size_t p = kDnsHdr;
+  bool nameOk = false;
+  while (p < nbLen) {
+    const uint8_t l = nb[p];
+    if (l == 0) { ++p; nameOk = true; break; }
+    if ((l & 0xC0) == 0xC0) { p += 2; nameOk = (p <= nbLen); break; }
+    p += static_cast<std::size_t>(l) + 1;
+  }
+  if (!nameOk || p + 4 > nbLen) {
+    ++framesDropped_;
+    return false;
+  }
+  const std::size_t nameEnd = p;  // [kDnsHdr, nameEnd) = the encoded name + terminator
+  if (RdBE16(nb + p) != 0x0020) return false;  // only NB name queries (not NBSTAT)
+
+  // Positive name-query response: header (qd=0, an=1) + an NB RR echoing the
+  // queried name and resolving to the sink IP.
+  std::vector<uint8_t> resp(kDnsHdr, 0);
+  WrBE16(resp.data(), RdBE16(nb));   // transaction id (echo)
+  WrBE16(resp.data() + 2, 0x8500);   // response, authoritative, recursion available
+  WrBE16(resp.data() + 4, 0);        // qdcount
+  WrBE16(resp.data() + 6, 1);        // ancount
+  resp.insert(resp.end(), nb + kDnsHdr, nb + nameEnd);  // answer NAME = the query name
+  auto push16 = [&](uint16_t v) {
+    resp.push_back(static_cast<uint8_t>(v >> 8));
+    resp.push_back(static_cast<uint8_t>(v & 0xFF));
+  };
+  push16(0x0020);  // TYPE NB
+  push16(0x0001);  // CLASS IN
+  push16(0x0000); push16(0x0708);  // TTL = 1800s
+  push16(6);       // RDLENGTH
+  push16(0x0000);  // NB_FLAGS (B-node, unique)
+  resp.push_back(static_cast<uint8_t>((ip_ >> 24) & 0xFF));
+  resp.push_back(static_cast<uint8_t>((ip_ >> 16) & 0xFF));
+  resp.push_back(static_cast<uint8_t>((ip_ >> 8) & 0xFF));
+  resp.push_back(static_cast<uint8_t>(ip_ & 0xFF));
+
+  // Wrap: Ethernet (to client) + IPv4 (sink -> guest) + UDP (137 -> client port).
+  const std::size_t udpTotal = kUdpHdr + resp.size();
+  const std::size_t ipTotal = ihl + udpTotal;
+  Frame r(kEthHdr + ipTotal, 0);
+  std::memcpy(r.data(), f + 6, 6);
+  std::memcpy(r.data() + 6, mac_.data(), 6);
+  WrBE16(r.data() + 12, kEthIpv4);
+  uint8_t *rip = r.data() + kEthHdr;
+  std::memcpy(rip, f + kEthHdr, ihl);
+  WrBE16(rip + 2, static_cast<uint16_t>(ipTotal));
+  WrBE16(rip + 4, 0);
+  WrBE16(rip + 6, 0x4000);
+  rip[8] = 64;
+  rip[9] = kIpProtoUdp;
+  uint8_t reqSrcIp[4];
+  std::memcpy(reqSrcIp, f + kEthHdr + 12, 4);
+  rip[12] = static_cast<uint8_t>((ip_ >> 24) & 0xFF);
+  rip[13] = static_cast<uint8_t>((ip_ >> 16) & 0xFF);
+  rip[14] = static_cast<uint8_t>((ip_ >> 8) & 0xFF);
+  rip[15] = static_cast<uint8_t>(ip_ & 0xFF);
+  std::memcpy(rip + 16, reqSrcIp, 4);
+  rip[10] = rip[11] = 0;
+  WrBE16(rip + 10, InternetChecksum(rip, ihl));
+  uint8_t *rudp = rip + ihl;
+  WrBE16(rudp, 137);                     // src port = NBNS
+  std::memcpy(rudp + 2, f + udpOff, 2);  // dst port = the query's src port
+  WrBE16(rudp + 4, static_cast<uint16_t>(udpTotal));
+  rudp[6] = rudp[7] = 0;
+  std::memcpy(rudp + kUdpHdr, resp.data(), resp.size());
+  WrBE16(rudp + 6, UdpChecksum(rip + 12, rip + 16, rudp, udpTotal));
+
+  out.push_back(std::move(r));
+  ++nbnsReplies_;
   return true;
 }
 
