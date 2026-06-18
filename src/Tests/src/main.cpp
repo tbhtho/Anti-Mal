@@ -4114,10 +4114,19 @@ void TestMalformedInputRobustness() {
     (void)ExtractCobaltStrikeConfig(in);
     (void)DetectShellcode(in);
     (void)ComputeCtph(in);
+    // Config/C2 recovery + YARA generation must also survive untrusted bytes.
+    (void)MineXorObfuscatedUrls(in);
+    (void)MineMultiByteXorObfuscatedUrls(in);
+    (void)MineBase64WrappedIocs(in);
+    (void)MineRc4WrappedConfig(in);
+    (void)GenerateYaraRule(ScanResult{}, in);
   }
   // The deobfuscator over garbage base64 must also not crash.
   (void)DecodePowerShellEncodedCommand("!!!not base64!!!");
   (void)DecodePowerShellEncodedCommand(std::string(10000, 'A'));
+  // A pathological all-base64-charset buffer maximizes the RC4 key/blob trial
+  // space -- the bound (blobs x keys x cap) must keep it finite.
+  (void)MineRc4WrappedConfig(std::vector<uint8_t>(16384, 'A'));
   Expect(true, "robustness: analyzers survive malformed/untrusted inputs");
 }
 
