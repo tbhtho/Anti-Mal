@@ -27,6 +27,8 @@ struct RtfAnalysis {
   bool hasAutoUpdate = false;   // \objupdate -- object updates (runs) on open
   bool equationEditor = false;  // Equation Editor CLSID/class in a decoded object
   bool embeddedExecutable = false; // \objdata decodes to a PE (MZ) or OLE (D0CF)
+  bool remoteLink = false;      // object loads a remote URL (CVE-2017-0199 / OLE2Link)
+  std::vector<std::string> urls; // remote URLs recovered from object monikers
   std::vector<ScanFinding> findings;
 };
 

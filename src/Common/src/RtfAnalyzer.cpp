@@ -90,6 +90,28 @@ RtfAnalysis AnalyzeRtf(const std::vector<uint8_t> &data) {
       // An embedded OLE is normal for \objdata; only note it if combined below.
       a.hasOleObject = true;
     }
+    // Remote object/template load (CVE-2017-0199 / OLE2Link): the moniker carries
+    // an http(s):// URL to a remote HTA/RTF/template fetched + run on open. The
+    // URL may be UTF-16LE in the OLE moniker, so scan both raw and de-NUL'd.
+    std::string flat(decoded.begin(), decoded.end());
+    std::string deNul;
+    deNul.reserve(flat.size());
+    for (char c : flat) if (c != '\0') deNul.push_back(c);
+    for (const std::string &hay : {flat, deNul}) {
+      for (const char *scheme : {"http://", "https://"}) {
+        size_t u = hay.find(scheme);
+        if (u == std::string::npos) continue;
+        size_t e = u;
+        while (e < hay.size() && hay[e] > 0x20 && hay[e] != '"' && hay[e] != '}')
+          ++e;
+        std::string url = hay.substr(u, e - u);
+        if (url.size() > 8 &&
+            std::find(a.urls.begin(), a.urls.end(), url) == a.urls.end()) {
+          a.urls.push_back(url);
+          a.remoteLink = true;
+        }
+      }
+    }
   }
   // Also catch the Equation class named in plaintext (some RTFs don't hex it).
   if (!a.equationEditor &&
@@ -121,6 +143,12 @@ RtfAnalysis AnalyzeRtf(const std::vector<uint8_t> &data) {
     a.findings.push_back(
         {"rtf.embedded_pe",
          "RTF \\objdata decodes to an embedded PE (MZ) executable", 50});
+  }
+  if (a.remoteLink) {
+    std::string msg =
+        "RTF object loads a remote URL on open (CVE-2017-0199 / OLE2Link): " +
+        a.urls.front();
+    a.findings.push_back({"rtf.remote_object_load", msg, 55});
   }
   return a;
 }

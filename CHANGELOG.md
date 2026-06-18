@@ -48,8 +48,10 @@ unit-tested. A living `private development documentation` tracks done/remaining 
   `ScanFile` routes `rtf` to a dedicated analyzer flagging embedded OLE objects (`\objdata`),
   `\objupdate` auto-run-on-open, the **Equation Editor** exploit carrier (CVE-2017-11882 /
   CVE-2018-0802, via the class name / CLSID in the decoded object), and an embedded PE (DOS-stub
-  anchor in the `\objdata` hex). Heuristic + bounds-safe; unit-tested + added to the malformed-input
-  corpus; verified end-to-end (synthetic RTF → 100/malicious with all four findings).
+  anchor in the `\objdata` hex), plus **CVE-2017-0199 / OLE2Link remote-object load** (recovers the
+  http(s) URL from the object moniker, incl. UTF-16LE, and surfaces it as an IOC). Heuristic +
+  bounds-safe; unit-tested + added to the malformed-input corpus; verified end-to-end (synthetic RTF
+  → 100/malicious with all findings).
 - **Bogon / non-routable C2 detection (`NetworkClassifier`):** a C2 endpoint in a reserved/
   non-routable range (0/8, 100.64/10 CGNAT, the RFC5737 TEST-NET blocks, 198.18/15, 224/4 multicast,
   240/4 reserved) is now flagged `bogon` + suspicious with a note — a real anomaly signal (sinkhole /

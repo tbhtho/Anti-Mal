@@ -575,6 +575,7 @@ ScanResult ScanFile(const std::filesystem::path &path,
     // dropper is still covered). Recovered C2 URLs are merged into result.iocs
     // AFTER Enrich() below, which reassigns result.iocs.
     std::vector<std::string> scriptRecoveredUrls;
+    std::vector<std::string> rtfRemoteUrls; // CVE-2017-0199 monikers; merged post-Enrich
     CobaltStrikeConfig csConfig; // populated below; C2 merged into IOCs post-Enrich
     if (result.detectedType.empty() || result.detectedType == "script") {
       const std::string ext = ToLowerAscii(PathToUtf8(path.extension()));
@@ -621,6 +622,9 @@ ScanResult ScanFile(const std::filesystem::path &path,
       for (const auto &f : rtf.findings) {
         AddFinding(result, f.ruleId, f.message, f.score);
       }
+      // A remote-object URL is a real C2/staging IOC. Stash it; merge into
+      // result.iocs AFTER Enrich() (which reassigns iocs), like scriptRecoveredUrls.
+      for (const auto &u : rtf.urls) rtfRemoteUrls.push_back(u);
     }
 
     // Config / C2 extraction (any file type): recover an embedded Cobalt Strike
@@ -860,6 +864,13 @@ ScanResult ScanFile(const std::filesystem::path &path,
     // PowerShell -EncodedCommand). Done here because Enrich() reassigns
     // result.iocs from the plaintext miner, which would otherwise drop them.
     for (const auto &u : scriptRecoveredUrls) {
+      if (std::find(result.iocs.urls.begin(), result.iocs.urls.end(), u) ==
+          result.iocs.urls.end()) {
+        result.iocs.urls.push_back(u);
+      }
+    }
+    // Likewise merge RTF remote-object (CVE-2017-0199) URLs.
+    for (const auto &u : rtfRemoteUrls) {
       if (std::find(result.iocs.urls.begin(), result.iocs.urls.end(), u) ==
           result.iocs.urls.end()) {
         result.iocs.urls.push_back(u);
