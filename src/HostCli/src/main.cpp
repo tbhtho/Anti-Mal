@@ -227,7 +227,7 @@ void PrintUsage() {
       << "  antimal base inspect --vhdx <base.vhdx> [--overlay <overlay.cow>]\n"
       << "                       [--dump-bcd <out.bcd>] [--dump-system <out.hive>]\n"
       << "  antimal base validate --vhdx <base.vhdx> [--overlay <o.cow>] [--json]   (offline boot-readiness pass/fail)\n"
-      << "  antimal classify-frame <frame.png> | --run <run-id> [--json]   (grade a frame: desktop-class? exit 0=Rich)\n"
+      << "  antimal classify-frame <frame.png> | --run <run-id> [--all] [--json]   (grade frame(s): desktop-class? exit 0=Rich)\n"
       << "  antimal fs-ls  [--vhdx <d.vhdx>] [--overlay <o.cow>] <guest\\path>   (offline guest dir listing)\n"
       << "  antimal fs-cat [--vhdx <d.vhdx>] [--overlay <o.cow>] <guest\\path> [--out <file>]\n"
       << "  antimal fs-find [--vhdx <d.vhdx>] [--overlay <o.cow>] <name-substring>   (offline recursive search)\n"
@@ -3279,7 +3279,65 @@ bool LoadPngAsBgra(const std::filesystem::path &path, std::vector<uint8_t> &out,
 int CommandClassifyFrame(int argc, wchar_t **argv) {
   const auto config = antimal::LoadConfig(antimal::DefaultConfigPath());
   std::filesystem::path png;
-  if (const auto runId = OptionValue(argc, argv, "--run")) {
+  const auto runId = OptionValue(argc, argv, "--run");
+
+  // `--run <id> --all`: classify EVERY guest-*.png chronologically and report
+  // the per-state histogram + the first frame that reached Rich (= when the run
+  // first rendered a desktop) -- pixel-objective desktop-reach evidence across
+  // the whole run, complementing the report.json-based boot-report. Exit 0 if
+  // ANY frame was desktop-class (Rich), 1 if none, 2 on error.
+  if (runId && HasFlag(argc, argv, "--all")) {
+    std::filesystem::path shots =
+        config.workspaceRoot / Utf8ToWide(*runId) / L"screenshots";
+    std::error_code ec;
+    std::vector<std::filesystem::path> frames;
+    for (const auto &e : std::filesystem::directory_iterator(shots, ec)) {
+      if (!e.is_regular_file()) continue;
+      const auto name = antimal::PathToUtf8(e.path().filename());
+      if (name.rfind("guest-", 0) == 0 && e.path().extension() == ".png")
+        frames.push_back(e.path());
+    }
+    std::sort(frames.begin(), frames.end());  // guest-NNNNNN.png == chronological
+    if (frames.empty()) {
+      std::cerr << "no guest-*.png frames in " << antimal::PathToUtf8(shots) << "\n";
+      return 2;
+    }
+    int nBlank = 0, nSparse = 0, nRich = 0, nUnknown = 0;
+    std::string firstRich;
+    for (const auto &fp : frames) {
+      std::vector<uint8_t> fpx;
+      uint32_t fw = 0, fh = 0, fstride = 0;
+      if (!LoadPngAsBgra(fp, fpx, fw, fh, fstride)) { ++nUnknown; continue; }
+      const auto st = antimal::hv::ClassifyScreenState(fpx.data(), fw, fh, fstride);
+      switch (st.state) {
+        case antimal::hv::ScreenState::Rich:
+          ++nRich;
+          if (firstRich.empty()) firstRich = antimal::PathToUtf8(fp.filename());
+          break;
+        case antimal::hv::ScreenState::Sparse: ++nSparse; break;
+        case antimal::hv::ScreenState::Blank: ++nBlank; break;
+        default: ++nUnknown; break;
+      }
+    }
+    const bool reached = nRich > 0;
+    if (HasFlag(argc, argv, "--json")) {
+      std::cout << "{\"frames\":" << frames.size() << ",\"rich\":" << nRich
+                << ",\"sparse\":" << nSparse << ",\"blank\":" << nBlank
+                << ",\"unknown\":" << nUnknown
+                << ",\"desktopReached\":" << (reached ? "true" : "false")
+                << ",\"firstRichFrame\":" << JsonQuote(firstRich) << "}\n";
+    } else {
+      std::cout << "Run " << *runId << " frames: " << frames.size() << "\n";
+      std::cout << "  rich " << nRich << " | sparse " << nSparse << " | blank "
+                << nBlank << " | unknown " << nUnknown << "\n";
+      std::cout << "  desktop reached: " << (reached ? "yes" : "no");
+      if (reached) std::cout << " (first rich frame: " << firstRich << ")";
+      std::cout << "\n";
+    }
+    return reached ? 0 : 1;
+  }
+
+  if (runId) {
     // Pick the largest guest-*.png in the run's screenshots dir.
     std::filesystem::path shots =
         config.workspaceRoot / Utf8ToWide(*runId) / L"screenshots";
