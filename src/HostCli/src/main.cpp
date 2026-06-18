@@ -3233,7 +3233,9 @@ int CommandReport(int argc, wchar_t **argv) {
                   << ",\"exceptionName\":" << JsonQuote(s.exceptionName)
                   << ",\"module\":" << JsonQuote(s.module)
                   << ",\"moduleVersion\":" << JsonQuote(s.moduleVersion)
-                  << ",\"offset\":" << JsonQuote(s.offset) << "}";
+                  << ",\"offset\":" << JsonQuote(s.offset)
+                  << ",\"fastFailSubcode\":" << s.fastFailSubcode
+                  << ",\"fastFailName\":" << JsonQuote(s.fastFailName) << "}";
       }
       std::cout << "]}\n";
       return 0;
@@ -3243,12 +3245,25 @@ int CommandReport(int argc, wchar_t **argv) {
     for (const auto &s : cs.signatures) {
       std::cout << "  " << s.count << "x  " << s.image << "  " << s.exceptionCode;
       if (!s.exceptionName.empty()) std::cout << " (" << s.exceptionName << ")";
+      if (s.fastFailSubcode >= 0) {
+        std::cout << " [fast-fail #" << s.fastFailSubcode;
+        if (!s.fastFailName.empty()) std::cout << " " << s.fastFailName;
+        std::cout << "]";
+      }
       if (!s.module.empty()) {
         std::cout << " in " << s.module;
         if (!s.moduleVersion.empty()) std::cout << " v" << s.moduleVersion;
         if (!s.offset.empty()) std::cout << " @+" << s.offset;
       }
       std::cout << "\n";
+    }
+    if (cs.totalCrashes > 0) {
+      bool anySub = false;
+      for (const auto &s : cs.signatures) if (s.fastFailSubcode >= 0) anySub = true;
+      if (!anySub) {
+        std::cout << "  (no fast-fail subcode captured; run a boot with subcode "
+                     "capture armed to decode the precise fault)\n";
+      }
     }
     return 0;
   }

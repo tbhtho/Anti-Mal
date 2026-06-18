@@ -3999,6 +3999,41 @@ void TestCrashSummary() {
          "crash: signatures differing only by module sort deterministically");
   Expect(byModule("aaa.dll", "bbb.dll") == "aaa.dll",
          "crash: module tiebreak orders ascending");
+
+  // __fastfail subcode decode (the shell-wall diagnostic). Known enum values map
+  // to their symbolic names; unknown -> "".
+  Expect(FastFailName(7) == "FATAL_APP_EXIT",
+         "crash: fast-fail 7 -> FATAL_APP_EXIT (unhandled exception/abort)");
+  Expect(FastFailName(2) == "STACK_COOKIE_CHECK_FAILURE",
+         "crash: fast-fail 2 -> stack cookie");
+  Expect(FastFailName(10) == "GUARD_ICALL_CHECK_FAILURE",
+         "crash: fast-fail 10 -> CFG indirect-call");
+  Expect(FastFailName(9999).empty(), "crash: unknown fast-fail subcode -> empty");
+
+  // A crash event carrying a subcode detail is decoded onto the signature, and
+  // two crashes that differ ONLY by subcode are distinct signatures.
+  auto crashFf = [&](const char *sub) {
+    EventRecord e = crash("Explorer.EXE", "c0000409", "ucrtbase.dll", "a4ace");
+    e.details["fastFailSubcode"] = sub;
+    return e;
+  };
+  std::vector<EventRecord> fv;
+  for (int i = 0; i < 3; ++i) fv.push_back(crashFf("7"));
+  fv.push_back(crashFf("0x2")); // hex form accepted
+  const auto fcs = SummarizeCrashes(fv);
+  Expect(fcs.signatures.size() == 2,
+         "crash: same module/offset, different subcode -> distinct signatures");
+  Expect(fcs.signatures[0].fastFailSubcode == 7 &&
+             fcs.signatures[0].fastFailName == "FATAL_APP_EXIT" &&
+             fcs.signatures[0].count == 3,
+         "crash: dominant subcode-7 signature decoded + counted");
+  bool sawHex2 = false;
+  for (const auto &s : fcs.signatures)
+    if (s.fastFailSubcode == 2) sawHex2 = true;
+  Expect(sawHex2, "crash: hex subcode form (0x2) parsed to 2");
+  // No-subcode crashes keep fastFailSubcode == -1.
+  Expect(SummarizeCrashes(ev).signatures[0].fastFailSubcode == -1,
+         "crash: missing subcode stays -1");
 }
 
 // Detections summary: aggregates static findings + persistence + suspicious

@@ -24,6 +24,13 @@ struct CrashSignature {
   std::string module;         // faulting module (e.g. "ucrtbase.dll")
   std::string moduleVersion;  // module version when captured
   std::string offset;         // fault offset within the module
+  // The __fastfail SUBCODE (RCX at the `int 29h`, == ExceptionInformation[0] of
+  // a 0xC0000409). This is the single most diagnostic field for the Win11
+  // modern-shell crash-loop: it says WHY the fast-fail fired (e.g. 7 =
+  // FATAL_APP_EXIT == unhandled C++/WinRT exception -> abort/terminate, vs 2 =
+  // stack-cookie, vs 10/11 = CFG). -1 when the capture didn't include it.
+  long fastFailSubcode = -1;
+  std::string fastFailName;   // decoded subcode name, e.g. "FATAL_APP_EXIT"; "" if none
   int count = 0;              // how many crashes matched this signature
 };
 
@@ -35,6 +42,14 @@ struct CrashSummary {
 // Map a hex NTSTATUS exception code (lower/upper case, with or without "0x") to a
 // short human name. Returns "" for codes we don't have a label for.
 std::string ExceptionCodeName(const std::string &hexCode);
+
+// Map a Windows __fastfail SUBCODE (the FAST_FAIL_* enum from winnt.h, i.e. the
+// value in RCX at the `int 29h` / ExceptionInformation[0] of a 0xC0000409) to its
+// symbolic name -- WITHOUT the "FAST_FAIL_" prefix (e.g. 7 -> "FATAL_APP_EXIT",
+// 2 -> "STACK_COOKIE_CHECK_FAILURE"). Returns "" for codes outside the known
+// table. This is the decode half of the shell-wall diagnostic: once a crash event
+// carries the subcode, this names the precise fast-fail reason.
+std::string FastFailName(long subcode);
 
 // Aggregate `process.crash` events into distinct fault signatures. Pure +
 // deterministic (ties broken by signature text). Non-crash events are ignored.
