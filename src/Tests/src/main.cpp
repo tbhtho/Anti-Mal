@@ -4598,14 +4598,30 @@ void TestMitreCatalog() {
          "mitre: unknown technique groups under Other (never dropped)");
 
   // Coverage guard: techniques the codebase actually emits must all resolve to a
-  // name (else the report shows a bare ID). These five were found missing by an
+  // name (else the report shows a bare ID). These were found missing by an
   // emitted-vs-catalog audit and added; assert they stay covered.
-  for (const char *id : {"T1056", "T1218.010", "T1539", "T1547.014", "T1620"}) {
+  for (const char *id : {"T1056", "T1218.010", "T1539", "T1547.014", "T1620",
+                         "T1203", "T1221", "T1553.005", "T1566.001"}) {
     Expect(!MitreTechniqueName(id).empty(),
            (std::string("mitre: emitted id ") + id + " has a name").c_str());
     Expect(MitreTechniqueTactic(id) != "Other",
            (std::string("mitre: emitted id ") + id + " has a real tactic").c_str());
   }
+
+  // Static scanner findings now contribute ATT&CK techniques, so a STATIC scan
+  // of a lure populates the matrix (not just capa/dynamic).
+  antimal::ScanResult sc;
+  sc.findings.push_back({"rtf.equation_editor", "x", 50});
+  sc.findings.push_back({"iso.lnk_plus_exe", "y", 55});
+  sc.findings.push_back({"strings.rc4_wrapped_config", "z", 35});
+  const auto tech = antimal::AggregateMitreTechniques({}, sc);
+  auto hasT = [&](const char *t) {
+    return std::find(tech.begin(), tech.end(), t) != tech.end();
+  };
+  Expect(hasT("T1203") && hasT("T1566.001"),
+         "mitre: rtf.equation_editor finding maps to client-exec + phishing");
+  Expect(hasT("T1553.005"), "mitre: iso lure maps to MOTW-bypass");
+  Expect(hasT("T1027"), "mitre: obfuscated-config finding maps to T1027");
 }
 
 // Report-to-report diff (T78): a report vs itself is materially identical; a

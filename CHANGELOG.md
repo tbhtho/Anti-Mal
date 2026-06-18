@@ -44,6 +44,12 @@ unit-tested. A living `private development documentation` tracks done/remaining 
   TLS C2, an interactive remote shell (T1219), keylogging (T1056.001), screen capture (T1113), and
   exfil over C2 (T1041) — spanning Execution→Persistence→Credential Access→Collection→C2→Exfil. Adds
   the ATT&CK techniques T1219/T1113 to the catalog (name + tactic).
+- **Static findings → ATT&CK matrix:** `AggregateMitreTechniques` now maps the static scanner
+  findings (the file-type analyzers + obfuscation/config recovery) to ATT&CK techniques, so a report
+  for a lure document/image populates the ATT&CK matrix from static analysis, not just capa/dynamic
+  telemetry (e.g. an RTF Equation-Editor object → T1203/T1204.002/T1566.001; an ISO lure → T1553.005
+  MOTW-bypass). Added T1203/T1221/T1553.005/T1566.001 to the catalog and **Initial Access** to the
+  kill-chain ordering. Only high-confidence finding→technique edges; nothing invented. Unit-tested.
 - **OneNote (.one) maldoc analyzer (`OneNoteAnalyzer`):** OneNote was the dominant malspam carrier of
   2023-24 (a "double-click to view" graphic over an embedded attachment OneNote runs with no macro
   warning). `ScanFile` now detects the [MS-ONESTORE] file GUID and routes to a heuristic analyzer

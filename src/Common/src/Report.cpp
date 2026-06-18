@@ -1240,10 +1240,10 @@ bool EmitMitreByTactic(std::ostringstream &html,
                        const std::vector<std::string> &techniques) {
   if (techniques.empty()) return false;
   static const char *kOrder[] = {
-      "Execution",        "Persistence",      "Privilege Escalation",
-      "Defense Evasion",  "Credential Access", "Discovery",
-      "Lateral Movement", "Collection",       "Command and Control",
-      "Exfiltration",     "Impact",           "Other"};
+      "Initial Access",   "Execution",        "Persistence",
+      "Privilege Escalation", "Defense Evasion", "Credential Access",
+      "Discovery",        "Lateral Movement", "Collection",
+      "Command and Control", "Exfiltration",  "Impact", "Other"};
   std::map<std::string, std::vector<std::string>> byTactic;
   for (const auto &t : techniques)
     if (!t.empty()) byTactic[MitreTechniqueTactic(t)].push_back(t);
@@ -2360,6 +2360,35 @@ std::vector<std::string> AggregateMitreTechniques(
       if (!t.empty()) {
         techniques.insert(t);
       }
+    }
+  }
+  // Map the static scanner findings (file-type analyzers + obfuscation/config
+  // recovery) to ATT&CK techniques, so a STATIC scan of a lure document/image
+  // populates the report's ATT&CK matrix too (not just capa/dynamic). Only
+  // high-confidence finding -> technique edges; nothing invented.
+  static const std::map<std::string, std::vector<std::string>> kFindingTech = {
+      {"rtf.equation_editor", {"T1203", "T1204.002", "T1566.001"}},
+      {"rtf.objupdate", {"T1204.002", "T1566.001"}},
+      {"rtf.remote_object_load", {"T1221", "T1566.001"}},
+      {"rtf.ole_object", {"T1204.002"}},
+      {"rtf.embedded_pe", {"T1204.002"}},
+      {"iso.lnk_plus_exe", {"T1204.002", "T1553.005", "T1566.001"}},
+      {"iso.embedded_exe", {"T1204.002", "T1553.005"}},
+      {"iso.embedded_lnk", {"T1204.002"}},
+      {"iso.small_payload_image", {"T1553.005"}},
+      {"onenote.embedded_file", {"T1204.002", "T1566.001"}},
+      {"onenote.embedded_exe", {"T1204.002"}},
+      {"onenote.embedded_script", {"T1204.002", "T1059"}},
+      {"strings.rc4_wrapped_config", {"T1027"}},
+      {"strings.xor_obfuscated_url", {"T1027"}},
+      {"strings.multibyte_xor_obfuscated_url", {"T1027"}},
+      {"strings.base64_wrapped_ioc", {"T1027"}},
+      {"config.cobalt_strike", {"T1071.001"}},
+  };
+  for (const auto &f : scan.findings) {
+    const auto it = kFindingTech.find(f.ruleId);
+    if (it != kFindingTech.end()) {
+      for (const auto &t : it->second) techniques.insert(t);
     }
   }
   return std::vector<std::string>(techniques.begin(), techniques.end());

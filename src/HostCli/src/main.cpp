@@ -3068,10 +3068,10 @@ int CommandReport(int argc, wchar_t **argv) {
     // ATT&CK kill-chain view: the run's observed techniques grouped by tactic in
     // canonical order (Any.Run-style matrix). --json emits {tactic:[{id,name}]}.
     static const char *kOrder[] = {
-        "Execution",        "Persistence",      "Privilege Escalation",
-        "Defense Evasion",  "Credential Access", "Discovery",
-        "Lateral Movement", "Collection",       "Command and Control",
-        "Exfiltration",     "Impact",           "Other"};
+        "Initial Access",   "Execution",        "Persistence",
+        "Privilege Escalation", "Defense Evasion", "Credential Access",
+        "Discovery",        "Lateral Movement", "Collection",
+        "Command and Control", "Exfiltration",  "Impact", "Other"};
     std::map<std::string, std::vector<std::string>> byTactic;
     for (const auto &id : report.mitreTechniques)
       byTactic[antimal::MitreTechniqueTactic(id)].push_back(id);
