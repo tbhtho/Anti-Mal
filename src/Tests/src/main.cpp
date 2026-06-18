@@ -4477,6 +4477,16 @@ void TestMitreCatalog() {
          "mitre: unlisted sub-technique falls back to parent tactic");
   Expect(MitreTechniqueTactic("T9999") == "Other",
          "mitre: unknown technique groups under Other (never dropped)");
+
+  // Coverage guard: techniques the codebase actually emits must all resolve to a
+  // name (else the report shows a bare ID). These five were found missing by an
+  // emitted-vs-catalog audit and added; assert they stay covered.
+  for (const char *id : {"T1056", "T1218.010", "T1539", "T1547.014", "T1620"}) {
+    Expect(!MitreTechniqueName(id).empty(),
+           (std::string("mitre: emitted id ") + id + " has a name").c_str());
+    Expect(MitreTechniqueTactic(id) != "Other",
+           (std::string("mitre: emitted id ") + id + " has a real tactic").c_str());
+  }
 }
 
 // Report-to-report diff (T78): a report vs itself is materially identical; a
