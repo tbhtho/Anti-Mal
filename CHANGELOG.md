@@ -50,6 +50,8 @@ unit-tested. A living `private development documentation` tracks done/remaining 
   Pure + deterministic + unit-tested; `antimal yara-gen <sample> [--out rule.yar] [--name R]`.
   Also reachable from the GUI: the scan panel gains a **Generate YARA rule** button (`scan.yara`
   bridge method, generated on a worker so a large file can't hang the UI) with copy-to-clipboard.
+  And from the indicator-export workflow: `export <run> --format yara` emits a hunt rule for the
+  run's sample alongside the existing STIX/MISP/CSV indicator formats.
 - **Severity-ranked Detections summary (`DetectionSummary`):** unifies static findings + persistence
   + suspicious network into one ranked behavior list; in the report + `report --detections [--json]`.
 - **Desktop-usability classifier (`UsabilityDiagnostics`):** measures which usability goals a run

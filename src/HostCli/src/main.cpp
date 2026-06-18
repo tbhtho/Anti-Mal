@@ -208,7 +208,7 @@ void PrintUsage() {
       << "  antimal reg-ls [--hive software|system|sam|...] [--overlay <o.cow>] <reg\\key> [--values] [--depth N] [--filter <s>]\n"
       << "  antimal report <run-id-or-report.json> [--html] [--detections|--usability|--timeline [--json]]\n"
       << "  antimal browser-impact <run-id-or-report.json> --decrypt-browser-secrets\n"
-      << "  antimal export <run-id-or-report.json> --format stix|misp|csv [--out <file>]\n"
+      << "  antimal export <run-id-or-report.json> --format stix|misp|csv|yara [--out <file>]\n"
       << "  antimal similarity <fileA> <fileB> [--json]   (fuzzy-hash similarity 0..100)\n"
       << "  antimal similarity <file> --to <ctph-digest>\n"
       << "  antimal doctor [--json]              (host & workflow readiness check)\n"
@@ -3099,7 +3099,8 @@ int CommandExport(int argc, wchar_t **argv) {
   }
   const auto format = OptionValue(argc, argv, "--format").value_or("stix");
   std::string body;
-  if (format == "stix" || format == "misp" || format == "csv") {
+  if (format == "stix" || format == "misp" || format == "csv" ||
+      format == "yara") {
     const auto config = antimal::LoadConfig(antimal::DefaultConfigPath());
     const auto reportPath =
         ResolveReportPath(config, std::filesystem::path(argv[2]));
@@ -3108,12 +3109,24 @@ int CommandExport(int argc, wchar_t **argv) {
       body = antimal::ExportIocsStix(report);
     } else if (format == "misp") {
       body = antimal::ExportIocsMisp(report);
-    } else {
+    } else if (format == "csv") {
       body = antimal::ExportIocsCsv(report);
+    } else {
+      // yara: a hunt rule from the run's sample. The report already holds the
+      // static analysis (scannerVerdict); we only re-read the bytes for the
+      // distinctive-string mining.
+      if (report.samplePath.empty() ||
+          !std::filesystem::exists(report.samplePath)) {
+        std::cerr << "yara export needs the run's sample on disk; not found at "
+                  << antimal::PathToUtf8(report.samplePath) << "\n";
+        return 2;
+      }
+      const auto bytes = antimal::ReadAllBytes(report.samplePath);
+      body = antimal::GenerateYaraRule(report.scannerVerdict, bytes);
     }
   } else {
     std::cerr << "Unknown --format '" << format
-              << "' (expected stix|misp|csv).\n";
+              << "' (expected stix|misp|csv|yara).\n";
     return 2;
   }
 
