@@ -1,6 +1,7 @@
 #include "antimal/FakeInternet.h"
 
 #include <cstring>
+#include <initializer_list>
 
 namespace antimal::net {
 
@@ -150,9 +151,9 @@ bool FakeInternet::HandleIpv4(const uint8_t *f, std::size_t len,
       ++framesDropped_;
       return false;
     }
-    if (RdBE16(f + l4Off + 2) == 53) {  // UDP dst port
-      return HandleDns(f, ihl, l4Off, l4Len, out);
-    }
+    const uint16_t dport = RdBE16(f + l4Off + 2);  // UDP dst port
+    if (dport == 53) return HandleDns(f, ihl, l4Off, l4Len, out);
+    if (dport == 67) return HandleDhcp(f, ihl, l4Off, l4Len, out);
     return false;  // other UDP ports: no reply (yet)
   }
   if (ip[9] == kIpProtoTcp) {
@@ -296,6 +297,109 @@ bool FakeInternet::HandleDns(const uint8_t *f, std::size_t ihl,
 
   out.push_back(std::move(r));
   ++dnsReplies_;
+  return true;
+}
+
+bool FakeInternet::HandleDhcp(const uint8_t *f, std::size_t ihl,
+                              std::size_t udpOff, std::size_t udpLen,
+                              std::vector<Frame> &out) {
+  // BOOTP/DHCP message starts after the UDP header. Need at least the fixed
+  // 236-byte BOOTP region + 4-byte magic cookie before options.
+  const std::size_t bootpOff = udpOff + kUdpHdr;
+  const std::size_t bootpLen = udpLen - kUdpHdr;
+  constexpr std::size_t kBootpFixed = 236;
+  if (bootpLen < kBootpFixed + 4) {
+    ++framesDropped_;
+    return false;
+  }
+  const uint8_t *bootp = f + bootpOff;
+  if (bootp[0] != 1) return false;  // op must be BOOTREQUEST
+  // Magic cookie 0x63825363 precedes the options.
+  if (!(bootp[236] == 0x63 && bootp[237] == 0x82 && bootp[238] == 0x53 &&
+        bootp[239] == 0x63)) {
+    ++framesDropped_;
+    return false;
+  }
+  // Walk options for the DHCP message type (option 53), strictly bounded.
+  uint8_t msgType = 0;
+  for (std::size_t o = 240; o < bootpLen;) {
+    const uint8_t code = bootp[o++];
+    if (code == 0) continue;       // pad
+    if (code == 255) break;        // end
+    if (o >= bootpLen) break;      // truncated (no length byte)
+    const uint8_t l = bootp[o++];
+    if (o + l > bootpLen) break;   // truncated option data
+    if (code == 53 && l >= 1) msgType = bootp[o];
+    o += l;
+  }
+  uint8_t replyType = 0;
+  if (msgType == 1) replyType = 2;       // DISCOVER -> OFFER
+  else if (msgType == 3) replyType = 5;  // REQUEST  -> ACK
+  else return false;                     // ignore RELEASE/INFORM/etc. for now
+
+  // The guest gets sink_ip with the host octet replaced by .15, mask /24, and
+  // the sink as both router and DNS — so DNS queries land back on the sink.
+  const uint32_t offeredIp = (ip_ & 0xFFFFFF00u) | 0x0Fu;  // x.x.x.15
+  auto put4 = [](uint8_t *p, uint32_t v) {
+    p[0] = static_cast<uint8_t>((v >> 24) & 0xFF);
+    p[1] = static_cast<uint8_t>((v >> 16) & 0xFF);
+    p[2] = static_cast<uint8_t>((v >> 8) & 0xFF);
+    p[3] = static_cast<uint8_t>(v & 0xFF);
+  };
+
+  // Build the BOOTREPLY: 236 fixed + cookie + options + end.
+  std::vector<uint8_t> dhcp(kBootpFixed + 4, 0);
+  dhcp[0] = 2;            // op = BOOTREPLY
+  dhcp[1] = bootp[1];     // htype (echo)
+  dhcp[2] = bootp[2];     // hlen
+  std::memcpy(&dhcp[4], bootp + 4, 4);    // xid (echo)
+  std::memcpy(&dhcp[10], bootp + 10, 2);  // flags (echo)
+  put4(&dhcp[16], offeredIp);             // yiaddr = offered address
+  put4(&dhcp[20], ip_);                   // siaddr = sink (next server)
+  std::memcpy(&dhcp[28], bootp + 28, 16); // chaddr (echo client hw addr)
+  dhcp[236] = 0x63; dhcp[237] = 0x82; dhcp[238] = 0x53; dhcp[239] = 0x63;  // cookie
+  auto opt = [&](uint8_t code, std::initializer_list<uint8_t> data) {
+    dhcp.push_back(code);
+    dhcp.push_back(static_cast<uint8_t>(data.size()));
+    for (uint8_t b : data) dhcp.push_back(b);
+  };
+  opt(53, {replyType});  // DHCP message type (offer/ack)
+  uint8_t sip[4]; put4(sip, ip_);
+  opt(54, {sip[0], sip[1], sip[2], sip[3]});           // server id
+  opt(51, {0x00, 0x01, 0x51, 0x80});                   // lease time 86400s
+  opt(1, {0xFF, 0xFF, 0xFF, 0x00});                    // subnet mask /24
+  opt(3, {sip[0], sip[1], sip[2], sip[3]});            // router = sink
+  opt(6, {sip[0], sip[1], sip[2], sip[3]});            // DNS = sink
+  dhcp.push_back(255);                                 // end
+
+  // Wrap: Ethernet (to client MAC) + IPv4 (sink -> broadcast) + UDP (67 -> 68).
+  const std::size_t udpTotal = kUdpHdr + dhcp.size();
+  const std::size_t ipTotal = ihl + udpTotal;
+  Frame r(kEthHdr + ipTotal, 0);
+  std::memcpy(r.data(), f + 6, 6);            // dst = the requesting client
+  std::memcpy(r.data() + 6, mac_.data(), 6);  // src = sink
+  WrBE16(r.data() + 12, kEthIpv4);
+  uint8_t *rip = r.data() + kEthHdr;
+  std::memcpy(rip, f + kEthHdr, ihl);
+  WrBE16(rip + 2, static_cast<uint16_t>(ipTotal));
+  WrBE16(rip + 4, 0);
+  WrBE16(rip + 6, 0x0000);  // allow fragmentation flags cleared
+  rip[8] = 64;
+  rip[9] = kIpProtoUdp;
+  put4(rip + 12, ip_);          // src = sink
+  rip[16] = rip[17] = rip[18] = rip[19] = 0xFF;  // dst = 255.255.255.255
+  rip[10] = rip[11] = 0;
+  WrBE16(rip + 10, InternetChecksum(rip, ihl));
+  uint8_t *rudp = rip + ihl;
+  WrBE16(rudp, 67);       // src port (server)
+  WrBE16(rudp + 2, 68);   // dst port (client)
+  WrBE16(rudp + 4, static_cast<uint16_t>(udpTotal));
+  rudp[6] = rudp[7] = 0;
+  std::memcpy(rudp + kUdpHdr, dhcp.data(), dhcp.size());
+  WrBE16(rudp + 6, UdpChecksum(rip + 12, rip + 16, rudp, udpTotal));
+
+  out.push_back(std::move(r));
+  ++dhcpReplies_;
   return true;
 }
 

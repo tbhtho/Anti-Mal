@@ -43,6 +43,7 @@ class FakeInternet {
   uint64_t IcmpReplies() const noexcept { return icmpReplies_; }
   uint64_t DnsReplies() const noexcept { return dnsReplies_; }
   uint64_t TcpReplies() const noexcept { return tcpReplies_; }
+  uint64_t DhcpReplies() const noexcept { return dhcpReplies_; }
   uint64_t FramesSeen() const noexcept { return framesSeen_; }
   uint64_t FramesDropped() const noexcept { return framesDropped_; }
 
@@ -61,6 +62,11 @@ class FakeInternet {
   // length; `tcpOff`/`tcpLen` bound the TCP segment.
   bool HandleTcp(const uint8_t *f, std::size_t ihl, std::size_t tcpOff,
                  std::size_t tcpLen, std::vector<Frame> &out);
+  // DHCP DISCOVER -> OFFER / REQUEST -> ACK so the guest auto-configures an IP,
+  // gateway, and DNS server all pointing at the sink (the keystone that makes
+  // the contained network usable: the guest then resolves + connects).
+  bool HandleDhcp(const uint8_t *f, std::size_t ihl, std::size_t udpOff,
+                  std::size_t udpLen, std::vector<Frame> &out);
 
   Mac mac_;
   uint32_t ip_;  // big-endian
@@ -68,6 +74,7 @@ class FakeInternet {
   uint64_t icmpReplies_ = 0;
   uint64_t dnsReplies_ = 0;
   uint64_t tcpReplies_ = 0;
+  uint64_t dhcpReplies_ = 0;
   uint64_t framesSeen_ = 0;
   uint64_t framesDropped_ = 0;
 };

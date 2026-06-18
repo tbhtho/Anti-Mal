@@ -9027,6 +9027,52 @@ void TestFakeInternet() {
     Expect(sink.TcpReplies() == 1, "sink TCP: counter advanced");
   }
 
+  // --- DHCP DISCOVER -> OFFER (the guest auto-configures to the sink) ---
+  {
+    std::vector<uint8_t> dh(236, 0);
+    dh[0] = 1; dh[1] = 1; dh[2] = 6;  // op=BOOTREQUEST, htype, hlen
+    dh[4] = 0x12; dh[5] = 0x34; dh[6] = 0x56; dh[7] = 0x78;  // xid
+    for (int i = 0; i < 6; ++i) dh[28 + i] = guestMac[i];    // chaddr
+    dh.push_back(0x63); dh.push_back(0x82); dh.push_back(0x53); dh.push_back(0x63);  // cookie
+    dh.push_back(53); dh.push_back(1); dh.push_back(1);  // DHCP DISCOVER
+    dh.push_back(255);                                   // end
+
+    std::vector<uint8_t> udp;
+    be16(udp, 68); be16(udp, 67);  // client -> server ports
+    be16(udp, static_cast<uint16_t>(8 + dh.size()));
+    be16(udp, 0);
+    udp.insert(udp.end(), dh.begin(), dh.end());
+
+    std::vector<uint8_t> ip;
+    ip.push_back(0x45); ip.push_back(0x00);
+    be16(ip, static_cast<uint16_t>(20 + udp.size()));
+    be16(ip, 0); be16(ip, 0); ip.push_back(64); ip.push_back(17);
+    be16(ip, 0);
+    for (int i = 0; i < 4; ++i) ip.push_back(0);     // src 0.0.0.0
+    for (int i = 0; i < 4; ++i) ip.push_back(0xFF);  // dst 255.255.255.255
+
+    std::vector<uint8_t> f;
+    for (int i = 0; i < 6; ++i) f.push_back(0xFF);        // dst = broadcast
+    for (int i = 0; i < 6; ++i) f.push_back(guestMac[i]); // src = guest
+    be16(f, 0x0800);
+    f.insert(f.end(), ip.begin(), ip.end());
+    f.insert(f.end(), udp.begin(), udp.end());
+
+    std::vector<Frame> out;
+    Expect(sink.OnGuestFrame(f.data(), f.size(), out) == 1,
+           "sink DHCP: one OFFER synthesized");
+    const Frame &r = out[0];
+    Expect(r[34] == 0 && r[35] == 67, "sink DHCP: reply UDP src port 67");
+    Expect(r[36] == 0 && r[37] == 68, "sink DHCP: reply UDP dst port 68");
+    // BOOTREPLY at +42; yiaddr at +42+16 = +58 -> offered 10.0.2.15.
+    Expect(r[42] == 2, "sink DHCP: op = BOOTREPLY");
+    Expect(r[58] == 0x0A && r[59] == 0x00 && r[60] == 0x02 && r[61] == 0x0F,
+           "sink DHCP: yiaddr = offered 10.0.2.15");
+    // First option after the magic cookie (+42+240 = +282): 53,1,2 (OFFER).
+    Expect(r[282] == 53 && r[284] == 2, "sink DHCP: message type = OFFER (2)");
+    Expect(sink.DhcpReplies() == 1, "sink DHCP: counter advanced");
+  }
+
   // --- bounds / fuzz: malformed frames yield no reply and never read OOB ---
   {
     std::vector<Frame> out;
