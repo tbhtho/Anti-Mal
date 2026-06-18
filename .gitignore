@@ -25,6 +25,7 @@ config/*.presession
 
 # Scratch commit-message file (used by the PowerShell `git commit -F` workflow)
 _commitmsg.txt
+_vm_dimensions.txt
 
 /docs/
 
