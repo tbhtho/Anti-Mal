@@ -3807,6 +3807,76 @@ void TestYaraGen() {
          "yara: fallback rule has a magic/size condition");
 }
 
+// Base64-wrapped RC4 config recovery (the .NET-RAT scheme). Round-trip: encrypt
+// a config the same way real samples do, embed it + the key, and verify the
+// miner recovers the URL with the right key. Plus a negative case (no FP when
+// the key isn't present).
+void TestRc4WrappedConfig() {
+  using namespace antimal;
+  auto rc4 = [](const std::string &key, const std::string &data) {
+    uint8_t s[256];
+    for (int i = 0; i < 256; ++i) s[i] = static_cast<uint8_t>(i);
+    int j = 0;
+    for (int i = 0; i < 256; ++i) {
+      j = (j + s[i] + static_cast<uint8_t>(key[i % key.size()])) & 0xFF;
+      std::swap(s[i], s[j]);
+    }
+    std::vector<uint8_t> out;
+    int x = 0, y = 0;
+    for (size_t k = 0; k < data.size(); ++k) {
+      x = (x + 1) & 0xFF;
+      y = (y + s[x]) & 0xFF;
+      std::swap(s[x], s[y]);
+      out.push_back(static_cast<uint8_t>(data[k]) ^ s[(s[x] + s[y]) & 0xFF]);
+    }
+    return out;
+  };
+  auto b64enc = [](const std::vector<uint8_t> &in) {
+    static const char *T =
+        "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    std::string o;
+    size_t i = 0;
+    for (; i + 3 <= in.size(); i += 3) {
+      uint32_t n = (in[i] << 16) | (in[i + 1] << 8) | in[i + 2];
+      o += T[(n >> 18) & 63]; o += T[(n >> 12) & 63];
+      o += T[(n >> 6) & 63];  o += T[n & 63];
+    }
+    if (i + 1 == in.size()) { uint32_t n = in[i] << 16; o += T[(n >> 18) & 63]; o += T[(n >> 12) & 63]; o += "=="; }
+    else if (i + 2 == in.size()) { uint32_t n = (in[i] << 16) | (in[i + 1] << 8); o += T[(n >> 18) & 63]; o += T[(n >> 12) & 63]; o += T[(n >> 6) & 63]; o += "="; }
+    return o;
+  };
+
+  const std::string key = "MySecretRc4Key01";
+  std::string plain = "url=http://rc4-c2.example/panel;id=ABC";
+  while (plain.size() % 3) plain += " "; // avoid base64 padding edge cases
+  const std::string blob = b64enc(rc4(key, plain));
+
+  auto build = [](std::initializer_list<std::string> toks) {
+    std::vector<uint8_t> b;
+    for (const auto &t : toks) {
+      for (char c : t) b.push_back(static_cast<uint8_t>(c));
+      b.push_back(0); // NUL splits tokens for the string extractor
+    }
+    return b;
+  };
+
+  // Positive: key + blob both present.
+  const auto buf = build({"Benign filler text for padding purposes only here.",
+                          key, blob, "more trailing filler content here too."});
+  const auto hits = MineRc4WrappedConfig(buf);
+  bool found = false;
+  for (const auto &h : hits)
+    if (h.value.find("rc4-c2.example") != std::string::npos && h.key == key)
+      found = true;
+  Expect(found, "rc4: recovered the URL with the right key");
+
+  // Negative: blob present but the key is NOT -> no recovery (no false positive).
+  const auto buf2 = build({"Benign filler text for padding purposes only here.",
+                           blob, "more trailing filler content here too."});
+  Expect(MineRc4WrappedConfig(buf2).empty(),
+         "rc4: no key present -> no false-positive recovery");
+}
+
 // Detections summary: aggregates static findings + persistence + suspicious
 // network into one severity-ranked list (high -> info), de-duplicated.
 void TestDetectionSummary() {
@@ -9081,6 +9151,7 @@ int main() {
     TestSimulatedReport();
     TestRebuildReportFromEvents();
     TestYaraGen();
+    TestRc4WrappedConfig();
     TestBootDiagnostics();
     TestCommandLineClassifier();
     TestUsabilityDiagnostics();

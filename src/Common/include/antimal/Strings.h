@@ -94,6 +94,21 @@ std::vector<uint8_t> DecodeBase64(const std::string &s); // {} on invalid input
 
 Base64DecodedIocs MineBase64WrappedIocs(const std::vector<uint8_t> &data);
 
+// C2/config recovered from a BASE64-wrapped RC4 blob -- the canonical .NET-RAT
+// (AsyncRAT/Quasar/njRAT-style) config scheme the XOR/base64 miners miss: the
+// settings are RC4-encrypted then base64'd, and the RC4 key is a short ASCII
+// string sitting elsewhere in the binary. This is family-agnostic: it tries each
+// embedded ASCII string (3..32 chars) as the key against each base64 blob and
+// keeps a result ONLY when the decryption yields a valid http(s):// URL -- the
+// same known-plaintext anchor the XOR recovery uses, so a chance hit on random
+// bytes is astronomically unlikely (near-zero false positives). Bounded work.
+struct Rc4ConfigIoc {
+  std::string value; // the decoded http(s):// URL
+  std::string key;   // the ASCII RC4 key that revealed it
+};
+
+std::vector<Rc4ConfigIoc> MineRc4WrappedConfig(const std::vector<uint8_t> &data);
+
 // ExtractDomain (URL -> host) lives in BrowserImpact.h and is reused here.
 
 } // namespace antimal

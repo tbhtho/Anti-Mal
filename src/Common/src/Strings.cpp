@@ -549,4 +549,90 @@ Base64DecodedIocs MineBase64WrappedIocs(const std::vector<uint8_t> &data) {
   return out;
 }
 
+namespace {
+
+// RC4 keystream-XOR over the first `maxOut` bytes of `ct` under ASCII `key`.
+// Returns {} for an empty key. Standard KSA + PRGA.
+std::vector<uint8_t> Rc4(const std::string &key, const std::vector<uint8_t> &ct,
+                         size_t maxOut) {
+  if (key.empty()) return {};
+  uint8_t s[256];
+  for (int i = 0; i < 256; ++i) s[i] = static_cast<uint8_t>(i);
+  int j = 0;
+  const size_t klen = key.size();
+  for (int i = 0; i < 256; ++i) {
+    j = (j + s[i] + static_cast<uint8_t>(key[i % klen])) & 0xFF;
+    std::swap(s[i], s[j]);
+  }
+  const size_t n = std::min(ct.size(), maxOut);
+  std::vector<uint8_t> out;
+  out.reserve(n);
+  int x = 0, y = 0;
+  for (size_t k = 0; k < n; ++k) {
+    x = (x + 1) & 0xFF;
+    y = (y + s[x]) & 0xFF;
+    std::swap(s[x], s[y]);
+    out.push_back(ct[k] ^ s[(s[x] + s[y]) & 0xFF]);
+  }
+  return out;
+}
+
+// Cheap pre-filter: does the buffer contain the ASCII substring "http"? Lets us
+// skip the full IOC mine for the ~all (blob,key) pairs that aren't a hit.
+bool ContainsHttp(const std::vector<uint8_t> &b) {
+  static const uint8_t pat[4] = {'h', 't', 't', 'p'};
+  if (b.size() < 4) return false;
+  for (size_t i = 0; i + 4 <= b.size(); ++i) {
+    if (b[i] == pat[0] && b[i + 1] == pat[1] && b[i + 2] == pat[2] &&
+        b[i + 3] == pat[3])
+      return true;
+  }
+  return false;
+}
+
+} // namespace
+
+std::vector<Rc4ConfigIoc> MineRc4WrappedConfig(const std::vector<uint8_t> &data) {
+  std::vector<Rc4ConfigIoc> out;
+  constexpr size_t kMaxBlobs = 128;   // base64 ciphertext candidates to try
+  constexpr size_t kMaxKeys = 256;    // ASCII key candidates to try
+  constexpr size_t kDecryptCap = 4096; // bytes decrypted per (blob,key)
+  constexpr size_t kMaxHits = 32;     // recovered URLs cap
+
+  const auto plainStrings = ExtractAllStrings(data);
+  const auto plain = MineIocs(plainStrings);
+  std::set<std::string> plainUrls(plain.urls.begin(), plain.urls.end());
+
+  // Candidate RC4 keys: short printable ASCII strings (dedup, bounded). RC4 keys
+  // in these families are human-typed strings, almost always <= 32 chars.
+  std::vector<std::string> keys;
+  std::set<std::string> keySeen;
+  for (const auto &s : plainStrings) {
+    if (s.size() < 3 || s.size() > 32) continue;
+    if (!keySeen.insert(s).second) continue;
+    keys.push_back(s);
+    if (keys.size() >= kMaxKeys) break;
+  }
+
+  std::set<std::string> seenUrl;
+  size_t blobN = 0;
+  for (const auto &blob : plain.base64Blobs) {
+    if (++blobN > kMaxBlobs) break;
+    const auto ct = DecodeBase64(blob);
+    if (ct.size() < 8) continue;
+    for (const auto &key : keys) {
+      const auto dec = Rc4(key, ct, kDecryptCap);
+      if (!ContainsHttp(dec)) continue; // cheap reject before the full mine
+      const auto inner = MineIocsFromBytes(dec);
+      for (const auto &u : inner.urls) {
+        if (plainUrls.count(u)) continue;       // already visible in plaintext
+        if (!seenUrl.insert(u).second) continue; // dedup across blobs/keys
+        out.push_back({u, key});
+        if (out.size() >= kMaxHits) return out;
+      }
+    }
+  }
+  return out;
+}
+
 } // namespace antimal

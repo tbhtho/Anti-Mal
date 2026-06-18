@@ -40,6 +40,12 @@ unit-tested. A living `private development documentation` tracks done/remaining 
 - **`boot-report` failure breakdown:** `--json` now emits `byCategory`, `byRemediation`, and the
   `incomplete` count; text mode prints the single most common actionable remediation across runs
   (the highest-leverage fix for the dominant failure mode).
+- **Base64-wrapped RC4 config recovery (T18, `MineRc4WrappedConfig`):** the canonical .NET-RAT
+  (AsyncRAT/Quasar/njRAT-style) scheme — config RC4-encrypted then base64'd, key a short ASCII string
+  elsewhere in the binary. Family-agnostic: tries each embedded ASCII string (3–32 chars) as the RC4
+  key against each base64 blob and keeps a result ONLY when the decryption yields a valid http(s) URL
+  (same known-plaintext anchor as the XOR recovery → near-zero false positives, verified clean on a
+  real benign PE). Bounded work; surfaced in scan findings + IOCs. Round-trip + negative unit tests.
 - **`report --summary` (T53-adjacent):** a compact at-a-glance triage view — verdict/score, boot
   stage, sample-executed, event count + per-category breakdown, process/MITRE/network/detection
   counts — without parsing the full report. `--json` emits a stable versioned (`schemaVersion:1`)

@@ -183,6 +183,22 @@ void Enrich(ScanResult &result, const std::vector<uint8_t> &data,
       AddFinding(result, "strings.base64_wrapped_ioc", msg,
                  std::min<int>(30, static_cast<int>(b64Total) * 12));
     }
+    // Recover base64-wrapped RC4 config (the .NET-RAT scheme): try each embedded
+    // ASCII string as the RC4 key against each base64 blob, keep only decryptions
+    // that yield a valid URL. A near-zero-FP, family-agnostic C2 recovery.
+    const auto rc4 = MineRc4WrappedConfig(data);
+    if (!rc4.empty()) {
+      for (const auto &hit : rc4) result.iocs.urls.push_back(hit.value);
+      std::string msg = "RC4-encrypted (base64-wrapped) C2 URL(s) recovered: ";
+      for (size_t i = 0; i < rc4.size() && i < 3; ++i) {
+        if (i) msg += ", ";
+        msg += rc4[i].value + " [key \"" + rc4[i].key + "\"]";
+      }
+      if (rc4.size() > 3) msg += ", +" + std::to_string(rc4.size() - 3) + " more";
+      // Encrypted config + a recovered network IOC is a strong malware signal.
+      AddFinding(result, "strings.rc4_wrapped_config", msg,
+                 std::min<int>(35, static_cast<int>(rc4.size()) * 18));
+    }
     if (!minedIocs.suspiciousApis.empty()) {
       AddFinding(result, "strings.suspicious_apis",
                  "Strings mention suspicious Windows APIs: " +
