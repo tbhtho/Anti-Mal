@@ -51,6 +51,9 @@ unit-tested. A living `private development documentation` tracks done/remaining 
   key against each base64 blob and keeps a result ONLY when the decryption yields a valid http(s) URL
   (same known-plaintext anchor as the XOR recovery → near-zero false positives, verified clean on a
   real benign PE). Bounded work; surfaced in scan findings + IOCs. Round-trip + negative unit tests.
+- **`triage <dir>` — risk-ranked bulk scan:** scans a folder and prints one compact line per file
+  sorted by score (rank / score / verdict / sha256 / top-tag / file), the "which of these do I look at
+  first?" workflow. `--json` for automation; exit 10 if any file is flagged.
 - **In-guest analyst desktop (`AntiMal.GuestAgent.exe --shell`):** since the Win11 modern shell
   crash-loops in this VM, AntiMal now ships its own minimal desktop/launcher — a Win32 window with
   Files / Command Prompt / Web Browser launch buttons and a live process list (Toolhelp) with

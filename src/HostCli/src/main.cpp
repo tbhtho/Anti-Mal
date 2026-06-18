@@ -194,6 +194,7 @@ void PrintUsage() {
       << "  antimal scan <path> [--threshold 70]\n"
       << "                    [--no-yara] [--no-capa] [--no-die] [--no-tagger]\n"
       << "                    [--intel] [--vt-key <KEY>] [--json <out.json>]\n"
+      << "  antimal triage <dir> [--threshold 70] [--json out.json]  (risk-ranked bulk scan)\n"
       << "  antimal detonate <sample> --timeout-sec 180 --network disabled|hostonly|nat\n"
       << "                    [--vcpus 1]   (1 = reliable default; >1 exercises SMP boot)\n"
       << "                    [--allow-execution]  (arms in-guest detonation; needs\n"
@@ -307,6 +308,71 @@ int CommandScan(int argc, wchar_t **argv) {
                            json.str());
     std::cout << "Wrote scan JSON to " << *jsonOut << "\n";
   }
+  return flagged > 0 ? 10 : 0;
+}
+
+// `triage` — bulk triage a folder of samples: scan them all and present a
+// single risk-RANKED compact table (one line per file, highest score first), the
+// standard "I have a directory of suspicious files, what do I look at first?"
+// workflow. `scan <dir>` already scans folders but prints full per-file detail;
+// this is the compact, sortable triage view. Exit 10 if any file is flagged.
+int CommandTriage(int argc, wchar_t **argv) {
+  if (argc < 3) {
+    std::cerr << "usage: antimal triage <dir> [--threshold N] [--json out.json] "
+                 "[--no-yara] [--no-capa] [--no-die]\n";
+    return 2;
+  }
+  int threshold = 70;
+  if (const auto v = OptionValue(argc, argv, "--threshold")) threshold = std::stoi(*v);
+  const auto config = antimal::LoadConfig(antimal::DefaultConfigPath());
+  const auto opts = BuildScannerOptions(argc, argv, config);
+  auto results = antimal::ScanPath(std::filesystem::path(argv[2]), opts);
+  if (results.empty()) {
+    std::cout << "No scan candidates found.\n";
+    return 0;
+  }
+  std::sort(results.begin(), results.end(),
+            [](const antimal::ScanResult &a, const antimal::ScanResult &b) {
+              if (a.score != b.score) return a.score > b.score;
+              return antimal::PathToUtf8(a.path) < antimal::PathToUtf8(b.path);
+            });
+  int flagged = 0;
+  for (const auto &r : results)
+    if (r.score >= threshold) ++flagged;
+
+  if (const auto jsonOut = OptionValue(argc, argv, "--json")) {
+    std::ostringstream json;
+    json << "[";
+    for (size_t i = 0; i < results.size(); ++i) {
+      const auto &r = results[i];
+      const std::string tag = r.tags.empty() ? "" : r.tags.front().tag;
+      json << (i ? "," : "") << "{\"rank\":" << (i + 1)
+           << ",\"score\":" << r.score
+           << ",\"verdict\":" << JsonQuote(antimal::ToString(r.verdict))
+           << ",\"sha256\":" << JsonQuote(r.sha256)
+           << ",\"topTag\":" << JsonQuote(tag)
+           << ",\"path\":" << JsonQuote(antimal::PathToUtf8(r.path)) << "}";
+    }
+    json << "]";
+    antimal::WriteTextFile(std::filesystem::path(antimal::Utf8ToWide(*jsonOut)),
+                           json.str());
+    std::cout << "Wrote triage JSON to " << *jsonOut << "\n";
+    return flagged > 0 ? 10 : 0;
+  }
+
+  std::cout << "Triage of " << results.size() << " file(s) (ranked by score):\n";
+  std::cout << "  #  score  verdict     sha256        top-tag       file\n";
+  for (size_t i = 0; i < results.size(); ++i) {
+    const auto &r = results[i];
+    const std::string tag = r.tags.empty() ? "-" : r.tags.front().tag;
+    char line[64];
+    std::snprintf(line, sizeof(line), "%3zu  %5d  %-10s  %-12.12s  %-12.12s  ",
+                  i + 1, r.score, antimal::ToString(r.verdict).c_str(),
+                  (r.sha256.empty() ? "-" : r.sha256.c_str()), tag.c_str());
+    std::cout << line << antimal::PathToUtf8(r.path.filename()) << "\n";
+  }
+  std::cout << "Flagged " << flagged << " of " << results.size()
+            << " at threshold " << threshold << ".\n";
   return flagged > 0 ? 10 : 0;
 }
 
@@ -4218,6 +4284,9 @@ int wmain(int argc, wchar_t **argv) {
     }
     if (command == "config") {
       return CommandConfig(argc, argv);
+    }
+    if (command == "triage") {
+      return CommandTriage(argc, argv);
     }
     if (command == "fs-ls" || command == "fs-cat" || command == "fs-find" ||
         command == "fs-scan" || command == "reg-ls") {
