@@ -55,12 +55,27 @@ try {
   & $Cli report $report --crashes | Out-Null
   Check "report --crashes runs (exit<>2)" ($LASTEXITCODE -ne 2)
 
+  $mitre = (& $Cli report $report --mitre) -join "`n"
+  Check "report --mitre groups by tactic" ($mitre -match 'by tactic')
+
+  # 2b) a second scenario (rat) must also produce a valid report.
+  $sim2 = Join-Path $work "sim-rat"
+  & $Cli simulate --scenario rat --out $sim2 | Out-Null
+  Check "simulate rat writes report.json" (Test-Path (Join-Path $sim2 "report.json"))
+
   # 3) IOC export formats.
   foreach ($fmt in @('stix','misp','csv')) {
     $outF = Join-Path $work "ioc.$fmt"
     & $Cli export $report --format $fmt --out $outF | Out-Null
     Check "export --format $fmt writes output" ((Test-Path $outF) -and ((Get-Item $outF).Length -gt 0))
   }
+  # CSV --defang must differ from the live CSV when dotted IOCs are present.
+  $csvLive = Join-Path $work "ioc-live.csv"; $csvSafe = Join-Path $work "ioc-safe.csv"
+  & $Cli export $report --format csv --out $csvLive | Out-Null
+  & $Cli export $report --format csv --defang --out $csvSafe | Out-Null
+  Check "export csv --defang differs from live (or no dotted IOCs)" (
+    ((Get-Content $csvSafe -Raw) -ne (Get-Content $csvLive -Raw)) -or
+    (-not ((Get-Content $csvLive -Raw) -match '\d\.\d')))
 
   # 4) yara-gen on a real PE (the CLI itself).
   $yar = Join-Path $work "rule.yar"
@@ -82,6 +97,8 @@ try {
   [IO.File]::WriteAllBytes($sample,$ms.ToArray())
   $conf = (& $Cli config $sample) -join "`n"
   Check "config recovers the synthetic RC4 C2" ($conf -match 'smoke-c2\.example')
+  $confDef = (& $Cli config $sample --defang) -join "`n"
+  Check "config --defang renders the C2 safe" ($confDef -match 'hxxp://smoke-c2\[\.\]example')
 
   # 6) triage a folder (the bin dir) -> ranked output.
   $tri = (& $Cli triage (Split-Path $Cli) --no-yara --no-capa --no-die) -join "`n"
