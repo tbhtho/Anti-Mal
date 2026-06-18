@@ -9222,6 +9222,48 @@ void TestFakeInternet() {
     Expect(sink.DhcpReplies() == 1, "sink DHCP: counter advanced");
   }
 
+  // --- NTP client request -> server reply (canned time) ---
+  {
+    std::vector<uint8_t> ntp(48, 0);
+    ntp[0] = (0u << 6) | (4u << 3) | 3u;  // LI=0, VN=4, mode=3 (client)
+    for (int i = 0; i < 8; ++i) ntp[40 + i] = static_cast<uint8_t>(0x70 + i);  // client xmit ts
+
+    std::vector<uint8_t> udp;
+    be16(udp, 50000); be16(udp, 123);  // src, dst (NTP)
+    be16(udp, static_cast<uint16_t>(8 + ntp.size()));
+    be16(udp, 0);
+    udp.insert(udp.end(), ntp.begin(), ntp.end());
+
+    std::vector<uint8_t> ip;
+    ip.push_back(0x45); ip.push_back(0x00);
+    be16(ip, static_cast<uint16_t>(20 + udp.size()));
+    be16(ip, 0x0007); be16(ip, 0x4000); ip.push_back(64); ip.push_back(17);
+    be16(ip, 0x0000);
+    const uint8_t gIp[4] = {0x0A, 0x00, 0x02, 0x64};
+    const uint8_t sIp[4] = {0x0A, 0x00, 0x02, 0x03};
+    for (int i = 0; i < 4; ++i) ip.push_back(gIp[i]);
+    for (int i = 0; i < 4; ++i) ip.push_back(sIp[i]);
+
+    std::vector<uint8_t> f;
+    for (int i = 0; i < 6; ++i) f.push_back(sinkMac[i]);
+    for (int i = 0; i < 6; ++i) f.push_back(guestMac[i]);
+    be16(f, 0x0800);
+    f.insert(f.end(), ip.begin(), ip.end());
+    f.insert(f.end(), udp.begin(), udp.end());
+
+    std::vector<Frame> out;
+    Expect(sink.OnGuestFrame(f.data(), f.size(), out) == 1,
+           "sink NTP: one reply synthesized");
+    const Frame &r = out[0];
+    Expect(r[34] == 0 && r[35] == 123, "sink NTP: reply UDP src port 123");
+    // NTP message at +42: mode (low 3 bits) = 4 (server).
+    Expect((r[42] & 0x07) == 4, "sink NTP: reply mode = server (4)");
+    // Originate timestamp (NTP +24, frame +66) echoes the client's transmit ts.
+    Expect(r[42 + 24] == 0x70 && r[42 + 31] == 0x77,
+           "sink NTP: originate ts echoes the client's transmit ts");
+    Expect(sink.NtpReplies() == 1, "sink NTP: counter advanced");
+  }
+
   // --- bounds / fuzz: malformed frames yield no reply and never read OOB ---
   {
     std::vector<Frame> out;

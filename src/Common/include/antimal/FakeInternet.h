@@ -45,6 +45,7 @@ class FakeInternet {
   uint64_t TcpReplies() const noexcept { return tcpReplies_; }
   uint64_t HttpReplies() const noexcept { return httpReplies_; }
   uint64_t DhcpReplies() const noexcept { return dhcpReplies_; }
+  uint64_t NtpReplies() const noexcept { return ntpReplies_; }
   uint64_t FramesSeen() const noexcept { return framesSeen_; }
   uint64_t FramesDropped() const noexcept { return framesDropped_; }
 
@@ -57,6 +58,11 @@ class FakeInternet {
   // UDP/53 DNS query -> resolve-all A response (every name -> the sink IP). `ihl`
   // is the IPv4 header length; `udpOff`/`udpLen` bound the UDP datagram.
   bool HandleDns(const uint8_t *f, std::size_t ihl, std::size_t udpOff,
+                 std::size_t udpLen, std::vector<Frame> &out);
+  // NTP (UDP/123) client request -> server reply with a canned time, so a
+  // contained guest's w32time / a sample's time-sync completes instead of
+  // hanging on a timeout (a common early network behavior).
+  bool HandleNtp(const uint8_t *f, std::size_t ihl, std::size_t udpOff,
                  std::size_t udpLen, std::vector<Frame> &out);
   // TCP SYN -> SYN-ACK so the guest's connection to the contacted endpoint
   // establishes (and it sends its first data payload). `ihl` is the IPv4 header
@@ -77,6 +83,7 @@ class FakeInternet {
   uint64_t tcpReplies_ = 0;
   uint64_t httpReplies_ = 0;
   uint64_t dhcpReplies_ = 0;
+  uint64_t ntpReplies_ = 0;
   uint64_t framesSeen_ = 0;
   uint64_t framesDropped_ = 0;
 };

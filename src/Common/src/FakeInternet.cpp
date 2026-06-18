@@ -208,6 +208,7 @@ bool FakeInternet::HandleIpv4(const uint8_t *f, std::size_t len,
     const uint16_t dport = RdBE16(f + l4Off + 2);  // UDP dst port
     if (dport == 53) return HandleDns(f, ihl, l4Off, l4Len, out);
     if (dport == 67) return HandleDhcp(f, ihl, l4Off, l4Len, out);
+    if (dport == 123) return HandleNtp(f, ihl, l4Off, l4Len, out);
     return false;  // other UDP ports: no reply (yet)
   }
   if (ip[9] == kIpProtoTcp) {
@@ -454,6 +455,69 @@ bool FakeInternet::HandleDhcp(const uint8_t *f, std::size_t ihl,
 
   out.push_back(std::move(r));
   ++dhcpReplies_;
+  return true;
+}
+
+bool FakeInternet::HandleNtp(const uint8_t *f, std::size_t ihl,
+                             std::size_t udpOff, std::size_t udpLen,
+                             std::vector<Frame> &out) {
+  // NTP message is >= 48 bytes after the UDP header.
+  const std::size_t ntpOff = udpOff + kUdpHdr;
+  const std::size_t ntpLen = udpLen - kUdpHdr;
+  if (ntpLen < 48) {
+    ++framesDropped_;
+    return false;
+  }
+  const uint8_t *req = f + ntpOff;
+  const uint8_t reqMode = req[0] & 0x07;
+  if (reqMode != 3) return false;  // only answer client-mode (3) requests
+  const uint8_t reqVn = (req[0] >> 3) & 0x07;
+
+  // A canned server time (NTP timestamp = seconds since 1900-01-01). The sink is
+  // pure/clockless; a contained guest only needs a plausible, monotonic-enough
+  // time to complete its sync. 0xEB000000 ~= mid-2024.
+  static const uint8_t kNtpSecs[4] = {0xEB, 0x00, 0x00, 0x00};
+  uint8_t ntp[48] = {0};
+  ntp[0] = static_cast<uint8_t>((0u << 6) | (reqVn << 3) | 4u);  // LI=0, VN echo, mode=server
+  ntp[1] = 2;     // stratum 2 (secondary reference)
+  ntp[2] = req[2] ? req[2] : 4;  // poll (echo client's, else 4)
+  ntp[3] = 0xEC;  // precision ~2^-20
+  ntp[12] = 'L'; ntp[13] = 'O'; ntp[14] = 'C'; ntp[15] = 'L';  // reference id
+  std::memcpy(&ntp[16], kNtpSecs, 4);  // reference timestamp (secs)
+  std::memcpy(&ntp[24], req + 40, 8);  // originate = client's transmit timestamp
+  std::memcpy(&ntp[32], kNtpSecs, 4);  // receive timestamp (secs)
+  std::memcpy(&ntp[40], kNtpSecs, 4);  // transmit timestamp (secs)
+
+  // Wrap: Ethernet (to client) + IPv4 (sink -> client) + UDP (123 -> client port).
+  const std::size_t udpTotal = kUdpHdr + sizeof(ntp);
+  const std::size_t ipTotal = ihl + udpTotal;
+  Frame r(kEthHdr + ipTotal, 0);
+  std::memcpy(r.data(), f + 6, 6);            // dst = client
+  std::memcpy(r.data() + 6, mac_.data(), 6);  // src = sink
+  WrBE16(r.data() + 12, kEthIpv4);
+  uint8_t *rip = r.data() + kEthHdr;
+  std::memcpy(rip, f + kEthHdr, ihl);
+  WrBE16(rip + 2, static_cast<uint16_t>(ipTotal));
+  WrBE16(rip + 4, 0);
+  WrBE16(rip + 6, 0x4000);
+  rip[8] = 64;
+  rip[9] = kIpProtoUdp;
+  uint8_t reqSrcIp[4];
+  std::memcpy(reqSrcIp, f + kEthHdr + 12, 4);
+  std::memcpy(rip + 12, f + kEthHdr + 16, 4);  // src = the server the guest dialed
+  std::memcpy(rip + 16, reqSrcIp, 4);          // dst = the guest
+  rip[10] = rip[11] = 0;
+  WrBE16(rip + 10, InternetChecksum(rip, ihl));
+  uint8_t *rudp = rip + ihl;
+  WrBE16(rudp, 123);                       // src port = NTP
+  std::memcpy(rudp + 2, f + udpOff, 2);    // dst port = the client's source port
+  WrBE16(rudp + 4, static_cast<uint16_t>(udpTotal));
+  rudp[6] = rudp[7] = 0;
+  std::memcpy(rudp + kUdpHdr, ntp, sizeof(ntp));
+  WrBE16(rudp + 6, UdpChecksum(rip + 12, rip + 16, rudp, udpTotal));
+
+  out.push_back(std::move(r));
+  ++ntpReplies_;
   return true;
 }
 
