@@ -28,6 +28,7 @@
 #include "antimal/IocExport.h"
 #include "antimal/Json.h"
 #include "antimal/JsonValue.h"
+#include "antimal/FakeInternet.h"
 #include "antimal/NetworkTelemetry.h"
 #include "antimal/PacketInspector.h"
 #include "antimal/PcapWriter.h"
@@ -8822,6 +8823,142 @@ void TestPcapWriter() {
   Expect(sb.size() == 24 + 16 + 16, "pcap: truncated record stores only snaplen bytes");
 }
 
+// FakeInternet sink: ARP who-has -> is-at, ICMP echo -> reply, checksum
+// correctness, and bounds/fuzz safety on malformed guest frames (zero-egress,
+// pure synthesis).
+void TestFakeInternet() {
+  using antimal::net::FakeInternet;
+  using antimal::net::Frame;
+  using antimal::net::InternetChecksum;
+  const antimal::net::Mac sinkMac = {0x02, 0x53, 0x49, 0x4E, 0x4B, 0x01};
+  // sink IP 10.0.2.3 (big-endian bytes 0x0A 0x00 0x02 0x03).
+  FakeInternet sink(sinkMac, 0x0A000203u);
+  const uint8_t guestMac[6] = {0x02, 0xA1, 0xA1, 0x00, 0x00, 0x01};
+
+  auto be16 = [](std::vector<uint8_t> &v, uint16_t x) {
+    v.push_back(static_cast<uint8_t>(x >> 8));
+    v.push_back(static_cast<uint8_t>(x & 0xFF));
+  };
+
+  // --- ARP request: who has 10.0.2.3? ---
+  {
+    std::vector<uint8_t> f;
+    for (int i = 0; i < 6; ++i) f.push_back(0xFF);            // dst = broadcast
+    for (int i = 0; i < 6; ++i) f.push_back(guestMac[i]);     // src = guest
+    be16(f, 0x0806);                                          // ARP
+    be16(f, 0x0001); be16(f, 0x0800); f.push_back(6); f.push_back(4);
+    be16(f, 1);                                               // request
+    for (int i = 0; i < 6; ++i) f.push_back(guestMac[i]);     // sender MAC
+    const uint8_t guestIp[4] = {0x0A, 0x00, 0x02, 0x64};      // 10.0.2.100
+    for (int i = 0; i < 4; ++i) f.push_back(guestIp[i]);
+    for (int i = 0; i < 6; ++i) f.push_back(0);               // target MAC (unknown)
+    const uint8_t askIp[4] = {0x0A, 0x00, 0x02, 0x03};        // asking for 10.0.2.3
+    for (int i = 0; i < 4; ++i) f.push_back(askIp[i]);
+
+    std::vector<Frame> out;
+    Expect(sink.OnGuestFrame(f.data(), f.size(), out) == 1 && out.size() == 1,
+           "sink ARP: one reply synthesized");
+    const Frame &r = out[0];
+    Expect(r.size() == 42, "sink ARP: reply is a 42-byte ARP frame");
+    Expect(r[12] == 0x08 && r[13] == 0x06, "sink ARP: ethertype ARP");
+    Expect(std::equal(r.begin(), r.begin() + 6, guestMac),
+           "sink ARP: Ethernet dst = requester");
+    Expect(std::equal(r.begin() + 6, r.begin() + 12, sinkMac.begin()),
+           "sink ARP: Ethernet src = sink");
+    Expect(r[20] == 0 && r[21] == 2, "sink ARP: opcode = reply (2)");
+    Expect(std::equal(r.begin() + 22, r.begin() + 28, sinkMac.begin()),
+           "sink ARP: sender MAC = sink (we are this IP)");
+    Expect(r[28] == 0x0A && r[31] == 0x03, "sink ARP: sender IP = asked-about IP");
+    Expect(sink.ArpReplies() == 1, "sink ARP: counter advanced");
+  }
+
+  // --- ICMP echo request -> reply ---
+  {
+    std::vector<uint8_t> icmp;
+    icmp.push_back(8); icmp.push_back(0);  // type=echo request, code 0
+    icmp.push_back(0); icmp.push_back(0);  // checksum placeholder
+    be16(icmp, 0x1234);                    // id
+    be16(icmp, 0x0001);                    // seq
+    for (int i = 0; i < 16; ++i) icmp.push_back(static_cast<uint8_t>(0xE0 + i));
+    const uint16_t icmpck = InternetChecksum(icmp.data(), icmp.size());
+    icmp[2] = static_cast<uint8_t>(icmpck >> 8);
+    icmp[3] = static_cast<uint8_t>(icmpck & 0xFF);
+
+    std::vector<uint8_t> ip;
+    ip.push_back(0x45); ip.push_back(0x00);
+    const uint16_t total = static_cast<uint16_t>(20 + icmp.size());
+    be16(ip, total);
+    be16(ip, 0xABCD); be16(ip, 0x0000); ip.push_back(64); ip.push_back(1);  // TTL, proto ICMP
+    be16(ip, 0x0000);                                  // checksum placeholder
+    const uint8_t gIp[4] = {0x0A, 0x00, 0x02, 0x64};   // src 10.0.2.100
+    const uint8_t sIp[4] = {0x0A, 0x00, 0x02, 0x03};   // dst 10.0.2.3 (sink)
+    for (int i = 0; i < 4; ++i) ip.push_back(gIp[i]);
+    for (int i = 0; i < 4; ++i) ip.push_back(sIp[i]);
+    const uint16_t ipck = InternetChecksum(ip.data(), ip.size());
+    ip[10] = static_cast<uint8_t>(ipck >> 8);
+    ip[11] = static_cast<uint8_t>(ipck & 0xFF);
+
+    std::vector<uint8_t> f;
+    for (int i = 0; i < 6; ++i) f.push_back(sinkMac[i]);  // dst = sink
+    for (int i = 0; i < 6; ++i) f.push_back(guestMac[i]); // src = guest
+    be16(f, 0x0800);                                      // IPv4
+    f.insert(f.end(), ip.begin(), ip.end());
+    f.insert(f.end(), icmp.begin(), icmp.end());
+
+    std::vector<Frame> out;
+    Expect(sink.OnGuestFrame(f.data(), f.size(), out) == 1,
+           "sink ICMP: one echo reply synthesized");
+    const Frame &r = out[0];
+    Expect(r[14 + 9] == 1, "sink ICMP: reply is IPv4/ICMP");
+    Expect(r[14 + 20] == 0, "sink ICMP: ICMP type = echo reply (0)");
+    // IP src/dst swapped: reply src = sink (10.0.2.3), dst = guest (10.0.2.100).
+    Expect(r[14 + 12] == 0x0A && r[14 + 15] == 0x03, "sink ICMP: reply src = sink IP");
+    Expect(r[14 + 19] == 0x64, "sink ICMP: reply dst = guest IP");
+    // Checksums valid: summing the header incl. its checksum folds to 0xFFFF, so
+    // InternetChecksum over the whole region (with checksum present) == 0.
+    Expect(InternetChecksum(r.data() + 14, 20) == 0, "sink ICMP: IP checksum valid");
+    Expect(InternetChecksum(r.data() + 34, r.size() - 34) == 0,
+           "sink ICMP: ICMP checksum valid");
+    Expect(sink.IcmpReplies() == 1, "sink ICMP: counter advanced");
+  }
+
+  // --- bounds / fuzz: malformed frames yield no reply and never read OOB ---
+  {
+    std::vector<Frame> out;
+    FakeInternet s2(sinkMac, 0x0A000203u);
+    Expect(s2.OnGuestFrame(nullptr, 0, out) == 0, "sink fuzz: null frame");
+    std::vector<uint8_t> tiny(10, 0xFF);
+    Expect(s2.OnGuestFrame(tiny.data(), tiny.size(), out) == 0,
+           "sink fuzz: sub-Ethernet frame dropped");
+    // ARP ethertype but truncated body.
+    std::vector<uint8_t> shortArp(20, 0);
+    shortArp[12] = 0x08; shortArp[13] = 0x06;
+    Expect(s2.OnGuestFrame(shortArp.data(), shortArp.size(), out) == 0,
+           "sink fuzz: truncated ARP dropped");
+    // IPv4 with a lying totalLen far beyond the frame.
+    std::vector<uint8_t> liar(34, 0);
+    liar[12] = 0x08; liar[13] = 0x00; liar[14] = 0x45; liar[15] = 0x00;
+    liar[16] = 0xFF; liar[17] = 0xFF;  // totalLen = 65535
+    liar[14 + 9] = 1;                  // proto ICMP
+    Expect(s2.OnGuestFrame(liar.data(), liar.size(), out) == 0,
+           "sink fuzz: IPv4 lying totalLen dropped (no OOB read)");
+    Expect(out.empty(), "sink fuzz: no replies from any malformed frame");
+    Expect(s2.FramesDropped() >= 3, "sink fuzz: drop counter advanced");
+
+    // Adversarial sweep: random-ish bytes must never crash or reply OOB.
+    for (uint32_t seed = 1; seed <= 400; ++seed) {
+      std::vector<uint8_t> g(14 + (seed % 80));
+      uint32_t x = seed * 2654435761u;
+      for (auto &b : g) { x ^= x << 13; x ^= x >> 17; x ^= x << 5; b = static_cast<uint8_t>(x); }
+      g[12] = (seed & 1) ? 0x08 : 0x08;
+      g[13] = (seed & 1) ? 0x06 : 0x00;  // alternate ARP / IPv4
+      std::vector<Frame> fout;
+      s2.OnGuestFrame(g.data(), g.size(), fout);  // must not crash / OOB
+    }
+    Expect(true, "sink fuzz: 400 adversarial frames processed without crashing");
+  }
+}
+
 void TestNicPciConfig() {
   antimal::hv::PcIoDevices pc;
   pc.SetNicPresent(true);
@@ -9924,6 +10061,7 @@ int main() {
     TestE1000Device();
     TestE1000RxRing();
     TestPcapWriter();
+    TestFakeInternet();
     TestNicPciConfig();
     TestHttpUrlEncode();
     TestFramebufferVisiblePixels();

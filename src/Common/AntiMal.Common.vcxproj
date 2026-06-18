@@ -45,6 +45,8 @@
     <ClInclude Include="include\antimal\BootReliability.h" />
     <ClInclude Include="include\antimal\CrashSummary.h" />
     <ClInclude Include="include\antimal\Crypto.h" />
+    <ClInclude Include="include\antimal\FakeInternet.h" />
+    <ClInclude Include="include\antimal\PcapWriter.h" />
     <ClInclude Include="include\antimal\DetectionSummary.h" />
     <ClInclude Include="include\antimal\EventJournal.h" />
     <ClInclude Include="include\antimal\EventTime.h" />
@@ -107,6 +109,7 @@
     <ClCompile Include="src\EventTime.cpp" />
     <ClCompile Include="src\ExternalTools.cpp" />
     <ClCompile Include="src\FileUtil.cpp" />
+    <ClCompile Include="src\FakeInternet.cpp" />
     <ClCompile Include="src\FuzzyHash.cpp" />
     <ClCompile Include="src\GuestMonitor.cpp" />
     <ClCompile Include="src\Http.cpp" />
