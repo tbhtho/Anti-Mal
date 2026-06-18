@@ -602,6 +602,8 @@ std::vector<Rc4ConfigIoc> MineRc4WrappedConfig(const std::vector<uint8_t> &data)
   const auto plainStrings = ExtractAllStrings(data);
   const auto plain = MineIocs(plainStrings);
   std::set<std::string> plainUrls(plain.urls.begin(), plain.urls.end());
+  std::set<std::string> plainIps(plain.ips.begin(), plain.ips.end());
+  std::set<std::string> plainDoms(plain.domains.begin(), plain.domains.end());
 
   // Candidate RC4 keys: short printable ASCII strings (dedup, bounded). RC4 keys
   // in these families are human-typed strings, almost always <= 32 chars.
@@ -614,7 +616,7 @@ std::vector<Rc4ConfigIoc> MineRc4WrappedConfig(const std::vector<uint8_t> &data)
     if (keys.size() >= kMaxKeys) break;
   }
 
-  std::set<std::string> seenUrl;
+  std::set<std::string> seen; // dedup across blobs/keys (any kind)
   size_t blobN = 0;
   for (const auto &blob : plain.base64Blobs) {
     if (++blobN > kMaxBlobs) break;
@@ -622,12 +624,28 @@ std::vector<Rc4ConfigIoc> MineRc4WrappedConfig(const std::vector<uint8_t> &data)
     if (ct.size() < 8) continue;
     for (const auto &key : keys) {
       const auto dec = Rc4(key, ct, kDecryptCap);
+      // A valid URL is the FP-safe GATE: only a correct key produces "http://"
+      // + a real host from RC4 output. We must confirm a URL before trusting
+      // anything else from this decryption.
       if (!ContainsHttp(dec)) continue; // cheap reject before the full mine
       const auto inner = MineIocsFromBytes(dec);
+      if (inner.urls.empty()) continue; // no validated URL -> not a real key
+      // Key confirmed by a URL: surface the URLs AND the IPs/domains from the
+      // SAME decryption (now trusted) -- RAT configs often carry a URL plus a
+      // bare IP/domain C2.
       for (const auto &u : inner.urls) {
-        if (plainUrls.count(u)) continue;       // already visible in plaintext
-        if (!seenUrl.insert(u).second) continue; // dedup across blobs/keys
-        out.push_back({u, key});
+        if (plainUrls.count(u) || !seen.insert(u).second) continue;
+        out.push_back({u, key, "url"});
+        if (out.size() >= kMaxHits) return out;
+      }
+      for (const auto &ip : inner.ips) {
+        if (plainIps.count(ip) || !seen.insert(ip).second) continue;
+        out.push_back({ip, key, "ip"});
+        if (out.size() >= kMaxHits) return out;
+      }
+      for (const auto &d : inner.domains) {
+        if (plainDoms.count(d) || !seen.insert(d).second) continue;
+        out.push_back({d, key, "domain"});
         if (out.size() >= kMaxHits) return out;
       }
     }

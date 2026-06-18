@@ -3344,7 +3344,8 @@ int CommandConfig(int argc, wchar_t **argv) {
               << ",\"base64Domains\":" << JsonStrArray(b64.domains)
               << ",\"rc4\":[";
     for (size_t i = 0; i < rc4.size(); ++i) {
-      std::cout << (i ? "," : "") << "{\"url\":" << JsonQuote(rc4[i].value)
+      std::cout << (i ? "," : "") << "{\"value\":" << JsonQuote(rc4[i].value)
+                << ",\"kind\":" << JsonQuote(rc4[i].kind)
                 << ",\"key\":" << JsonQuote(rc4[i].key) << "}";
     }
     std::cout << "]}\n";
@@ -3370,7 +3371,8 @@ int CommandConfig(int argc, wchar_t **argv) {
               << std::dec << "): " << x.value << "\n";
   for (const auto &x : xorN) std::cout << "  multi-byte-XOR C2: " << x.value << "\n";
   for (const auto &h : rc4)
-    std::cout << "  RC4 C2 (key \"" << h.key << "\"): " << h.value << "\n";
+    std::cout << "  RC4 C2 " << h.kind << " (key \"" << h.key << "\"): " << h.value
+              << "\n";
   for (const auto &u : b64.urls) std::cout << "  base64-wrapped URL: " << u << "\n";
   for (const auto &ip : b64.ips) std::cout << "  base64-wrapped IP: " << ip << "\n";
   for (const auto &d : b64.domains) std::cout << "  base64-wrapped domain: " << d << "\n";

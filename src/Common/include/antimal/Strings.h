@@ -103,8 +103,9 @@ Base64DecodedIocs MineBase64WrappedIocs(const std::vector<uint8_t> &data);
 // same known-plaintext anchor the XOR recovery uses, so a chance hit on random
 // bytes is astronomically unlikely (near-zero false positives). Bounded work.
 struct Rc4ConfigIoc {
-  std::string value; // the decoded http(s):// URL
+  std::string value; // the decoded IOC (URL / IP / domain)
   std::string key;   // the ASCII RC4 key that revealed it
+  std::string kind;  // "url" | "ip" | "domain"
 };
 
 std::vector<Rc4ConfigIoc> MineRc4WrappedConfig(const std::vector<uint8_t> &data);

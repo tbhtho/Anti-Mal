@@ -3847,7 +3847,8 @@ void TestRc4WrappedConfig() {
   };
 
   const std::string key = "MySecretRc4Key01";
-  std::string plain = "url=http://rc4-c2.example/panel;id=ABC";
+  // Config carries a URL (the FP-safe anchor) AND a bare IP -- both must surface.
+  std::string plain = "url=http://rc4-c2.example/panel host=203.0.113.77 end";
   while (plain.size() % 3) plain += " "; // avoid base64 padding edge cases
   const std::string blob = b64enc(rc4(key, plain));
 
@@ -3864,11 +3865,15 @@ void TestRc4WrappedConfig() {
   const auto buf = build({"Benign filler text for padding purposes only here.",
                           key, blob, "more trailing filler content here too."});
   const auto hits = MineRc4WrappedConfig(buf);
-  bool found = false;
-  for (const auto &h : hits)
-    if (h.value.find("rc4-c2.example") != std::string::npos && h.key == key)
-      found = true;
-  Expect(found, "rc4: recovered the URL with the right key");
+  bool foundUrl = false, foundIp = false;
+  for (const auto &h : hits) {
+    if (h.key != key) continue;
+    if (h.kind == "url" && h.value.find("rc4-c2.example") != std::string::npos)
+      foundUrl = true;
+    if (h.kind == "ip" && h.value == "203.0.113.77") foundIp = true;
+  }
+  Expect(foundUrl, "rc4: recovered the URL with the right key");
+  Expect(foundIp, "rc4: recovered the bare IP from the confirmed-key decryption");
 
   // Negative: blob present but the key is NOT -> no recovery (no false positive).
   const auto buf2 = build({"Benign filler text for padding purposes only here.",

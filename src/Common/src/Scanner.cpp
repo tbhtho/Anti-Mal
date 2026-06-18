@@ -188,8 +188,12 @@ void Enrich(ScanResult &result, const std::vector<uint8_t> &data,
     // that yield a valid URL. A near-zero-FP, family-agnostic C2 recovery.
     const auto rc4 = MineRc4WrappedConfig(data);
     if (!rc4.empty()) {
-      for (const auto &hit : rc4) result.iocs.urls.push_back(hit.value);
-      std::string msg = "RC4-encrypted (base64-wrapped) C2 URL(s) recovered: ";
+      for (const auto &hit : rc4) {
+        if (hit.kind == "ip") result.iocs.ips.push_back(hit.value);
+        else if (hit.kind == "domain") result.iocs.domains.push_back(hit.value);
+        else result.iocs.urls.push_back(hit.value);
+      }
+      std::string msg = "RC4-encrypted (base64-wrapped) C2 recovered: ";
       for (size_t i = 0; i < rc4.size() && i < 3; ++i) {
         if (i) msg += ", ";
         msg += rc4[i].value + " [key \"" + rc4[i].key + "\"]";
