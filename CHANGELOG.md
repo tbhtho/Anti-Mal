@@ -40,6 +40,11 @@ unit-tested. A living `private development documentation` tracks done/remaining 
 - **`boot-report` failure breakdown:** `--json` now emits `byCategory`, `byRemediation`, and the
   `incomplete` count; text mode prints the single most common actionable remediation across runs
   (the highest-leverage fix for the dominant failure mode).
+- **MITRE ATT&CK tactic grouping (kill-chain view):** `MitreCatalog` gains `MitreTechniqueTactic`
+  (technique→tactic, with sub-technique→parent fallback and an "Other" catch-all so nothing is
+  dropped). The report's MITRE panel now groups techniques by tactic in canonical kill-chain order
+  (Execution→…→Impact), the way Any.Run presents the chain, and a new `report --mitre [--json]` CLI
+  view does the same. Unit-tested.
 - **Analyst-workflow smoke test (`tools/Smoke-AnalystWorkflow.ps1`):** an end-to-end, no-VM
   regression of the CLI glue unit tests can't reach — simulate → report --summary/--why/--crashes/
   --detections → export stix/misp/csv → yara-gen → config (synthetic RC4 round-trip) → triage, with

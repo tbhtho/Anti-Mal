@@ -15,6 +15,7 @@
 #include "antimal/HyperVOrchestrator.h"
 #include "antimal/IocExport.h"
 #include "antimal/Json.h"
+#include "antimal/MitreCatalog.h"
 #include "antimal/Report.h"
 #include "antimal/ReportDiff.h"
 #include "antimal/Scanner.h"
@@ -210,7 +211,7 @@ void PrintUsage() {
       << "  antimal fs-find [--vhdx <d.vhdx>] [--overlay <o.cow>] <name-substring>   (offline recursive search)\n"
       << "  antimal fs-scan [--vhdx <d.vhdx>] [--overlay <o.cow>] <guest\\path>   (extract + static-scan a guest file)\n"
       << "  antimal reg-ls [--hive software|system|sam|...] [--overlay <o.cow>] <reg\\key> [--values] [--depth N] [--filter <s>]\n"
-      << "  antimal report <run-id-or-report.json> [--html] [--summary|--why|--detections|--crashes|--usability|--timeline [--json]]\n"
+      << "  antimal report <run-id-or-report.json> [--html] [--summary|--why|--detections|--crashes|--mitre|--usability|--timeline [--json]]\n"
       << "  antimal browser-impact <run-id-or-report.json> --decrypt-browser-secrets\n"
       << "  antimal export <run-id-or-report.json> --format stix|misp|csv|yara [--out <file>]\n"
       << "  antimal similarity <fileA> <fileB> [--json]   (fuzzy-hash similarity 0..100)\n"
@@ -3044,6 +3045,52 @@ int CommandReport(int argc, wchar_t **argv) {
       std::cout << "Why:\n";
       for (const auto &line : report.verdictRationale) {
         std::cout << "  - " << line << "\n";
+      }
+    }
+    return 0;
+  }
+  if (HasFlag(argc, argv, "--mitre")) {
+    // ATT&CK kill-chain view: the run's observed techniques grouped by tactic in
+    // canonical order (Any.Run-style matrix). --json emits {tactic:[{id,name}]}.
+    static const char *kOrder[] = {
+        "Execution",        "Persistence",      "Privilege Escalation",
+        "Defense Evasion",  "Credential Access", "Discovery",
+        "Lateral Movement", "Collection",       "Command and Control",
+        "Exfiltration",     "Impact",           "Other"};
+    std::map<std::string, std::vector<std::string>> byTactic;
+    for (const auto &id : report.mitreTechniques)
+      byTactic[antimal::MitreTechniqueTactic(id)].push_back(id);
+    if (HasFlag(argc, argv, "--json")) {
+      std::cout << "{";
+      bool firstT = true;
+      for (const char *tac : kOrder) {
+        const auto it = byTactic.find(tac);
+        if (it == byTactic.end()) continue;
+        std::cout << (firstT ? "" : ",") << JsonQuote(tac) << ":[";
+        firstT = false;
+        for (size_t i = 0; i < it->second.size(); ++i) {
+          std::cout << (i ? "," : "") << "{\"id\":" << JsonQuote(it->second[i])
+                    << ",\"name\":"
+                    << JsonQuote(antimal::MitreTechniqueName(it->second[i])) << "}";
+        }
+        std::cout << "]";
+      }
+      std::cout << "}\n";
+      return 0;
+    }
+    std::cout << "ATT&CK techniques (" << report.mitreTechniques.size()
+              << ") by tactic:\n";
+    if (report.mitreTechniques.empty()) {
+      std::cout << "  (none observed)\n";
+      return 0;
+    }
+    for (const char *tac : kOrder) {
+      const auto it = byTactic.find(tac);
+      if (it == byTactic.end()) continue;
+      std::cout << "  " << tac << ":\n";
+      for (const auto &id : it->second) {
+        const std::string name = antimal::MitreTechniqueName(id);
+        std::cout << "    " << id << (name.empty() ? "" : "  " + name) << "\n";
       }
     }
     return 0;

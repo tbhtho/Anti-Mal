@@ -1233,6 +1233,32 @@ bool EmitMitreChips(std::ostringstream &html,
   return true;
 }
 
+// ATT&CK matrix-style view: the techniques grouped by tactic in canonical
+// kill-chain order (Any.Run presents the chain this way). Each non-empty tactic
+// becomes a labeled row of chips.
+bool EmitMitreByTactic(std::ostringstream &html,
+                       const std::vector<std::string> &techniques) {
+  if (techniques.empty()) return false;
+  static const char *kOrder[] = {
+      "Execution",        "Persistence",      "Privilege Escalation",
+      "Defense Evasion",  "Credential Access", "Discovery",
+      "Lateral Movement", "Collection",       "Command and Control",
+      "Exfiltration",     "Impact",           "Other"};
+  std::map<std::string, std::vector<std::string>> byTactic;
+  for (const auto &t : techniques)
+    if (!t.empty()) byTactic[MitreTechniqueTactic(t)].push_back(t);
+  for (const char *tac : kOrder) {
+    const auto it = byTactic.find(tac);
+    if (it == byTactic.end()) continue;
+    html << "<div class=\"mitre-tactic\"><div class=\"mitre-tactic-h\">"
+         << HtmlEscape(tac) << " <span style=\"opacity:.6\">("
+         << it->second.size() << ")</span></div>";
+    EmitMitreChips(html, it->second);
+    html << "</div>";
+  }
+  return true;
+}
+
 const char *kStylesheet = R"CSS(
 :root{
   --bg:#0f1620; --panel:#151e2a; --panel2:#1a2433; --border:#27344a;
@@ -1344,6 +1370,8 @@ code,.mono{font-family:Consolas,Cascadia Code,monospace;font-size:12px;
 .chip.exit{background:#3f2330;color:#ffd6df}
 .chip.integ{background:#243245;color:#cfe1f6}
 .mitre-chips{display:flex;gap:6px;flex-wrap:wrap}
+.mitre-tactic{margin:6px 0}
+.mitre-tactic-h{font-size:12px;font-weight:600;color:var(--accent);margin:4px 0 3px}
 h3.bad{color:var(--bad);margin:10px 0 6px}
 tr.bad td{background:rgba(240,75,94,.10);color:#ffd0d6}
 .muted{color:var(--muted);font-size:12px;margin-top:4px}
@@ -2266,7 +2294,7 @@ std::string BuildHtmlReportWithFrames(const AnalysisReport &report,
   }
   if (!report.mitreTechniques.empty()) {
     html << "<h2>MITRE ATT&amp;CK</h2>";
-    EmitMitreChips(html, report.mitreTechniques); // ID + name, consistent with the panel
+    EmitMitreByTactic(html, report.mitreTechniques); // grouped by tactic (kill chain)
   }
   if (!report.browserImpact.empty()) {
     html << "<h2>Browser risk</h2><table><thead><tr><th>Domain</th><th>Creds</th><th>Cookies</th></tr></thead><tbody>";

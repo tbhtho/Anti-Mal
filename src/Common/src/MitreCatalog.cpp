@@ -82,4 +82,53 @@ std::string MitreTechniqueName(const std::string &id) {
   return it == kCatalog.end() ? std::string() : it->second;
 }
 
+std::string MitreTechniqueTactic(const std::string &id) {
+  // Primary ATT&CK tactic per technique (the tactic AntiMal groups it under in
+  // the report's kill-chain view). For techniques ATT&CK lists under several
+  // tactics, the most behavior-relevant one is chosen. Covers every ID in the
+  // name catalog above.
+  static const std::unordered_map<std::string, std::string> kTactic = {
+      {"T1059", "Execution"},        {"T1059.001", "Execution"},
+      {"T1059.003", "Execution"},    {"T1059.005", "Execution"},
+      {"T1059.007", "Execution"},    {"T1106", "Execution"},
+      {"T1204", "Execution"},        {"T1204.002", "Execution"},
+      {"T1047", "Execution"},        {"T1053", "Execution"},
+      {"T1053.005", "Execution"},    {"T1569.002", "Execution"},
+      {"T1547", "Persistence"},      {"T1547.001", "Persistence"},
+      {"T1547.004", "Persistence"},  {"T1543.003", "Persistence"},
+      {"T1546", "Persistence"},      {"T1546.010", "Persistence"},
+      {"T1546.012", "Persistence"},  {"T1546.015", "Persistence"},
+      {"T1574", "Persistence"},      {"T1574.002", "Persistence"},
+      {"T1136.001", "Persistence"},  {"T1098", "Persistence"},
+      {"T1197", "Defense Evasion"},  {"T1548", "Privilege Escalation"},
+      {"T1055", "Defense Evasion"},  {"T1055.001", "Defense Evasion"},
+      {"T1055.012", "Defense Evasion"}, {"T1562.001", "Defense Evasion"},
+      {"T1027", "Defense Evasion"},  {"T1027.002", "Defense Evasion"},
+      {"T1140", "Defense Evasion"},  {"T1112", "Defense Evasion"},
+      {"T1218", "Defense Evasion"},  {"T1218.011", "Defense Evasion"},
+      {"T1218.005", "Defense Evasion"}, {"T1497", "Defense Evasion"},
+      {"T1070.001", "Defense Evasion"},
+      {"T1555", "Credential Access"}, {"T1555.003", "Credential Access"},
+      {"T1003", "Credential Access"}, {"T1056.001", "Credential Access"},
+      {"T1082", "Discovery"},        {"T1083", "Discovery"},
+      {"T1057", "Discovery"},        {"T1018", "Discovery"},
+      {"T1016", "Discovery"},        {"T1005", "Collection"},
+      {"T1071", "Command and Control"}, {"T1071.001", "Command and Control"},
+      {"T1095", "Command and Control"}, {"T1105", "Command and Control"},
+      {"T1573", "Command and Control"}, {"T1571", "Command and Control"},
+      {"T1041", "Exfiltration"},     {"T1486", "Impact"},
+      {"T1485", "Impact"},           {"T1490", "Impact"},
+      {"T1496", "Impact"},           {"T1561.002", "Impact"},
+  };
+  auto it = kTactic.find(id);
+  if (it != kTactic.end()) return it->second;
+  // Sub-technique not explicitly listed -> fall back to the parent technique.
+  const auto dot = id.find('.');
+  if (dot != std::string::npos) {
+    it = kTactic.find(id.substr(0, dot));
+    if (it != kTactic.end()) return it->second;
+  }
+  return "Other";
+}
+
 } // namespace antimal

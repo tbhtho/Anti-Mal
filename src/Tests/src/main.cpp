@@ -4462,6 +4462,21 @@ void TestMitreCatalog() {
   Expect(MitreTechniqueName("T9999").empty(),
          "mitre: an unknown technique returns empty (falls back to the ID)");
   Expect(MitreTechniqueName("").empty(), "mitre: empty id returns empty");
+
+  using antimal::MitreTechniqueTactic;
+  Expect(MitreTechniqueTactic("T1547.001") == "Persistence",
+         "mitre: Run-key sub-technique -> Persistence tactic");
+  Expect(MitreTechniqueTactic("T1059.001") == "Execution",
+         "mitre: PowerShell -> Execution tactic");
+  Expect(MitreTechniqueTactic("T1486") == "Impact",
+         "mitre: ransomware encryption -> Impact tactic");
+  Expect(MitreTechniqueTactic("T1071.001") == "Command and Control",
+         "mitre: web protocols -> C2 tactic");
+  // Sub-technique not explicitly listed falls back to its parent's tactic.
+  Expect(MitreTechniqueTactic("T1547.999") == "Persistence",
+         "mitre: unlisted sub-technique falls back to parent tactic");
+  Expect(MitreTechniqueTactic("T9999") == "Other",
+         "mitre: unknown technique groups under Other (never dropped)");
 }
 
 // Report-to-report diff (T78): a report vs itself is materially identical; a
