@@ -3558,6 +3558,18 @@ void TestFramePacingStats() {
   Expect(slow.OnTargetRatio() < 0.01,
          "pacing: 10fps is off-target for a 30fps goal");
 
+  // Stall detection: a steady 30fps stream punctuated by two long freezes.
+  Expect(s.StallCount() == 0, "pacing: a steady 30fps stream has no stalls");
+  FramePacingStats st(30);
+  uint64_t v = 0;
+  for (int i = 0; i < 20; ++i) { st.RecordPublish(v); v += 33333; }
+  st.RecordPublish(v += 250000); // ~283ms gap -> a visible stall
+  for (int i = 0; i < 20; ++i) { st.RecordPublish(v); v += 33333; }
+  st.RecordPublish(v += 500000); // another freeze
+  Expect(st.StallCount() == 2, "pacing: two long freezes counted as stalls");
+  Expect(st.Summary().find("stalls 2") != std::string::npos,
+         "pacing: summary reports the stall count");
+
   // The retained-interval window caps memory at the most recent N.
   FramePacingStats win(30, 10);
   uint64_t w = 0;

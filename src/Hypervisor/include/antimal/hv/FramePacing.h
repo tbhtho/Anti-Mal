@@ -82,6 +82,21 @@ public:
     if (idx >= sorted.size()) idx = sorted.size() - 1;
     return static_cast<double>(sorted[idx]) / 1000.0;
   }
+  // A "stall" is an inter-frame interval far beyond the target frame time -- a
+  // visible hitch/freeze the average FPS hides. Threshold = 3x the target frame
+  // interval (e.g. 100ms at 30fps).
+  double StallThresholdMs() const noexcept {
+    return 1000.0 / static_cast<double>(targetFps_) * 3.0;
+  }
+  uint64_t StallCount() const {
+    const double stallMicros = 1.0e6 / static_cast<double>(targetFps_) * 3.0;
+    uint64_t n = 0;
+    for (uint64_t v : intervalsMicros_) {
+      if (static_cast<double>(v) > stallMicros) ++n;
+    }
+    return n;
+  }
+
   // Fraction (0..1) of inter-frame intervals at/under the target frame time (with
   // 20% slack) -- frames that kept pace with the target rate.
   double OnTargetRatio() const {
@@ -100,8 +115,8 @@ public:
       << targetFps_ << ") p50 " << PercentileIntervalMs(0.50) << "ms p95 "
       << PercentileIntervalMs(0.95) << "ms min " << MinIntervalMs() << "ms max "
       << MaxIntervalMs() << "ms" << std::setprecision(0) << " on-target "
-      << (OnTargetRatio() * 100.0) << "% frames " << framesPublished_
-      << " blank-skips " << blankSkips_;
+      << (OnTargetRatio() * 100.0) << "% stalls " << StallCount() << " frames "
+      << framesPublished_ << " blank-skips " << blankSkips_;
     return o.str();
   }
 
