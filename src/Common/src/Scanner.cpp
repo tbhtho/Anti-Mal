@@ -969,7 +969,7 @@ std::vector<ScanResult> ScanPath(const std::filesystem::path &path,
         ".ps1", ".psm1", ".bat", ".cmd", ".vbs", ".vbe", ".js", ".jse",
         ".wsf", ".wsh", ".hta",
         ".doc", ".docm", ".dot", ".dotm", ".xls", ".xlsm", ".xlsb", ".xlsx",
-        ".ppt", ".pptm", ".docx", ".rtf",
+        ".ppt", ".pptm", ".docx", ".rtf", ".one", ".onepkg", ".msi",
         ".zip", ".jar", ".cab", ".7z", ".rar", ".iso", ".img", ".gz",
         ".pdf"};
     const auto ext = ToLowerAscii(entry.path().extension().string());
