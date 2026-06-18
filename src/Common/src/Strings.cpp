@@ -577,6 +577,30 @@ std::vector<uint8_t> Rc4(const std::string &key, const std::vector<uint8_t> &ct,
   return out;
 }
 
+// Collect UNTRUNCATED base64-alphabet runs (>= minLen) from a string into `out`.
+// MineIocs caps its stored base64Blobs at 256 chars, which would silently drop
+// the larger RC4 configs this targets -- so the RC4 miner scans for full runs
+// itself. '=' padding is excluded from the run (DecodeBase64 tolerates missing
+// padding), and both standard (+/) and URL-safe (-_) alphabets are accepted.
+void CollectBase64Runs(const std::string &s, size_t minLen,
+                       std::vector<std::string> &out) {
+  auto isCh = [](char c) {
+    return (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
+           (c >= '0' && c <= '9') || c == '+' || c == '/' || c == '-' ||
+           c == '_';
+  };
+  std::string run;
+  for (char c : s) {
+    if (isCh(c)) {
+      run.push_back(c);
+    } else {
+      if (run.size() >= minLen) out.push_back(run);
+      run.clear();
+    }
+  }
+  if (run.size() >= minLen) out.push_back(run);
+}
+
 // Cheap pre-filter: does the buffer contain the ASCII substring "http"? Lets us
 // skip the full IOC mine for the ~all (blob,key) pairs that aren't a hit.
 bool ContainsHttp(const std::vector<uint8_t> &b) {
@@ -616,9 +640,21 @@ std::vector<Rc4ConfigIoc> MineRc4WrappedConfig(const std::vector<uint8_t> &data)
     if (keys.size() >= kMaxKeys) break;
   }
 
+  // Ciphertext candidates: UNTRUNCATED base64 runs scanned directly from the
+  // extracted strings (>= 24 chars ~ >= 18 ciphertext bytes). Using
+  // plain.base64Blobs would miss configs whose base64 exceeds MineIocs's 256-char
+  // display cap -- exactly the larger real-world RAT configs this targets.
+  std::vector<std::string> blobs;
+  std::set<std::string> blobSeen;
+  for (const auto &s : plainStrings) {
+    CollectBase64Runs(s, 24, blobs);
+    if (blobs.size() > kMaxBlobs * 4) break; // bound the gather too
+  }
+
   std::set<std::string> seen; // dedup across blobs/keys (any kind)
   size_t blobN = 0;
-  for (const auto &blob : plain.base64Blobs) {
+  for (const auto &blob : blobs) {
+    if (!blobSeen.insert(blob).second) continue; // dedup duplicate runs
     if (++blobN > kMaxBlobs) break;
     const auto ct = DecodeBase64(blob);
     if (ct.size() < 8) continue;

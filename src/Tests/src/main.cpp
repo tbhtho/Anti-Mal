@@ -3881,6 +3881,21 @@ void TestRc4WrappedConfig() {
                            blob, "more trailing filler content here too."});
   Expect(MineRc4WrappedConfig(buf2).empty(),
          "rc4: no key present -> no false-positive recovery");
+
+  // Regression: a LARGE config whose base64 exceeds 256 chars must still be
+  // recovered. MineIocs truncates its stored base64Blobs to 256 chars, so the
+  // miner scans untruncated runs itself -- this guards that path.
+  std::string big = "url=http://big-rc4-c2.example/panel host=198.51.100.9 ";
+  big += std::string(300, 'A'); // pad ciphertext well past the 256-char b64 cap
+  while (big.size() % 3) big += " ";
+  const std::string bigBlob = b64enc(rc4(key, big));
+  Expect(bigBlob.size() > 256, "rc4: large blob exceeds the 256-char cap");
+  const auto bufBig = build({"filler", key, bigBlob, "trailing filler"});
+  bool foundBig = false;
+  for (const auto &h : MineRc4WrappedConfig(bufBig))
+    if (h.key == key && h.value.find("big-rc4-c2.example") != std::string::npos)
+      foundBig = true;
+  Expect(foundBig, "rc4: recovers config from a >256-char base64 blob");
 }
 
 // Crash-signature summary: collapse process.crash events into distinct

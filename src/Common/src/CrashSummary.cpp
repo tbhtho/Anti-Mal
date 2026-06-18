@@ -79,12 +79,19 @@ CrashSummary SummarizeCrashes(const std::vector<EventRecord> &events) {
     }
   }
   // Sort by count desc, then by a stable signature text for determinism.
+  // Total order over the FULL signature (matches the dedup key) so the sort is
+  // deterministic even for signatures that differ only by faulting module --
+  // std::sort isn't stable, so an incomplete tiebreak would reorder equal-keyed
+  // rows across runs.
   std::sort(sigs.begin(), sigs.end(),
             [](const CrashSignature &a, const CrashSignature &b) {
               if (a.count != b.count) return a.count > b.count;
               if (a.image != b.image) return a.image < b.image;
               if (a.exceptionCode != b.exceptionCode)
                 return a.exceptionCode < b.exceptionCode;
+              if (a.module != b.module) return a.module < b.module;
+              if (a.moduleVersion != b.moduleVersion)
+                return a.moduleVersion < b.moduleVersion;
               return a.offset < b.offset;
             });
   out.signatures = std::move(sigs);
