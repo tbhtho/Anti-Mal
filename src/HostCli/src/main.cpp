@@ -1,5 +1,6 @@
 #include "antimal/BehaviorScore.h"
 #include "antimal/BootDiagnostics.h"
+#include "antimal/ConfigExtractor.h"
 #include "antimal/BrowserImpact.h"
 #include "antimal/Config.h"
 #include "antimal/DetectionSummary.h"
@@ -16,6 +17,7 @@
 #include "antimal/Report.h"
 #include "antimal/ReportDiff.h"
 #include "antimal/Scanner.h"
+#include "antimal/Strings.h"
 #include "antimal/Subprocess.h"
 #include "antimal/Version.h"
 #include "antimal/YaraGen.h"
@@ -216,7 +218,8 @@ void PrintUsage() {
       << "  antimal rebuild-report <run-id-or-dir> [--html] [--force]  (recover report.json from events.jsonl)\n"
       << "  antimal simulate [--scenario stealer|ransomware|loader|coinminer|wiper] [--out <dir>] [--run-id <id>]\n"
       << "  antimal report-diff <run-or-report-A> <run-or-report-B> [--json]  (what changed)\n"
-      << "  antimal yara-gen <sample> [--out rule.yar] [--name R] [--max-strings N]  (auto YARA rule)\n";
+      << "  antimal yara-gen <sample> [--out rule.yar] [--name R] [--max-strings N]  (auto YARA rule)\n"
+      << "  antimal config <sample> [--json]     (recovered malware config / C2)\n";
 }
 
 antimal::ScannerOptions BuildScannerOptions(int argc, wchar_t **argv,
@@ -3292,6 +3295,88 @@ int CommandYaraGen(int argc, wchar_t **argv) {
   return 0;
 }
 
+// `config` — the "Malware Configuration" view: run every static config/C2
+// extractor on a sample and present the recovered config in one focused,
+// analyst-facing place (Cobalt Strike beacon + XOR/multi-byte-XOR/base64-wrapped
+// + base64-wrapped-RC4 C2). Aggregates the same tested extractors `scan` runs,
+// but surfaces ONLY the embedded configuration -- the thing an analyst opens a
+// sample to find. Exit 0 when something was recovered, 1 when nothing was.
+int CommandConfig(int argc, wchar_t **argv) {
+  if (argc < 3) {
+    std::cerr << "usage: antimal config <sample> [--json]\n";
+    return 2;
+  }
+  const std::filesystem::path sample(argv[2]);
+  if (!std::filesystem::exists(sample)) {
+    std::cerr << "sample not found: " << antimal::PathToUtf8(sample) << "\n";
+    return 2;
+  }
+  const auto bytes = antimal::ReadAllBytes(sample);
+  const auto cs = antimal::ExtractCobaltStrikeConfig(bytes);
+  const auto xor1 = antimal::MineXorObfuscatedUrls(bytes);
+  const auto xorN = antimal::MineMultiByteXorObfuscatedUrls(bytes);
+  const auto b64 = antimal::MineBase64WrappedIocs(bytes);
+  const auto rc4 = antimal::MineRc4WrappedConfig(bytes);
+  const bool any = cs.found || !xor1.empty() || !xorN.empty() || !rc4.empty() ||
+                   (b64.urls.size() + b64.ips.size() + b64.domains.size()) > 0;
+
+  if (HasFlag(argc, argv, "--json")) {
+    std::cout << "{\"sample\":" << JsonQuote(antimal::PathToUtf8(sample))
+              << ",\"recovered\":" << (any ? "true" : "false")
+              << ",\"cobaltStrike\":";
+    if (cs.found) {
+      std::cout << "{\"found\":true,\"xorKey\":" << static_cast<int>(cs.xorKey)
+                << ",\"beaconType\":" << cs.beaconType << ",\"port\":" << cs.port
+                << ",\"sleepMs\":" << cs.sleepMs << ",\"jitter\":" << cs.jitter
+                << ",\"watermark\":" << cs.watermark
+                << ",\"userAgent\":" << JsonQuote(cs.userAgent)
+                << ",\"c2Servers\":" << JsonStrArray(cs.c2Servers)
+                << ",\"uris\":" << JsonStrArray(cs.uris) << "}";
+    } else {
+      std::cout << "{\"found\":false}";
+    }
+    std::vector<std::string> xorUrls;
+    for (const auto &x : xor1) xorUrls.push_back(x.value);
+    for (const auto &x : xorN) xorUrls.push_back(x.value);
+    std::cout << ",\"xorUrls\":" << JsonStrArray(xorUrls)
+              << ",\"base64Urls\":" << JsonStrArray(b64.urls)
+              << ",\"base64Ips\":" << JsonStrArray(b64.ips)
+              << ",\"base64Domains\":" << JsonStrArray(b64.domains)
+              << ",\"rc4\":[";
+    for (size_t i = 0; i < rc4.size(); ++i) {
+      std::cout << (i ? "," : "") << "{\"url\":" << JsonQuote(rc4[i].value)
+                << ",\"key\":" << JsonQuote(rc4[i].key) << "}";
+    }
+    std::cout << "]}\n";
+    return any ? 0 : 1;
+  }
+
+  std::cout << "Malware configuration for " << antimal::PathToUtf8(sample) << "\n";
+  if (!any) {
+    std::cout << "  (no embedded config/C2 recovered statically)\n";
+    return 1;
+  }
+  if (cs.found) {
+    std::cout << "  Cobalt Strike beacon (xor key 0x" << std::hex
+              << static_cast<int>(cs.xorKey) << std::dec << "):\n";
+    std::cout << "    beacon type: " << cs.beaconType << "  port: " << cs.port
+              << "  sleep: " << cs.sleepMs << "ms  jitter: " << cs.jitter << "%\n";
+    if (!cs.userAgent.empty()) std::cout << "    user-agent: " << cs.userAgent << "\n";
+    for (const auto &s : cs.c2Servers) std::cout << "    C2: " << s << "\n";
+    for (const auto &u : cs.uris) std::cout << "    URI: " << u << "\n";
+  }
+  for (const auto &x : xor1)
+    std::cout << "  XOR C2 (key 0x" << std::hex << static_cast<int>(x.xorKey)
+              << std::dec << "): " << x.value << "\n";
+  for (const auto &x : xorN) std::cout << "  multi-byte-XOR C2: " << x.value << "\n";
+  for (const auto &h : rc4)
+    std::cout << "  RC4 C2 (key \"" << h.key << "\"): " << h.value << "\n";
+  for (const auto &u : b64.urls) std::cout << "  base64-wrapped URL: " << u << "\n";
+  for (const auto &ip : b64.ips) std::cout << "  base64-wrapped IP: " << ip << "\n";
+  for (const auto &d : b64.domains) std::cout << "  base64-wrapped domain: " << d << "\n";
+  return 0;
+}
+
 // `report-diff` — show what changed between two analysis reports (T78). Pairs
 // with `similarity`: compare the same sample run twice (a determinism check) or
 // two related variants. Exit 1 when material differences exist (so a
@@ -4085,6 +4170,9 @@ int wmain(int argc, wchar_t **argv) {
     }
     if (command == "yara-gen") {
       return CommandYaraGen(argc, argv);
+    }
+    if (command == "config") {
+      return CommandConfig(argc, argv);
     }
     if (command == "fs-ls" || command == "fs-cat" || command == "fs-find" ||
         command == "fs-scan" || command == "reg-ls") {

@@ -40,6 +40,11 @@ unit-tested. A living `private development documentation` tracks done/remaining 
 - **`boot-report` failure breakdown:** `--json` now emits `byCategory`, `byRemediation`, and the
   `incomplete` count; text mode prints the single most common actionable remediation across runs
   (the highest-leverage fix for the dominant failure mode).
+- **`config` command — the "Malware Configuration" view:** runs every static config/C2 extractor
+  (Cobalt Strike beacon + single/multi-byte XOR + base64-wrapped + base64-wrapped RC4) on a sample and
+  presents only the recovered configuration in one focused, analyst-facing place (text + `--json`).
+  Exit 0 when config was recovered, 1 when none. Verified: clean on a benign PE, recovers C2+key from
+  a synthetic RC4-config sample.
 - **Base64-wrapped RC4 config recovery (T18, `MineRc4WrappedConfig`):** the canonical .NET-RAT
   (AsyncRAT/Quasar/njRAT-style) scheme — config RC4-encrypted then base64'd, key a short ASCII string
   elsewhere in the binary. Family-agnostic: tries each embedded ASCII string (3–32 chars) as the RC4

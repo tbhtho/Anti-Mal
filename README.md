@@ -158,6 +158,15 @@ bin\x64\Release\AntiMal.HostCli.exe yara-gen suspicious.exe
 bin\x64\Release\AntiMal.HostCli.exe yara-gen suspicious.exe --out hunt.yar --name MyFamily
 ```
 
+See the recovered **malware configuration / C2** (Cobalt Strike beacon + XOR /
+base64 / base64-wrapped-RC4 obfuscated C2) in one focused view — the analyst's
+"what will this talk to?" question, answered statically:
+
+```powershell
+bin\x64\Release\AntiMal.HostCli.exe config suspicious.exe          # text
+bin\x64\Release\AntiMal.HostCli.exe config suspicious.exe --json   # for automation
+```
+
 Generate a complete Any.Run-style report from a SYNTHETIC detonation — no VM,
 firmware, or hardware required. This exercises the events → report.json →
 report.html (+ filmstrip) pipeline end-to-end and is the documented local
