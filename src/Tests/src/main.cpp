@@ -8922,6 +8922,61 @@ void TestFakeInternet() {
     Expect(sink.IcmpReplies() == 1, "sink ICMP: counter advanced");
   }
 
+  // --- DNS A query -> resolve-all to the sink IP ---
+  {
+    std::vector<uint8_t> dns;
+    be16(dns, 0xBEEF);  // transaction id
+    be16(dns, 0x0100);  // flags: RD
+    be16(dns, 1); be16(dns, 0); be16(dns, 0); be16(dns, 0);  // qd=1, an/ns/ar=0
+    // QNAME "evil.example": 04 e v i l 07 e x a m p l e 00
+    const char *l1 = "evil"; dns.push_back(4);
+    for (const char *c = l1; *c; ++c) dns.push_back(static_cast<uint8_t>(*c));
+    const char *l2 = "example"; dns.push_back(7);
+    for (const char *c = l2; *c; ++c) dns.push_back(static_cast<uint8_t>(*c));
+    dns.push_back(0);
+    be16(dns, 1);  // QTYPE A
+    be16(dns, 1);  // QCLASS IN
+
+    std::vector<uint8_t> udp;
+    be16(udp, 12345); be16(udp, 53);  // src, dst (53 = DNS)
+    be16(udp, static_cast<uint16_t>(8 + dns.size()));  // length
+    be16(udp, 0);                                       // checksum 0 (optional)
+    udp.insert(udp.end(), dns.begin(), dns.end());
+
+    std::vector<uint8_t> ip;
+    ip.push_back(0x45); ip.push_back(0x00);
+    be16(ip, static_cast<uint16_t>(20 + udp.size()));
+    be16(ip, 0x0001); be16(ip, 0x0000); ip.push_back(64); ip.push_back(17);  // proto UDP
+    be16(ip, 0x0000);
+    const uint8_t gIp[4] = {0x0A, 0x00, 0x02, 0x64};
+    const uint8_t sIp[4] = {0x0A, 0x00, 0x02, 0x03};
+    for (int i = 0; i < 4; ++i) ip.push_back(gIp[i]);
+    for (int i = 0; i < 4; ++i) ip.push_back(sIp[i]);
+
+    std::vector<uint8_t> f;
+    for (int i = 0; i < 6; ++i) f.push_back(sinkMac[i]);
+    for (int i = 0; i < 6; ++i) f.push_back(guestMac[i]);
+    be16(f, 0x0800);
+    f.insert(f.end(), ip.begin(), ip.end());
+    f.insert(f.end(), udp.begin(), udp.end());
+
+    std::vector<Frame> out;
+    Expect(sink.OnGuestFrame(f.data(), f.size(), out) == 1,
+           "sink DNS: one response synthesized");
+    const Frame &r = out[0];
+    Expect(r[14 + 9] == 17, "sink DNS: reply is IPv4/UDP");
+    // UDP at +34: src port 53.
+    Expect(r[34] == 0 && r[35] == 53, "sink DNS: reply UDP src port 53");
+    // DNS at +42: QR set + ancount 1.
+    Expect(r[42 + 2] == 0x81 && r[42 + 3] == 0x80, "sink DNS: QR/RA flags set");
+    Expect(r[42 + 6] == 0 && r[42 + 7] == 1, "sink DNS: ancount = 1");
+    // The A answer's rdata is the final 4 bytes = the sink IP 10.0.2.3.
+    Expect(r[r.size() - 4] == 0x0A && r[r.size() - 3] == 0x00 &&
+               r[r.size() - 2] == 0x02 && r[r.size() - 1] == 0x03,
+           "sink DNS: A answer resolves to the sink IP (resolve-all)");
+    Expect(sink.DnsReplies() == 1, "sink DNS: counter advanced");
+  }
+
   // --- bounds / fuzz: malformed frames yield no reply and never read OOB ---
   {
     std::vector<Frame> out;

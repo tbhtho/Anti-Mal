@@ -9,11 +9,34 @@ namespace {
 constexpr uint16_t kEthArp = 0x0806;
 constexpr uint16_t kEthIpv4 = 0x0800;
 constexpr uint8_t kIpProtoIcmp = 1;
+constexpr uint8_t kIpProtoUdp = 17;
 
 constexpr std::size_t kEthHdr = 14;   // dst[6] src[6] type[2]
 constexpr std::size_t kArpLen = 28;   // ARP packet body
 constexpr std::size_t kIpMinHdr = 20; // IPv4 header (no options)
 constexpr std::size_t kIcmpHdr = 8;   // type code cksum id seq
+constexpr std::size_t kUdpHdr = 8;    // srcPort dstPort length checksum
+constexpr std::size_t kDnsHdr = 12;   // id flags qd an ns ar
+
+// IPv4 UDP checksum over the pseudo-header (srcIP, dstIP, 0, proto, udpLen) +
+// the UDP header & data. `udp` points at the UDP header (checksum field 0).
+uint16_t UdpChecksum(const uint8_t *srcIp, const uint8_t *dstIp,
+                     const uint8_t *udp, std::size_t udpLen) {
+  uint32_t sum = 0;
+  auto add = [&](const uint8_t *p, std::size_t n) {
+    for (std::size_t i = 0; i + 1 < n; i += 2)
+      sum += static_cast<uint32_t>((p[i] << 8) | p[i + 1]);
+    if (n & 1) sum += static_cast<uint32_t>(p[n - 1]) << 8;
+  };
+  add(srcIp, 4);
+  add(dstIp, 4);
+  sum += kIpProtoUdp;          // zero byte + proto
+  sum += static_cast<uint32_t>(udpLen & 0xFFFF);
+  add(udp, udpLen);
+  while (sum >> 16) sum = (sum & 0xFFFF) + (sum >> 16);
+  const uint16_t c = static_cast<uint16_t>(~sum & 0xFFFF);
+  return c == 0 ? 0xFFFF : c;  // 0 means "no checksum"; use 0xFFFF instead
+}
 
 uint16_t RdBE16(const uint8_t *p) {
   return static_cast<uint16_t>((static_cast<uint16_t>(p[0]) << 8) | p[1]);
@@ -109,10 +132,25 @@ bool FakeInternet::HandleIpv4(const uint8_t *f, std::size_t len,
     ++framesDropped_;  // truncated / lying length — don't trust it
     return false;
   }
-  if (ip[9] != kIpProtoIcmp) return false;  // TCP/UDP/DNS in later slices
+  const std::size_t l4Off = kEthHdr + ihl;
+  const std::size_t l4Len = static_cast<std::size_t>(totalLen) - ihl;
 
-  const std::size_t icmpOff = kEthHdr + ihl;
-  const std::size_t icmpLen = static_cast<std::size_t>(totalLen) - ihl;
+  // UDP: only DNS (port 53) is synthesized for now — the highest-value sink
+  // behavior (C2 domain resolution succeeds so the sample proceeds).
+  if (ip[9] == kIpProtoUdp) {
+    if (l4Len < kUdpHdr || l4Off + l4Len > len) {
+      ++framesDropped_;
+      return false;
+    }
+    if (RdBE16(f + l4Off + 2) == 53) {  // UDP dst port
+      return HandleDns(f, ihl, l4Off, l4Len, out);
+    }
+    return false;  // other UDP ports: no reply (yet)
+  }
+  if (ip[9] != kIpProtoIcmp) return false;  // TCP handshake in a later slice
+
+  const std::size_t icmpOff = l4Off;
+  const std::size_t icmpLen = l4Len;
   if (icmpLen < kIcmpHdr || icmpOff + icmpLen > len) {
     ++framesDropped_;
     return false;
@@ -141,6 +179,112 @@ bool FakeInternet::HandleIpv4(const uint8_t *f, std::size_t len,
 
   out.push_back(std::move(r));
   ++icmpReplies_;
+  return true;
+}
+
+bool FakeInternet::HandleDns(const uint8_t *f, std::size_t ihl,
+                             std::size_t udpOff, std::size_t udpLen,
+                             std::vector<Frame> &out) {
+  // The DNS message sits after the 8-byte UDP header.
+  const std::size_t dnsOff = udpOff + kUdpHdr;
+  const std::size_t dnsLen = udpLen - kUdpHdr;
+  if (dnsLen < kDnsHdr) {
+    ++framesDropped_;
+    return false;
+  }
+  const uint8_t *dns = f + dnsOff;
+  const uint16_t qd = RdBE16(dns + 4);
+  if (qd != 1) return false;  // only single-question queries (the common case)
+  if (dns[2] & 0x80) return false;  // already a response (QR set) — ignore
+
+  // Parse the single question's name length (labels until a 0 byte or a
+  // compression pointer), strictly bounded by the DNS message length.
+  std::size_t p = kDnsHdr;  // offset within the DNS message
+  bool nameOk = false;
+  while (p < dnsLen) {
+    const uint8_t l = dns[p];
+    if (l == 0) {
+      ++p;  // root label terminator
+      nameOk = true;
+      break;
+    }
+    if ((l & 0xC0) == 0xC0) {  // compression pointer (2 bytes) ends the name
+      p += 2;
+      nameOk = (p <= dnsLen);
+      break;
+    }
+    p += static_cast<std::size_t>(l) + 1;  // label length byte + label
+  }
+  if (!nameOk || p + 4 > dnsLen) {  // need QTYPE(2) + QCLASS(2)
+    ++framesDropped_;
+    return false;
+  }
+  const std::size_t questionLen = p + 4;  // name + qtype + qclass
+  const uint16_t qtype = RdBE16(dns + p);
+  const bool answerA = (qtype == 1);  // A record -> resolve to the sink IP
+
+  // Build the DNS response: echo header (flags = response) + the question +
+  // (for an A query) one answer pointing the name back at offset 12 (0xC00C).
+  std::vector<uint8_t> resp;
+  resp.reserve(questionLen + 16);
+  resp.insert(resp.end(), dns, dns + questionLen);  // header + question verbatim
+  WrBE16(resp.data(), RdBE16(dns));                 // transaction id (echo)
+  WrBE16(resp.data() + 2, 0x8180);  // QR=1, RD=1, RA=1, rcode=0 (no error)
+  WrBE16(resp.data() + 4, 1);       // qdcount
+  WrBE16(resp.data() + 6, answerA ? 1 : 0);  // ancount
+  WrBE16(resp.data() + 8, 0);       // nscount
+  WrBE16(resp.data() + 10, 0);      // arcount
+  if (answerA) {
+    const uint8_t answer[16] = {
+        0xC0, 0x0C,             // name: pointer to offset 12 (the question name)
+        0x00, 0x01,             // type A
+        0x00, 0x01,             // class IN
+        0x00, 0x00, 0x00, 0x3C, // TTL 60s
+        0x00, 0x04,             // rdlength 4
+        static_cast<uint8_t>((ip_ >> 24) & 0xFF),
+        static_cast<uint8_t>((ip_ >> 16) & 0xFF),
+        static_cast<uint8_t>((ip_ >> 8) & 0xFF),
+        static_cast<uint8_t>(ip_ & 0xFF)};  // rdata = sink IP (big-endian)
+    resp.insert(resp.end(), answer, answer + sizeof(answer));
+  }
+
+  // Assemble Ethernet + IPv4 + UDP + DNS reply.
+  const std::size_t udpTotal = kUdpHdr + resp.size();
+  const std::size_t ipTotal = ihl + udpTotal;  // reuse the request's IHL (no options assumed past 20 is fine to copy)
+  Frame r(kEthHdr + ipTotal, 0);
+  // Ethernet: dst = guest src, src = sink.
+  std::memcpy(r.data(), f + 6, 6);
+  std::memcpy(r.data() + 6, mac_.data(), 6);
+  WrBE16(r.data() + 12, kEthIpv4);
+  // IPv4 header: copy the request's header (preserves IHL/options), then fix up.
+  uint8_t *rip = r.data() + kEthHdr;
+  std::memcpy(rip, f + kEthHdr, ihl);
+  WrBE16(rip + 2, static_cast<uint16_t>(ipTotal));  // total length
+  WrBE16(rip + 4, 0);                               // id 0
+  WrBE16(rip + 6, 0x4000);                          // flags = DF, no frag
+  rip[8] = 64;                                      // TTL
+  rip[9] = kIpProtoUdp;
+  // src <- sink IP, dst <- the guest's source IP (from the request).
+  uint8_t reqSrc[4];
+  std::memcpy(reqSrc, f + kEthHdr + 12, 4);
+  rip[12] = static_cast<uint8_t>((ip_ >> 24) & 0xFF);
+  rip[13] = static_cast<uint8_t>((ip_ >> 16) & 0xFF);
+  rip[14] = static_cast<uint8_t>((ip_ >> 8) & 0xFF);
+  rip[15] = static_cast<uint8_t>(ip_ & 0xFF);
+  std::memcpy(rip + 16, reqSrc, 4);
+  rip[10] = rip[11] = 0;
+  WrBE16(rip + 10, InternetChecksum(rip, ihl));
+  // UDP header: src port 53, dst port = the query's src port.
+  uint8_t *rudp = rip + ihl;
+  WrBE16(rudp, 53);
+  std::memcpy(rudp + 2, f + udpOff, 2);  // dst port = request's src port
+  WrBE16(rudp + 4, static_cast<uint16_t>(udpTotal));
+  rudp[6] = rudp[7] = 0;  // checksum 0 before recompute
+  std::memcpy(rudp + kUdpHdr, resp.data(), resp.size());
+  WrBE16(rudp + 6, UdpChecksum(rip + 12, rip + 16, rudp, udpTotal));
+
+  out.push_back(std::move(r));
+  ++dnsReplies_;
   return true;
 }
 
