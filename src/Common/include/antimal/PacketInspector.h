@@ -42,6 +42,13 @@ std::string ParseDnsQueryName(const uint8_t *dns, size_t len);
 bool ParseHttpRequest(const uint8_t *data, size_t len, std::string &method,
                       std::string &path, std::string &host);
 
+// Extracts the SNI host_name from a TLS ClientHello, or "" if the payload is not
+// a ClientHello / has no SNI / is malformed. This is the no-MITM way to recover
+// an HTTPS C2's hostname: the destination is plaintext in the ClientHello even
+// though the rest of the session is encrypted. Strictly bounds-checked (parses
+// untrusted guest bytes); does not require completing or decrypting the session.
+std::string ParseTlsClientHelloSni(const uint8_t *data, size_t len);
+
 // Inspects one outbound Ethernet frame and returns the network events it implies
 // (network.connect for a SYN, network.dns for a port-53 query, network.http for a
 // port-80 request). Returns {} for frames it doesn't recognize.

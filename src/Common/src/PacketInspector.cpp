@@ -101,6 +101,68 @@ bool ParseHttpRequest(const uint8_t *data, size_t len, std::string &method,
   return true;
 }
 
+std::string ParseTlsClientHelloSni(const uint8_t *data, size_t len) {
+  // TLS record (5B): type(1)=0x16 handshake, version(2), length(2).
+  if (!data || len < 5 + 4) return {};
+  if (data[0] != 0x16) return {};  // not a handshake record
+  size_t p = 5;
+  // Handshake header (4B): msg type(1)=0x01 ClientHello, length(3).
+  if (data[p] != 0x01) return {};  // not a ClientHello
+  p += 4;
+  // ClientHello body: client_version(2) + random(32).
+  if (p + 2 + 32 > len) return {};
+  p += 2 + 32;
+  // session_id: len(1) + bytes.
+  if (p + 1 > len) return {};
+  const size_t sidLen = data[p++];
+  if (p + sidLen > len) return {};
+  p += sidLen;
+  // cipher_suites: len(2) + bytes.
+  if (p + 2 > len) return {};
+  const size_t csLen = (static_cast<size_t>(data[p]) << 8) | data[p + 1];
+  p += 2;
+  if (p + csLen > len) return {};
+  p += csLen;
+  // compression_methods: len(1) + bytes.
+  if (p + 1 > len) return {};
+  const size_t cmLen = data[p++];
+  if (p + cmLen > len) return {};
+  p += cmLen;
+  // extensions: total len(2), then [type(2) len(2) data]*.
+  if (p + 2 > len) return {};
+  const size_t extTotal = (static_cast<size_t>(data[p]) << 8) | data[p + 1];
+  p += 2;
+  size_t extEnd = p + extTotal;
+  if (extEnd > len) extEnd = len;  // clamp to captured bytes
+  while (p + 4 <= extEnd) {
+    const uint16_t extType = (static_cast<uint16_t>(data[p]) << 8) | data[p + 1];
+    const size_t extLen = (static_cast<size_t>(data[p + 2]) << 8) | data[p + 3];
+    p += 4;
+    if (p + extLen > extEnd) break;
+    if (extType == 0x0000) {  // server_name
+      // server_name_list: len(2), then entries [name_type(1) name_len(2) name].
+      size_t q = p;
+      if (q + 2 > p + extLen) return {};
+      q += 2;  // skip the list length
+      if (q + 3 > p + extLen) return {};
+      const uint8_t nameType = data[q];
+      const size_t nameLen =
+          (static_cast<size_t>(data[q + 1]) << 8) | data[q + 2];
+      q += 3;
+      if (nameType != 0 || q + nameLen > p + extLen || nameLen == 0) return {};
+      std::string host;
+      host.reserve(nameLen);
+      for (size_t i = 0; i < nameLen && i < 255; ++i) {
+        const char c = static_cast<char>(data[q + i]);
+        host.push_back((c > 32 && c < 127) ? c : '?');
+      }
+      return host;
+    }
+    p += extLen;
+  }
+  return {};
+}
+
 std::vector<EventRecord> InspectEthernetFrame(const uint8_t *frame, size_t len) {
   std::vector<EventRecord> out;
   if (!frame || len < 14) return out;
@@ -132,6 +194,17 @@ std::vector<EventRecord> InspectEthernetFrame(const uint8_t *frame, size_t len) 
         ev.details["method"] = method;
         ev.details["host"] = host;
         ev.details["path"] = path;
+        out.push_back(std::move(ev));
+      }
+    }
+    // TLS ClientHello (any port — C2 isn't always on 443): recover the SNI
+    // host, the HTTPS destination in plaintext, without MITM/decryption.
+    if (dataLen > 9 && data[0] == 0x16) {
+      const std::string sni = ParseTlsClientHelloSni(data, dataLen);
+      if (!sni.empty()) {
+        EventRecord ev = MakeNetEvent("network.tls", sni);
+        ev.details["sni"] = sni;
+        ev.details["dstPort"] = std::to_string(dstPort);
         out.push_back(std::move(ev));
       }
     }

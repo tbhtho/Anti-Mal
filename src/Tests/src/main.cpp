@@ -8524,6 +8524,68 @@ void TestPacketInspector() {
              synEvents[0].target == "93.184.216.34:443",
          "packet: TCP SYN -> network.connect");
 
+  // TLS ClientHello to :443 -> network.tls with the SNI host (no MITM).
+  {
+    const std::string host = "c2.evil.example";
+    // Build a minimal but well-formed ClientHello carrying an SNI extension.
+    std::vector<uint8_t> ch;
+    auto p16 = [&](std::vector<uint8_t> &v, uint16_t x) {
+      v.push_back(static_cast<uint8_t>(x >> 8));
+      v.push_back(static_cast<uint8_t>(x & 0xFF));
+    };
+    // SNI extension data: list_len(2) + [name_type(1) name_len(2) name].
+    std::vector<uint8_t> sniExt;
+    p16(sniExt, static_cast<uint16_t>(host.size() + 3));  // server_name_list len
+    sniExt.push_back(0);                                  // name_type host_name
+    p16(sniExt, static_cast<uint16_t>(host.size()));
+    for (char c : host) sniExt.push_back(static_cast<uint8_t>(c));
+    // extensions = [type=0x0000(2) len(2) sniExt].
+    std::vector<uint8_t> exts;
+    p16(exts, 0x0000);
+    p16(exts, static_cast<uint16_t>(sniExt.size()));
+    exts.insert(exts.end(), sniExt.begin(), sniExt.end());
+    // ClientHello body: version(2) random(32) sid_len(1)=0 cs_len(2)=2 cs(2)
+    //   comp_len(1)=1 comp(1) ext_len(2) exts.
+    std::vector<uint8_t> body;
+    p16(body, 0x0303);                       // TLS 1.2
+    for (int i = 0; i < 32; ++i) body.push_back(0xAB);  // random
+    body.push_back(0);                       // session id len
+    p16(body, 2); p16(body, 0x1301);         // cipher suites
+    body.push_back(1); body.push_back(0);    // compression
+    p16(body, static_cast<uint16_t>(exts.size()));
+    body.insert(body.end(), exts.begin(), exts.end());
+    // Handshake header: type(1)=0x01, length(3).
+    std::vector<uint8_t> hs;
+    hs.push_back(0x01);
+    hs.push_back(static_cast<uint8_t>((body.size() >> 16) & 0xFF));
+    hs.push_back(static_cast<uint8_t>((body.size() >> 8) & 0xFF));
+    hs.push_back(static_cast<uint8_t>(body.size() & 0xFF));
+    hs.insert(hs.end(), body.begin(), body.end());
+    // TLS record header: type 0x16, version, length.
+    ch.push_back(0x16); p16(ch, 0x0301);
+    p16(ch, static_cast<uint16_t>(hs.size()));
+    ch.insert(ch.end(), hs.begin(), hs.end());
+
+    Expect(antimal::ParseTlsClientHelloSni(ch.data(), ch.size()) == host,
+           "packet: ParseTlsClientHelloSni extracts the SNI host");
+
+    std::vector<uint8_t> tls;
+    eth(tls, 0x0800);
+    ipv4(tls, 6, {93, 184, 216, 34});
+    const uint8_t tcp443[] = {0xC0, 0x00, 0x01, 0xBB, 0, 0, 0, 0, 0, 0,
+                              0,    0,    0x50, 0x18, 0, 0, 0, 0, 0, 0};
+    for (uint8_t b : tcp443) tls.push_back(b);  // dst 443, PSH+ACK
+    tls.insert(tls.end(), ch.begin(), ch.end());
+    auto tlsEvents = antimal::InspectEthernetFrame(tls.data(), tls.size());
+    bool sawTls = false;
+    for (const auto &e : tlsEvents)
+      if (e.action == "network.tls" && e.target == host) sawTls = true;
+    Expect(sawTls, "packet: TLS ClientHello -> network.tls with SNI");
+    // Truncated ClientHello must not over-read.
+    Expect(antimal::ParseTlsClientHelloSni(ch.data(), 12).empty(),
+           "packet: truncated ClientHello -> no SNI (bounds-safe)");
+  }
+
   // Malformed / non-IPv4 frames yield nothing (hardened against guest bytes).
   Expect(antimal::InspectEthernetFrame(nullptr, 0).empty(),
          "packet: null frame -> no events");
