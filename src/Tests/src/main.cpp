@@ -3608,7 +3608,8 @@ void TestSimulatedReport() {
                         antimal::SimScenario::Ransomware,
                         antimal::SimScenario::Loader,
                         antimal::SimScenario::Coinminer,
-                        antimal::SimScenario::Wiper}) {
+                        antimal::SimScenario::Wiper,
+                        antimal::SimScenario::Rat}) {
     const auto s = antimal::BuildSimulatedReport("sc", scenario);
     const std::string which = antimal::SimScenarioName(scenario);
     Expect(s.sandboxVerdict == antimal::Verdict::Malicious,

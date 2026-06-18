@@ -63,6 +63,7 @@ std::optional<SimScenario> ParseSimScenario(const std::string &name) {
   if (name == "loader") return SimScenario::Loader;
   if (name == "coinminer") return SimScenario::Coinminer;
   if (name == "wiper") return SimScenario::Wiper;
+  if (name == "rat") return SimScenario::Rat;
   return std::nullopt;
 }
 
@@ -73,6 +74,7 @@ const char *SimScenarioName(SimScenario scenario) {
     case SimScenario::Loader: return "loader";
     case SimScenario::Coinminer: return "coinminer";
     case SimScenario::Wiper: return "wiper";
+    case SimScenario::Rat: return "rat";
   }
   return "stealer";
 }
@@ -334,6 +336,52 @@ AnalysisReport BuildSimulatedReport(const std::string &runId,
         "Deleted volume shadow copies, disabled boot recovery, then overwrote "
         "user files and raw disk sectors -- destructive wiper (T1485/T1561).",
         "No exfiltration or C2: impact is destruction, not theft."};
+  } else if (scenario == SimScenario::Rat) {
+    report.samplePath = "samples/simulated/client.exe";
+    sampleBlob =
+        "MZP synthetic AntiMal RAT simulation -- not real. strings: "
+        "https://rat-c2.example/gate keylogger GetAsyncKeyState BitBlt "
+        "remote shell upload download persistence";
+    scan.score = 85;
+    scan.iocs.urls = {"https://rat-c2.example/gate"};
+    scan.iocs.domains = {"rat-c2.example"};
+    scan.iocs.registryPaths = {
+        "HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Run\\WindowsClient"};
+    scan.iocs.suspiciousApis = {"GetAsyncKeyState", "SetWindowsHookExW", "BitBlt",
+                                "InternetOpenW"};
+    scan.tags = {
+        {"rat", "family", 88, {"remote-access + keylog + screen-capture strings"}},
+        {"persistence", "capability", 70, {"Run-key write under HKCU"}}};
+    scan.findings = {
+        {"sim.rat", "Remote-access trojan behavior modeled by the simulation", 60},
+        {"sim.keylog", "Keystroke capture modeled by the simulation", 25}};
+    ev.push_back(Proc(Ts(4), 4242, 4000, "client.exe",
+                      "C:\\Users\\analyst\\AppData\\Roaming\\client.exe", "T1204.002"));
+    ev.push_back(Ev(Ts(4), "agent", "agent.sample.received", 4242, 4000,
+                    "client.exe", "sampleExecuted=true"));
+    ev.push_back(Ev(Ts(6), "registry", "registry.set", 4242, 4000, "client.exe",
+                    "HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Run\\"
+                    "WindowsClient = client.exe",
+                    "T1547.001"));
+    ev.push_back(Ev(Ts(8), "network", "network.connection", 4242, 4000,
+                    "client.exe", "rat-c2.example:443 (TLS)", "T1071.001"));
+    ev.push_back(Ev(Ts(9), "behavior", "behavior.remote_access", 4242, 4000,
+                    "client.exe", "interactive remote shell over C2", "T1219"));
+    ev.push_back(Ev(Ts(11), "behavior", "behavior.keylog", 4242, 4000,
+                    "client.exe", "GetAsyncKeyState keystroke capture", "T1056.001"));
+    ev.push_back(Ev(Ts(13), "behavior", "behavior.screen_capture", 4242, 4000,
+                    "client.exe", "BitBlt desktop screenshot", "T1113"));
+    ev.push_back(Ev(Ts(15), "network", "network.upload", 4242, 4000, "client.exe",
+                    "rat-c2.example:443 (captured input exfil)", "T1041"));
+    report.networkDomains = {"rat-c2.example"};
+    report.verdictScore = 88;
+    report.verdictRationale = {
+        kSimLabel,
+        "Established persistent TLS C2 (T1071/T1573), opened an interactive remote "
+        "shell (T1219), captured keystrokes + the screen, and exfiltrated over the "
+        "C2 channel (T1041) -- a remote-access trojan.",
+        "Run-key persistence under a deceptive 'WindowsClient' name corroborates "
+        "the RAT tag."};
   }
 
   // Real static hashes over the scenario buffer.

@@ -40,6 +40,10 @@ unit-tested. A living `private development documentation` tracks done/remaining 
 - **`boot-report` failure breakdown:** `--json` now emits `byCategory`, `byRemediation`, and the
   `incomplete` count; text mode prints the single most common actionable remediation across runs
   (the highest-leverage fix for the dominant failure mode).
+- **`simulate --scenario rat`:** a sixth synthetic scenario — a remote-access trojan with persistent
+  TLS C2, an interactive remote shell (T1219), keylogging (T1056.001), screen capture (T1113), and
+  exfil over C2 (T1041) — spanning Execution→Persistence→Credential Access→Collection→C2→Exfil. Adds
+  the ATT&CK techniques T1219/T1113 to the catalog (name + tactic).
 - **MITRE ATT&CK tactic grouping (kill-chain view):** `MitreCatalog` gains `MitreTechniqueTactic`
   (technique→tactic, with sub-technique→parent fallback and an "Other" catch-all so nothing is
   dropped). The report's MITRE panel now groups techniques by tactic in canonical kill-chain order

@@ -219,7 +219,7 @@ void PrintUsage() {
       << "  antimal doctor [--json]              (host & workflow readiness check)\n"
       << "  antimal boot-report [--workspace <dir>] [--json]  (boot reliability over all runs)\n"
       << "  antimal rebuild-report <run-id-or-dir> [--html] [--force]  (recover report.json from events.jsonl)\n"
-      << "  antimal simulate [--scenario stealer|ransomware|loader|coinminer|wiper] [--out <dir>] [--run-id <id>]\n"
+      << "  antimal simulate [--scenario stealer|ransomware|loader|coinminer|wiper|rat] [--out <dir>] [--run-id <id>]\n"
       << "  antimal report-diff <run-or-report-A> <run-or-report-B> [--json]  (what changed)\n"
       << "  antimal yara-gen <sample> [--out rule.yar] [--name R] [--max-strings N]  (auto YARA rule)\n"
       << "  antimal config <sample> [--json]     (recovered malware config / C2)\n";

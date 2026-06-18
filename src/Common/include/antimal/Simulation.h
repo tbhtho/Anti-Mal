@@ -17,6 +17,7 @@ enum class SimScenario {
   Loader,     // stage download + process injection / hollowing
   Coinminer,  // resource hijacking: miner + pool C2 + persistence
   Wiper,      // data destruction: file overwrite + shadow/recovery wipe
+  Rat,        // remote-access trojan: persistent C2 + keylog + screen capture
 };
 
 std::optional<SimScenario> ParseSimScenario(const std::string &name);
