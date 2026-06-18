@@ -80,6 +80,7 @@
       if (m.evt === 'scan.yara' && m.data) onYaraResult(m.data);
       if (m.evt === 'scan.config' && m.data) onConfigResult(m.data);
       if (m.evt === 'reports.data' && m.data) onReportsData(m.data);
+      if (m.evt === 'reliability.data' && m.data) onReliabilityData(m.data);
       if (m.evt === 'dashboard.data' && m.data) onDashboardData(m.data);
       if (m.evt === 'run.status' && m.data) onRunStatus(m.data);
       if (m.evt === 'telemetry' && m.data) onTelemetry(m.data);
@@ -185,6 +186,7 @@
     },
     reports: function () {
       return '<h1 class="page-title">Reports</h1><p class="page-sub">Static and dynamic analysis reports archived under the workspace.</p>' +
+        '<div class="panel"><h2>Boot reliability</h2><div id="reliability-box"><p class="page-sub" style="margin:0">Loading&hellip;</p></div></div>' +
         '<div class="panel"><table class="grid"><thead><tr><th>Run</th><th>File</th><th>Risk</th><th>Verdict</th><th>Created</th><th>Type</th><th>Actions</th></tr></thead><tbody id="reports-rows"><tr><td colspan="7" class="page-sub" style="padding:14px">Loading&hellip;</td></tr></tbody></table></div>';
     },
     base: function () {
@@ -361,7 +363,26 @@
       appendLog(r && r.ok ? 'INFO' : 'ERROR', r && r.ok ? 'Config loaded from host.' : 'Config load failed.');
     });
   }
+  function pctOf(n, d) { return d > 0 ? Math.round(100 * n / d) : 0; }
+  function onReliabilityData(d) {
+    var box = $('#reliability-box'); if (!box) return;
+    if (!d || d.error) { box.innerHTML = '<p class="page-sub" style="margin:0">Reliability unavailable.</p>'; return; }
+    if (!d.runs) { box.innerHTML = '<p class="page-sub" style="margin:0">No runs yet — detonate first.</p>'; return; }
+    var stages = d.byStage || {};
+    // kv with injection-safe stage labels (textContent below)
+    box.innerHTML = '<p class="page-sub" style="margin:0 0 8px">' + (d.runs | 0) + ' run(s) · reached user-mode ' +
+      pctOf(d.reachedUserMode | 0, d.runs) + '% · reached desktop ' + pctOf(d.reachedDesktop | 0, d.runs) +
+      '% · ' + (d.incomplete | 0) + ' incomplete</p><div class="kv" id="reliability-kv"></div>';
+    var kv = $('#reliability-kv');
+    Object.keys(stages).sort().forEach(function (k) {
+      var kd = document.createElement('div'); kd.className = 'k'; kd.textContent = k;
+      var vd = document.createElement('div'); vd.className = 'v'; vd.textContent = (stages[k] | 0) + ' (' + pctOf(stages[k] | 0, d.runs) + '%)';
+      kv.appendChild(kd); kv.appendChild(vd);
+    });
+  }
   function loadReports() {
+    var rbox = $('#reliability-box'); if (rbox) rbox.innerHTML = '<p class="page-sub" style="margin:0">Loading…</p>';
+    send('reliability.get');
     var body = $('#reports-rows');
     if (body) body.innerHTML = '<tr><td colspan="7" class="page-sub" style="padding:14px">Loading…</td></tr>';
     send('reports.list').then(function (r) {

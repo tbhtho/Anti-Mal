@@ -24,6 +24,7 @@
 #include "antimal/FileUtil.h"
 #include "antimal/Json.h"
 #include "antimal/JsonValue.h"
+#include "antimal/BootReliability.h"
 #include "antimal/ConfigExtractor.h"
 #include "antimal/Report.h"
 #include "antimal/Scanner.h"
@@ -805,6 +806,38 @@ void WebViewHost::RegisterHandlers() {
   // report.json, sorts by mtime, and surfaces the most recent kMax (a workspace
   // can hold hundreds of runs, and each parse is non-trivial). Runs on a worker
   // and returns the rows via a reports.data event so the UI never blocks.
+  // P3: boot-reliability rollup across the workspace (the GUI view of the
+  // `boot-report` CLI). Uses the shared Common aggregation on a worker, then
+  // Emits reliability.data with the reach rates + per-stage histogram.
+  router_.Register("reliability.get", [this](const JsonValue &) -> std::string {
+    const HWND h = hwnd_;
+    std::thread([h]() {
+      CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+      try {
+        const AppConfig c = LoadConfig(DefaultConfigPath());
+        const BootReliability r = AggregateBootReliability(c.workspaceRoot);
+        std::string stages = "{";
+        bool first = true;
+        for (const auto &kv : r.byStage) {
+          stages += (first ? "" : ",") + JsonQuote(kv.first) + ":" +
+                    std::to_string(kv.second);
+          first = false;
+        }
+        stages += "}";
+        WebViewHost::Emit(
+            h, "reliability.data",
+            "{\"runs\":" + std::to_string(r.runs) + ",\"reachedDesktop\":" +
+                std::to_string(r.reachedDesktop) + ",\"reachedUserMode\":" +
+                std::to_string(r.reachedUserMode) + ",\"incomplete\":" +
+                std::to_string(r.incomplete) + ",\"byStage\":" + stages + "}");
+      } catch (...) {
+        WebViewHost::Emit(h, "reliability.data", R"({"error":true})");
+      }
+      CoUninitialize();
+    }).detach();
+    return std::string(R"({"started":true})");
+  });
+
   router_.Register("reports.list", [this](const JsonValue &) -> std::string {
     const HWND h = hwnd_;
     std::thread([h]() {
