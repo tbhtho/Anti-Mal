@@ -3343,6 +3343,14 @@ int CommandReport(int argc, wchar_t **argv) {
       if (d.severityLabel == "high") ++high;
       else if (d.severityLabel == "medium") ++med;
     }
+    // Measured live-display FPS (Criterion 6). The pacing summary is a string
+    // like "28.6fps (target 30) p50 ...". Parse the leading number so the 25-30
+    // FPS target is checkable from the CLI/automation; -1 when not measured.
+    const std::string &pacing = report.dynamicSummary.liveFramePacingSummary;
+    double measuredFps = -1.0;
+    if (!pacing.empty()) {
+      try { measuredFps = std::stod(pacing); } catch (...) { measuredFps = -1.0; }
+    }
     if (HasFlag(argc, argv, "--json")) {
       std::cout << "{\"schemaVersion\":1"
                 << ",\"runId\":" << JsonQuote(report.runId)
@@ -3358,6 +3366,8 @@ int CommandReport(int argc, wchar_t **argv) {
                 << ",\"detections\":" << dets.size()
                 << ",\"detectionsHigh\":" << high
                 << ",\"detectionsMedium\":" << med
+                << ",\"measuredFps\":" << measuredFps
+                << ",\"liveFramePacing\":" << JsonQuote(pacing)
                 << ",\"eventsByCategory\":{";
       bool first = true;
       for (const auto &kv : byCat) {
@@ -3383,6 +3393,10 @@ int CommandReport(int argc, wchar_t **argv) {
     std::cout << "  network:    " << report.networkDomains.size() << " domain(s)\n";
     std::cout << "  detections: " << dets.size() << " (" << high << " high, "
               << med << " medium)\n";
+    if (measuredFps >= 0) {
+      std::cout << "  display:    " << measuredFps << " fps measured (target 25-30)"
+                << (measuredFps < 25 ? "  [below target]" : "") << "\n";
+    }
     const auto crashes = antimal::SummarizeCrashes(report.events);
     if (crashes.totalCrashes > 0 && !crashes.signatures.empty()) {
       const auto &top = crashes.signatures.front();
