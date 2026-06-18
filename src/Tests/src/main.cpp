@@ -9259,6 +9259,85 @@ void TestFakeInternet() {
   }
 }
 
+// End-to-end contained-network data path: wire E1000Device + FakeInternet
+// EXACTLY as the orchestrator/VM does (TX handler -> sink.OnGuestFrame ->
+// DeliverRxFrame), then transmit a guest ARP request through the TX ring and
+// confirm the sink's ARP reply lands in the guest's RX ring. This proves the
+// pieces COMPOSE (which the separate unit tests don't) -- a wiring/seq bug
+// would slip past per-component tests.
+void TestContainedNetworkPath() {
+  using antimal::hv::E1000Device;
+  E1000Device nic;
+  const uint64_t kMmio = 0xF0000000ull;
+  nic.SetMmioBase(kMmio);
+  const uint64_t base = 0x30000ull;
+  std::vector<uint8_t> mem(32768, 0);
+  nic.SetDmaMemory([&](uint64_t gpa, std::size_t len) -> uint8_t * {
+    if (gpa < base || gpa + len > base + mem.size()) return nullptr;
+    return mem.data() + static_cast<size_t>(gpa - base);
+  });
+  // The exact wiring from VirtualMachine::MaybeAttachNic + the orchestrator.
+  antimal::net::FakeInternet sink({0x02, 0x53, 0x49, 0x4E, 0x4B, 0x01},
+                                  0x0A000203u);
+  nic.SetTxHandler([&](const uint8_t *f, std::size_t len) {
+    std::vector<std::vector<uint8_t>> replies;
+    sink.OnGuestFrame(f, len, replies);
+    for (auto &r : replies) nic.DeliverRxFrame(r.data(), r.size());
+  });
+
+  const uint8_t guestMac[6] = {0x02, 0xA1, 0xA1, 0x00, 0x00, 0x01};
+  // ARP request frame at base+0x100 (42 bytes).
+  const uint64_t frameGpa = base + 0x100;
+  uint8_t *fr = mem.data() + 0x100;
+  for (int i = 0; i < 6; ++i) fr[i] = 0xFF;            // dst broadcast
+  for (int i = 0; i < 6; ++i) fr[6 + i] = guestMac[i]; // src guest
+  fr[12] = 0x08; fr[13] = 0x06;                        // ARP
+  fr[14] = 0x00; fr[15] = 0x01; fr[16] = 0x08; fr[17] = 0x00;  // htype/ptype
+  fr[18] = 6; fr[19] = 4; fr[20] = 0x00; fr[21] = 0x01;        // hlen/plen/op=req
+  for (int i = 0; i < 6; ++i) fr[22 + i] = guestMac[i];        // sender MAC
+  fr[28] = 0x0A; fr[29] = 0x00; fr[30] = 0x02; fr[31] = 0x40;  // sender IP 10.0.2.64
+  fr[38] = 0x0A; fr[39] = 0x00; fr[40] = 0x02; fr[41] = 0x01;  // target IP 10.0.2.1
+
+  auto w = [&](uint32_t reg, uint32_t v) { nic.OnWrite(kMmio + reg, 4, v); };
+  // TX ring (8 descs @ base+0): desc 0 -> the ARP frame.
+  uint8_t *txd = mem.data() + 0;
+  for (int i = 0; i < 8; ++i) txd[i] = static_cast<uint8_t>((frameGpa >> (i * 8)) & 0xFF);
+  txd[8] = 42; txd[9] = 0; txd[11] = 0x09;  // len=42, CMD=EOP|RS
+  w(0x3800, static_cast<uint32_t>(base & 0xFFFFFFFF));  // TDBAL
+  w(0x3804, static_cast<uint32_t>(base >> 32));         // TDBAH
+  w(0x3808, 16 * 8);                                    // TDLEN=128
+  w(0x3810, 0);                                         // TDH
+  // RX ring (8 descs @ base+0x200): desc i -> buffer base+0x400+i*0x800.
+  const uint64_t rxRingGpa = base + 0x200;
+  for (uint32_t d = 0; d < 8; ++d) {
+    const uint64_t buf = base + 0x400 + static_cast<uint64_t>(d) * 0x800;
+    uint8_t *rd = mem.data() + 0x200 + d * 16;
+    for (int i = 0; i < 8; ++i) rd[i] = static_cast<uint8_t>((buf >> (i * 8)) & 0xFF);
+  }
+  w(0x2800, static_cast<uint32_t>(rxRingGpa & 0xFFFFFFFF));  // RDBAL
+  w(0x2804, static_cast<uint32_t>(rxRingGpa >> 32));         // RDBAH
+  w(0x2808, 16 * 8);  // RDLEN=128
+  w(0x2810, 0);       // RDH
+  w(0x0100, 0x2);     // RCTL.EN
+  w(0x2818, 3);       // RDT: post 3 RX buffers
+
+  // Kick TX: the tail bump runs ProcessTx -> TX handler -> sink -> RX delivery.
+  w(0x3818, 1);  // TDT = 1
+
+  Expect(nic.FramesTransmitted() == 1, "net path: guest ARP frame transmitted");
+  Expect(nic.FramesReceived() == 1, "net path: sink reply delivered to RX ring");
+  // RX descriptor 0 (at base+0x200) written back with DD|EOP.
+  Expect((mem[0x200 + 12] & 0x03) == 0x03, "net path: RX desc 0 DD|EOP set");
+  // The RX buffer (base+0x400) holds an ARP REPLY: ethertype ARP + opcode 2,
+  // sender MAC = the sink's.
+  const uint8_t *rxbuf = mem.data() + 0x400;
+  Expect(rxbuf[12] == 0x08 && rxbuf[13] == 0x06, "net path: RX frame is ARP");
+  Expect(rxbuf[20] == 0x00 && rxbuf[21] == 0x02, "net path: RX frame is an ARP reply");
+  Expect(rxbuf[22] == 0x02 && rxbuf[23] == 0x53,
+         "net path: ARP reply sender MAC = the sink");
+  Expect(sink.ArpReplies() == 1, "net path: sink recorded one ARP reply");
+}
+
 void TestNicPciConfig() {
   antimal::hv::PcIoDevices pc;
   pc.SetNicPresent(true);
@@ -10362,6 +10441,7 @@ int main() {
     TestE1000RxRing();
     TestPcapWriter();
     TestFakeInternet();
+    TestContainedNetworkPath();
     TestNicPciConfig();
     TestHttpUrlEncode();
     TestFramebufferVisiblePixels();
