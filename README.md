@@ -131,7 +131,8 @@ bin\x64\Release\AntiMal.HostCli.exe init
 
 For an end-to-end, task-oriented walkthrough of the CLI (triage → config → yara-gen
 → detonate → report views → export → offline browsing), see
-private development documentation (private documentation).
+private development documentation (private documentation). For the `report.json` field
+reference (for integrating with the output), see private development documentation (private documentation).
 
 Scan a file:
 
