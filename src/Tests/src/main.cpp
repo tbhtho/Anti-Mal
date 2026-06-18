@@ -1365,6 +1365,33 @@ void TestPs2QueuedInput() {
          "PS/2 input: read diagnostics count port traffic");
 }
 
+// The head-of-line-blocking fix (split keyboard/mouse queues): a mouse byte
+// queued BEFORE a keystroke must not stall the keystroke. The original single
+// queue had a mouse byte block keys; the fix gives independent queues with
+// keyboard priority. Verify a keystroke queued AFTER a full mouse packet is
+// still served first, and the mouse packet survives intact behind it.
+void TestPs2HeadOfLineBlocking() {
+  antimal::hv::Ps2Controller ps2;
+  ps2.InjectMousePacket(0x00, 1, 1);  // 3 mouse bytes queued FIRST (status 0x08,1,1)
+  ps2.InjectKeyboardScancode(0x2A);   // a keystroke queued AFTER the mouse packet
+
+  // Keyboard wins: IRQ1 + AUXB clear + the keystroke drains before any mouse byte.
+  Expect(ps2.PendingIrqLine() == 1,
+         "PS/2 HOL: keyboard IRQ served first despite the older mouse packet");
+  Expect((ps2.OnRead(0x64, 1) & 0x20u) == 0,
+         "PS/2 HOL: next byte is keyboard (AUXB clear), not the queued mouse");
+  Expect((ps2.OnRead(0x60, 1) & 0xFFu) == 0x2Au,
+         "PS/2 HOL: the keystroke drains while the mouse packet waits");
+
+  // The mouse packet is intact behind it and now served (IRQ12 + AUXB set).
+  Expect(ps2.PendingIrqLine() == 12, "PS/2 HOL: mouse served after the keystroke");
+  Expect((ps2.OnRead(0x64, 1) & 0x20u) != 0, "PS/2 HOL: AUXB now set (mouse data)");
+  Expect((ps2.OnRead(0x60, 1) & 0xFFu) == 0x08u,
+         "PS/2 HOL: mouse status byte intact (not corrupted by the keystroke)");
+  Expect((ps2.OnRead(0x60, 1) & 0xFFu) == 0x01u, "PS/2 HOL: mouse dx intact");
+  Expect((ps2.OnRead(0x60, 1) & 0xFFu) == 0x01u, "PS/2 HOL: mouse dy intact");
+}
+
 // A real PS/2 mouse returns MULTI-byte replies to several AUX commands. The old
 // stub ACK-only reply truncated mouse RESET/GET-ID, so mouclass/i8042prt init
 // busy-polled 0x64 forever waiting for the missing bytes -- the cold-boot
@@ -10416,6 +10443,7 @@ int main() {
     TestSerialThreInterruptIsEdgeTriggered();
     TestSerialRxFifoResetPreservesBacklog();
     TestPs2QueuedInput();
+    TestPs2HeadOfLineBlocking();
     TestPs2MouseCommandSequence();
     TestScreenStateClassifier();
     TestLiveInputProtocol();
