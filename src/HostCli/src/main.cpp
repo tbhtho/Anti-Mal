@@ -3105,6 +3105,52 @@ int CommandBaseValidate(int argc, wchar_t **argv,
                    .has_value(),
                "{60FD87F8-...}.cip vulnerable-driver-blocklist policy (removing "
                "it breaks winload)");
+        // e1000e (82574L) inbox driver: pre-answers the networking acceptance
+        // gate offline. The contained NIC presents as 8086:10D3, which binds
+        // only if this Windows build ships a driver declaring that device ID.
+        // The authoritative signal is INF CONTENT, not filename: Win11 renames
+        // DriverStore packages to hashed NET*.INF_* names, so we scan the
+        // net-class packages' .inf files for "DEV_10D3" (and also Windows\INF).
+        // Bounded so it stays a few-second offline check.
+        {
+          std::string hit;
+          size_t infsScanned = 0;
+          constexpr size_t kMaxInfs = 120;
+          auto scanInfForDevId = [&](const std::string &infPath) -> bool {
+            const auto e = ntfs.FindPath(infPath);
+            if (!e || e->directory) return false;
+            const auto bytes = ntfs.ReadFile(*e, 1024ull * 1024ull);
+            return ContainsAsciiNoCase(bytes, "DEV_10D3") ||
+                   ContainsUtf16AsciiNoCase(bytes, "DEV_10D3");
+          };
+          const std::string repo =
+              "Windows\\System32\\DriverStore\\FileRepository";
+          for (const auto &pkg : ntfs.ListDir(repo)) {
+            if (!pkg.directory || infsScanned >= kMaxInfs) break;
+            std::string up = pkg.name;
+            for (char &c : up) c = static_cast<char>(std::toupper((unsigned char)c));
+            if (up.find("NET") == std::string::npos) continue;  // net-class only
+            for (const auto &fl : ntfs.ListDir(repo + "\\" + pkg.name)) {
+              std::string low = fl.name;
+              for (char &c : low) c = static_cast<char>(std::tolower((unsigned char)c));
+              if (low.size() < 4 || low.substr(low.size() - 4) != ".inf") continue;
+              if (++infsScanned > kMaxInfs) break;
+              if (scanInfForDevId(repo + "\\" + pkg.name + "\\" + fl.name)) {
+                hit = pkg.name;
+                break;
+              }
+            }
+            if (!hit.empty()) break;
+          }
+          advise("nic.e1000e-driver", !hit.empty(),
+                 !hit.empty()
+                     ? ("an inbox driver declares PCI\\VEN_8086&DEV_10D3 (" + hit +
+                        ") -> the 82574L NIC should bind on first boot")
+                     : "no inbox driver declares DEV_10D3 (scanned " +
+                           std::to_string(infsScanned) +
+                           " net INFs) -> the 82574L NIC likely won't bind; bake "
+                           "virtio-net or inject an e1000e driver");
+        }
         // Deployed GuestAgent binary (present in an agent overlay, not the clean base).
         advise("agent.exe",
                ntfs.FindPath("AntiMal\\AntiMal.GuestAgent.exe").has_value(),
