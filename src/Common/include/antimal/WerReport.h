@@ -38,7 +38,15 @@ struct WerCrashInfo {
   std::string faultModuleVersion; // Sig "Fault Module Version"
   std::string exceptionCode;      // Sig "Exception Code" (e.g. "c0000409")
   std::string exceptionOffset;    // Sig "Exception Offset"
-  std::string eventType;          // top-level EventType= (e.g. "APPCRASH")
+  std::string eventType;          // top-level EventType= (e.g. "APPCRASH"/"BEX64")
+  // The __fastfail SUBCODE (ExceptionInformation[0], == RCX at the `int 29h`),
+  // when the report carries it. A fast-fail (0xC0000409) surfaces in WER as a
+  // BEX/BEX64 bucket whose signature set includes a "Data" / "Exception
+  // Information" field; for an explicit-parameter form we also read a
+  // "Param[N].Name=Exception Information" / "Param[N].Value=<n>" pair. We only
+  // accept a value from a field NAMED for exception info -- never by position --
+  // so we never misread the app-name/version params as a subcode. -1 = absent.
+  long fastFailSubcode = -1;
   bool valid = false;             // true when an app name or exception code was found
 };
 
@@ -65,8 +73,47 @@ inline std::string WerLower(std::string s) {
   return s;
 }
 
-// Parses an index from a key of the form "Sig[N].Name" / "Sig[N].Value".
-// Returns true and fills `index` / `isName` on a match.
+// Parses an index from a key of the form "<prefix>[N].Name" / "<prefix>[N].Value"
+// (prefix is "sig[" or "param[", lowercase, including the bracket). Returns true
+// and fills `index` / `isName` on a match.
+inline bool ParseIndexedKey(const std::string &key, const char *lowerPrefix,
+                            long &index, bool &isName) {
+  const std::string lower = WerLower(key);
+  const size_t plen = std::char_traits<char>::length(lowerPrefix);
+  if (lower.rfind(lowerPrefix, 0) != 0) {
+    return false;
+  }
+  size_t pos = plen; // after "<prefix>["
+  size_t numStart = pos;
+  while (pos < lower.size() && std::isdigit(static_cast<unsigned char>(lower[pos]))) {
+    ++pos;
+  }
+  // Real WER indices are < 100; cap the digit run so a pathological huge index
+  // can't throw std::out_of_range out of std::stol (this parses semi-untrusted
+  // on-disk content). >9 digits is never a legitimate index.
+  if (pos == numStart || pos >= lower.size() || lower[pos] != ']' ||
+      pos - numStart > 9) {
+    return false;
+  }
+  index = std::stol(lower.substr(numStart, pos - numStart));
+  ++pos; // skip ']'
+  if (pos >= lower.size() || lower[pos] != '.') {
+    return false;
+  }
+  ++pos; // skip '.'
+  const std::string field = lower.substr(pos);
+  if (field == "name") {
+    isName = true;
+    return true;
+  }
+  if (field == "value") {
+    isName = false;
+    return true;
+  }
+  return false;
+}
+
+// Back-compat wrapper for the original Sig[N] parser.
 inline bool ParseSigKey(const std::string &key, long &index, bool &isName) {
   // Expect: Sig[<digits>].Name | Sig[<digits>].Value (case-insensitive prefix).
   const std::string lower = WerLower(key);
@@ -106,6 +153,36 @@ inline bool ParseSigKey(const std::string &key, long &index, bool &isName) {
   return false;
 }
 
+// True when a WER signature/parameter NAME denotes the exception-information
+// block that carries a fast-fail subcode. Matched case-insensitively. We key on
+// the NAME (never on a positional index) so the app-name/version params are
+// never misread as a subcode.
+inline bool IsExceptionInfoName(const std::string &lowerName) {
+  return lowerName == "data" || lowerName == "exception information" ||
+         lowerName == "additional information" ||
+         lowerName == "fast fail code" || lowerName == "fastfail code" ||
+         lowerName == "exceptioninformation";
+}
+
+// Parses the leading numeric token of a WER value as a long: hex when it starts
+// with "0x", else decimal. Tolerates trailing junk. Returns -1 on no number
+// (also -1 for a literal 0xFFFFFFFF, which is FAST_FAIL_INVALID_FAST_FAIL_CODE).
+inline long ParseWerNumber(const std::string &v) {
+  const std::string s = WerTrim(v);
+  if (s.empty()) return -1;
+  try {
+    if (s.size() > 2 && (s[0] == '0') && (s[1] == 'x' || s[1] == 'X')) {
+      return std::stol(s.substr(2), nullptr, 16);
+    }
+    if (std::isdigit(static_cast<unsigned char>(s[0]))) {
+      return std::stol(s, nullptr, 10);
+    }
+  } catch (...) {
+    return -1;
+  }
+  return -1;
+}
+
 } // namespace detail
 
 // Parses the text of a WER Report.wer (already converted to UTF-8) into a
@@ -115,8 +192,10 @@ inline bool ParseSigKey(const std::string &key, long &index, bool &isName) {
 // recovered (i.e. this really was a crash report).
 inline WerCrashInfo ParseWerReport(const std::string &utf8Text) {
   WerCrashInfo info;
-  std::map<long, std::string> names;  // index -> Sig[N].Name value
-  std::map<long, std::string> values; // index -> Sig[N].Value value
+  std::map<long, std::string> names;   // index -> Sig[N].Name value
+  std::map<long, std::string> values;  // index -> Sig[N].Value value
+  std::map<long, std::string> pNames;  // index -> Param[N].Name value
+  std::map<long, std::string> pValues; // index -> Param[N].Value value
 
   size_t start = 0;
   while (start <= utf8Text.size()) {
@@ -138,40 +217,50 @@ inline WerCrashInfo ParseWerReport(const std::string &utf8Text) {
     long index = 0;
     bool isName = false;
     if (detail::ParseSigKey(key, index, isName)) {
-      if (isName) {
-        names[index] = value;
-      } else {
-        values[index] = value;
-      }
+      (isName ? names : values)[index] = value;
+      continue;
+    }
+    // Explicit-parameter form: Param[N].Name / Param[N].Value (some WER versions
+    // emit the exception-information block this way alongside the Sig set).
+    if (detail::ParseIndexedKey(key, "param[", index, isName)) {
+      (isName ? pNames : pValues)[index] = value;
       continue;
     }
 
-    // Top-level EventType (e.g. APPCRASH). Case-insensitive on the key.
+    // Top-level EventType (e.g. APPCRASH/BEX64). Case-insensitive on the key.
     if (detail::WerLower(key) == "eventtype") {
       info.eventType = value;
     }
   }
 
   // Pair names with values by shared index N and map onto structured fields.
-  for (const auto &n : names) {
-    const auto vit = values.find(n.first);
-    if (vit == values.end()) {
-      continue;
+  // Both the Sig set and the Param set are scanned for an exception-information
+  // field (by NAME) to recover the __fastfail subcode.
+  auto mapPairs = [&](const std::map<long, std::string> &nm,
+                      const std::map<long, std::string> &vl) {
+    for (const auto &n : nm) {
+      const auto vit = vl.find(n.first);
+      if (vit == vl.end()) continue;
+      const std::string sigName = detail::WerLower(n.second);
+      const std::string &sigValue = vit->second;
+      if (sigName == "application name") {
+        info.appName = sigValue;
+      } else if (sigName == "fault module name") {
+        info.faultModule = sigValue;
+      } else if (sigName == "fault module version") {
+        info.faultModuleVersion = sigValue;
+      } else if (sigName == "exception code") {
+        info.exceptionCode = sigValue;
+      } else if (sigName == "exception offset") {
+        info.exceptionOffset = sigValue;
+      } else if (info.fastFailSubcode < 0 &&
+                 detail::IsExceptionInfoName(sigName)) {
+        info.fastFailSubcode = detail::ParseWerNumber(sigValue);
+      }
     }
-    const std::string sigName = detail::WerLower(n.second);
-    const std::string &sigValue = vit->second;
-    if (sigName == "application name") {
-      info.appName = sigValue;
-    } else if (sigName == "fault module name") {
-      info.faultModule = sigValue;
-    } else if (sigName == "fault module version") {
-      info.faultModuleVersion = sigValue;
-    } else if (sigName == "exception code") {
-      info.exceptionCode = sigValue;
-    } else if (sigName == "exception offset") {
-      info.exceptionOffset = sigValue;
-    }
-  }
+  };
+  mapPairs(names, values);
+  mapPairs(pNames, pValues);
 
   info.valid = !info.appName.empty() || !info.exceptionCode.empty();
   return info;

@@ -9571,6 +9571,39 @@ void TestWerReportParser() {
       "Sig[0].Name=Application Name\r\nSig[0].Value=ShellHost.exe\r\n");
   Expect(bigIdx.valid && bigIdx.appName == "ShellHost.exe",
          "WER: absurd Sig index is rejected without throwing; valid pairs survive");
+
+  // __fastfail subcode capture: a BEX64 report whose Sig set carries a "Data"
+  // field (the exception-information block) should populate fastFailSubcode by
+  // NAME -- never by position, so the app-name params aren't misread.
+  const antimal::WerCrashInfo bex = antimal::ParseWerReport(
+      "EventType=BEX64\r\n"
+      "Sig[0].Name=Application Name\r\nSig[0].Value=Explorer.EXE\r\n"
+      "Sig[3].Name=Fault Module Name\r\nSig[3].Value=ucrtbase.dll\r\n"
+      "Sig[6].Name=Exception Code\r\nSig[6].Value=c0000409\r\n"
+      "Sig[7].Name=Exception Offset\r\nSig[7].Value=00000000000a4ace\r\n"
+      "Sig[8].Name=Data\r\nSig[8].Value=7\r\n");
+  Expect(bex.valid && bex.exceptionCode == "c0000409" &&
+             bex.faultModule == "ucrtbase.dll",
+         "WER: BEX64 fields still parse");
+  Expect(bex.fastFailSubcode == 7,
+         "WER: BEX64 'Data' Sig recovers the fast-fail subcode (7)");
+
+  // Explicit Param[N] exception-information form, hex value.
+  const antimal::WerCrashInfo paramForm = antimal::ParseWerReport(
+      "Sig[0].Name=Application Name\r\nSig[0].Value=ShellHost.exe\r\n"
+      "Sig[6].Name=Exception Code\r\nSig[6].Value=c0000409\r\n"
+      "Param[0].Name=Exception Information\r\nParam[0].Value=0x2\r\n");
+  Expect(paramForm.fastFailSubcode == 2,
+         "WER: Param[N] 'Exception Information' (hex) recovers subcode 2");
+
+  // No exception-info field -> subcode stays -1 (honest "not captured"); the
+  // positional app-name/version params must NOT be misread as a subcode.
+  const antimal::WerCrashInfo noSub = antimal::ParseWerReport(
+      "Sig[0].Name=Application Name\r\nSig[0].Value=Explorer.EXE\r\n"
+      "Sig[1].Name=Application Version\r\nSig[1].Value=10.0.26100.1\r\n"
+      "Sig[6].Name=Exception Code\r\nSig[6].Value=c0000409\r\n");
+  Expect(noSub.fastFailSubcode == -1,
+         "WER: no exception-info field -> subcode -1 (no positional misread)");
 }
 
 int main() {

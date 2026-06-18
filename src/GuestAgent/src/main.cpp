@@ -728,6 +728,12 @@ void ScanWerRoot(HANDLE com2, const std::wstring &werRoot,
       ev.details["exceptionCode"] = crash.exceptionCode;
       ev.details["exceptionOffset"] = crash.exceptionOffset;
       ev.details["eventType"] = crash.eventType;
+      // The __fastfail subcode (when the WER report carried an exception-info
+      // field). SummarizeCrashes decodes it to a FAST_FAIL_* name -> the precise
+      // reason the shell crash-loop fast-fails.
+      if (crash.fastFailSubcode >= 0) {
+        ev.details["fastFailSubcode"] = std::to_string(crash.fastFailSubcode);
+      }
       (void)SendAgentEvent(com2, ev);
     } while (FindNextFileW(find, &fd));
     FindClose(find);
