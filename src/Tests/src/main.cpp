@@ -3785,6 +3785,12 @@ void TestYaraGen() {
          "yara: DOS-stub boilerplate filtered out");
   Expect(rule.find("KERNEL32.DLL") == std::string::npos,
          "yara: import-table DLL boilerplate filtered out");
+  // The string extractors mask output to printable ASCII, so a generated rule
+  // is always clean ASCII -- guard that contract (catches an extractor change).
+  bool cleanAscii = true;
+  for (char c : rule)
+    if (static_cast<unsigned char>(c) > 0x7E) cleanAscii = false;
+  Expect(cleanAscii, "yara: emitted rule is clean ASCII");
   // Balanced braces -> single complete rule.
   Expect(std::count(rule.begin(), rule.end(), '{') == 1 &&
              std::count(rule.begin(), rule.end(), '}') == 1,
