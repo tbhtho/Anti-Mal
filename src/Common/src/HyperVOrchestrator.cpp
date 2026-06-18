@@ -7894,9 +7894,22 @@ bool PatchOverlaySetShellCmd(hv::IBlockDevice &disk,
         sz.push_back(0);
         sz.push_back(0);
         if (hive.UpsertBinaryValueSameSize(*cmdProc, "AutoRun", REG_SZ, sz)) {
-          if (result)
+          if (result) {
             result->notes.push_back(std::string("shell-cmd: AutoRun -> '") +
                                     runCmd + "'");
+            // The AutoRun launches the agent baked at C:\AntiMal\ in the base.
+            // The GUI modes (--shell/--file-browser) only exist in a current
+            // build; if the base agent predates them the arg falls through to the
+            // host-channel loop (no window). Flag that so a missing window isn't a
+            // mystery -- re-run `base deploy-agent` / rebuild the base if so.
+            if (runCmd.find("--shell") != std::string::npos ||
+                runCmd.find("--file-browser") != std::string::npos) {
+              result->notes.push_back(
+                  "shell-cmd: GUI mode requires the C:\\AntiMal\\ base agent to "
+                  "be a build with --shell/--file-browser (re-run base "
+                  "deploy-agent if no window appears)");
+            }
+          }
         } else if (result) {
           result->notes.push_back("shell-cmd: AutoRun write failed");
         }
