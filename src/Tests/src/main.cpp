@@ -9093,6 +9093,47 @@ void TestE1000RxRingReuse() {
   Expect(mem[bufOff(1)] == 10, "e1000e RX reuse: desc 1 holds the latest frame");
 }
 
+// MMIO dispatch bounds + access-size handling: the device must claim ONLY
+// accesses inside its BAR (else it shadows other devices on the MmioBus), serve
+// sub-dword reads correctly, and never crash on an unknown in-BAR register.
+void TestE1000MmioBounds() {
+  antimal::hv::E1000Device nic;
+  const uint64_t kMmio = 0xF0000000ull;
+  nic.SetMmioBase(kMmio);
+  Expect(nic.MmioBase() == kMmio && nic.MmioLast() == kMmio + 0x20000 - 1,
+         "e1000 mmio: BAR window is [base, base+128KiB)");
+
+  uint64_t v = 0xDEAD;
+  // Below the BAR / above the BAR -> NOT handled (returns false, value untouched).
+  Expect(!nic.OnRead(kMmio - 4, 4, &v),
+         "e1000 mmio: access below the BAR is not claimed");
+  Expect(!nic.OnRead(kMmio + 0x20000, 4, &v),
+         "e1000 mmio: access at BAR-end+1 is not claimed");
+  Expect(!nic.OnWrite(kMmio - 4, 4, 0x1234),
+         "e1000 mmio: write below the BAR is not claimed");
+  Expect(v == 0xDEAD, "e1000 mmio: a rejected read leaves the out value untouched");
+
+  // An unknown in-BAR register reads 0 (ReadReg default) without crashing.
+  v = 0x55;
+  Expect(nic.OnRead(kMmio + 0x9990, 4, &v) && v == 0,
+         "e1000 mmio: unknown in-BAR register reads 0");
+
+  // Sub-dword read of STATUS (0x8): link-up bit (0x2) is in the low byte.
+  uint64_t b = 0;
+  Expect(nic.OnRead(kMmio + 0x8, 1, &b) && (b & 0x2) != 0,
+         "e1000 mmio: byte read of STATUS still exposes link-up");
+  uint64_t hi = 0;
+  Expect(nic.OnRead(kMmio + 0x9, 1, &hi),
+         "e1000 mmio: a byte read at an odd offset is handled (sub-dword shift)");
+
+  // A write to an unknown in-BAR register is accepted (counts) without crashing.
+  const uint64_t before = nic.RegisterWrites();
+  Expect(nic.OnWrite(kMmio + 0x9994, 4, 0xABCD),
+         "e1000 mmio: write to an unknown in-BAR register is claimed");
+  Expect(nic.RegisterWrites() == before + 1,
+         "e1000 mmio: in-BAR writes count toward the driver-touch gate");
+}
+
 // PcapWriter: the network.pcap capture artifact. Verifies the libpcap global
 // header, per-record headers (ts + incl/orig length), frame payloads, and
 // snaplen truncation.
@@ -10810,6 +10851,7 @@ int main() {
     TestE1000TxBoundsSafety();
     TestE1000RxRing();
     TestE1000RxRingReuse();
+    TestE1000MmioBounds();
     TestPcapWriter();
     TestFakeInternet();
     TestContainedNetworkPath();
