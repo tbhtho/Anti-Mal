@@ -9437,6 +9437,46 @@ void TestFakeInternet() {
     Expect(sink.TcpReplies() == 1, "sink TCP: counter advanced");
   }
 
+  // --- TCP FIN -> FIN-ACK (clean connection teardown) ---
+  {
+    std::vector<uint8_t> tcp;
+    be16(tcp, 49152); be16(tcp, 443);
+    const uint32_t cseq = 0x00002000, cack = 0x10000001;
+    for (int i = 0; i < 4; ++i) tcp.push_back(static_cast<uint8_t>((cseq >> (24 - i * 8)) & 0xFF));
+    for (int i = 0; i < 4; ++i) tcp.push_back(static_cast<uint8_t>((cack >> (24 - i * 8)) & 0xFF));
+    tcp.push_back(0x50); tcp.push_back(0x11);  // data offset 5, flags FIN|ACK
+    be16(tcp, 0xFFFF); be16(tcp, 0); be16(tcp, 0);
+
+    std::vector<uint8_t> ip;
+    ip.push_back(0x45); ip.push_back(0x00);
+    be16(ip, static_cast<uint16_t>(20 + tcp.size()));
+    be16(ip, 0x000C); be16(ip, 0x4000); ip.push_back(64); ip.push_back(6);
+    be16(ip, 0x0000);
+    const uint8_t gIp[4] = {0x0A, 0x00, 0x02, 0x64};
+    const uint8_t cIp[4] = {0x5D, 0xB8, 0xD8, 0x22};
+    for (int i = 0; i < 4; ++i) ip.push_back(gIp[i]);
+    for (int i = 0; i < 4; ++i) ip.push_back(cIp[i]);
+
+    std::vector<uint8_t> f;
+    for (int i = 0; i < 6; ++i) f.push_back(sinkMac[i]);
+    for (int i = 0; i < 6; ++i) f.push_back(guestMac[i]);
+    be16(f, 0x0800);
+    f.insert(f.end(), ip.begin(), ip.end());
+    f.insert(f.end(), tcp.begin(), tcp.end());
+
+    std::vector<Frame> out;
+    Expect(sink.OnGuestFrame(f.data(), f.size(), out) == 1,
+           "sink TCP FIN: one FIN-ACK synthesized");
+    const Frame &r = out[0];
+    Expect(r[34 + 13] == 0x11, "sink TCP FIN: reply flags = FIN|ACK");
+    const uint32_t rseq = (static_cast<uint32_t>(r[34 + 4]) << 24) |
+                          (r[34 + 5] << 16) | (r[34 + 6] << 8) | r[34 + 7];
+    const uint32_t rack = (static_cast<uint32_t>(r[34 + 8]) << 24) |
+                          (r[34 + 9] << 16) | (r[34 + 10] << 8) | r[34 + 11];
+    Expect(rseq == 0x10000001u, "sink TCP FIN: response seq = client's ack");
+    Expect(rack == 0x00002001u, "sink TCP FIN: ack = client seq + 1 (FIN consumes a seq)");
+  }
+
   // --- HTTP request on an established connection -> 200 OK ---
   {
     const std::string http = "GET /gate.php HTTP/1.1\r\nHost: evil.example\r\n\r\n";

@@ -690,6 +690,18 @@ bool FakeInternet::HandleTcp(const uint8_t *f, std::size_t ihl,
     ++httpReplies_;
     return true;
   }
+  // Connection teardown: a client FIN gets a FIN+ACK so the connection closes
+  // cleanly (acking the client's data + its FIN, which consumes one seq) instead
+  // of the guest retransmitting FINs / hanging in FIN-WAIT and leaving the
+  // captured conversation open. Reactive + stateless: seq = the client's ack.
+  const bool fin = (flags & 0x01) != 0;
+  if (fin && ack) {
+    EmitTcpReply(mac_, f, ihl, dstPort, srcPort, segAck,
+                 segSeq + static_cast<uint32_t>(payloadLen) + 1u,
+                 0x11 /*FIN|ACK*/, nullptr, 0, out);
+    ++tcpReplies_;
+    return true;
+  }
   return false;
 }
 
