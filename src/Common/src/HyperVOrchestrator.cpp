@@ -6343,11 +6343,12 @@ BootOverlayPatchResult ApplyEphemeralBootOverlay(hv::IBlockDevice &disk) {
   // STABLE console shell we can drive (type `start msedge` etc.) regardless of
   // the broken modern-shell/AppX provisioning. Pairs with ANTIMAL_PROBE_RUN_CMD.
   // Overlay-only; base untouched.
-  // ANTIMAL_PROBE_FILE_BROWSER implies the cmd-shell swap (cmd is what reads the
-  // AutoRun that launches the file browser), so a single flag gives live
-  // file-browsing on logon.
+  // ANTIMAL_PROBE_FILE_BROWSER / ANTIMAL_PROBE_SHELL both imply the cmd-shell
+  // swap (cmd is what reads the AutoRun that launches the GUI), so a single flag
+  // gives live file-browsing / the analyst desktop on logon.
   if (EnvFlagEnabled("ANTIMAL_PROBE_SHELL_CMD") ||
-      EnvFlagEnabled("ANTIMAL_PROBE_FILE_BROWSER")) {
+      EnvFlagEnabled("ANTIMAL_PROBE_FILE_BROWSER") ||
+      EnvFlagEnabled("ANTIMAL_PROBE_SHELL")) {
     PatchOverlaySetShellCmd(disk, &result);
   }
   // ROOT-CAUSE FIX for the interactive-shell crash-loop: the base image's
@@ -7876,6 +7877,11 @@ bool PatchOverlaySetShellCmd(hv::IBlockDevice &disk,
     // flag yields live file-browsing on a seed boot.
     if (runCmd.empty() && EnvFlagEnabled("ANTIMAL_PROBE_FILE_BROWSER")) {
       runCmd = "start \"\" C:\\AntiMal\\AntiMal.GuestAgent.exe --file-browser";
+    }
+    // ANTIMAL_PROBE_SHELL launches AntiMal's own analyst desktop (a usable
+    // launcher + process list replacing the crash-looping modern shell) on logon.
+    if (runCmd.empty() && EnvFlagEnabled("ANTIMAL_PROBE_SHELL")) {
+      runCmd = "start \"\" C:\\AntiMal\\AntiMal.GuestAgent.exe --shell";
     }
     if (!runCmd.empty()) {
       const auto cmdProc = EnsureHivePath(hive, {"Microsoft", "Command Processor"});

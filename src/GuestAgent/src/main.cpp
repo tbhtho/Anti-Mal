@@ -1430,6 +1430,8 @@ bool HasArg(int argc, wchar_t **argv, std::wstring_view needle) {
 
 // Defined in FileBrowser.cpp (a self-contained Win32 file browser).
 int RunFileBrowserGui(const std::wstring &startDir);
+// Defined in MiniShell.cpp (a minimal analyst desktop / launcher).
+int RunMiniShellGui();
 
 int wmain(int argc, wchar_t **argv) {
   BootLog("wmain start argc=" + std::to_string(argc) +
@@ -1447,6 +1449,12 @@ int wmain(int argc, wchar_t **argv) {
         }
       }
       return RunFileBrowserGui(start);
+    }
+    // Minimal analyst desktop / launcher -- a usable replacement for the
+    // crash-looping modern shell. Set as the Winlogon shell (ANTIMAL_PROBE_SHELL)
+    // or launch from cmd: `AntiMal.GuestAgent.exe --shell`.
+    if (HasArg(argc, argv, L"--shell")) {
+      return RunMiniShellGui();
     }
     if (HasArg(argc, argv, L"--service")) {
       return RunAsService();

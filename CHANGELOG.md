@@ -51,6 +51,14 @@ unit-tested. A living `private development documentation` tracks done/remaining 
   key against each base64 blob and keeps a result ONLY when the decryption yields a valid http(s) URL
   (same known-plaintext anchor as the XOR recovery → near-zero false positives, verified clean on a
   real benign PE). Bounded work; surfaced in scan findings + IOCs. Round-trip + negative unit tests.
+- **In-guest analyst desktop (`AntiMal.GuestAgent.exe --shell`):** since the Win11 modern shell
+  crash-loops in this VM, AntiMal now ships its own minimal desktop/launcher — a Win32 window with
+  Files / Command Prompt / Web Browser launch buttons and a live process list (Toolhelp) with
+  End-Task, depending on nothing the modern shell needs (user32/comctl32/shell32/toolhelp). One flag
+  (`ANTIMAL_PROBE_SHELL`) swaps the Winlogon shell to cmd and AutoRun-launches it, so a seed boot
+  lands in a usable analyst desktop. Also enlarged the in-guest **file browser** into a fuller
+  File-Explorer replacement (editable address bar + Enter-navigate, Up/Refresh/Open/This-PC toolbar,
+  drive listing, keyboard nav, ShellExecute Open). Both host-verified (build + window opens).
 - **Crash-signature summary (`CrashSummary`, `report --crashes`):** collapses `process.crash`
   telemetry spam into distinct fault signatures — (image, NTSTATUS code + human name, faulting module
   + version + offset) with counts — for both the Win11 modern-shell wall and a detonated sample that
