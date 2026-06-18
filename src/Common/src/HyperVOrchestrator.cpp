@@ -12623,6 +12623,15 @@ DetonationResult InHouseOrchestrator::PrepareAndRun(
           ++idx;
         }
         pcap.WriteFile(PathToUtf8(result.runDir / "network.pcap"));
+        // Turn the captured frames into network telemetry (DNS / HTTP / TCP
+        // connect) so the report shows what the sample requested on the wire —
+        // complementing the in-guest TCP-table telemetry. PacketInspector is
+        // pure + bounds-checked; reply frames it doesn't recognize yield nothing.
+        for (const auto &fr : vmSummary.capturedNetworkFrames) {
+          for (auto &ev : InspectEthernetFrame(fr.data(), fr.size())) {
+            AppendJournalEvent(result.journalPath, ev, &events);
+          }
+        }
       }
       result.dynamicSummary =
           ToDynamicSummary(vmSummary, networkMode, serialLogPath, kdLogPath,
