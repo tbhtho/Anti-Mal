@@ -12474,6 +12474,7 @@ DetonationResult InHouseOrchestrator::PrepareAndRun(
                 " arp=" + std::to_string(netSink.ArpReplies()) +
                 " icmp=" + std::to_string(netSink.IcmpReplies()) +
                 " dns=" + std::to_string(netSink.DnsReplies()) +
+                " nbns=" + std::to_string(netSink.NbnsReplies()) +
                 " ntp=" + std::to_string(netSink.NtpReplies()) +
                 " tcp=" + std::to_string(netSink.TcpReplies()) +
                 " http=" + std::to_string(netSink.HttpReplies()) +
