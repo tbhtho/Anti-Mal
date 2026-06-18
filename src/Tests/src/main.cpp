@@ -8853,6 +8853,55 @@ void TestE1000TxMultiDescriptor() {
          "e1000 TX multi-desc: counters reflect one 64-byte frame");
 }
 
+// TX descriptor error-handling: malformed TX descriptors (zero length, an
+// oversized length past the 16 KiB guard, an unbacked buffer GPA) must be
+// skipped without emitting a frame or reading out of bounds, and a valid
+// descriptor in the same batch still transmits.
+void TestE1000TxBoundsSafety() {
+  antimal::hv::E1000Device nic;
+  const uint64_t kMmio = 0xF0000000ull;
+  nic.SetMmioBase(kMmio);
+  const uint64_t base = 0x10000ull;
+  std::vector<uint8_t> mem(4096, 0);
+  nic.SetDmaMemory([&](uint64_t gpa, std::size_t len) -> uint8_t * {
+    if (gpa < base || gpa + len > base + mem.size()) return nullptr;
+    return mem.data() + static_cast<size_t>(gpa - base);
+  });
+  std::vector<uint8_t> captured;
+  int txCallbacks = 0;
+  nic.SetTxHandler([&](const uint8_t *f, std::size_t len) {
+    captured.assign(f, f + len);
+    ++txCallbacks;
+  });
+  auto setDesc = [&](int d, uint64_t bufGpa, uint16_t len, uint8_t cmd) {
+    uint8_t *desc = mem.data() + d * 16;
+    for (int i = 0; i < 8; ++i) desc[i] = static_cast<uint8_t>((bufGpa >> (i * 8)) & 0xFF);
+    desc[8] = static_cast<uint8_t>(len & 0xFF);
+    desc[9] = static_cast<uint8_t>((len >> 8) & 0xFF);
+    desc[11] = cmd;
+  };
+  const uint64_t goodBuf = base + 0x200;
+  for (int i = 0; i < 16; ++i) mem[0x200 + i] = static_cast<uint8_t>(0xA0 + i);
+  setDesc(0, base + 0x100, 0, 0x09);            // zero-length, EOP|RS -> no frame
+  setDesc(1, base + 0x100, 0x5000, 0x09);       // 20480 > 16384 guard -> skipped
+  setDesc(2, 0xDEAD0000ull, 32, 0x09);          // unbacked buffer GPA -> skipped
+  setDesc(3, goodBuf, 16, 0x09);                // valid -> the only emitted frame
+
+  auto w = [&](uint32_t reg, uint32_t v) { nic.OnWrite(kMmio + reg, 4, v); };
+  w(0x3800, static_cast<uint32_t>(base & 0xFFFFFFFF));
+  w(0x3804, static_cast<uint32_t>(base >> 32));
+  w(0x3808, 16 * 8);  // TDLEN
+  w(0x3810, 0);       // TDH
+  w(0x3818, 4);       // TDT = 4 -> process descriptors 0..3 (no crash / OOB)
+
+  Expect(txCallbacks == 1,
+         "e1000 TX bounds: only the one valid descriptor emits a frame");
+  Expect(captured.size() == 16 && captured[0] == 0xA0,
+         "e1000 TX bounds: the valid frame transmits intact after the malformed ones");
+  Expect(nic.FramesTransmitted() == 1,
+         "e1000 TX bounds: malformed descriptors don't inflate the TX count");
+}
+
 // RX ring: the host sink delivers inbound frames into the guest via
 // DeliverRxFrame. Exercises the descriptor write-back, RDH advance, RXT0
 // interrupt, the no-free-buffer drop, RX-disabled drop, length clamping, and
@@ -10706,6 +10755,7 @@ int main() {
     TestPacketInspector();
     TestE1000Device();
     TestE1000TxMultiDescriptor();
+    TestE1000TxBoundsSafety();
     TestE1000RxRing();
     TestE1000RxRingReuse();
     TestPcapWriter();
