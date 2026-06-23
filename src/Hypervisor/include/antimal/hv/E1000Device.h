@@ -144,6 +144,22 @@ class E1000Device final : public IMmioDevice {
   uint64_t bytesReceived_ = 0;
   uint64_t framesDropped_ = 0;
   uint64_t mmioWrites_ = 0;
+
+  // Guest-visible statistics-register baselines. The 82574L stats registers are
+  // clear-on-read; each reports the delta of a monotonic host counter since its
+  // last read (so a polling driver accumulates the true total without
+  // double-counting). good == total for us, but each register clears
+  // independently so each keeps its own baseline. Reset rebases these to the
+  // current totals so each boot's stats start at zero.
+  uint64_t statBaseGptc_ = 0, statBaseTpt_ = 0;  // good / total packets TX
+  uint64_t statBaseGprc_ = 0, statBaseTpr_ = 0;  // good / total packets RX
+  uint64_t statBaseGotc_ = 0, statBaseTot_ = 0;  // good / total octets TX
+  uint64_t statBaseGorc_ = 0, statBaseTor_ = 0;  // good / total octets RX
+  uint64_t statBaseMpc_ = 0;                     // missed packets (RX drops)
+  // Latched high words of the 64-bit octet counters, set on the low-register
+  // read and returned (and cleared) by the immediately-following high read.
+  uint32_t statGotcHigh_ = 0, statTotHigh_ = 0;  // octets TX (good/total)
+  uint32_t statGorcHigh_ = 0, statTorHigh_ = 0;  // octets RX (good/total)
 };
 
 }  // namespace antimal::hv

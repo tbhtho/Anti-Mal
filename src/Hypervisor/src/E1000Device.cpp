@@ -29,6 +29,24 @@ constexpr uint32_t kRegRDLEN = 0x2808;
 constexpr uint32_t kRegRDH = 0x2810;
 constexpr uint32_t kRegRDT = 0x2818;
 
+// Statistics registers (clear-on-read), offsets per the 82574 datasheet. Only
+// the counters that move with traffic are modelled; error/collision counters
+// (CRCERRS 0x4000, the PRC*/PTC* size buckets, BPRC/MPRC, etc.) read 0, which is
+// realistic for a clean point-to-point contained link.
+constexpr uint32_t kRegMPC = 0x4010;    // Missed Packets Count (RX drops)
+constexpr uint32_t kRegGPRC = 0x4074;   // Good Packets Received
+constexpr uint32_t kRegGPTC = 0x4080;   // Good Packets Transmitted
+constexpr uint32_t kRegGORCL = 0x4088;  // Good Octets Received (low/high)
+constexpr uint32_t kRegGORCH = 0x408C;
+constexpr uint32_t kRegGOTCL = 0x4090;  // Good Octets Transmitted (low/high)
+constexpr uint32_t kRegGOTCH = 0x4094;
+constexpr uint32_t kRegTORL = 0x40C0;   // Total Octets Received (low/high)
+constexpr uint32_t kRegTORH = 0x40C4;
+constexpr uint32_t kRegTOTL = 0x40C8;   // Total Octets Transmitted (low/high)
+constexpr uint32_t kRegTOTH = 0x40CC;
+constexpr uint32_t kRegTPR = 0x40D0;    // Total Packets Received
+constexpr uint32_t kRegTPT = 0x40D4;    // Total Packets Transmitted
+
 constexpr uint32_t kStatusFD = 1u << 0;  // full duplex
 constexpr uint32_t kStatusLU = 1u << 1;  // link up
 constexpr uint32_t kIntTXDW = 1u << 0;   // transmit descriptor written back
@@ -86,6 +104,27 @@ uint16_t PhyRead(uint32_t reg) {
   }
 }
 
+// The 82574L statistics registers are clear-on-read: each read returns the count
+// accumulated since the previous read, then resets. We model that as the delta of
+// a monotonic host counter against a per-register baseline, so a driver polling
+// on a timer accumulates the true total without double-counting.
+uint32_t StatDelta32(uint64_t total, uint64_t &base) {
+  const uint32_t d = static_cast<uint32_t>(total - base);
+  base = total;
+  return d;
+}
+
+// 64-bit octet counters are read as a low/high register pair. Reading the LOW
+// register computes the delta, returns its low 32 bits, and latches the high 32
+// bits for the immediately-following high-register read (the order real drivers
+// use). The high read returns and clears that latch.
+uint32_t StatOctetLow(uint64_t total, uint64_t &base, uint32_t &highLatch) {
+  const uint64_t d = total - base;
+  base = total;
+  highLatch = static_cast<uint32_t>(d >> 32);
+  return static_cast<uint32_t>(d & 0xFFFFFFFFu);
+}
+
 }  // namespace
 
 E1000Device::E1000Device() {
@@ -123,6 +162,15 @@ void E1000Device::Reset() noexcept {
   rctl_ = rdbal_ = rdbah_ = rdlen_ = rdh_ = rdt_ = 0;
   linkAnnounced_ = false;
   interruptPending_ = false;
+  // Guest-visible statistics restart at zero each boot: the monotonic host
+  // counters persist for host-side diagnostics, so rebase the clear-on-read
+  // baselines to their current values and drop the octet-high latches.
+  statBaseGptc_ = statBaseTpt_ = framesTransmitted_;
+  statBaseGprc_ = statBaseTpr_ = framesReceived_;
+  statBaseGotc_ = statBaseTot_ = bytesTransmitted_;
+  statBaseGorc_ = statBaseTor_ = bytesReceived_;
+  statBaseMpc_ = framesDropped_;
+  statGotcHigh_ = statTotHigh_ = statGorcHigh_ = statTorHigh_ = 0;
   // MAC (eeprom_ / ral_ / rah_) is retained across a guest reboot.
 }
 
@@ -197,6 +245,47 @@ uint32_t E1000Device::ReadReg(uint32_t off) {
       return rdh_;
     case kRegRDT:
       return rdt_;
+    // Statistics (clear-on-read). For us good == total (no bad frames) and the
+    // good/total registers are independent clear-on-read counters, so each keeps
+    // its own baseline against the same monotonic host total.
+    case kRegMPC:
+      return StatDelta32(framesDropped_, statBaseMpc_);
+    case kRegGPRC:
+      return StatDelta32(framesReceived_, statBaseGprc_);
+    case kRegTPR:
+      return StatDelta32(framesReceived_, statBaseTpr_);
+    case kRegGPTC:
+      return StatDelta32(framesTransmitted_, statBaseGptc_);
+    case kRegTPT:
+      return StatDelta32(framesTransmitted_, statBaseTpt_);
+    case kRegGORCL:
+      return StatOctetLow(bytesReceived_, statBaseGorc_, statGorcHigh_);
+    case kRegGORCH: {
+      const uint32_t v = statGorcHigh_;
+      statGorcHigh_ = 0;
+      return v;
+    }
+    case kRegGOTCL:
+      return StatOctetLow(bytesTransmitted_, statBaseGotc_, statGotcHigh_);
+    case kRegGOTCH: {
+      const uint32_t v = statGotcHigh_;
+      statGotcHigh_ = 0;
+      return v;
+    }
+    case kRegTORL:
+      return StatOctetLow(bytesReceived_, statBaseTor_, statTorHigh_);
+    case kRegTORH: {
+      const uint32_t v = statTorHigh_;
+      statTorHigh_ = 0;
+      return v;
+    }
+    case kRegTOTL:
+      return StatOctetLow(bytesTransmitted_, statBaseTot_, statTotHigh_);
+    case kRegTOTH: {
+      const uint32_t v = statTotHigh_;
+      statTotHigh_ = 0;
+      return v;
+    }
     default:
       return 0;
   }

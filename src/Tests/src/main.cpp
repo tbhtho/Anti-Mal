@@ -9029,6 +9029,101 @@ void TestE1000RxRing() {
   }
 }
 
+// 82574L statistics registers (clear-on-read) must accumulate as frames move so
+// the in-guest NDIS driver / Get-NetAdapterStatistics see plausible non-zero
+// counters. An always-zero stats block is both a driver-correctness gap and an
+// anti-evasion tell — real hardware counts. Offsets per the 82574 datasheet:
+// MPC 0x4010, GPRC 0x4074, GPTC 0x4080, GORCL/H 0x4088/0x408C, GOTCL/H
+// 0x4090/0x4094, TORL/H 0x40C0/0x40C4, TOTL/H 0x40C8/0x40CC, TPR 0x40D0, TPT 0x40D4.
+void TestE1000StatisticsRegisters() {
+  using antimal::hv::E1000Device;
+  E1000Device nic;
+  const uint64_t kMmio = 0xF0000000ull;
+  nic.SetMmioBase(kMmio);
+  const uint64_t base = 0x10000ull;
+  std::vector<uint8_t> mem(32768, 0);
+  nic.SetDmaMemory([&](uint64_t gpa, std::size_t len) -> uint8_t * {
+    if (gpa < base || gpa + len > base + mem.size()) return nullptr;
+    return mem.data() + static_cast<size_t>(gpa - base);
+  });
+  nic.SetTxHandler([&](const uint8_t *, std::size_t) {});
+  auto w = [&](uint32_t reg, uint32_t v) { nic.OnWrite(kMmio + reg, 4, v); };
+  auto r = [&](uint32_t reg) -> uint32_t {
+    uint64_t v = 0;
+    nic.OnRead(kMmio + reg, 4, &v);
+    return static_cast<uint32_t>(v);
+  };
+
+  // Pristine device: every statistic reads zero.
+  Expect(r(0x4074) == 0 && r(0x4080) == 0 && r(0x40D0) == 0 && r(0x40D4) == 0 &&
+             r(0x4088) == 0 && r(0x4090) == 0 && r(0x40C0) == 0 &&
+             r(0x40C8) == 0 && r(0x4010) == 0,
+         "e1000e stats: pristine device reports zero counters");
+
+  // Transmit one 64-byte frame through the TX ring.
+  const uint64_t bufGpa = base + 0x200;
+  for (int i = 0; i < 64; ++i) mem[0x200 + i] = static_cast<uint8_t>(i + 1);
+  for (int i = 0; i < 8; ++i)
+    mem[i] = static_cast<uint8_t>((bufGpa >> (i * 8)) & 0xFF);
+  mem[8] = 64;
+  mem[9] = 0;
+  mem[11] = 0x09;  // len 64, CMD = EOP | RS
+  w(0x3800, static_cast<uint32_t>(base & 0xFFFFFFFF));  // TDBAL
+  w(0x3804, static_cast<uint32_t>(base >> 32));         // TDBAH
+  w(0x3808, 16 * 8);                                    // TDLEN = 8 descriptors
+  w(0x3810, 0);                                         // TDH
+  w(0x3818, 1);  // TDT = 1 -> transmit descriptor 0
+
+  // TX statistics advance: good + total packets, good + total octets.
+  Expect(r(0x4080) == 1, "e1000e stats: GPTC counts the transmitted frame");
+  Expect(r(0x40D4) == 1, "e1000e stats: TPT counts the transmitted frame");
+  // GOTCL/GOTCH 64-bit good-octets: low = 64, high = 0.
+  Expect(r(0x4090) == 64, "e1000e stats: GOTCL = transmitted octets");
+  Expect(r(0x4094) == 0, "e1000e stats: GOTCH high word zero for a small count");
+  Expect(r(0x40C8) == 64, "e1000e stats: TOTL = total transmitted octets");
+
+  // Clear-on-read: a real 82574L clears statistics on read so the driver's
+  // periodic poll accumulates deltas. GPTC/TPT were just read -> now zero.
+  Expect(r(0x4080) == 0, "e1000e stats: GPTC cleared on read");
+  Expect(r(0x40D4) == 0, "e1000e stats: TPT cleared on read");
+
+  // Receive one 100-byte frame into a posted RX ring (8 descriptors).
+  const uint64_t ring = base + 0x1000;
+  const uint32_t descCount = 8;
+  for (uint32_t d = 0; d < descCount; ++d) {
+    const uint64_t rbuf = base + 0x2000 + static_cast<uint64_t>(d) * 0x800;
+    uint8_t *desc =
+        mem.data() + static_cast<size_t>(ring - base) + d * 16;
+    for (int i = 0; i < 8; ++i)
+      desc[i] = static_cast<uint8_t>((rbuf >> (i * 8)) & 0xFF);
+  }
+  w(0x2800, static_cast<uint32_t>(ring & 0xFFFFFFFF));  // RDBAL
+  w(0x2804, static_cast<uint32_t>(ring >> 32));         // RDBAH
+  w(0x2808, 16 * descCount);                            // RDLEN = 128
+  w(0x2810, 0);                                         // RDH
+  w(0x0100, 0x2);                                       // RCTL.EN
+  w(0x2818, 3);                                         // post 3 free buffers
+  std::vector<uint8_t> frame(100, 0xC5);
+  Expect(nic.DeliverRxFrame(frame.data(), frame.size()),
+         "e1000e stats: RX frame delivered");
+
+  Expect(r(0x4074) == 1, "e1000e stats: GPRC counts the received frame");
+  Expect(r(0x40D0) == 1, "e1000e stats: TPR counts the received frame");
+  Expect(r(0x4088) == 100, "e1000e stats: GORCL = received octets");
+  Expect(r(0x408C) == 0, "e1000e stats: GORCH high word zero");
+  Expect(r(0x40C0) == 100, "e1000e stats: TORL = total received octets");
+
+  // Missed Packets Count (MPC) reflects RX drops: fill the ring, force a drop.
+  nic.DeliverRxFrame(frame.data(), frame.size());  // 2nd
+  nic.DeliverRxFrame(frame.data(), frame.size());  // 3rd -> ring now full
+  const uint64_t dropBefore = nic.FramesDropped();
+  Expect(!nic.DeliverRxFrame(frame.data(), frame.size()),
+         "e1000e stats: delivery drops when the ring is full");
+  Expect(nic.FramesDropped() == dropBefore + 1,
+         "e1000e stats: host drop counter advances");
+  Expect(r(0x4010) == 1, "e1000e stats: MPC counts the missed packet");
+}
+
 // RX ring buffer reuse / starvation / wraparound: the driver re-posts buffers by
 // advancing RDT, RDH wraps past the last descriptor, and a reused descriptor's
 // buffer is overwritten by the newer frame. Covers the ring lifecycle the
@@ -10947,6 +11042,7 @@ int main() {
     TestE1000TxBoundsSafety();
     TestE1000RxRing();
     TestE1000RxRingReuse();
+    TestE1000StatisticsRegisters();
     TestE1000MmioBounds();
     TestPcapWriter();
     TestFakeInternet();
