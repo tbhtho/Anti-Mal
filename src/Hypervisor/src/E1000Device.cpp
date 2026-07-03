@@ -129,8 +129,11 @@ uint32_t StatOctetLow(uint64_t total, uint64_t &base, uint32_t &highLatch) {
 
 E1000Device::E1000Device() {
   Reset();
-  // A locally-administered MAC: 02:A1:A1:00:00:01.
-  const uint8_t mac[6] = {0x02, 0xA1, 0xA1, 0x00, 0x00, 0x01};
+  // A real globally-administered Intel vendor MAC (OUI 00:1B:21 = Intel
+  // Corporate). A locally-administered address (U/L bit 0x02 set in the first
+  // octet) is a classic VM/sandbox tell — evasive malware checks for it via
+  // GetAdaptersAddresses / WMI — so the first octet is 0x00 (U/L + I/G clear).
+  const uint8_t mac[6] = {0x00, 0x1B, 0x21, 0x3C, 0x9A, 0x57};
   eeprom_[0] = static_cast<uint16_t>(mac[0] | (mac[1] << 8));
   eeprom_[1] = static_cast<uint16_t>(mac[2] | (mac[3] << 8));
   eeprom_[2] = static_cast<uint16_t>(mac[4] | (mac[5] << 8));
