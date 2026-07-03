@@ -5,7 +5,7 @@
 // whose `e1net*.inf` was dropped) so the in-guest driver actually binds, while
 // reusing the existing 82540EM-family register layout (same TX/RX descriptor
 // format + MDIC/PHY model). It presents as a real Intel desktop GbE NIC (no
-// paravirt fingerprint). See historical design notes (not distributed).
+// paravirt fingerprint).
 //
 // This is BOTH halves of contained network visibility:
 //   * TX (capture): the guest transmits Ethernet frames through the TX descriptor

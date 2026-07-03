@@ -19,7 +19,7 @@ AntiMal has two major layers:
 
 **Deep dynamic-analysis pipeline (built + reviewed this session, live on Detonate via per-run agent redeploy):** rich process telemetry (full path, command line, integrity, user/SID, session, start time, **exit codes**), persistence detection across 8 families with **ATT&CK tags**, an in-guest **WER crash decoder** (names the faulting module behind a crash), **dropped-file** SHA-256 + magic-byte type, **DLL-load / injection** detection (side-loaded/hijacked DLLs → T1574), a **scored, explainable behavioral verdict** (kills the `timeout==Malicious` false positive; signed-installer FP dampened), an **analyst-grade report** (process tree + persistence/drops/network/crashes/MITRE sections), and machine-readable **IOC export** (STIX 2.1 / MISP / CSV via `HostCli export`).
 
-In-guest sample execution is **wired but gated off by default** behind a two-key gate: it arms only when `dynamic_execution_enabled = true` (config) **and** `--allow-execution` is passed to `detonate` (plus the guest's own arm). When armed, the host delivers the staged sample over COM2 (paced) and the GuestAgent launches it and streams its behavior. The live console's **Detonate Sample (live)** button self-arms the gate and deploys the execute-capable agent into the disposable overlay per run. See `historical design notes (not distributed)`.
+In-guest sample execution is **wired but gated off by default** behind a two-key gate: it arms only when `dynamic_execution_enabled = true` (config) **and** `--allow-execution` is passed to `detonate` (plus the guest's own arm). When armed, the host delivers the staged sample over COM2 (paced) and the GuestAgent launches it and streams its behavior. The live console's **Detonate Sample (live)** button self-arms the gate and deploys the execute-capable agent into the disposable overlay per run.
 
 ## What Works Today
 
@@ -78,7 +78,7 @@ The dynamic console, telemetry, live input, and the full analysis pipeline are b
 
 After those: bake the current telemetry agent into the new snapshot (`base deploy-agent`), then validate the full **Detonate → telemetry → verdict → report → IOC** loop end-to-end on the settled desktop.
 
-**Deeper frontier (not blocking the above):** a 2-vCPU AP-bringup SMP race (`ntkrnlmp+0x2916EC`; 1-vCPU is the reliable default), a guest-bindable NIC + fake-internet capture (designed — see `historical design notes (not distributed)`; recommended NIC is e1000e `8086:10D3`), real-time ETW telemetry, and a true RAM snapshot.
+**Deeper frontier (not blocking the above):** a 2-vCPU AP-bringup SMP race (`ntkrnlmp+0x2916EC`; 1-vCPU is the reliable default), a guest-bindable NIC + fake-internet capture (designed; recommended NIC is e1000e `8086:10D3`), real-time ETW telemetry, and a true RAM snapshot.
 
 ## Safety Model
 
