@@ -101,6 +101,10 @@ struct VmRunSummary {
   // Set by Run() when the guest requested a platform reset (0xCF9) and exited so
   // the orchestrator can recreate the VM and continue the (rebooting) boot.
   bool rebootRequested = false;
+  // Set by the orchestrator's reboot loop when it hits the reboot cap while the
+  // guest STILL wants to reboot -- a genuine reboot loop, distinct from a clean
+  // end. Lets the report/boot-report flag it instead of reading it as a finish.
+  bool rebootLoopExhausted = false;
   uint8_t guestShutdownSleepType = 0;
   bool pm1SleepEnable = false;
   bool pm1HostStopRequested = false;

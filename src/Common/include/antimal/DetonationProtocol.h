@@ -187,13 +187,18 @@ inline std::optional<SampleChunk> ParseSampleChunkPayload(
   return chunk;
 }
 
+// The single source of truth for the maximum sample size deliverable over the
+// paced COM2 channel. The host refuses to SEND a larger sample and the guest
+// reassembler refuses to ACCEPT one, so both sides agree on one bound.
+constexpr uint64_t kMaxCom2SampleBytes = 8ull * 1024 * 1024;
+
 // Reassembles in-order, non-overlapping SampleChunks into a contiguous buffer,
 // bounded by expectedBytes and a hard cap. The host sends chunks sequentially,
 // so out-of-order or overflowing fragments are rejected rather than tolerated.
 class SampleReassembler {
  public:
   explicit SampleReassembler(uint64_t expectedBytes,
-                             uint64_t capBytes = 64ull * 1024 * 1024)
+                             uint64_t capBytes = kMaxCom2SampleBytes)
       : expected_(expectedBytes), cap_(capBytes) {
     if (expected_ <= cap_) buf_.reserve(static_cast<size_t>(expected_));
   }

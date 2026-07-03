@@ -112,6 +112,40 @@ void WriteTextFile(const std::filesystem::path &path, std::string_view data) {
   file.write(data.data(), static_cast<std::streamsize>(data.size()));
 }
 
+void WriteTextFileAtomic(const std::filesystem::path &path,
+                         std::string_view data) {
+  EnsureDirectory(path.parent_path());
+  std::filesystem::path tmp = path;
+  tmp += L".tmp";
+  {
+    std::ofstream file(tmp, std::ios::binary | std::ios::trunc);
+    if (!file) {
+      throw std::runtime_error("Unable to write temp file: " + PathToUtf8(tmp));
+    }
+    file.write(data.data(), static_cast<std::streamsize>(data.size()));
+    file.flush();
+    const bool ok = static_cast<bool>(file);
+    file.close();
+    if (!ok) {
+      // A write/flush failure (disk full, quota) leaves a partial temp -- remove
+      // it so a failed write never orphans a stale <path>.tmp on disk.
+      std::error_code ec;
+      std::filesystem::remove(tmp, ec);
+      throw std::runtime_error("Failed writing temp file: " + PathToUtf8(tmp));
+    }
+  } // stream already closed above
+  // MoveFileExW with MOVEFILE_REPLACE_EXISTING is an atomic same-volume replace:
+  // readers see either the whole old file or the whole new one, never a partial.
+  if (!MoveFileExW(tmp.wstring().c_str(), path.wstring().c_str(),
+                   MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
+    const DWORD err = GetLastError();
+    std::error_code ec;
+    std::filesystem::remove(tmp, ec); // don't leave the temp behind
+    throw std::runtime_error("Unable to finalize file " + PathToUtf8(path) +
+                             ": " + SystemErrorMessage(err));
+  }
+}
+
 void EnsureDirectory(const std::filesystem::path &path) {
   if (path.empty()) {
     return;

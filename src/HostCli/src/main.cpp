@@ -165,6 +165,33 @@ bool HasFlag(int argc, wchar_t **argv, std::string_view name) {
   return false;
 }
 
+// Parse an integer CLI option value. Rejects non-numeric / trailing-garbage
+// input with a clear message and returns nullopt, instead of letting
+// std::stoi/std::stoul throw std::invalid_argument out of wmain (which crashes
+// the CLI with an unhandled-exception dialog and no useful output). Callers
+// treat nullopt as a usage error.
+std::optional<long long> ParseIntArg(const std::string &value,
+                                     std::string_view flag) {
+  try {
+    size_t pos = 0;
+    const long long n = std::stoll(value, &pos);
+    while (pos < value.size() &&
+           std::isspace(static_cast<unsigned char>(value[pos]))) {
+      ++pos;
+    }
+    if (pos != value.size()) {
+      std::cerr << "error: " << flag << " expects a number, got '" << value
+                << "'\n";
+      return std::nullopt;
+    }
+    return n;
+  } catch (...) {
+    std::cerr << "error: " << flag << " expects a number, got '" << value
+              << "'\n";
+    return std::nullopt;
+  }
+}
+
 // Minimal JSON string quoting for the hand-rolled --json command outputs (the
 // values here are hashes / paths / IOC strings -- no control chars beyond what
 // this escapes). Shared by the doctor/similarity/report-diff machine-readable
@@ -296,7 +323,9 @@ int CommandScan(int argc, wchar_t **argv) {
   }
   int threshold = 70;
   if (const auto value = OptionValue(argc, argv, "--threshold")) {
-    threshold = std::stoi(*value);
+    const auto n = ParseIntArg(*value, "--threshold");
+    if (!n) return 2;
+    threshold = static_cast<int>(*n);
   }
 
   const auto config = antimal::LoadConfig(antimal::DefaultConfigPath());
@@ -346,7 +375,11 @@ int CommandTriage(int argc, wchar_t **argv) {
     return 2;
   }
   int threshold = 70;
-  if (const auto v = OptionValue(argc, argv, "--threshold")) threshold = std::stoi(*v);
+  if (const auto v = OptionValue(argc, argv, "--threshold")) {
+    const auto n = ParseIntArg(*v, "--threshold");
+    if (!n) return 2;
+    threshold = static_cast<int>(*n);
+  }
   const auto config = antimal::LoadConfig(antimal::DefaultConfigPath());
   const auto opts = BuildScannerOptions(argc, argv, config);
   auto results = antimal::ScanPath(std::filesystem::path(argv[2]), opts);
@@ -408,7 +441,14 @@ int CommandDetonate(int argc, wchar_t **argv) {
   auto config = antimal::LoadConfig(antimal::DefaultConfigPath());
   uint32_t timeout = config.defaultTimeoutSec;
   if (const auto value = OptionValue(argc, argv, "--timeout-sec")) {
-    timeout = static_cast<uint32_t>(std::stoul(*value));
+    const auto n = ParseIntArg(*value, "--timeout-sec");
+    // Range-check against the destination type BEFORE the cast: a value like 2^32
+    // is positive as a long long but truncates to 0 (the very value we reject).
+    if (!n || *n <= 0 || *n > static_cast<long long>(UINT32_MAX)) {
+      std::cerr << "error: --timeout-sec must be a positive number of seconds\n";
+      return 2;
+    }
+    timeout = static_cast<uint32_t>(*n);
   }
   const auto networkText = OptionValue(argc, argv, "--network").value_or(antimal::ToString(config.networkMode));
   const auto network = antimal::ParseNetworkMode(networkText).value_or(antimal::NetworkMode::Disabled);
@@ -417,6 +457,11 @@ int CommandDetonate(int argc, wchar_t **argv) {
   // ANTIMAL_VCPU_COUNT, so the flag simply sets it (unless the env var is
   // already present, which takes precedence — explicit env wins over flag).
   if (const auto value = OptionValue(argc, argv, "--vcpus")) {
+    const auto n = ParseIntArg(*value, "--vcpus");
+    if (!n || *n < 1 || *n > 64) {
+      std::cerr << "error: --vcpus must be an integer between 1 and 64\n";
+      return 2;
+    }
     if (GetEnvironmentVariableW(L"ANTIMAL_VCPU_COUNT", nullptr, 0) == 0) {
       SetEnvironmentVariableW(L"ANTIMAL_VCPU_COUNT",
                               antimal::Utf8ToWide(*value).c_str());

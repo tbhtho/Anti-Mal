@@ -8708,8 +8708,9 @@ std::vector<uint8_t> BuildFirstBootCom2Bytes(bool executionAuthorized,
   }
   // COM2 is the only delivery channel today (~11 KB/s emulated). Cap the
   // sample size so a large binary can't balloon the guest RX queue; a
-  // disk-backed delivery is the documented perf follow-up.
-  constexpr uint64_t kMaxCom2Sample = 8ull * 1024 * 1024;
+  // disk-backed delivery is the documented perf follow-up. Shared with the
+  // guest reassembler so both sides agree on the bound.
+  constexpr uint64_t kMaxCom2Sample = kMaxCom2SampleBytes;
   std::error_code ec;
   const auto size = std::filesystem::file_size(stagedSample, ec);
   if (ec || size == 0 || size > kMaxCom2Sample) {
@@ -9009,8 +9010,10 @@ void WriteErrorReport(const std::filesystem::path &reportPath,
   report.networkDomains = AggregateNetworkDomains(events);
   report.artifacts = artifacts;
   report.errors = errors;
-  WriteTextFile(reportPath, ToJson(report));
+  // HTML first, then atomically publish report.json: a dirty-kill can never
+  // leave a truncated report.json, and its presence implies report.html exists.
   WriteReportHtml(reportPath.parent_path() / "report.html", report);
+  WriteTextFileAtomic(reportPath, ToJson(report));
 }
 
 void WriteStagedReport(const std::filesystem::path &reportPath,
@@ -9029,8 +9032,10 @@ void WriteStagedReport(const std::filesystem::path &reportPath,
   report.artifacts = artifacts;
   report.errors.push_back(
       "Dynamic execution not started; this run is staged for the in-house VM path.");
-  WriteTextFile(reportPath, ToJson(report));
+  // HTML first, then atomically publish report.json: a dirty-kill can never
+  // leave a truncated report.json, and its presence implies report.html exists.
   WriteReportHtml(reportPath.parent_path() / "report.html", report);
+  WriteTextFileAtomic(reportPath, ToJson(report));
 }
 
 hv::VmNetworkMode ToHvNetworkMode(NetworkMode mode) {
@@ -11178,7 +11183,10 @@ DetonationResult InHouseOrchestrator::PrepareAndRun(
   result.journalPath = result.runDir / "events.jsonl";
   result.screenshotsDir = result.runDir / "screenshots";
   result.artifactsDir = result.runDir / "artifacts";
-  result.overlayDiskPath = result.runDir / "disk" / "overlay.vhdx";
+  // Left empty here; set to the real overlay path (overlay.raw or overlay.cow)
+  // inside whichever branch actually creates the overlay below. The former
+  // "overlay.vhdx" default was a phantom -- no code path ever creates that file.
+  result.overlayDiskPath.clear();
   result.reportPath = result.runDir / "report.json";
   result.dynamicSummary.networkMode = networkMode;
   result.status = "staging";
@@ -12484,6 +12492,11 @@ DetonationResult InHouseOrchestrator::PrepareAndRun(
             break;
           }
         }
+        // Fell off the loop with the guest STILL asking to reboot (and not by
+        // timeout): we hit kMaxReboots -- a real reboot loop, not a clean end.
+        if (s.rebootRequested && !s.timedOut) {
+          s.rebootLoopExhausted = true;
+        }
         return s;
       };
       if (preflight.rawBaseReady) {
@@ -12748,6 +12761,24 @@ DetonationResult InHouseOrchestrator::PrepareAndRun(
       result.completed = vmSummary.completed;
       result.dynamicSummary.eventsCaptured =
           static_cast<uint32_t>(events.size());
+
+      // A reboot loop that hit the cap is a distinct, diagnosable outcome -- not
+      // a clean finish. Surface it as its own status + error + journal event so
+      // boot-report and the verdict don't read it as a normal end. (Handled here,
+      // where vmSummary is in scope, rather than the shared terminal section.)
+      if (vmSummary.rebootLoopExhausted) {
+        result.errors.push_back(
+            "Reboot loop: the guest kept requesting platform resets and hit the "
+            "reboot cap without settling -- the boot did not converge.");
+        result.dynamicSummary.status = "reboot-loop-exhausted";
+        result.status = result.dynamicSummary.status;
+        AppendJournalEvent(
+            result.journalPath,
+            MakeSandboxEvent("vm.boot.reboot-loop", result.overlayDiskPath,
+                             {{"guestReboots",
+                               std::to_string(vmSummary.guestReboots)}}),
+            &events);
+      }
 
       if (hostCapture.guestAgentConnected) {
         AppendJournalEvent(result.journalPath,
@@ -13136,13 +13167,20 @@ DetonationResult InHouseOrchestrator::PrepareAndRun(
                          &events);
     }
 
-    // Only claim "not executed" when the guest's ReportComplete did not confirm
-    // a detonation -- an authorized run that actually launched the sample sets
-    // sampleExecuted=true above (do not clobber it back to false here).
-    if (!result.dynamicSummary.sampleExecuted) {
+    // "Sample not executed" is only an ERROR when execution was actually
+    // ARMED (the two-key gate held) yet the guest never confirmed a detonation.
+    // A default gated run -- and any interactive boot -- deliberately does not
+    // execute the sample, so flagging that as an error made a clean boot +
+    // healthcheck look failed in the report. Recompute the same gate the run
+    // loop used (config_ + per-run key are stable across the run).
+    const bool executionWasAuthorized =
+        (config_.dynamicExecutionEnabled ||
+         EnvFlagEnabled("ANTIMAL_FORCE_DYNAMIC_EXEC")) &&
+        PerRunExecutionAuthorized();
+    if (executionWasAuthorized && !result.dynamicSummary.sampleExecuted) {
       result.errors.push_back(
-          "Sample was staged but not executed; host/guest channel and safe "
-          "sample execution remain disabled.");
+          "Execution was authorized but the sample did not run (delivery/launch "
+          "failed, or the in-guest execution key was not armed).");
     }
     result.dynamicSummary.eventsCaptured = static_cast<uint32_t>(events.size());
     result.dynamicSummary.artifactsCaptured =

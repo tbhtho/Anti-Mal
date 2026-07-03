@@ -776,6 +776,12 @@ std::string HtmlPath(std::filesystem::path path) {
 
 // ----- HTML building blocks --------------------------------------------
 
+// Cycle/abuse guard shared by both process-tree renderers (the left-rail
+// EmitProcessNode forest and BuildProcessTree). Adversarial or buggy telemetry
+// can self-parent a PID or form a parent cycle; a visited set plus this hard
+// depth cap guarantee the recursive renderers terminate.
+constexpr int kProcessTreeMaxDepth = 64;
+
 struct ProcNode {
   uint32_t pid = 0;
   uint32_t parentPid = 0;
@@ -816,7 +822,13 @@ ProcessForest BuildProcessForest(const std::vector<EventRecord> &events) {
 
 std::string EmitProcessTreeHtml(const ProcessForest &forest);
 
-void EmitProcessNode(std::ostringstream &out, const ProcNode *node) {
+// Renders one node and its subtree. `visited` breaks parent cycles (a
+// self-parented PID makes a node its own child) and `depth` bounds runaway
+// chains, so malformed telemetry can never blow the stack while rendering.
+void EmitProcessNode(std::ostringstream &out, const ProcNode *node,
+                     std::set<uint32_t> &visited, int depth) {
+  if (depth > kProcessTreeMaxDepth) return;
+  if (!visited.insert(node->pid).second) return; // already drawn -> break cycle
   out << "<li class=\"proc\" data-pid=\"" << node->pid << "\">";
   out << "<div class=\"proc-row\" onclick=\"AntiMal.filterByPid(" << node->pid << ")\">";
   out << "<span class=\"pid\">" << node->pid << "</span>";
@@ -832,7 +844,8 @@ void EmitProcessNode(std::ostringstream &out, const ProcNode *node) {
   out << "</div>";
   if (!node->children.empty()) {
     out << "<ul>";
-    for (const auto *child : node->children) EmitProcessNode(out, child);
+    for (const auto *child : node->children)
+      EmitProcessNode(out, child, visited, depth + 1);
     out << "</ul>";
   }
   out << "</li>";
@@ -841,7 +854,14 @@ void EmitProcessNode(std::ostringstream &out, const ProcNode *node) {
 std::string EmitProcessTreeHtml(const ProcessForest &forest) {
   std::ostringstream out;
   out << "<ul class=\"proc-tree\">";
-  for (const auto *root : forest.roots) EmitProcessNode(out, root);
+  std::set<uint32_t> visited;
+  for (const auto *root : forest.roots) EmitProcessNode(out, root, visited, 0);
+  // Safety net: a pure cycle (e.g. A<->B parented to each other) leaves both
+  // nodes off the root list, which would silently drop them. Emit any unvisited
+  // node as a depth-0 orphan so nothing vanishes from the report.
+  for (auto &[pid, node] : forest.nodes) {
+    if (!visited.count(pid)) EmitProcessNode(out, &node, visited, 0);
+  }
   out << "</ul>";
   return out.str();
 }
@@ -852,8 +872,6 @@ std::string EmitProcessTreeHtml(const ProcessForest &forest) {
 // and renders nothing (returns "did it draw anything?") when it has no rows, so
 // the caller can skip the surrounding section card. Every untrusted string runs
 // through HtmlEscape, matching the rest of this renderer.
-
-constexpr int kProcessTreeMaxDepth = 64; // cycle/abuse guard for BuildProcessTree
 
 // Truncate a command line for the visible cell; the full value goes in title=.
 std::string TruncateForCell(const std::string &text, size_t max = 120) {
@@ -1336,6 +1354,11 @@ section.panel h2{margin:0 0 10px;font-size:13px;letter-spacing:1px;
 .badge.suspicious{background:var(--warn);color:#1a1308}
 .badge.clean{background:var(--good);color:#0c1b13}
 .badge.error{background:#555;color:#fff}
+td.hot{color:var(--bad);font-weight:700}
+details.vmdiag{margin:8px 0 2px}
+details.vmdiag>summary{cursor:pointer;color:var(--muted);font-size:12px;
+       letter-spacing:.3px;user-select:none}
+details.vmdiag[open]>summary{margin-bottom:8px}
 table{width:100%;border-collapse:collapse;font-size:13px}
 th,td{padding:6px 8px;text-align:left;border-bottom:1px solid var(--border);
       vertical-align:top}
@@ -1872,6 +1895,13 @@ std::string BuildHtmlReportWithFrames(const AnalysisReport &report,
            << HtmlEscape(report.dynamicSummary.bootstatScalarSummary)
            << "</div>";
     }
+    // Raw VMM device counters are diagnostics, not analyst signal -- collapse
+    // them behind a <details> so the verdict / boot outcome / desktop usability
+    // rows above lead. Close the analyst-facing kv grid and open a nested one
+    // inside the disclosure so the grid layout stays intact either way.
+    html << "</div>"; // close the analyst-facing kv grid
+    html << "<details class=\"vmdiag\"><summary>VM diagnostics &mdash; raw device "
+            "counters</summary><div class=\"kv\">";
     html << "<div class=\"k\">vCPU exits</div><div class=\"mono\">"
          << report.dynamicSummary.vcpuExits << "</div>";
     html << "<div class=\"k\">IDE commands</div><div class=\"mono\">"
@@ -2031,6 +2061,8 @@ std::string BuildHtmlReportWithFrames(const AnalysisReport &report,
       }
       html << "</div>";
     }
+    html << "</div></details>"; // close the raw-counter kv + collapsible
+    html << "<div class=\"kv\">"; // resume the top-level kv for the scan fields
   }
   html << "<div class=\"k\">entropy</div><div class=\"mono\">"
        << scan.entropy << "</div>";
@@ -2182,7 +2214,7 @@ std::string BuildHtmlReportWithFrames(const AnalysisReport &report,
       const bool hot = sec.executable && sec.entropy > 7.0;
       html << "<tr><td class=\"mono\">" << HtmlEscape(sec.name) << "</td><td>"
            << sec.virtualSize << "</td><td>" << sec.rawSize << "</td><td"
-           << (hot ? " class=\"badge Malicious\"" : "") << ">";
+           << (hot ? " class=\"hot\" title=\"executable + high entropy (packer/encryption tell)\"" : "") << ">";
       char buf[16];
       std::snprintf(buf, sizeof(buf), "%.2f", sec.entropy);
       html << buf << "</td><td class=\"mono\">" << (sec.executable ? "X" : "-")
@@ -2241,13 +2273,9 @@ std::string BuildHtmlReportWithFrames(const AnalysisReport &report,
            << "</div>";
     }
   }
-  {
-    std::ostringstream body;
-    if (EmitMitreChips(body, report.mitreTechniques)) {
-      html << "<div class=\"section-card\"><h2>MITRE ATT&amp;CK</h2>"
-           << body.str() << "</div>";
-    }
-  }
+  // NOTE: MITRE ATT&CK is rendered once, as the grouped kill-chain view in the
+  // right-rail Indicators section (EmitMitreByTactic). The former flat chip card
+  // here duplicated it, so it was removed.
 
   html << "<h2 style=\"margin-top:16px\">Full Event Timeline</h2>";
   EmitEventTable(html, report.events);
@@ -2364,12 +2392,14 @@ std::string BuildHtmlReportWithFrames(const AnalysisReport &report,
 }
 
 void WriteReportJson(const std::filesystem::path &path, const AnalysisReport &report) {
-  WriteTextFile(path, ToJson(report));
+  // Atomic: a dirty-kill of the VM process must never leave a truncated,
+  // unparseable report.json (the primary machine-read artifact).
+  WriteTextFileAtomic(path, ToJson(report));
 }
 
 void WriteReportHtml(const std::filesystem::path &path, const AnalysisReport &report) {
   const auto frames = DiscoverFramesNextTo(path);
-  WriteTextFile(path, BuildHtmlReportWithFrames(report, frames));
+  WriteTextFileAtomic(path, BuildHtmlReportWithFrames(report, frames));
 }
 
 std::vector<std::string> AggregateMitreTechniques(
