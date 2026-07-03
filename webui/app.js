@@ -47,12 +47,10 @@
   var heldKeys = {};       // e.code -> break scancodes, flushed on blur/stop
   var liveMouse = { btn: 0, dx: 0, dy: 0 }; // accumulated relative mouse state
   var liveMouseTimer = null;                // flushes accumulated movement
-  // The guest draws its pointer as a HARDWARE cursor sprite that is NOT in the
-  // linear framebuffer we capture, so once Pointer Lock hides the host cursor
-  // there'd be no visible pointer. We reconstruct an absolute position from the
-  // same relative deltas we feed the guest and draw a synthetic pointer on the
-  // canvas (an aiming aid — it can drift slightly from the guest's own ballistics).
-  var liveCursor = { x: 0, y: 0, valid: false };
+  // NOTE: no synthetic host-drawn cursor. The guest renders its own pointer into
+  // the framebuffer we capture; a second host-drawn one caused a "two cursors"
+  // artifact, so we hide the host cursor on capture (cursor:none) and show only
+  // the guest's real pointer.
   var curFrameW = 0, curFrameH = 0, liveRaf = 0; // render loop decoupled from publish rate
   var liveFrameBuffer = null;    // host-shared ArrayBuffer of live RGBA pixels
   var usingSharedFrames = false; // true once the canvas path is live (no <img>)
@@ -62,9 +60,17 @@
   function send(cmd, args) {
     var reqId = nextReqId++;
     return new Promise(function (resolve) {
-      pending.set(reqId, resolve);
+      // Guard against a host worker that throws before replying: without this the
+      // Promise never settles and callers that pre-disable a button (Generate
+      // YARA, Recover config) stay disabled forever. Time out after 30s so their
+      // error path fires and re-enables. A late real reply for a timed-out reqId
+      // is harmless (the message handler just finds no pending entry).
+      var timer = setTimeout(function () {
+        if (pending.has(reqId)) { pending.delete(reqId); resolve({ ok: false, error: 'timeout' }); }
+      }, 30000);
+      pending.set(reqId, function (m) { clearTimeout(timer); resolve(m); });
       try { window.chrome.webview.postMessage({ cmd: cmd, reqId: reqId, args: args || {} }); }
-      catch (e) { resolve({ ok: false, error: 'bridge unavailable' }); }
+      catch (e) { clearTimeout(timer); pending.delete(reqId); resolve({ ok: false, error: 'bridge unavailable' }); }
     });
   }
   if (window.chrome && window.chrome.webview) {
@@ -173,6 +179,11 @@
       return '<h1 class="page-title">VM Analysis</h1><p class="page-sub">In-house WHP sandbox: live view, state, boot timeline, and safety gates.</p>' +
         '<div class="panel"><h2>VM Console <span id="vm-live-status" class="page-sub" style="font-weight:400"></span><span id="vm-display-mode" class="page-sub" style="font-weight:600;margin-left:10px;font-size:12px"></span></h2>' +
         '<div class="actions"><button class="btn primary" id="vm-boot-btn">Boot VM (live)</button><button class="btn danger" id="vm-detonate-btn">Detonate Sample (live)</button><button class="btn" id="vm-stop-btn">Stop</button><button class="btn" id="vm-fs-btn" title="Fill the screen with the VM (Esc to exit)">⛶ Fullscreen</button></div>' +
+        '<div class="actions" style="margin-top:8px;flex-wrap:wrap"><button class="btn" id="vm-paste-btn" title="Type the host clipboard into the guest">📋 Paste</button>' +
+        '<input id="vm-text-input" class="mono" placeholder="text to send to the guest…" style="flex:1;min-width:160px;padding:6px 8px;border-radius:6px;border:1px solid var(--border,#2a2f3a);background:var(--panel-2,#11151c);color:inherit" />' +
+        '<button class="btn" id="vm-text-btn" title="Type the text on the left into the guest, then press Enter">Send Text ⏎</button>' +
+        '<button class="btn" id="vm-login-btn" title="Type the configured login password + Enter (the password never leaves the host)">🔑 Send Login Password</button>' +
+        '<button class="btn" id="vm-cad-btn" title="Send the Ctrl+Alt+Del secure-attention sequence to the guest">Ctrl+Alt+Del</button></div>' +
         '<div class="screenframe" id="live-frame" tabindex="0" style="margin-top:12px;outline:none">Click “Boot VM (live)” for a clean session, or “Detonate Sample (live)” to run a BENIGN sample inside it.</div>' +
         '</div>' +
         '<div class="panel"><h2>Process Telemetry <span id="vm-telemetry-status" class="page-sub" style="font-weight:400"></span></h2>' +
@@ -773,22 +784,6 @@
     }
     liveRaf = requestAnimationFrame(renderLoop);
   }
-  // A crisp white arrow with a dark outline so it reads on any background.
-  function drawLiveCursor(ctx, x, y) {
-    var p = [[0, 0], [0, 16], [4, 12], [7, 18], [9, 17], [6, 11], [11, 11]];
-    ctx.save();
-    ctx.beginPath();
-    ctx.moveTo(x + p[0][0], y + p[0][1]);
-    for (var i = 1; i < p.length; i++) ctx.lineTo(x + p[i][0], y + p[i][1]);
-    ctx.closePath();
-    ctx.fillStyle = '#fff';
-    ctx.strokeStyle = '#000';
-    ctx.lineWidth = 1.5;
-    ctx.lineJoin = 'round';
-    ctx.fill();
-    ctx.stroke();
-    ctx.restore();
-  }
   // Honest liveness readout while a live session runs. fps counts frames the VM
   // process actually published this second; 0 now means the publisher isn't
   // advancing frameSeq (the VM process stalled/exited) -- NOT the old blank-skip
@@ -885,6 +880,53 @@
     };
     var fsb = $('#vm-fs-btn');
     if (fsb) fsb.onclick = toggleFullscreen;
+    // Host clipboard -> guest: the host returns its clipboard text (never written,
+    // capped 4096) and the paced typer types it into the guest.
+    var pasteBtn = $('#vm-paste-btn');
+    if (pasteBtn) pasteBtn.onclick = function () {
+      if (!livePollTimer) { appendLog('WARN', 'Boot a VM first — no live session to paste into.'); return; }
+      send('vm.paste').then(function (r) {
+        var t = (r && r.result && r.result.text) || '';
+        if (!t) { appendLog('INFO', 'Clipboard is empty or not text.'); return; }
+        sendTextToGuest(t, false);
+      });
+    };
+    // Send Text: type the field content into the guest, terminated by Enter.
+    var textInput = $('#vm-text-input'), textBtn = $('#vm-text-btn');
+    function sendTextField() {
+      var v = textInput ? textInput.value : '';
+      if (!v) return;
+      sendTextToGuest(v, true);
+      if (textInput) textInput.value = '';
+    }
+    if (textBtn) textBtn.onclick = sendTextField;
+    if (textInput) textInput.addEventListener('keydown', function (e) {
+      // Enter in the field submits it; the field isn't the captured frame, so this
+      // never reaches the guest keydown path.
+      if (e.key === 'Enter') { e.preventDefault(); sendTextField(); }
+    });
+    // Send Login Password: the host types the configured password itself (it is
+    // never exposed to this page), so this is a no-arg trigger.
+    var loginBtn = $('#vm-login-btn');
+    if (loginBtn) loginBtn.onclick = function () {
+      if (!livePollTimer) { appendLog('WARN', 'Boot a VM first — no live session to log into.'); return; }
+      send('vm.login').then(function (r) {
+        var res = (r && r.result) || {};
+        if ((r && r.ok === false) || res.ok === false) {
+          appendLog('ERROR', 'Send Login Password failed: ' + String(res.error || (r && r.error) || 'unknown'));
+          return;
+        }
+        appendLog('INFO', 'Typing the configured login password into the guest…');
+      });
+    };
+    // Ctrl+Alt+Del: the secure-attention chord, sent as one atomic scancode burst.
+    // L-Ctrl make, L-Alt make, Delete(ext) make/break, L-Alt break, L-Ctrl break.
+    var cadBtn = $('#vm-cad-btn');
+    if (cadBtn) cadBtn.onclick = function () {
+      if (!livePollTimer) { appendLog('WARN', 'Boot a VM first — no live session for Ctrl+Alt+Del.'); return; }
+      send('vm.input', { scancodes: [0x1D, 0x38, 0xE0, 0x53, 0xE0, 0xD3, 0xB8, 0x9D] });
+      appendLog('INFO', 'Sent Ctrl+Alt+Del to the guest.');
+    };
     // Live mouse: route movement/clicks over the frame into the guest (relative
     // PS/2 mouse). Movement deltas are scaled from displayed px to guest px and
     // accumulated; flushLiveMouse sends them ~20/s. Buttons go immediately.
@@ -931,11 +973,10 @@
             // (WebView2 does NOT hide the OS cursor on pointer-lock, hence cursor:none).
             if (f) { f.style.outline = '2px solid #4ea1ff'; f.style.cursor = 'none'; }
             if (cv) cv.style.cursor = 'none';
-            liveCursor.x = cv ? cv.width / 2 : 0; liveCursor.y = cv ? cv.height / 2 : 0; liveCursor.valid = !!cv; // center the synthetic pointer on capture
           } else {
             if (f) { f.style.outline = 'none'; f.style.cursor = ''; } // restore the host cursor on release
             if (cv) cv.style.cursor = '';
-            liveCursor.valid = false; releaseHeldKeys(); // never leave a key stuck
+            releaseHeldKeys(); // never leave a key stuck
           }
         });
         // While driving the VM, the scroll wheel must NOT scroll the host page.
@@ -955,12 +996,6 @@
           var gx = (e.movementX || 0) * s.x, gy = (e.movementY || 0) * s.y;
           liveMouse.dx += gx;            // delta -> guest (relative PS/2)
           liveMouse.dy += gy;
-          var cv = document.getElementById('live-frame-canvas'); // integrate -> synthetic pointer
-          if (cv) {
-            liveCursor.x = Math.max(0, Math.min(cv.width, liveCursor.x + gx));
-            liveCursor.y = Math.max(0, Math.min(cv.height, liveCursor.y + gy));
-            liveCursor.valid = true;
-          }
         });
         document.addEventListener('mouseup', function (e) {
           if (!livePollTimer || !vmCaptured()) return;
@@ -1108,13 +1143,11 @@
           if (!res.started) { appendLog('ERROR', 'Detonate failed: ' + String(res.error || 'unknown')); return; }
           appendLog('WARN', 'Detonating ' + (res.sample || 'sample') + ' live' + (res.seeded ? ' (seed-boot)' : ' (cold boot)') + ' — watch it run on VM Analysis.');
           liveSession = 'detonate';
-          if (currentPage !== 'vm') route('vm');
-          // The VM page just mounted; start streaming the framebuffer + telemetry.
-          setTimeout(function () {
-            setVmState('detonating', res.sample || '');
-            startLivePoll();
-            var fr = $('#live-frame'); if (fr) fr.focus();
-          }, 80);
+          if (currentPage !== 'vm') route('vm'); // route() mounts synchronously
+          // The VM page is now mounted; start streaming the framebuffer + telemetry.
+          setVmState('detonating', res.sample || '');
+          startLivePoll();
+          var fr = $('#live-frame'); if (fr) fr.focus();
         });
       });
       return;

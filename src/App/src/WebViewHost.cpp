@@ -18,7 +18,6 @@
 #include <utility>
 #include <vector>
 
-#include "antimal/BrowserImpact.h"
 #include "antimal/Config.h"
 #include "antimal/EventJournal.h"
 #include "antimal/FileUtil.h"
@@ -30,6 +29,7 @@
 #include "antimal/Scanner.h"
 #include "antimal/Strings.h"
 #include "antimal/YaraGen.h"
+#include "antimal/hv/LiveInputProtocol.h"
 
 // CLSID_FileOpenDialog lives in uuid.lib; CoCreateInstance/CoInitializeEx in
 // ole32.lib. Both are MSVC default libs, but pin them so the native picker
@@ -661,7 +661,17 @@ void WebViewHost::RegisterHandlers() {
     boolean("enrichTagger", c.enrichTagger);
     u32("screenshotIntervalMs", c.screenshotIntervalMs);
     boolean("dynamicExecutionEnabled", c.dynamicExecutionEnabled);
-    str("vmLoginMode", c.vmLoginMode);
+    {
+      // Validate against the known modes (like networkMode above) so a typo from
+      // the UI can't persist a garbage login mode that vm.boot then can't honor.
+      const JsonValue &v = args.At("vmLoginMode");
+      if (v.IsString()) {
+        const std::string s = v.AsString();
+        if (s == "password" || s == "autologon" || s == "manual") {
+          c.vmLoginMode = s;
+        }
+      }
+    }
     str("vmLoginPassword", c.vmLoginPassword);
     try {
       std::ofstream out(DefaultConfigPath(), std::ios::binary | std::ios::trunc);
@@ -1100,55 +1110,9 @@ void WebViewHost::RegisterHandlers() {
     return std::string(R"({"loading":true})");
   });
 
-  // P7: browser-impact triage over the latest run's contacted domains.
-  // Decryption is OFF -- decrypting saved browser secrets is a deliberate,
-  // separately-gated action, never auto-run from the UI. Worker -> browser.data.
-  router_.Register("browser.get", [this](const JsonValue &) -> std::string {
-    const HWND h = hwnd_;
-    std::thread([h]() {
-      CoInitializeEx(nullptr, COINIT_MULTITHREADED);
-      try {
-      const AppConfig c = LoadConfig(DefaultConfigPath());
-      const NewestRun nr = FindNewestRun(c.workspaceRoot);
-      std::vector<std::string> domains;
-      std::string runId;
-      if (!nr.json.empty()) {
-        const AnalysisReport r = LoadReportBestEffort(nr.json);
-        domains = r.networkDomains;
-        runId = r.runId.empty() ? Narrow(nr.dir.filename().wstring().c_str())
-                                : r.runId;
-      }
-      const std::vector<BrowserRisk> risks =
-          AnalyzeBrowserImpact(domains, /*decryptBrowserSecrets=*/false);
-      std::string arr = "[";
-      for (size_t i = 0; i < risks.size(); ++i) {
-        if (i) {
-          arr += ",";
-        }
-        JsonObjectBuilder o;
-        o.AddString("site", risks[i].site);
-        o.AddString("domain", risks[i].domain);
-        o.AddBool("contactedBySample", risks[i].contactedBySample);
-        o.AddBool("savedCredentials", risks[i].savedCredentials);
-        o.AddBool("cookiesPresent", risks[i].cookiesPresent);
-        o.AddString("recommendation", risks[i].recommendation);
-        arr += o.Finish();
-      }
-      arr += "]";
-      WebViewHost::Emit(h, "browser.data",
-                        std::string("{\"risks\":") + arr +
-                            ",\"domains\":" + std::to_string(domains.size()) +
-                            ",\"runId\":" + JsonQuote(runId) + "}");
-      } catch (...) {
-        // A worker exception must never std::terminate the whole UI process.
-        WebViewHost::Emit(
-            h, "log",
-            R"({"level":"ERROR","msg":"a background task error - see status"})");
-      }
-      CoUninitialize();
-    }).detach();
-    return std::string(R"({"loading":true})");
-  });
+  // NOTE: the browser.get bridge handler was removed -- the T31 Browser Risk UI
+  // nav that consumed it is gone, so it had zero callers. Browser-impact triage
+  // remains available as the standalone `browser-impact` HostCli subcommand.
 
   // P5 (host->UI half of the live telemetry channel): tail a run's events.jsonl
   // with EventJournalTailer and stream each new EventRecord to the page as a
@@ -1576,9 +1540,12 @@ void WebViewHost::RegisterHandlers() {
   //   keyboard: 'K' <count> <Set-1 scancodes...>
   //   mouse:    'M' <buttons> <dx int8> <dy int8>   (relative PS/2 packet)
   router_.Register("vm.input", [](const JsonValue &args) -> std::string {
-    const AppConfig c = LoadConfig(DefaultConfigPath());
-    const std::filesystem::path liveInput =
-        c.workspaceRoot / L"_live-input.bin";
+    // vm.input fires on every keystroke and at mouse-move rates (dozens/sec), so
+    // re-reading + parsing the TOML per event is wasteful. The workspace root is
+    // fixed for the process lifetime (same as vm.frame's cache), so resolve the
+    // live-input path once. A config edit mid-session doesn't move it.
+    static const std::filesystem::path liveInput =
+        LoadConfig(DefaultConfigPath()).workspaceRoot / L"_live-input.bin";
     std::vector<uint8_t> rec;
     const JsonValue &codes = args.At("scancodes");
     const JsonValue &mouse = args.At("mouse");
@@ -1591,22 +1558,16 @@ void WebViewHost::RegisterHandlers() {
           sc.push_back(static_cast<uint8_t>(b));
         }
       }
-      for (size_t i = 0; i < sc.size(); i += 255) {
-        const size_t n = (sc.size() - i) < 255 ? (sc.size() - i) : 255;
-        rec.push_back('K');
-        rec.push_back(static_cast<uint8_t>(n));
-        rec.insert(rec.end(), sc.begin() + i, sc.begin() + i + n);
-      }
+      rec = antimal::hv::EncodeKeyRecords(sc);
     } else if (mouse.IsObject()) {
-      auto clamp8 = [](int64_t v) -> uint8_t {
+      auto clamp8 = [](int64_t v) -> int8_t {
         if (v > 127) v = 127;
         if (v < -127) v = -127;
-        return static_cast<uint8_t>(static_cast<int8_t>(v));
+        return static_cast<int8_t>(v);
       };
-      rec.push_back('M');
-      rec.push_back(static_cast<uint8_t>(mouse.At("buttons").AsInt64() & 0x07));
-      rec.push_back(clamp8(mouse.At("dx").AsInt64()));
-      rec.push_back(clamp8(mouse.At("dy").AsInt64()));
+      rec = antimal::hv::EncodeMouseRecord(
+          static_cast<uint8_t>(mouse.At("buttons").AsInt64() & 0x07),
+          clamp8(mouse.At("dx").AsInt64()), clamp8(mouse.At("dy").AsInt64()));
     } else {
       return std::string(R"({"ok":false,"error":"no input"})");
     }
@@ -1644,6 +1605,48 @@ void WebViewHost::RegisterHandlers() {
       text.resize(4096);
     }
     return std::string("{\"text\":") + JsonQuote(text) + "}";
+  });
+
+  // Type the configured login password (+ Enter) into the guest. The password is
+  // NEVER sent to the UI (config.get only exposes vmLoginPasswordSet), so a
+  // dedicated host handler does the typing: it converts the password to Set-1
+  // scancodes and appends paced 'K' records to the live-input file the VM tails.
+  // Pacing (one key per >100ms poll window) is required or the guest keyboard
+  // stack drops batched keys -- the same reason the UI's paced typer exists.
+  // The typing runs on a detached thread so the bridge thread never blocks; it
+  // captures only value copies, so it is safe to outlive this handler.
+  router_.Register("vm.login", [](const JsonValue &) -> std::string {
+    const AppConfig c = LoadConfig(DefaultConfigPath());
+    const std::string pw = c.vmLoginPassword;
+    if (pw.empty()) {
+      return std::string(
+          R"({"ok":false,"error":"no login password configured"})");
+    }
+    const std::filesystem::path liveInput = c.workspaceRoot / L"_live-input.bin";
+    std::thread([pw, liveInput]() {
+      auto appendRecord = [&](const std::vector<uint8_t> &rec) -> bool {
+        if (rec.empty()) {
+          return true;
+        }
+        std::ofstream out(liveInput, std::ios::binary | std::ios::app);
+        if (!out) {
+          return false;
+        }
+        out.write(reinterpret_cast<const char *>(rec.data()),
+                  static_cast<std::streamsize>(rec.size()));
+        return true;
+      };
+      for (char ch : pw) {
+        const std::vector<uint8_t> tap = antimal::hv::AsciiToSet1Tap(ch);
+        if (!appendRecord(antimal::hv::EncodeKeyRecords(tap))) {
+          return; // workspace gone / VM stopped -- stop typing
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(120));
+      }
+      // Trailing Enter to submit the login.
+      appendRecord(antimal::hv::EncodeKeyRecords({0x1C, 0x9C}));
+    }).detach();
+    return std::string(R"({"ok":true,"typing":true})");
   });
 }
 
