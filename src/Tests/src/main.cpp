@@ -1314,6 +1314,132 @@ void TestLiveInputProtocol() {
   }
 }
 
+// The encoders (EncodeKeyRecords / EncodeMouseRecord / AsciiToSet1Tap) are the
+// host side of the wire the parser decodes; verify they round-trip so the App's
+// live-input path and the VM run loop can never drift out of sync.
+void TestLiveInputEncode() {
+  using antimal::hv::AsciiToSet1Tap;
+  using antimal::hv::EncodeKeyRecords;
+  using antimal::hv::EncodeMouseRecord;
+  using antimal::hv::LiveInputEvent;
+  using antimal::hv::ParseLiveInput;
+
+  // Keyboard: a scancode burst encodes to one 'K' record that decodes verbatim.
+  {
+    std::vector<uint8_t> sc = {0x1D, 0x38, 0xE0, 0x53, 0xE0, 0xD3, 0xB8, 0x9D};
+    std::vector<uint8_t> buf = EncodeKeyRecords(sc);
+    std::vector<LiveInputEvent> ev;
+    ParseLiveInput(buf, ev);
+    Expect(ev.size() == 1 && ev[0].scancodes == sc,
+           "EncodeKeyRecords round-trips a scancode burst");
+    Expect(buf.empty(), "encoded keyboard record fully consumed");
+  }
+
+  // A burst over the 255-per-record cap splits into multiple records that still
+  // decode to the same total scancode stream.
+  {
+    std::vector<uint8_t> sc(600, 0x1E);
+    std::vector<uint8_t> buf = EncodeKeyRecords(sc);
+    std::vector<LiveInputEvent> ev;
+    ParseLiveInput(buf, ev);
+    size_t total = 0;
+    for (const auto &e : ev) total += e.scancodes.size();
+    Expect(ev.size() == 3 && total == 600,
+           "a >255 burst splits into 255+255+90 records preserving every code");
+    Expect(buf.empty(), "split records fully consumed");
+  }
+
+  // Empty input encodes to no bytes.
+  Expect(EncodeKeyRecords({}).empty(), "empty scancodes encode to nothing");
+
+  // Mouse: signed dx/dy + masked buttons round-trip.
+  {
+    std::vector<uint8_t> buf = EncodeMouseRecord(0x05, -9, 12);
+    std::vector<LiveInputEvent> ev;
+    ParseLiveInput(buf, ev);
+    Expect(ev.size() == 1 && ev[0].type == LiveInputEvent::Type::Mouse &&
+               ev[0].buttons == 0x05 && ev[0].dx == -9 && ev[0].dy == 12,
+           "EncodeMouseRecord round-trips buttons/dx/dy");
+  }
+
+  // AsciiToSet1Tap: unshifted key = make+break; shifted key wraps in L-Shift.
+  {
+    std::vector<uint8_t> a = AsciiToSet1Tap('a');
+    Expect(a.size() == 2 && a[0] == 0x1E && a[1] == 0x9E,
+           "'a' taps make 0x1E / break 0x9E");
+    std::vector<uint8_t> A = AsciiToSet1Tap('A');
+    Expect(A.size() == 4 && A[0] == 0x2A && A[1] == 0x1E && A[2] == 0x9E &&
+               A[3] == 0xAA,
+           "'A' wraps the tap in Left-Shift make/break");
+    std::vector<uint8_t> bang = AsciiToSet1Tap('!');
+    Expect(bang.size() == 4 && bang[0] == 0x2A && bang[1] == 0x02,
+           "'!' is shift + the '1' key");
+    Expect(AsciiToSet1Tap('\t').empty(),
+           "an unmappable character taps to nothing");
+  }
+}
+
+// A self-parented PID (pid == ppid) makes a process node its own child, and a
+// 2-cycle (A<->B) leaves both off the root list. The left-rail process-tree
+// renderer must terminate on both (visited set + depth cap) and never silently
+// drop a node -- otherwise crafted or buggy telemetry can crash the report
+// renderer via stack overflow or make processes vanish from the report.
+void TestReportProcessTreeCycleGuard() {
+  auto proc = [](uint32_t pid, uint32_t ppid, const char *img) {
+    antimal::EventRecord e;
+    e.category = "process";
+    e.action = "process.start";
+    e.processId = pid;
+    e.parentProcessId = ppid;
+    e.imagePath = img;
+    return e;
+  };
+  antimal::AnalysisReport report;
+  report.runId = "cycle-test";
+  report.events.push_back(proc(100, 100, "self.exe"));  // self-parented
+  report.events.push_back(proc(200, 201, "acyc.exe"));  // 2-cycle A->B
+  report.events.push_back(proc(201, 200, "bcyc.exe"));  // 2-cycle B->A
+  report.events.push_back(proc(300, 1, "normal.exe"));  // ordinary root
+
+  // Reaching this line at all proves the recursive renderer terminated -- a real
+  // cycle would stack-overflow and take down the test process.
+  const std::string html = antimal::BuildHtmlReport(report);
+  Expect(!html.empty(), "report renders despite cyclic process telemetry");
+  auto has = [&](const char *s) {
+    return html.find(s) != std::string::npos;
+  };
+  // Every process, including the pure-cycle members, must still appear (the
+  // orphan safety net emits nodes unreachable from any root).
+  Expect(has("self.exe") && has("acyc.exe") && has("bcyc.exe") &&
+             has("normal.exe"),
+         "cyclic + orphaned process nodes are all still rendered once");
+}
+
+// WriteTextFileAtomic hardens the report-write path: a dirty-kill mid-write must
+// never leave a truncated file, and a successful write leaves no temp behind.
+void TestWriteTextFileAtomic() {
+  namespace fs = std::filesystem;
+  const fs::path dir =
+      fs::temp_directory_path() / ("antimal-atomic-" + antimal::MakeRunId());
+  std::error_code ec;
+  const fs::path target = dir / "sub" / "report.json";
+
+  // Creates parent dirs and writes the full content to a new path.
+  antimal::WriteTextFileAtomic(target, "hello world");
+  Expect(antimal::ReadTextFile(target) == "hello world",
+         "atomic write creates the file with full content");
+  // No leftover .tmp after a successful write.
+  fs::path tmp = target;
+  tmp += ".tmp";
+  Expect(!fs::exists(tmp), "atomic write leaves no .tmp behind");
+  // Fully replaces prior (longer) content with shorter content -- no stale tail.
+  antimal::WriteTextFileAtomic(target, "x");
+  Expect(antimal::ReadTextFile(target) == "x",
+         "atomic write fully replaces prior content");
+
+  fs::remove_all(dir, ec);
+}
+
 void TestPs2QueuedInput() {
   antimal::hv::Ps2Controller ps2;
   ps2.InjectKeyboardScancode(0x1E);
@@ -9124,6 +9250,49 @@ void TestE1000StatisticsRegisters() {
   Expect(r(0x4010) == 1, "e1000e stats: MPC counts the missed packet");
 }
 
+// The NIC must present a real globally-administered Intel vendor MAC, not a
+// locally-administered one (the U/L bit 0x02 in the first octet) — a
+// locally-administered MAC is a classic VM/sandbox tell that evasive malware
+// checks via GetAdaptersAddresses / WMI. The EEPROM checksum invariant (all 64
+// words sum to 0xBABA) must still hold or the Windows driver rejects the EEPROM.
+void TestE1000MacIdentity() {
+  using antimal::hv::E1000Device;
+  E1000Device nic;
+  const uint64_t kMmio = 0xF0000000ull;
+  nic.SetMmioBase(kMmio);
+  auto eepromWord = [&](uint32_t addr) -> uint16_t {
+    nic.OnWrite(kMmio + 0x0014, 4, (addr << 8) | 0x1);  // EERD START + addr
+    uint64_t v = 0;
+    nic.OnRead(kMmio + 0x0014, 4, &v);
+    return static_cast<uint16_t>((v >> 16) & 0xFFFF);
+  };
+  const uint16_t w0 = eepromWord(0), w1 = eepromWord(1), w2 = eepromWord(2);
+  const uint8_t mac[6] = {
+      static_cast<uint8_t>(w0 & 0xFF), static_cast<uint8_t>(w0 >> 8),
+      static_cast<uint8_t>(w1 & 0xFF), static_cast<uint8_t>(w1 >> 8),
+      static_cast<uint8_t>(w2 & 0xFF), static_cast<uint8_t>(w2 >> 8)};
+
+  Expect((mac[0] & 0x01) == 0, "e1000e MAC: unicast (I/G bit clear)");
+  Expect((mac[0] & 0x02) == 0,
+         "e1000e MAC: globally administered (U/L bit clear — not a VM tell)");
+  Expect(mac[0] == 0x00 && mac[1] == 0x1B && mac[2] == 0x21,
+         "e1000e MAC: real Intel OUI 00:1B:21");
+
+  // EEPROM checksum still valid after the MAC change.
+  uint16_t sum = 0;
+  for (uint32_t a = 0; a < 64; ++a)
+    sum = static_cast<uint16_t>(sum + eepromWord(a));
+  Expect(sum == 0xBABA, "e1000e MAC: EEPROM checksum holds (driver accepts it)");
+
+  // RAL/RAH (the receive-address filter) reflect the same MAC, Address Valid set.
+  uint64_t ral = 0, rah = 0;
+  nic.OnRead(kMmio + 0x5400, 4, &ral);
+  nic.OnRead(kMmio + 0x5404, 4, &rah);
+  Expect((ral & 0xFF) == mac[0] && ((ral >> 8) & 0xFF) == mac[1],
+         "e1000e MAC: RAL low bytes match the MAC");
+  Expect((rah & (1u << 31)) != 0, "e1000e MAC: RAH Address Valid bit set");
+}
+
 // RX ring buffer reuse / starvation / wraparound: the driver re-posts buffers by
 // advancing RDT, RDH wraps past the last descriptor, and a reused descriptor's
 // buffer is overwritten by the newer frame. Covers the ring lifecycle the
@@ -10926,6 +11095,9 @@ int main() {
     TestPs2MouseCommandSequence();
     TestScreenStateClassifier();
     TestLiveInputProtocol();
+    TestLiveInputEncode();
+    TestReportProcessTreeCycleGuard();
+    TestWriteTextFileAtomic();
     TestLiveFrameShmContract();
     TestLiveFramePublishGate();
     TestRunDirLiveLock();
@@ -11043,6 +11215,7 @@ int main() {
     TestE1000RxRing();
     TestE1000RxRingReuse();
     TestE1000StatisticsRegisters();
+    TestE1000MacIdentity();
     TestE1000MmioBounds();
     TestPcapWriter();
     TestFakeInternet();
