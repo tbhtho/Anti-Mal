@@ -105,6 +105,44 @@ private:
   std::ifstream stream_;
 };
 
+// A read-only file presented as a sector device, ZERO-PADDED up to a whole
+// sector. Used for disk-backed sample delivery: the sample file is attached as
+// a second AHCI disk and the in-guest agent copies it off the raw device. The
+// padding lets an unaligned file (an arbitrary .exe/.iso size) be read back
+// exactly; the guest truncates to the true byte size carried in the job request.
+class PaddedFileBlockDevice final : public IBlockDevice {
+public:
+  static PaddedFileBlockDevice Open(const std::filesystem::path &path);
+
+  PaddedFileBlockDevice(PaddedFileBlockDevice &&) noexcept;
+  PaddedFileBlockDevice &operator=(PaddedFileBlockDevice &&) noexcept;
+
+  PaddedFileBlockDevice(const PaddedFileBlockDevice &) = delete;
+  PaddedFileBlockDevice &operator=(const PaddedFileBlockDevice &) = delete;
+
+  ~PaddedFileBlockDevice();
+
+  uint64_t SectorCount() const noexcept override;
+  bool ReadSectors(uint64_t lba, uint16_t count, uint8_t *out) override;
+  bool WriteSectors(uint64_t lba, uint16_t count,
+                    const uint8_t *data) override;
+  bool Flush() override;
+
+  // Exact on-disk file size (the region the guest actually uses).
+  uint64_t FileByteSize() const noexcept { return fileBytes_; }
+
+private:
+  PaddedFileBlockDevice(std::filesystem::path path, uint64_t fileBytes,
+                        uint64_t sectors, std::ifstream stream);
+
+  bool RangeValid(uint64_t lba, uint16_t count) const noexcept;
+
+  std::filesystem::path path_;
+  uint64_t fileBytes_ = 0;
+  uint64_t sectors_ = 0;
+  std::ifstream stream_;
+};
+
 class VhdxBlockDevice final : public IBlockDevice {
 public:
   static VhdxBlockDevice Open(const std::filesystem::path &path);

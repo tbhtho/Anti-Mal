@@ -455,6 +455,11 @@ struct VmRunSummary {
   uint32_t ahciReadCommands = 0;
   uint32_t ahciWriteCommands = 0;
   uint64_t ahciSectorsRead = 0;
+  // Sample-delivery disk (AHCI port 1) activity: how many commands the guest
+  // issued and sectors it copied off the raw sample disk.
+  uint64_t ahciSampleCommandsIssued = 0;
+  uint64_t ahciSampleSectorsRead = 0;
+  uint64_t ahciSampleWriteCommands = 0;
   uint64_t ahciSectorsWritten = 0;
   uint32_t ahciUnknownCommands = 0;
   uint32_t ahciLastCommand = 0;
@@ -510,6 +515,12 @@ struct VirtualMachineOptions {
   // Default off until the TPM CRB is genuinely functional.
   bool enableTpm2Table = false;
   VmNetworkMode networkMode = VmNetworkMode::Disabled;
+  // Optional disk-backed sample delivery: a read-only block device (the staged
+  // sample file) presented on AHCI port 1. The in-guest agent finds the raw
+  // device by its reported length and copies the sample off it -- no COM2 size
+  // cap. The caller owns the device; it must outlive every VM generation
+  // (the orchestrator recreates the VM per guest reboot).
+  IBlockDevice *sampleDisk = nullptr;
 };
 
 struct VmProgressSnapshot {

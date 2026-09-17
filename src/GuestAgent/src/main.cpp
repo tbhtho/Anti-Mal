@@ -15,6 +15,7 @@
 #include "antimal/WerReport.h"
 
 #include <Windows.h>
+#include <winioctl.h>  // IOCTL_DISK_GET_LENGTH_INFO (raw sample-disk delivery)
 #include <tlhelp32.h>  // CreateToolhelp32Snapshot (per-process module enumeration)
 #include <UserEnv.h>   // CreateEnvironmentBlock (visible-session launch)
 #include <WtsApi32.h>  // WTSQueryUserToken (active console session token)
@@ -27,6 +28,7 @@
 #include <cstdint>
 #include <exception>
 #include <filesystem>
+#include <fstream>
 #include <iostream>
 #include <iterator>
 #include <optional>
@@ -472,6 +474,56 @@ bool LaunchSampleProcess(const std::filesystem::path &path, DWORD *pid,
     }
   }
 
+  // Fallback 2: duplicate our own (SYSTEM) token into the ACTIVE console
+  // session and launch there. This keeps the sample VISIBLE on the logged-in
+  // desktop even when the per-user token path above refuses -- e.g. the user
+  // token is UAC-filtered while the executable's manifest requires elevation
+  // (common for installers), or WTSQueryUserToken succeeded but the secondary
+  // token cannot create the process. The session id must be set on the token
+  // before CreateProcessAsUser, which is what makes the window land on the
+  // interactive desktop instead of the invisible session 0.
+  if (sessionId != 0xFFFFFFFFu) {
+    HANDLE selfToken = nullptr;
+    if (OpenProcessToken(GetCurrentProcess(), TOKEN_ALL_ACCESS, &selfToken)) {
+      HANDLE sessionToken = nullptr;
+      if (DuplicateTokenEx(selfToken, MAXIMUM_ALLOWED, nullptr,
+                           SecurityImpersonation, TokenPrimary,
+                           &sessionToken)) {
+        DWORD sessionForToken = sessionId;
+        if (SetTokenInformation(sessionToken, TokenSessionId,
+                                &sessionForToken,
+                                sizeof(sessionForToken))) {
+          STARTUPINFOW si2{};
+          si2.cb = sizeof(si2);
+          wchar_t desktop2[] = L"winsta0\\default";
+          si2.lpDesktop = desktop2;
+          PROCESS_INFORMATION pi2{};
+          LPVOID env2 = nullptr;
+          const bool haveEnv2 =
+              CreateEnvironmentBlock(&env2, sessionToken, FALSE) != FALSE;
+          const BOOL ok2 = CreateProcessAsUserW(
+              sessionToken, nullptr, cmd.data(), nullptr, nullptr, FALSE,
+              (haveEnv2 ? CREATE_UNICODE_ENVIRONMENT : 0u) | CREATE_NEW_CONSOLE,
+              haveEnv2 ? env2 : nullptr, cwd, &si2, &pi2);
+          if (haveEnv2) {
+            DestroyEnvironmentBlock(env2);
+          }
+          if (ok2) {
+            CloseHandle(pi2.hThread);
+            CloseHandle(sessionToken);
+            CloseHandle(selfToken);
+            *pid = pi2.dwProcessId;
+            *proc = pi2.hProcess;
+            if (interactive) *interactive = true;
+            return true;
+          }
+        }
+        CloseHandle(sessionToken);
+      }
+      CloseHandle(selfToken);
+    }
+  }
+
   STARTUPINFOW si{};
   si.cb = sizeof(si);
   PROCESS_INFORMATION pi{};
@@ -501,6 +553,15 @@ bool HasInteractiveSession() {
   return true;
 }
 
+// Resolves WHAT to launch (the sample itself, or -- for a delivered .iso -- the
+// installer inside the mounted image) and launches it INTO the active desktop
+// session. Emits process.create. Returns true and fills proc/pid/deadline on
+// success; false (with a failure event) otherwise.
+bool LaunchPreparedSample(HANDLE com2, const antimal::ExecuteJobRequest &req,
+                          const std::filesystem::path &samplePath, HANDLE *proc,
+                          DWORD *pid,
+                          std::chrono::steady_clock::time_point *deadline);
+
 // Writes the reassembled sample to a per-run guest directory and launches it.
 // Emits agent.sample.received + process.create over COM2. Returns true and fills
 // proc/pid/deadline on success; false (with a failure event) otherwise.
@@ -509,6 +570,7 @@ bool LaunchExecuteJob(HANDLE com2, const antimal::ExecuteJobRequest &req,
                       DWORD *pid, std::chrono::steady_clock::time_point *deadline) {
   auto received = MakeAgentEvent("agent.sample.received", req.sampleName);
   received.details["bytes"] = std::to_string(bytes.size());
+  received.details["delivery"] = "serial";
   (void)SendAgentEvent(com2, received);
 
   const std::filesystem::path runDir =
@@ -528,14 +590,146 @@ bool LaunchExecuteJob(HANDLE com2, const antimal::ExecuteJobRequest &req,
     (void)SendAgentEvent(com2, fail);
     return false;
   }
+  return LaunchPreparedSample(com2, req, samplePath, proc, pid, deadline);
+}
+
+// Mounts a delivered .iso in-guest (Windows' native ISO mount) and picks the
+// installer to run from its root: the well-known Adobe/modern installer names
+// first, else the first top-level .exe/.msi. Fills launchPath (+ mountRoot).
+bool MountIsoAndFindInstaller(HANDLE com2, const std::filesystem::path &isoPath,
+                              std::filesystem::path *launchPath,
+                              std::wstring *mountRoot) {
+  const std::filesystem::path letterFile =
+      isoPath.parent_path() / L"iso-letter.txt";
+  std::error_code ec;
+  std::filesystem::remove(letterFile, ec);
+  std::wstring cmd =
+      L"powershell.exe -NoProfile -NonInteractive -Command \""
+      L"$v = Mount-DiskImage -ImagePath '" + isoPath.wstring() +
+      L"' -PassThru | Get-Volume; "
+      L"if ($v) { Set-Content -LiteralPath '" + letterFile.wstring() +
+      L"' -Value $v.DriveLetter }\"";
+  cmd.push_back(L'\0');
+  STARTUPINFOW si{};
+  si.cb = sizeof(si);
+  PROCESS_INFORMATION pi{};
+  if (!CreateProcessW(nullptr, cmd.data(), nullptr, nullptr, FALSE,
+                      CREATE_NO_WINDOW, nullptr, nullptr, &si, &pi)) {
+    return false;
+  }
+  WaitForSingleObject(pi.hProcess, 120000);
+  DWORD psExit = 1;
+  GetExitCodeProcess(pi.hProcess, &psExit);
+  CloseHandle(pi.hThread);
+  CloseHandle(pi.hProcess);
+
+  std::ifstream letterIn(letterFile);
+  std::string letter;
+  std::getline(letterIn, letter);
+  if (letter.empty()) {
+    auto fail = MakeAgentEvent("agent.sample.mount-failed", antimal::PathToUtf8(isoPath.filename()));
+    fail.details["powershellExit"] = std::to_string(psExit);
+    fail.details["error"] = std::to_string(GetLastError());
+    (void)SendAgentEvent(com2, fail);
+    return false;
+  }
+  const std::wstring root =
+      std::wstring(letter.begin(), letter.end()) + L":\\";
+  auto lowerExt = [](std::wstring ext) {
+    for (wchar_t &c : ext) {
+      if (c >= L'A' && c <= L'Z') {
+        c = static_cast<wchar_t>(c - L'A' + L'a');
+      }
+    }
+    return ext;
+  };
+  static const wchar_t *kPreferred[] = {L"Set-up.exe", L"setup.exe",
+                                        L"Setup.exe", L"Autoplay.exe",
+                                        L"install.exe"};
+  for (const wchar_t *name : kPreferred) {
+    const std::filesystem::path candidate = std::filesystem::path(root) / name;
+    if (std::filesystem::exists(candidate)) {
+      *launchPath = candidate;
+      *mountRoot = root;
+      auto mounted = MakeAgentEvent("agent.sample.mounted", antimal::PathToUtf8(isoPath.filename()));
+      mounted.details["mountRoot"] = antimal::PathToUtf8(root);
+      mounted.details["installer"] = antimal::PathToUtf8(candidate);
+      (void)SendAgentEvent(com2, mounted);
+      return true;
+    }
+  }
+  // Bounded recursive scan (an Adobe-style ISO can nest its installer one or
+  // two levels down). Prefer setup/install-sounding names, then any exe/msi.
+  std::filesystem::path firstCandidate;
+  size_t seen = 0;
+  constexpr size_t kMaxEntries = 4000;
+  for (auto it = std::filesystem::recursive_directory_iterator(
+           root, std::filesystem::directory_options::skip_permission_denied, ec);
+       it != std::filesystem::recursive_directory_iterator() &&
+       seen < kMaxEntries;
+       it.increment(ec)) {
+    if (ec) {
+      break;
+    }
+    ++seen;
+    if (!it->is_regular_file(ec)) {
+      continue;
+    }
+    const std::wstring ext = lowerExt(it->path().extension().wstring());
+    if (ext != L".exe" && ext != L".msi") {
+      continue;
+    }
+    const std::wstring stem = lowerExt(it->path().stem().wstring());
+    if (stem.find(L"setup") != std::wstring::npos ||
+        stem.find(L"set-up") != std::wstring::npos ||
+        stem.find(L"install") != std::wstring::npos ||
+        stem.find(L"autoplay") != std::wstring::npos) {
+      *launchPath = it->path();
+      *mountRoot = root;
+      auto mounted = MakeAgentEvent("agent.sample.mounted", antimal::PathToUtf8(isoPath.filename()));
+      mounted.details["mountRoot"] = antimal::PathToUtf8(root);
+      mounted.details["installer"] = antimal::PathToUtf8(it->path());
+      (void)SendAgentEvent(com2, mounted);
+      return true;
+    }
+    if (firstCandidate.empty()) {
+      firstCandidate = it->path();
+    }
+  }
+  if (!firstCandidate.empty()) {
+    *launchPath = firstCandidate;
+    *mountRoot = root;
+    auto mounted = MakeAgentEvent("agent.sample.mounted", antimal::PathToUtf8(isoPath.filename()));
+    mounted.details["mountRoot"] = antimal::PathToUtf8(root);
+    mounted.details["installer"] = antimal::PathToUtf8(firstCandidate);
+    (void)SendAgentEvent(com2, mounted);
+    return true;
+  }
+  auto fail = MakeAgentEvent("agent.sample.mount-failed", antimal::PathToUtf8(isoPath.filename()));
+  fail.details["reason"] = "no installer found at the image root";
+  (void)SendAgentEvent(com2, fail);
+  return false;
+}
+
+bool LaunchPreparedSample(HANDLE com2, const antimal::ExecuteJobRequest &req,
+                          const std::filesystem::path &samplePath, HANDLE *proc,
+                          DWORD *pid,
+                          std::chrono::steady_clock::time_point *deadline) {
+  std::filesystem::path launchPath = samplePath;
+  if (req.sampleKind == "iso") {
+    std::wstring mountRoot;
+    if (!MountIsoAndFindInstaller(com2, samplePath, &launchPath, &mountRoot)) {
+      return false;
+    }
+  }
 
   DWORD launchedPid = 0;
   HANDLE launchedProc = nullptr;
   bool interactive = false;
-  if (!LaunchSampleProcess(samplePath, &launchedPid, &launchedProc,
+  if (!LaunchSampleProcess(launchPath, &launchedPid, &launchedProc,
                            &interactive)) {
     auto fail = MakeAgentEvent("process.create-failed",
-                               antimal::PathToUtf8(samplePath));
+                               antimal::PathToUtf8(launchPath));
     fail.category = "process";
     fail.details["error"] = std::to_string(GetLastError());
     (void)SendAgentEvent(com2, fail);
@@ -546,15 +740,136 @@ bool LaunchExecuteJob(HANDLE com2, const antimal::ExecuteJobRequest &req,
   *deadline = std::chrono::steady_clock::now() +
               std::chrono::milliseconds(req.timeoutMs);
   auto created =
-      MakeAgentEvent("process.create", antimal::PathToUtf8(samplePath));
+      MakeAgentEvent("process.create", antimal::PathToUtf8(launchPath));
   created.category = "process";
   created.processId = launchedPid;
   created.details["sampleExecuted"] = "true";
   // SP5: "desktop" = launched into the active interactive session (visible on
   // the live desktop); "service" = headless session-0 fallback (no logon yet).
   created.details["session"] = interactive ? "desktop" : "service";
+  if (launchPath != samplePath) {
+    created.details["launchedFrom"] = antimal::PathToUtf8(samplePath);
+  }
   (void)SendAgentEvent(com2, created);
   return true;
+}
+
+// Disk-backed delivery: the sample rides a second read-only AHCI disk presented
+// by the host. Find the raw device whose length matches the job's declared disk
+// size, then copy exactly sampleBytes off it into the per-run sample dir.
+std::optional<std::filesystem::path> ReceiveDiskSample(
+    HANDLE com2, const antimal::ExecuteJobRequest &req) {
+  if (req.diskBytes == 0) {
+    return std::nullopt;
+  }
+  HANDLE disk = INVALID_HANDLE_VALUE;
+  DWORD selectedDrive = 0;
+  for (DWORD i = 0; i < 16; ++i) {
+    const std::wstring path = L"\\\\.\\PhysicalDrive" + std::to_wstring(i);
+    HANDLE h = CreateFileW(path.c_str(), GENERIC_READ,
+                           FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr,
+                           OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (h == INVALID_HANDLE_VALUE) {
+      continue;
+    }
+    GET_LENGTH_INFORMATION li{};
+    DWORD bytes = 0;
+    const bool ok = DeviceIoControl(h, IOCTL_DISK_GET_LENGTH_INFO, nullptr, 0,
+                                    &li, sizeof(li), &bytes, nullptr) != FALSE;
+    if (ok && static_cast<uint64_t>(li.Length.QuadPart) == req.diskBytes) {
+      disk = h;
+      selectedDrive = i;
+      break;
+    }
+    CloseHandle(h);
+  }
+  if (disk == INVALID_HANDLE_VALUE) {
+    auto fail = MakeAgentEvent("agent.sample.disk-not-found", req.sampleName);
+    fail.details["diskBytes"] = std::to_string(req.diskBytes);
+    (void)SendAgentEvent(com2, fail);
+    return std::nullopt;
+  }
+  auto found = MakeAgentEvent("agent.sample.disk-found", req.sampleName);
+  found.details["physicalDrive"] = std::to_string(selectedDrive);
+  found.details["diskBytes"] = std::to_string(req.diskBytes);
+  (void)SendAgentEvent(com2, found);
+
+  const std::filesystem::path runDir =
+      std::filesystem::path(L"C:\\AntiMal\\run") /
+      std::filesystem::path(req.runId.empty() ? "exec" : req.runId);
+  const std::filesystem::path sampleDir = runDir / "sample";
+  antimal::EnsureDirectory(sampleDir);
+  std::wstring safeName =
+      std::filesystem::path(req.sampleName).filename().wstring();
+  if (safeName.empty()) {
+    safeName = L"sample.bin";
+  }
+  const std::filesystem::path samplePath = sampleDir / safeName;
+
+  HANDLE out = CreateFileW(samplePath.c_str(), GENERIC_WRITE, 0, nullptr,
+                           CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+  if (out == INVALID_HANDLE_VALUE) {
+    CloseHandle(disk);
+    auto fail = MakeAgentEvent("agent.sample.write-failed", req.sampleName);
+    fail.details["error"] = std::to_string(GetLastError());
+    (void)SendAgentEvent(com2, fail);
+    return std::nullopt;
+  }
+
+  LARGE_INTEGER zero{};
+  zero.QuadPart = 0;
+  SetFilePointerEx(disk, zero, nullptr, FILE_BEGIN);
+  constexpr DWORD kChunk = 1u << 20;             // 1 MiB (sector-aligned).
+  constexpr DWORD kSector = 512;
+  std::vector<uint8_t> buf(kChunk);
+  uint64_t remaining = req.sampleBytes;
+  bool ok = true;
+  while (remaining > 0) {
+    // Raw-disk reads MUST be sector-aligned in both offset and length; the
+    // final chunk of an unaligned file is rounded UP to a whole sector and the
+    // extra bytes are trimmed when writing the file out.
+    const DWORD want = static_cast<DWORD>(std::min<uint64_t>(remaining, kChunk));
+    DWORD readSize = (want + kSector - 1) / kSector * kSector;
+    if (readSize > kChunk) {
+      readSize = kChunk;
+    }
+    DWORD got = 0;
+    if (!ReadFile(disk, buf.data(), readSize, &got, nullptr) || got == 0) {
+      ok = false;
+      break;
+    }
+    const DWORD toWrite = static_cast<DWORD>(
+        std::min<uint64_t>(got, remaining));
+    DWORD wrote = 0;
+    if (!WriteFile(out, buf.data(), toWrite, &wrote, nullptr) || wrote != toWrite) {
+      ok = false;
+      break;
+    }
+    remaining -= toWrite;
+  }
+  if (ok) {
+    // The sample disk is sector-padded; truncate to the exact byte size.
+    LARGE_INTEGER end{};
+    end.QuadPart = static_cast<LONGLONG>(req.sampleBytes);
+    SetFilePointerEx(out, end, nullptr, FILE_BEGIN);
+    SetEndOfFile(out);
+  }
+  CloseHandle(out);
+  CloseHandle(disk);
+  if (!ok) {
+    std::error_code ec;
+    std::filesystem::remove(samplePath, ec);
+    auto fail = MakeAgentEvent("agent.sample.disk-read-failed", req.sampleName);
+    fail.details["remainingBytes"] = std::to_string(remaining);
+    (void)SendAgentEvent(com2, fail);
+    return std::nullopt;
+  }
+  auto received = MakeAgentEvent("agent.sample.received", req.sampleName);
+  received.details["bytes"] = std::to_string(req.sampleBytes);
+  received.details["delivery"] = "disk";
+  received.details["physicalDrive"] = std::to_string(selectedDrive);
+  (void)SendAgentEvent(com2, received);
+  return samplePath;
 }
 
 // Terminal failure of an execute job: an agent.job.rejected Event AND a
@@ -893,16 +1208,20 @@ int RunHostChannelLoop(std::string reason, bool serviceMode) {
   // track it to exit/timeout. All gated on GuestExecutionAuthorized().
   std::optional<antimal::ExecuteJobRequest> executeReq;
   std::optional<antimal::SampleReassembler> reassembler;
+  // Disk-backed delivery: the sample was already written from the raw sample
+  // disk; this is the path the deferred launch will run.
+  std::optional<std::filesystem::path> diskSamplePath;
   HANDLE sampleProcess = nullptr;
   DWORD samplePid = 0;
   std::chrono::steady_clock::time_point sampleDeadline{};
   // Bounds the sample TRANSFER (JobStart -> all SampleChunks). Without it, a lost
   // chunk would leave the agent waiting on Complete() forever (24h in service
-  // mode). Paced host->guest delivery (SetPacedCom2Payload) intentionally drips
-  // ~100 KB over ~80-100s to avoid overrunning the serial RX in-queue, so the
-  // deadline must clear that with headroom -- 300s bounds even a near-cap sample.
+  // mode). Paced host->guest delivery (SetPacedCom2Payload) now sustains ~8 KB/s
+  // (2 KB bursts, 250 ms interval, RX-queue-gated), so a near-cap 8 MB sample
+  // takes ~17 min; 1800s bounds that with headroom while still failing a truly
+  // dropped chunk instead of heartbeating to maxTicks.
   std::chrono::steady_clock::time_point transferDeadline{};
-  constexpr int kTransferTimeoutSec = 300;
+  constexpr int kTransferTimeoutSec = 1800;
   bool sampleLaunched = false;
   bool sampleReported = false;
   // SP5 deferred launch: after the transfer completes the agent waits (up to
@@ -990,6 +1309,33 @@ int RunHostChannelLoop(std::string reason, bool serviceMode) {
           auto rejected = MakeAgentEvent("agent.job.rejected", "execute");
           rejected.details["reason"] = "execute-already-active";
           (void)SendAgentEvent(com2, rejected);
+        } else if (req.delivery == "disk") {
+          // Disk-backed delivery: the sample rides a second read-only disk the
+          // host attached; copy it off the raw device (inline -- it is
+          // disk-speed, and the sample window the host computed already budgeted
+          // for it).
+          executeReq = req;
+          auto started = MakeAgentEvent("agent.job.start", "execute");
+          started.details["kind"] = "execute";
+          started.details["delivery"] = "disk";
+          started.details["sampleName"] = req.sampleName;
+          started.details["sampleBytes"] = std::to_string(req.sampleBytes);
+          (void)SendAgentEvent(com2, started);
+          const auto diskPath = ReceiveDiskSample(com2, req);
+          if (diskPath) {
+            diskSamplePath = *diskPath;
+            sampleStaged = true;
+            launchDeadline = std::chrono::steady_clock::now() +
+                             std::chrono::seconds(kLaunchWaitSec);
+            auto stagedEvent =
+                MakeAgentEvent("agent.sample.staged", req.sampleName);
+            stagedEvent.details["waitingForDesktop"] = "true";
+            stagedEvent.details["delivery"] = "disk";
+            (void)SendAgentEvent(com2, stagedEvent);
+          } else {
+            SendExecuteFailure(com2, "sample-disk-read-failed");
+            executeReq.reset();
+          }
         } else {
           executeReq = req;
           reassembler.emplace(req.sampleBytes);
@@ -1033,15 +1379,19 @@ int RunHostChannelLoop(std::string reason, bool serviceMode) {
       reassembler.reset();
     }
 
-    // Deferred launch (SP5): the transfer is staged; launch the sample as soon as
+    // Deferred launch (SP5): the delivery is staged; launch the sample as soon as
     // a desktop session is logged in (so it runs VISIBLY on the live desktop), or
     // after the wait budget so a no-login boot still detonates (headless).
-    if (sampleStaged && !sampleLaunched && executeReq && reassembler) {
+    if (sampleStaged && !sampleLaunched && executeReq &&
+        (diskSamplePath || reassembler)) {
       if (HasInteractiveSession() ||
           std::chrono::steady_clock::now() >= launchDeadline) {
         sampleLaunched =
-            LaunchExecuteJob(com2, *executeReq, reassembler->Bytes(),
-                             &sampleProcess, &samplePid, &sampleDeadline);
+            diskSamplePath
+                ? LaunchPreparedSample(com2, *executeReq, *diskSamplePath,
+                                       &sampleProcess, &samplePid, &sampleDeadline)
+                : LaunchExecuteJob(com2, *executeReq, reassembler->Bytes(),
+                                   &sampleProcess, &samplePid, &sampleDeadline);
         sampleStaged = false;
         if (!sampleLaunched) {
           (void)SendFrame(com2, antimal::HostChannelMessage::ReportComplete,
@@ -1049,6 +1399,7 @@ int RunHostChannelLoop(std::string reason, bool serviceMode) {
                           "reason=sample-launch-failed\n");
           executeReq.reset();
           reassembler.reset();
+          diskSamplePath.reset();
         }
       }
     }
@@ -1081,15 +1432,26 @@ int RunHostChannelLoop(std::string reason, bool serviceMode) {
       }
     }
 
-    const std::string heartbeat =
-        "heartbeat=" + std::to_string(tick) +
-        "; healthcheckComplete=" + (healthcheckComplete ? "true" : "false");
-    if (!SendFrame(com2, antimal::HostChannelMessage::Heartbeat, heartbeat)) {
-      CloseHandle(com2);
-      return 1;
+    // Fast-drain while a sample transfer is in flight: the paced host->guest
+    // delivery is the critical path, so pause the ~1s telemetry cadence
+    // (heartbeat + collectors + tick) and poll COM2 at ~20 Hz instead. The
+    // collectors resume the moment the transfer completes (staged/launched) or
+    // is failed by the watchdog above. Frame processing is unaffected -- the
+    // inner PopFrame loop above still drains every arrival.
+    const bool transferInFlight = executeReq && !sampleLaunched && !sampleStaged;
+    const bool telemetryTick = !transferInFlight;
+
+    if (telemetryTick) {
+      const std::string heartbeat =
+          "heartbeat=" + std::to_string(tick) +
+          "; healthcheckComplete=" + (healthcheckComplete ? "true" : "false");
+      if (!SendFrame(com2, antimal::HostChannelMessage::Heartbeat, heartbeat)) {
+        CloseHandle(com2);
+        return 1;
+      }
     }
 
-    if (tick % kProcessPollEveryTicks == 0) {
+    if (telemetryTick && tick % kProcessPollEveryTicks == 0) {
       auto current = antimal::CaptureProcessSnapshot();
       if (!current.empty() || processBaselineSent) {
         // Enrich every process in the fresh snapshot with deep detail (full
@@ -1169,7 +1531,7 @@ int RunHostChannelLoop(std::string reason, bool serviceMode) {
     // network.connect / network.close deltas (what the sample is reaching out
     // to). Fully meaningful once the VM has a NIC (SP3); until then it captures
     // local/loopback connections.
-    if (tick % kProcessPollEveryTicks == 0) {
+    if (telemetryTick && tick % kProcessPollEveryTicks == 0) {
       auto conns = antimal::CaptureTcpConnections();
       if (!conns.empty() || netBaselineSent) {
         auto netEvents = antimal::DiffTcpConnections(
@@ -1188,7 +1550,7 @@ int RunHostChannelLoop(std::string reason, bool serviceMode) {
 
     // Registry-persistence telemetry: snapshot the autostart keys and stream
     // registry.set / registry.delete deltas (did the sample install persistence?).
-    if (tick % kProcessPollEveryTicks == 0) {
+    if (telemetryTick && tick % kProcessPollEveryTicks == 0) {
       auto reg = antimal::CaptureRegistrySnapshot();
       if (!reg.empty() || regBaselineSent) {
         auto regEvents = antimal::DiffRegistrySnapshots(
@@ -1217,7 +1579,7 @@ int RunHostChannelLoop(std::string reason, bool serviceMode) {
     // details["hashSkipped"]="rate"), each capped at kMaxHashBytes; a locked file
     // is reported WITHOUT a hash. The pure diff above stays untouched -- all of
     // the disk I/O / hashing happens here.
-    if (tick % kFilePollEveryTicks == 0) {
+    if (telemetryTick && tick % kFilePollEveryTicks == 0) {
       auto files = antimal::CaptureFileSnapshot(watchedDirs);
       if (!files.empty() || fileBaselineSent) {
         auto fileEvents = antimal::DiffFileSnapshots(
@@ -1251,7 +1613,7 @@ int RunHostChannelLoop(std::string reason, bool serviceMode) {
     // module walk is the heaviest collector; PIDs come from the freshest process
     // snapshot (knownProcs), and BuildModuleSnapshot bounds PIDs + modules so a
     // module flood can't stall the single vCPU.
-    if (tick % kModulePollEveryTicks == 0) {
+    if (telemetryTick && tick % kModulePollEveryTicks == 0) {
       std::vector<uint32_t> livePids;
       livePids.reserve(knownProcs.size());
       for (const auto &entry : knownProcs) {
@@ -1277,12 +1639,16 @@ int RunHostChannelLoop(std::string reason, bool serviceMode) {
     // and stream a process.crash event for each new fault, decoding the exact
     // faulting module + exception code + offset behind a process crash. Polled
     // on the process cadence (~2s); bounded per tick + de-duped by full path.
-    if (tick % kProcessPollEveryTicks == 0) {
+    if (telemetryTick && tick % kProcessPollEveryTicks == 0) {
       ScanForWerCrashes(com2, seenWerReports);
     }
 
-    ++tick;
-    std::this_thread::sleep_for(std::chrono::seconds(1));
+    if (telemetryTick) {
+      ++tick;
+    }
+    std::this_thread::sleep_for(transferInFlight
+                                    ? std::chrono::milliseconds(50)
+                                    : std::chrono::seconds(1));
   }
 
   for (auto &h : procHandles) {

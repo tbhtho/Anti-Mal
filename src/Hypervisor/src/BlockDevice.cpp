@@ -416,6 +416,101 @@ bool ReadOnlyRawBlockDevice::RangeValid(uint64_t lba,
          static_cast<uint64_t>(count) <= sectors_ - lba;
 }
 
+PaddedFileBlockDevice
+PaddedFileBlockDevice::Open(const std::filesystem::path &path) {
+  const auto size = std::filesystem::file_size(path);
+  if (size == 0) {
+    throw std::runtime_error("sample disk file is empty");
+  }
+  std::ifstream stream(path, std::ios::binary);
+  if (!stream) {
+    throw std::runtime_error("unable to open sample disk file");
+  }
+  const uint64_t sectors =
+      (size + IBlockDevice::kSectorSize - 1) / IBlockDevice::kSectorSize;
+  return PaddedFileBlockDevice(path, size, sectors, std::move(stream));
+}
+
+PaddedFileBlockDevice::PaddedFileBlockDevice(std::filesystem::path path,
+                                             uint64_t fileBytes,
+                                             uint64_t sectors,
+                                             std::ifstream stream)
+    : path_(std::move(path)), fileBytes_(fileBytes), sectors_(sectors),
+      stream_(std::move(stream)) {}
+
+PaddedFileBlockDevice::PaddedFileBlockDevice(
+    PaddedFileBlockDevice &&other) noexcept
+    : path_(std::move(other.path_)), fileBytes_(other.fileBytes_),
+      sectors_(other.sectors_), stream_(std::move(other.stream_)) {
+  other.fileBytes_ = 0;
+  other.sectors_ = 0;
+}
+
+PaddedFileBlockDevice &
+PaddedFileBlockDevice::operator=(PaddedFileBlockDevice &&other) noexcept {
+  if (this != &other) {
+    stream_.close();
+    path_ = std::move(other.path_);
+    fileBytes_ = other.fileBytes_;
+    sectors_ = other.sectors_;
+    stream_ = std::move(other.stream_);
+    other.fileBytes_ = 0;
+    other.sectors_ = 0;
+  }
+  return *this;
+}
+
+PaddedFileBlockDevice::~PaddedFileBlockDevice() {
+  if (stream_.is_open()) {
+    stream_.close();
+  }
+}
+
+uint64_t PaddedFileBlockDevice::SectorCount() const noexcept {
+  return sectors_;
+}
+
+bool PaddedFileBlockDevice::ReadSectors(uint64_t lba, uint16_t count,
+                                        uint8_t *out) {
+  if (!out || !stream_ || !RangeValid(lba, count)) {
+    return false;
+  }
+  const uint64_t offset = ByteOffset(lba);
+  const size_t wanted = static_cast<size_t>(ByteCount(count));
+  std::memset(out, 0, wanted);
+  if (offset >= fileBytes_) {
+    return true; // Entirely inside the sector padding.
+  }
+  const size_t readable =
+      static_cast<size_t>(std::min<uint64_t>(wanted, fileBytes_ - offset));
+  stream_.clear();
+  stream_.seekg(static_cast<std::streamoff>(offset), std::ios::beg);
+  stream_.read(reinterpret_cast<char *>(out),
+               static_cast<std::streamsize>(readable));
+  return stream_.gcount() == static_cast<std::streamsize>(readable);
+}
+
+bool PaddedFileBlockDevice::WriteSectors(uint64_t, uint16_t,
+                                         const uint8_t *) {
+  // Black-hole writes and report SUCCESS. The sample disk is delivery media:
+  // the file behind it must never change, but ABRT-ing a write makes Windows'
+  // storage stack enter an error/retry path (disk-signature / GPT-backup
+  // maintenance) that wedges storahci on this emulated port. Discarding the
+  // bytes keeps the sample intact while letting the guest's storage stack
+  // believe the write completed.
+  return true;
+}
+
+bool PaddedFileBlockDevice::Flush() {
+  return true;
+}
+
+bool PaddedFileBlockDevice::RangeValid(uint64_t lba,
+                                       uint16_t count) const noexcept {
+  return count > 0 && lba <= sectors_ &&
+         static_cast<uint64_t>(count) <= sectors_ - lba;
+}
+
 VhdxBlockDevice VhdxBlockDevice::Open(const std::filesystem::path &path) {
   std::ifstream stream(path, std::ios::binary);
   if (!stream) {

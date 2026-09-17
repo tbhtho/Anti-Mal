@@ -16,6 +16,8 @@ Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "AntiMal.DriverBridge", "src
 EndProject
 Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "AntiMal.Hypervisor", "src\Hypervisor\AntiMal.Hypervisor.vcxproj", "{E3B8D01A-15C0-44E8-8B60-577E85CC3C40}"
 EndProject
+Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "AntiMal.McpServer", "src\McpServer\AntiMal.McpServer.vcxproj", "{9E2F2C4B-6C7A-45D1-9A1E-2B7E4C1D8F31}"
+EndProject
 Global
 	GlobalSection(SolutionConfigurationPlatforms) = preSolution
 		Debug|x64 = Debug|x64
@@ -50,6 +52,10 @@ Global
 		{E3B8D01A-15C0-44E8-8B60-577E85CC3C40}.Debug|x64.Build.0 = Debug|x64
 		{E3B8D01A-15C0-44E8-8B60-577E85CC3C40}.Release|x64.ActiveCfg = Release|x64
 		{E3B8D01A-15C0-44E8-8B60-577E85CC3C40}.Release|x64.Build.0 = Release|x64
+		{9E2F2C4B-6C7A-45D1-9A1E-2B7E4C1D8F31}.Debug|x64.ActiveCfg = Debug|x64
+		{9E2F2C4B-6C7A-45D1-9A1E-2B7E4C1D8F31}.Debug|x64.Build.0 = Debug|x64
+		{9E2F2C4B-6C7A-45D1-9A1E-2B7E4C1D8F31}.Release|x64.ActiveCfg = Release|x64
+		{9E2F2C4B-6C7A-45D1-9A1E-2B7E4C1D8F31}.Release|x64.Build.0 = Release|x64
 	EndGlobalSection
 	GlobalSection(SolutionProperties) = preSolution
 		HideSolutionNode = FALSE

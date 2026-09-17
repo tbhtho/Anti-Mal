@@ -2,24 +2,28 @@
 
 AntiMal is a defensive malware-analysis scaffold for Windows. The long-term goal is a local, open-source interactive sandbox for safely detonating suspicious Windows binaries without relying on Windows Sandbox, VirtualBox, VMware, or commercial services.
 
-Overall progress: [█████████████████░] 92%
+Overall progress: [██████████████████] 94%
 
-> **For the authoritative, dated "where we are" status, read private development documentation (private documentation) first** (and the latest session record [`historical session notes (not distributed)`](historical session notes (not distributed))). This section is the narrative; those files are the source of truth.
+> **For the authoritative, dated "where we are" status, read private development documentation (private documentation) first.** This section is the narrative; that file is the source of truth. Open work is tracked in [`list.md`](list.md) and private development documentation (private documentation).
 
 ## Current Status
 
 AntiMal has two major layers:
 
 1. **Static enrichment — ships today.** Multi-hash + entropy, deep PE metadata, magic-byte file typing, **file-type-aware analyzers for scripts / `.lnk` / Office-OLE macros / archives / PDF / RTF / ISO / OneNote**, strings + IOC mining with **obfuscated-C2 recovery** (XOR / base64 / base64-wrapped RC4 / PowerShell `-EncodedCommand`), Cobalt Strike beacon-config extraction, **auto YARA-rule generation**, rule/tag tracker, optional YARA/capa/DIE, optional MalwareBazaar/VirusTotal lookups (off by default), JSON + HTML reports.
-2. **Dynamic "live sandbox" — boots to a real desktop, with a deep analysis pipeline; one blocker left.** The in-house WHP VM boots Windows 11 25H2 **to an actual desktop** (live-confirmed 2026-06-09: the console showed the bloom desktop with Recycle Bin + Edge icons at a live **`LIVE · 14 FPS`** readout, telemetry *Watching*), the **WebView2 live console** streams the framebuffer + accepts keyboard/mouse, and the **host↔guest telemetry pipeline streams live** (122 KB of `events.jsonl` captured on that boot).
+2. **Dynamic detonation — works end-to-end.** A sample is staged into a disposable COW overlay; a seed-boot of the in-house WHP VM brings up the in-guest agent; the sample is delivered (COM2 for ≤8 MB, a second read-only AHCI disk for anything larger, or an **ISO the guest mounts and auto-runs**); it executes and its behavior streams back as `events.jsonl` → scored verdict → Any.Run-style `report.json` / `report.html` + screenshot filmstrip. Live-confirmed repeatedly, including a 2.3 GB Adobe-style installer (mounted ISO, UAC answered live, installer driven to completion) on 2026-09-17.
+   - **The interactive desktop is reachable and drivable, with one intrinsic caveat:** the Win11 modern shell (`explorer`/`ShellHost`) crash-loops `0xC0000409` on this image — not fixable from a disposable overlay; the supported paths are the cmd-shell sidestep or a base rebuild with full OOBE automation (private development documentation (private documentation)). Detonation telemetry does **not** depend on a settled desktop.
+   - **Agent tools:** `AntiMal.McpServer.exe` exposes the live VM to agents over stdio MCP (boot, screenshot, closed-loop coordinate clicks, keyboard, journal tail, process list, report), with CLI parity in `HostCli` (`vmstatus` / `vmframe` / `vmmouse` / `vmview` / `vminput`). Reference: private development documentation (private documentation).
+   - **Contained network capture:** `--nic` attaches an emulated Intel 82574L (Win11 inbox driver) and routes guest frames through an in-process fake-internet sink (DHCP/DNS/ARP/ICMP/NTP/NBNS/LLMNR/HTTP) — **zero real egress, structurally**. DNS queries, TLS SNI and full packets land in `network.pcap` + the report. Default remains `network disabled`.
+   - **Remaining frontier is polish + performance** ([`list.md`](list.md)): operator-visible progress during the invisible phases (stage/copy/mount), input-encoding bugs found live, a true unlimited time budget, CD-ROM/ATAPI + dirty-rect frames + faster storage, and a re-serviced base image.
 
 **The full boot chain works:** OVMF → `bootmgfw` → `winload.efi` → code-integrity → **ntoskrnl** → kernel Phase 0/1 → **AHCI storage mount** → win32k/dxgkrnl/display → OOBE → **VM warm-reset (guest reboot is serviced)** → account creation → **login → "Preparing Windows" → desktop**. Walls cleared to get here: the `0xc0000225` code-integrity abort (source-built TPM2 OVMF), the `0xc0430001` winload wall (our own ACPI checksum bug), the **`0x7B INACCESSIBLE_BOOT_DEVICE`** storage wall (a from-scratch PCI-native **AHCI** controller — `storahci.sys` binds it), VM warm-reset, **injected-input garbling** (fixed by pacing), and a **CET kernel hang** (fixed by masking CET in CPUID leaf 7).
 
-**The framing corrected (2026-06-09):** the blocker was never *boot reliability* — the VM reaches a desktop. The real issue was a **non-interactive, "frozen-screenshot" desktop**, now diagnosed cold to two causes: (1) the seed snapshot `AntiMalDesktop.cow` was captured **mid-first-logon** (`LastUsedUsername=defaultuser0`), so every boot resumes a half-provisioned Windows whose XAML/`twinui` shell (`ShellHost.exe`) crash-loops — **but it does reach a settled desktop if left ~15-30 min**, so the fix is a **re-snapshot of a settled desktop** (`tools\Promote-DesktopSnapshot.ps1`, backup-first, base untouched); and (2) **mouse clicks don't reliably land** (relative-PS/2-mouse desync). Also fixed this session: the live display no longer **freezes** on low-variance frames (`LiveFramePublishGate`). Full detail + resume steps in [`historical session notes (not distributed)`](historical session notes (not distributed)).
+**The desktop caveat, precisely (corrected 2026-06-17):** the shell crash-loop is **intrinsic to this image** — it reproduces on a clean cold-OOBE desktop (456× explorer restarts, two distinct `__fastfail` signatures) and is **not fixable from a disposable overlay** (every IFEO/AppX-quieting edit was tried and refuted; removing the base WDAC `.cip` anchor breaks boot entirely). Evidence: private development documentation (private documentation). Working sidesteps: swap the Winlogon shell to `cmd.exe` (`ANTIMAL_PROBE_SHELL_CMD=1`) — a rock-solid console from which interactive apps launch — or rebuild the base with a complete `Autounattend.xml` (private development documentation (private documentation)). The live display is no longer a freeze/slideshow (shared-memory framebuffer + `LiveFramePublishGate`), and the pointer is closed-loop (`VmPointer`) — current input bugs and perf items live in [`list.md`](list.md).
 
 **Deep dynamic-analysis pipeline (built + reviewed this session, live on Detonate via per-run agent redeploy):** rich process telemetry (full path, command line, integrity, user/SID, session, start time, **exit codes**), persistence detection across 8 families with **ATT&CK tags**, an in-guest **WER crash decoder** (names the faulting module behind a crash), **dropped-file** SHA-256 + magic-byte type, **DLL-load / injection** detection (side-loaded/hijacked DLLs → T1574), a **scored, explainable behavioral verdict** (kills the `timeout==Malicious` false positive; signed-installer FP dampened), an **analyst-grade report** (process tree + persistence/drops/network/crashes/MITRE sections), and machine-readable **IOC export** (STIX 2.1 / MISP / CSV via `HostCli export`).
 
-In-guest sample execution is **wired but gated off by default** behind a two-key gate: it arms only when `dynamic_execution_enabled = true` (config) **and** `--allow-execution` is passed to `detonate` (plus the guest's own arm). When armed, the host delivers the staged sample over COM2 (paced) and the GuestAgent launches it and streams its behavior. The live console's **Detonate Sample (live)** button self-arms the gate and deploys the execute-capable agent into the disposable overlay per run.
+In-guest sample execution is **gated off by default** behind a **three-key gate**: `dynamic_execution_enabled = true` (config) **and** `--allow-execution` on `detonate` **and** the guest key `ANTIMAL_ARM_GUEST_EXEC=1` (the GUI and the MCP server's `vm_boot` arm all three for you). When armed, the host delivers the staged sample — paced COM2 (≤8 MB), or a second read-only AHCI disk for larger files, or an ISO the guest mounts and auto-runs — and the GuestAgent launches it and streams its behavior. Full recipe: private development documentation (private documentation).
 
 ## What Works Today
 
@@ -45,7 +49,7 @@ In-guest sample execution is **wired but gated off by default** behind a two-key
   - optional YARA/capa/DIE wrappers
   - optional MalwareBazaar/VirusTotal hash lookups
 - JSON and self-contained HTML report generation
-- **WebView2 live console** (`AntiMal.exe`): the Win32 app is now a thin shell hosting a hardened WebView2 UI (`webui/`, vanilla HTML/CSS/JS), 8 sections all wired to a real C++ bridge — scan, config, reports, dashboard, browser-impact, and the live VM view (**Boot VM (live)** streams frames + accepts mouse/keyboard).
+- **WebView2 live console** (`AntiMal.exe`): the Win32 app is now a thin shell hosting a hardened WebView2 UI (`webui/`, vanilla HTML/CSS/JS), 8 sections all wired to a real C++ bridge — scan, config, reports, dashboard, browser-impact, and the live VM view (**Boot VM (live)** streams frames + accepts mouse/keyboard). The **same live session is drivable by agents/scripts**: `AntiMal.McpServer.exe` (stdio MCP) and `HostCli vmstatus|vmframe|vmmouse|vmview|vminput` — see private development documentation (private documentation).
 - **Host↔guest telemetry pipeline (3b) — streams live (confirmed 2026-06-09):** in-guest collectors → COM2/AMCH channel → host live-journaling to `events.jsonl` → UI Live Process Telemetry panel (`run.watch`). A live boot streamed 122 KB of real events (process tree, registry, files). The `AntiMalGuestAgent` service is installed in the base image.
 - **Deep dynamic-analysis pipeline (2026-06-09, built + reviewed across 3 review passes; live on Detonate via per-run agent redeploy):**
   - process telemetry with full path, command line, integrity level, user/SID, session, start time, and **exit codes** (surfaces crash codes like `0xC0000409`)
@@ -55,7 +59,9 @@ In-guest sample execution is **wired but gated off by default** behind a two-key
   - a **scored, explainable behavioral verdict** (per-signal rationale; kills the `timeout==Malicious` FP; raises the bar for signed installers)
   - an **analyst-grade report**: process tree + grouped Persistence / Dropped-Files / Network / Crashes / Module-Loads / MITRE sections
   - machine-readable **IOC export** — STIX 2.1 / MISP / CSV / YARA (`AntiMal.HostCli.exe export <run> --format stix|misp|csv|yara`); `yara` emits an auto-generated hunt rule for the run's sample
-- **Live interaction (3c):** the VM framebuffer mirrors into the UI over a **zero-copy shared-memory → WebView2 `SharedBuffer` → `<canvas>`** path (live-confirmed at `LIVE · 14 FPS`; an on-screen fps readout shows live-vs-stalled). Keyboard + mouse, **host→guest clipboard paste**, **Ctrl+Alt+Del**, and paced login/text are injected via a framed `_live-input.bin` protocol; the live display no longer **freezes** on low-variance frames (`LiveFramePublishGate`). The live VM runs in a separate process from the UI (escape-isolation). *(Known live issue: relative-mouse clicks don't reliably land — see In Progress.)*
+- **Live interaction (3c):** the VM framebuffer mirrors into the UI over a **zero-copy shared-memory → WebView2 `SharedBuffer` → `<canvas>`** path (live-confirmed at `LIVE · 14 FPS`; an on-screen fps readout shows live-vs-stalled). Keyboard + mouse, **host→guest clipboard paste**, **Ctrl+Alt+Del**, and paced login/text are injected via a framed `_live-input.bin` protocol; the live display no longer **freezes** on low-variance frames (`LiveFramePublishGate`). The live VM runs in a separate process from the UI (escape-isolation). *(Known input issues, all listed in [`list.md`](list.md): `vminput --mouse` truncates deltas to int8 and uses PS/2 Y-sign; `vmmouse`'s cursor learn is defeated by Windows pointer acceleration; UAC's secure desktop needs the keyboard fallback.)*
+- **Sample delivery beyond COM2:** the staged sample is exposed as a **second read-only AHCI disk** (`PaddedFileBlockDevice`, port 1) for anything >2 MB — no size cap, disk-speed transfer — and a delivered **`.iso` is mounted in-guest** (`Mount-DiskImage`) with a setup/installer auto-pick (`Set-up.exe`/`setup.exe`/…) and launched into the interactive desktop. This is what lets multi-gigabyte installers detonate at all.
+- **Contained network capture:** emulated **Intel 82574L / e1000e** (`8086:10D3`, inbox driver) behind `ANTIMAL_ENABLE_NIC`/`--nic`; guest TX routes through the in-process **`FakeInternet`** sink (DHCP/DNS/ARP/ICMP/NTP/NBNS/LLMNR/HTTP 200) and replies are injected back — **the host never opens a socket**. Both directions are written to `network.pcap`; DNS + TLS **SNI** are surfaced as `network.*` events and `report.networkDomains`.
 - **Console quality-of-life:** editable **Settings** page (writes back to `antimal.toml`), in-app **report viewer**, a **confirmation gate** before arming live detonation, a **minidump crash handler**, **GitHub Actions CI** (build + test on every push), `detonate --json` for automation, anti-evasion scrubbing of the sandbox-identifying disk/ACPI/**TPM** strings, and a controllable guest clock (no longer leaks host wall-clock).
 - In-house WHP VM that boots Windows 11 25H2 through the kernel + GUI stack + OOBE + **login to the desktop** (intermittently — see Current Status):
   - WHP host and vCPU wrappers; guest RAM and firmware mapping
@@ -71,14 +77,14 @@ In-guest sample execution is **wired but gated off by default** behind a two-key
 
 ## What Is In Progress
 
-The dynamic console, telemetry, live input, and the full analysis pipeline are built and (where possible) live-confirmed. **Two concrete, well-understood steps remain to make the desktop drivable** (full detail + commands in [`historical session notes (not distributed)`](historical session notes (not distributed))):
+The dynamic pipeline (delivery → execution → telemetry → verdict → report → IOC) is built and live-confirmed. What remains is operator polish, input reliability, and performance — tracked with checkboxes in [`list.md`](list.md):
 
-1. **Re-snapshot a settled desktop.** The current seed `AntiMalDesktop.cow` was captured mid-first-logon, so every boot resumes a half-provisioned Windows that crash-loops the shell until it eventually settles (~15-30 min). Seed-boot *copies* the snapshot into a per-run differencing overlay, so a run that reaches a settled desktop leaves a promotable image: **boot → wait for a fully settled desktop → `Stop` → `tools\Promote-DesktopSnapshot.ps1`** (backup-first, base untouched, reversible). Future boots then resume straight into the settled desktop — fast and stable.
-2. **Make mouse clicks land.** On the live desktop the relative-PS/2 mouse doesn't reliably hit targets (couldn't dismiss a dialog). BochsVbe has no hardware cursor, so the guest's real software cursor should be in the captured frame — next step is to confirm one-vs-two cursors and either drop the synthetic cursor or add an absolute pointing device for 1:1 tracking.
+1. **Operator-visible progress.** During a run's invisible phases (host staging copy, in-guest ISO copy at ~10 MB/s, mount) the screen can sit on a static desktop for minutes. Add a phase/progress surface (delivery %, phase name, run id/fps, counters) to the live console, `vmview`, and the report.
+2. **Input reliability.** Fix `vminput --mouse` int8 truncation + PS/2 Y-sign, make `vmmouse`'s cursor learn acceleration-aware, and add a UAC auto-answer path for unattended elevating samples.
+3. **A re-serviced base image** (user-gated): rebuild from the Win11 ISO with a complete `Autounattend.xml` + clean `SetupComplete.cmd` to get a settled snapshot and capture the `__fastfail` subcode (the exact invariant the modern shell trips on). Procedure: private development documentation (private documentation).
+4. **Performance:** CD-ROM/ATAPI so ISOs attach directly (kills the in-guest copy), dirty-rect frame publishing, screenshot dedupe/interval, faster storage, hardlink staging, and a true `--timeout-sec unlimited`.
 
-After those: bake the current telemetry agent into the new snapshot (`base deploy-agent`), then validate the full **Detonate → telemetry → verdict → report → IOC** loop end-to-end on the settled desktop.
-
-**Deeper frontier (not blocking the above):** a 2-vCPU AP-bringup SMP race (`ntkrnlmp+0x2916EC`; 1-vCPU is the reliable default), a guest-bindable NIC + fake-internet capture (designed; recommended NIC is e1000e `8086:10D3`), real-time ETW telemetry, and a true RAM snapshot.
+**Deeper frontier (not blocking the above):** a 2-vCPU AP-bringup SMP race (`ntkrnlmp+0x2916EC`; 1-vCPU is the reliable default), real-time ETW telemetry, a true RAM snapshot, and a guest-trusted CA for TLS-body capture.
 
 ## Safety Model
 
@@ -88,7 +94,8 @@ AntiMal is meant for malware analysis, so safety beats speed.
 - Threat-intel HTTP lookups are off unless explicitly enabled.
 - The in-house VM stages samples but does not execute them by default.
 - GuestAgent heartbeats over COM2 when no executable job is authorized.
-- In-guest execution is behind a **two-key gate** (`dynamic_execution_enabled` config **and** per-run `--allow-execution`); with either key absent, the host sends only a `kind=healthcheck` job and submitted samples are staged but not launched.
+- In-guest execution is behind a **three-key gate** (`dynamic_execution_enabled` config **and** per-run `--allow-execution` **and** the guest-side `ANTIMAL_ARM_GUEST_EXEC` arm); with any key absent, the host sends only a `kind=healthcheck` job and submitted samples are staged but not launched.
+- Network is structurally contained: default mode is `disabled` (no NIC at all); `--nic` routes guest frames to an in-process fake-internet sink that **never opens a host socket**.
 - A future execution gate must prove:
   - benign GuestAgent connection
   - disposable overlay writes
@@ -252,7 +259,7 @@ $env:ANTIMAL_FIRMWARE_NAME = "OVMF-debug.fd"
 bin\x64\Release\AntiMal.HostCli.exe detonate C:\Path\To\File.exe --network disabled --timeout-sec 180
 ```
 
-This creates a run directory under `C:\AntiMalRuns`, writes `job.json`, `events.jsonl`, `report.json`, `report.html`, `serial.log`, `vm-summary.json`, `vm-diagnostics.txt`, and per-second `screenshots/guest-*.png` frames, and keeps sample execution blocked by default. By default the run **seed-boots from `AntiMalDesktop.cow`** (a desktop snapshot next to the base) and runs the full chain through the kernel + GUI stack (via the in-house AHCI disk) to the Windows **desktop**; `--cold` boots from the clean base instead (cold OOBE is slower/fragile). For an interactive session use **Boot VM (live)** / **Detonate Sample (live)** in `AntiMal.exe`. (Until the seed snapshot is re-captured from a fully settled desktop — see In Progress — the desktop crash-loops the shell for ~15-30 min before settling.)
+This creates a run directory under `C:\AntiMalRuns`, writes `job.json`, `events.jsonl`, `report.json`, `report.html`, `serial.log`, `vm-summary.json`, `vm-diagnostics.txt`, and per-second `screenshots/guest-*.png` frames, and keeps sample execution blocked by default. By default the run **seed-boots from `AntiMalDesktop.cow`** (a desktop snapshot next to the base) and runs the full chain through the kernel + GUI stack (via the in-house AHCI disk) to the Windows **desktop**; `--cold` boots from the clean base instead (cold OOBE is slower/fragile). For an interactive session use **Boot VM (live)** / **Detonate Sample (live)** in `AntiMal.exe`, or the agent tools in private development documentation (private documentation). Samples >2 MB ride a second read-only disk; a `.iso` sample is mounted in-guest and its installer auto-launched — this is how multi-gigabyte installers detonate. The desktop itself may sit in the documented modern-shell crash-loop; detonation telemetry does not depend on it (private development documentation (private documentation)).
 
 Before each in-house VM boot, AntiMal may apply a disposable overlay-only boot repair to the run disk (recovery disabled, boot-status policy set to ignore failed boots, `bootstat.dat` cleared, boot-storage services forced boot-start, CriticalDeviceDatabase IDE mappings added). The base VHDX is never mutated by this path. Set `ANTIMAL_DISABLE_BOOT_OVERLAY_PATCH=1` to turn that diagnostic patch off for comparison probes.
 
@@ -321,15 +328,17 @@ See private development documentation (private documentation) for the full unblo
 ## Repository Layout
 
 ```text
-src/Common/        shared types, scanner, reports, config, enrichment, journal
-src/Hypervisor/    WHP VMM, firmware, devices, disks, ACPI, host channel
-src/App/           Win32 GUI
-src/HostCli/       command-line scan/detonate/report tool
-src/GuestAgent/    in-guest agent, currently heartbeat-safe by default
+src/Common/        shared types, scanner, reports, config, enrichment, journal, LiveVm/VmPointer
+src/Hypervisor/    WHP VMM, firmware, devices, disks (AHCI boot + sample disk), ACPI, host channel
+src/App/           Win32 GUI (WebView2 live console)
+src/HostCli/       command-line scan/detonate/report/vm tool
+src/GuestAgent/    in-guest agent (telemetry, execution, ISO mount, file browser, MiniShell)
+src/McpServer/     stdio MCP server exposing the live VM to agents
+src/DriverBridge/  dev-only IPC adapter to a separately-loaded lab helper (unreferenced by exes)
 src/Tests/         self-contained Expect() test binary
 tools/             base-image, firmware, and validation scripts
 firmware/          current private-checkpoint OVMF blobs
-docs/              design docs and roadmap
+docs/              design docs and roadmaps (CURRENT_STATE, INHOUSE_VM, ENRICHMENT, AGENT_TOOLS, …)
 rules/             tagger rules
 ```
 
@@ -346,9 +355,9 @@ rules/             tagger rules
 - **88%: complete. Live console + telemetry + input software.** WebView2 UI + bridge; in-guest process collector + COM2/AMCH channel + host journaling + UI panel; live keyboard+mouse injection; GuestAgent installed in the base.
 - **90%: complete. Live-confirmed desktop + live display + live telemetry.** A real boot reached the Windows desktop (Recycle Bin + Edge icons) at a live `LIVE · 14 FPS` readout with 122 KB of telemetry streamed; root cause of the "frozen-screenshot" desktop diagnosed cold (mid-first-logon snapshot); the display-freeze fixed (`LiveFramePublishGate`). Additional historical session notes are not distributed.
 - **92%: complete. Deep analysis pipeline + reporting.** Rich process/persistence/dropped-file/DLL-injection/crash telemetry → scored explainable verdict → analyst-grade report → STIX/MISP/CSV IOC export, all built and reviewed (3 passes).
-- **92% → 95%: in progress. Drivable desktop.** Two concrete steps: re-snapshot a settled desktop (`tools\Promote-DesktopSnapshot.ps1`) so boots resume stable; fix the relative-mouse so clicks land (or add an absolute pointer).
-- 98%: bake the telemetry agent into the new snapshot; validate the full Detonate → telemetry → verdict → report → IOC loop end-to-end on the settled desktop; network modes + fake-internet (designed).
-- 100%: interactive malware sandbox MVP.
+- **94%: complete. Full dynamic loop, end-to-end.** Disk-backed + ISO sample delivery (multi-GB installers detonate), contained fake-internet capture (`network.pcap`, DNS/SNI), agent tools (MCP server + `vmmouse`/`vmview`/`vminput`), and a live-driven installer run (2026-09-17).
+- **94% → 97%: in progress. Operator polish + input + perf.** Progress UI for the invisible phases, input-encoding fixes, unlimited timeout, CD-ROM/dirty-rect/storage performance ([`list.md`](list.md)).
+- 97% → 100%: a re-serviced base snapshot (settled desktop) and a fully interactive malware sandbox MVP.
 
 ## Important Notes
 

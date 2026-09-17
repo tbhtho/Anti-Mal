@@ -399,6 +399,11 @@ VirtualMachine::VirtualMachine(const std::filesystem::path &firmwarePath,
     // OVMF's AhciBusDxe and Windows' storahci.sys both drive the disk via AHCI.
     AttachAhciDisk(ideDisk);
   }
+  // Disk-backed sample delivery: present the staged sample file as a second
+  // read-only AHCI disk (port 1). Only meaningful once the HBA exists.
+  if (options.sampleDisk && ahci_) {
+    ahci_->SetPortDisk(1, options.sampleDisk);
+  }
   MaybeAttachNic();
 }
 
@@ -2724,11 +2729,17 @@ VmRunSummary VirtualMachine::RunLoop(
     // exactly why the first live detonation read every byte yet never launched.
     // Instead we drip it: start only once the agent has transmitted (it has
     // opened COM2 and is draining), then a small burst at a time, gated on our RX
-    // queue being nearly empty and a >1s interval so the agent's per-tick read
-    // keeps pace. This bounds the in-flight bytes well under the guest in-queue.
+    // queue being nearly empty. The RxQueuedBytes gate is the structural
+    // overrun protection: burst (2 KB) + queued (<1 KB) keeps in-flight bytes
+    // under ~3 KB, ~35x below the one-shot send that dropped the front frame.
+    // The interval only paces the agent's read cadence; 100 ms raises the
+    // sustained rate to ~20 KB/s (vs 1.8 KB/s at the old 1100 ms) while the
+    // gate still throttles automatically whenever the guest drains slowly. The
+    // agent also switches to a 50 ms fast-drain loop while a transfer is in
+    // flight, so end-to-end throughput tracks this interval.
     if (pacedCom2Cursor_ < pacedCom2Payload_.size() &&
         com2_.CapturedBytes() > 0 && com2_.RxQueuedBytes() < 1024 &&
-        now - lastPacedCom2 >= std::chrono::milliseconds{1100}) {
+        now - lastPacedCom2 >= std::chrono::milliseconds{100}) {
       constexpr size_t kBurst = 2048;
       const size_t remaining = pacedCom2Payload_.size() - pacedCom2Cursor_;
       const size_t n = remaining < kBurst ? remaining : kBurst;
@@ -3153,6 +3164,9 @@ VmRunSummary VirtualMachine::RunLoop(
   }
   if (ahci_) {
     summary.ahciCommandsIssued = ahci_->CommandsIssued();
+    summary.ahciSampleCommandsIssued = ahci_->SampleCommandsIssued();
+    summary.ahciSampleSectorsRead = ahci_->SampleSectorsRead();
+    summary.ahciSampleWriteCommands = ahci_->SampleWriteCommands();
     summary.ahciIdentifyCommands = ahci_->IdentifyCommands();
     summary.ahciReadCommands = ahci_->ReadCommands();
     summary.ahciWriteCommands = ahci_->WriteCommands();

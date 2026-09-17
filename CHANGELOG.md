@@ -8,6 +8,46 @@ that landed on `main`.
 
 ## [Unreleased]
 
+### 2026-09-17 — Agent tools: MCP server, coordinate-based pointer, evidence-first live interaction
+Agent-driven dynamic analysis gets a real tool surface over the SAME live session the GUI streams, so
+operator watchability and evidence replace guesswork.
+- **`AntiMal.McpServer.exe` (new project):** hand-rolled stdio MCP (newline-delimited JSON-RPC 2.0)
+  exposing the live VM — `vm_status`, `vm_screenshot`, `vm_click`/`vm_move`/`vm_drag`,
+  `vm_type`/`vm_key`/`vm_chord`, `vm_events`, `vm_processes`, `vm_report`, `vm_boot`, `vm_view`,
+  `vm_stop`. Tool results carry evidence (screenshot paths, measured cursor position/pixel error,
+  raw journal lines + `nextLine` for polling); `vm_boot` reproduces the GUI's Boot VM recipe and
+  refuses to double-boot. Registered as the `antimal` server in `opencode.json`.
+- **Coordinate-based pointer (`VmPointer`, unit-tested pure math + `LiveVm` wiring):** probes the
+  guest, learns the software-cursor sprite from a known-shift frame pair, then runs a gain-measuring
+  closed loop (Windows pointer acceleration is measured, never assumed). Fails honestly
+  (`pointer did not respond` / `lost the guest pointer`). Screen-space Y is flipped into the PS/2
+  packet; every injected move/click is followed by a capture for verification.
+- **CLI parity:** `vmstatus [--json]`, `vmframe [--out png]`, `vmmouse --to X,Y [--click|--double]`
+  over the same `LiveVm`/`VmPointer` code; `private development documentation` documents the workflow, evidence
+  contract, and limits (100 ms input poll, no scroll wheel, desktop-reach caveat).
+- **Tests:** synthetic-frame cursor learn/track, aim convergence on a fake 1.6x-accelerated guest,
+  frozen-pointer failure, screen→PS/2 Y flip and chord encoding. Full solution + `AntiMal.Tests`
+  green.
+
+### 2026-09-17 — Disk-backed + ISO sample delivery (multi-GB detonations)
+The paced COM2 channel (~10 KB/s, 8 MB cap) was the only way a sample could reach the guest, so a
+real-world installer bundle could not detonate at all. Two new delivery channels fix that — both
+host-driven, both still behind the execution gate:
+- **Disk-backed delivery (`AhciController` port 1 + `PaddedFileBlockDevice`):** any staged sample
+  >2 MB is exposed as a second read-only SATA disk (zero-padded to a sector; the exact byte size
+  rides the job). The in-guest agent locates the raw device by length, copies it off at disk speed,
+  and launches it. No COM2 size cap; the serial path stays for small samples where it is proven.
+  `agent.sample.disk-found` / `agent.sample.received` journal the transfer.
+- **ISO delivery + mount:** a `.iso` sample is delivered the same way (`sampleKind=iso`); the agent
+  mounts it in-guest (`Mount-DiskImage`), auto-picks the installer inside (preferring
+  `Set-up.exe` / `setup.exe` / install-sounding names) and launches it into the interactive
+  desktop. This is how a 2.3 GB `Set-up.exe` bundle was detonated live (UAC answered interactively,
+  installer driven to 71% then cut by the 30-min run budget — full telemetry + filmstrip captured).
+- **Protocol:** `ExecuteJobRequest.sampleKind` / `delivery` / `diskBytes`; both delivery paths
+  share the same execute JobStart, observation window, and report pipeline.
+- **Known gap:** `PaddedFileBlockDevice` + the disk-delivery path do not yet have unit tests
+  (tracked in [`list.md`](list.md)).
+
 ### 2026-06-18 — VM frontier: readiness checklist, fast-fail subcode capture, offline base validation
 Pivot to proving/hardening the in-house VM. Grounded in a multi-pass parallel investigation of every
 blocker dimension (`private development documentation`).

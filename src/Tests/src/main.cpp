@@ -28,6 +28,8 @@
 #include "antimal/IocExport.h"
 #include "antimal/Json.h"
 #include "antimal/JsonValue.h"
+#include "antimal/LiveVm.h"
+#include "antimal/VmPointer.h"
 #include "antimal/FakeInternet.h"
 #include "antimal/NetworkTelemetry.h"
 #include "antimal/PacketInspector.h"
@@ -11069,6 +11071,179 @@ void TestWerReportParser() {
          "WER: no exception-info field -> subcode -1 (no positional misread)");
 }
 
+// ---- VmPointer / LiveVm: the agent pointer + input tooling ------------------
+
+namespace {
+
+void FillTestBackground(antimal::BgrxFrame *f) {
+  for (uint32_t y = 0; y < f->height; ++y) {
+    for (uint32_t x = 0; x < f->width; ++x) {
+      uint8_t *p = f->At(static_cast<int>(x), static_cast<int>(y));
+      const uint32_t seed = x * 2654435761u + y * 40503u;
+      p[0] = static_cast<uint8_t>((seed >> 8) & 0xFF);
+      p[1] = static_cast<uint8_t>((seed >> 16) & 0xFF);
+      p[2] = static_cast<uint8_t>((seed >> 24) & 0xFF);
+      p[3] = 0xFF;
+    }
+  }
+}
+
+// A black-bordered white triangle-ish pointer drawn with its top-left at
+// (x, y) -- distinctive enough that masked tracking cannot confuse it with the
+// deterministic noise background.
+void DrawTestCursor(antimal::BgrxFrame *f, int x, int y) {
+  constexpr int kWidth = 11;
+  constexpr int kHeight = 16;
+  for (int r = 0; r < kHeight; ++r) {
+    const int run = std::max(1, kWidth - r / 2);
+    for (int c = 0; c < run; ++c) {
+      const int px = x + c;
+      const int py = y + r;
+      if (!f->Contains(px, py)) {
+        continue;
+      }
+      uint8_t *p = f->At(px, py);
+      const bool border = (c == 0 || r == 0 || c == run - 1);
+      p[0] = p[1] = p[2] = border ? 0 : 255;
+      p[3] = 0xFF;
+    }
+  }
+}
+
+antimal::BgrxFrame MakeTestFrame(uint32_t w, uint32_t h) {
+  antimal::BgrxFrame f;
+  f.width = w;
+  f.height = h;
+  f.pixels.assign(static_cast<size_t>(w) * h * 4, 0);
+  FillTestBackground(&f);
+  return f;
+}
+
+} // namespace
+
+void TestVmPointerLearnAndTrack() {
+  using namespace antimal;
+  constexpr int kDx = 12;
+  BgrxFrame before = MakeTestFrame(320, 240);
+  DrawTestCursor(&before, 100, 100);
+  BgrxFrame after = MakeTestFrame(320, 240);
+  DrawTestCursor(&after, 100 + kDx, 100);
+
+  const ShiftLearnResult learn = LearnCursorByKnownShift(before, after, kDx, 0);
+  Expect(learn.valid, "VmPointer: sprite learned from a known-shift pair");
+  Expect(std::abs(learn.x - (100 + kDx)) <= 1 && std::abs(learn.y - 100) <= 1,
+         "VmPointer: learned sprite sits where the pointer moved");
+  Expect(learn.actualDx == kDx && learn.actualDy == 0,
+         "VmPointer: measured delta equals the injected 1:1 shift");
+  Expect(learn.sprite.Valid(), "VmPointer: learned sprite is valid");
+
+  const CursorMatch hit = TrackCursor(after, learn.sprite, 100 + kDx, 100, 8);
+  Expect(hit.valid && hit.x == 100 + kDx && hit.y == 100 && hit.score > 0.9,
+         "VmPointer: tracking finds the pointer at the hint");
+
+  BgrxFrame empty = MakeTestFrame(320, 240);
+  const CursorMatch miss = TrackCursor(empty, learn.sprite, 112, 100, 24);
+  Expect(!miss.valid,
+         "VmPointer: tracking refuses a frame without the pointer");
+
+  const ShiftLearnResult zero = LearnCursorByKnownShift(before, after, 0, 0);
+  Expect(!zero.valid, "VmPointer: a zero probe delta is rejected");
+}
+
+void TestVmPointerAimLoop() {
+  using namespace antimal;
+  // Fake guest: 1.6x pointer acceleration past 6 counts (like Windows
+  // "Enhance pointer precision"), so the controller must MEASURE the gain
+  // rather than assume 1:1.
+  auto guest = [](int pos, int inj) {
+    const int mag = std::abs(inj);
+    const int moved = mag <= 6
+                          ? inj
+                          : (inj > 0 ? 1 : -1) *
+                                static_cast<int>(std::lround(mag * 1.6));
+    return pos + moved;
+  };
+  PointerAimState st;
+  st.targetX = 700;
+  st.targetY = 500;
+  st.cursorX = 50;
+  st.cursorY = 50;
+  st.tolerance = 4;
+  st.maxIterations = 24;
+  int gx = 50, gy = 50;
+  bool done = false, failed = false;
+  for (int i = 0; i < 64 && !done; ++i) {
+    const PointerAimState::Decision d = st.Next();
+    if (d.done) {
+      done = true;
+      failed = d.failed;
+      break;
+    }
+    const int nx = guest(gx, d.dx);
+    const int ny = guest(gy, d.dy);
+    st.Observe(d.dx, d.dy, nx - gx, ny - gy);
+    gx = nx;
+    gy = ny;
+  }
+  Expect(done && !failed, "VmPointer: aim converges on an accelerated guest");
+  Expect(st.WithinTolerance(), "VmPointer: aim lands inside the tolerance");
+  Expect(st.gainX > 1.2 && st.gainX < 2.2,
+         "VmPointer: aim learned the ~1.6x pointer gain");
+
+  // Frozen pointer: the loop must fail honestly, not spin forever.
+  PointerAimState stalled;
+  stalled.targetX = 300;
+  stalled.targetY = 300;
+  stalled.cursorX = 10;
+  stalled.cursorY = 10;
+  stalled.maxIterations = 32;
+  bool sdone = false, sfailed = false;
+  for (int i = 0; i < 64 && !sdone; ++i) {
+    const PointerAimState::Decision d = stalled.Next();
+    if (d.done) {
+      sdone = true;
+      sfailed = d.failed;
+      break;
+    }
+    stalled.Observe(d.dx, d.dy, 0, 0);
+  }
+  Expect(sdone && sfailed && stalled.stalls >= 4,
+         "VmPointer: a frozen pointer fails fast after repeated stalls");
+}
+
+void TestLiveVmInputEncoding() {
+  using namespace antimal;
+  namespace hv = antimal::hv;
+  const std::filesystem::path tmp =
+      std::filesystem::temp_directory_path() / L"antimal-test-live-input.bin";
+  std::error_code ec;
+  std::filesystem::remove(tmp, ec);
+  LiveInputWriter w(tmp);
+  Expect(w.Mouse(0x01, 10, 20), "LiveVm: mouse record appended");
+  Expect(w.NamedKey("Enter"), "LiveVm: named key appended");
+  std::vector<uint8_t> tap;
+  Expect(ChordScancodes("ctrl+alt+del", &tap) &&
+             (tap == std::vector<uint8_t>{0x1D, 0x38, 0xE0, 0x53, 0xE0, 0xD3,
+                                          0xB8, 0x9D}),
+         "LiveVm: ctrl+alt+del chord matches the documented Set-1 sequence");
+
+  const std::vector<uint8_t> bytes = ReadAllBytes(tmp);
+  std::vector<uint8_t> buf = bytes;
+  std::vector<hv::LiveInputEvent> events;
+  hv::ParseLiveInput(buf, events);
+  Expect(events.size() == 2, "LiveVm: two framed records parsed back");
+  if (events.size() == 2) {
+    Expect(events[0].type == hv::LiveInputEvent::Type::Mouse &&
+               events[0].buttons == 0x01 && events[0].dx == 10 &&
+               events[0].dy == -20,
+           "LiveVm: screen dy=20 encodes as PS/2 dy=-20 (Y is up)");
+    Expect(events[1].type == hv::LiveInputEvent::Type::Keyboard &&
+               events[1].scancodes == std::vector<uint8_t>({0x1C, 0x9C}),
+           "LiveVm: Enter tap round-trips");
+  }
+  std::filesystem::remove(tmp, ec);
+}
+
 int main() {
   try {
     // Must run before anything else touches the guest clock: GuestRtcNowEpoch()
@@ -11238,6 +11413,10 @@ int main() {
     TestOrchestratorBootAttemptDoesNotExecuteSample();
     TestOrchestratorCreatesDifferencingOverlay();
     TestOrchestratorCreatesRawCowOverlay();
+
+    TestVmPointerLearnAndTrack();
+    TestVmPointerAimLoop();
+    TestLiveVmInputEncoding();
 
     if (g_failed) {
       std::cerr << g_failed << " test(s) failed.\n";

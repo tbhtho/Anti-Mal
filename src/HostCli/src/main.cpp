@@ -254,6 +254,13 @@ void PrintUsage() {
       << "  antimal base inspect --vhdx <base.vhdx> [--overlay <overlay.cow>]\n"
       << "                       [--dump-bcd <out.bcd>] [--dump-system <out.hive>]\n"
       << "  antimal base validate --vhdx <base.vhdx> [--overlay <o.cow>] [--json]   (offline boot-readiness pass/fail)\n"
+      << "  antimal vmview [--name <shm>] [--x N --y N --w N --h N]   (live guest-screen window;\n"
+      << "                                                             pair with ANTIMAL_LIVE_FRAME_SHM=<shm>)\n"
+      << "  antimal vmstatus [--json]                     (live VM + newest run state)\n"
+      << "  antimal vmframe [--name <shm>] [--out <png>]  (capture the live guest screen)\n"
+      << "  antimal vmmouse --to X,Y [--click] [--double] [--button left|right|middle]\n"
+      << "                  [--file <live-input.bin>] [--shm <name>]\n"
+      << "                                                (coordinate-based pointer, closed-loop)\n"
       << "  antimal classify-frame <frame.png> | --run <run-id> [--all] [--json]   (grade frame(s): desktop-class? exit 0=Rich)\n"
       << "  antimal fs-ls  [--vhdx <d.vhdx>] [--overlay <o.cow>] <guest\\path>   (offline guest dir listing)\n"
       << "  antimal fs-cat [--vhdx <d.vhdx>] [--overlay <o.cow>] <guest\\path> [--out <file>]\n"
@@ -4850,6 +4857,18 @@ int CommandDumpHive(int argc, wchar_t **argv) {
   return 0;
 }
 
+// Defined in VmViewer.cpp: a plain Win32 window mirroring the VM's live
+// framebuffer (the "watch the guest screen" display for CLI-driven runs).
+int CommandVmView(int argc, wchar_t **argv);
+// Defined in VmInput.cpp: appends keyboard/mouse records to a running
+// detonation's live-input file (interactive control of the guest).
+int CommandVmInput(int argc, wchar_t **argv);
+// Defined in VmTools.cpp: the agent-facing live-VM tools (status, screenshot,
+// coordinate-based pointer) over the Common LiveVm layer.
+int CommandVmStatus(int argc, wchar_t **argv);
+int CommandVmFrame(int argc, wchar_t **argv);
+int CommandVmMouse(int argc, wchar_t **argv);
+
 int wmain(int argc, wchar_t **argv) {
   try {
     if (argc < 2) {
@@ -4916,6 +4935,21 @@ int wmain(int argc, wchar_t **argv) {
     }
     if (command == "triage") {
       return CommandTriage(argc, argv);
+    }
+    if (command == "vmview") {
+      return CommandVmView(argc, argv);
+    }
+    if (command == "vminput") {
+      return CommandVmInput(argc, argv);
+    }
+    if (command == "vmstatus") {
+      return CommandVmStatus(argc, argv);
+    }
+    if (command == "vmframe") {
+      return CommandVmFrame(argc, argv);
+    }
+    if (command == "vmmouse") {
+      return CommandVmMouse(argc, argv);
     }
     if (command == "fs-ls" || command == "fs-cat" || command == "fs-find" ||
         command == "fs-scan" || command == "reg-ls") {

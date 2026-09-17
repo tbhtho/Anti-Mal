@@ -8621,11 +8621,22 @@ HostChannelCapture ProcessHostChannelOutput(
       break;
     case hv::HostChannelMessage::Event: {
       auto event = ParseEventJsonLine(payload);
-      // Interactive sessions journal events live (in the progress callback) so
-      // the UI can tail them in real time; re-journaling the same frames here
-      // post-run would duplicate them.
+      // Always collect into the report's in-memory vector. Interactive sessions
+      // journal events live in the progress callback (for real-time tailing), so
+      // re-journaling here would duplicate journal lines -- but the report is
+      // built from this vector, and skipping it here previously made an
+      // interactive run's report blind to every guest telemetry event (process
+      // tree, registry, files, network). Journal only on the non-interactive
+      // post-run pass; collect unconditionally.
+      if (events) {
+        events->push_back(event);
+      }
       if (journalEvents) {
-        AppendJournalEvent(journalPath, event, events);
+        try {
+          EventJournalWriter writer(journalPath);
+          writer.Append(event);
+        } catch (...) {
+        }
       }
       ++capture.eventsReturned;
       break;
@@ -8735,7 +8746,23 @@ std::vector<uint8_t> BuildFirstBootCom2Bytes(bool executionAuthorized,
   req.allowSampleExecution = true;
   req.sampleName = PathToUtf8(stagedSample.filename());
   req.sampleBytes = sample.size();
-  req.timeoutMs = timeoutMs;
+  // The guest's sample-observation window MUST end before the host's overall
+  // run deadline: otherwise a sample that never exits on its own (a UI dialog,
+  // a hung installer) gets the VM stopped out from under the agent, and the
+  // run is misreported as "the sample did not run" even though it executed and
+  // streamed telemetry. Reserve a margin for boot + paced COM2 transfer
+  // (~14 KB/s observed) + the deferred launch + the final report round-trip.
+  {
+    // 6 KB/s is deliberately conservative: the paced channel sustains ~8-14
+    // KB/s in practice, and under-estimating it makes the sample window too
+    // small (the host deadline then cuts the VM before the agent reports).
+    constexpr uint64_t kPacedBytesPerSec = 6u * 1024u;
+    const uint64_t transferMs = (sample.size() / kPacedBytesPerSec) * 1000ull;
+    const uint64_t marginMs = 300000ull + transferMs;
+    req.timeoutMs = timeoutMs > marginMs + 60000ull
+                        ? static_cast<uint32_t>(timeoutMs - marginMs)
+                        : 60000u;
+  }
   req.networkMode = ToString(networkMode);
   req.runId = runId;
 
@@ -8754,6 +8781,61 @@ std::vector<uint8_t> BuildFirstBootCom2Bytes(bool executionAuthorized,
             " bytes) over COM2 for in-guest detonation";
   }
   return out;
+}
+
+// Builds the first-boot COM2 payload for DISK-BACKED delivery: a single
+// execute JobStart frame telling the agent to read the sample off the raw
+// sample disk (matched by the guest-visible byte length) instead of expecting
+// SampleChunk frames. This is what lets samples ABOVE the 8 MB COM2 cap
+// detonate at all -- the file rides a second read-only AHCI disk at disk speed.
+std::vector<uint8_t> BuildDiskDeliveryCom2Bytes(
+    const std::string &runId, const std::filesystem::path &stagedSample,
+    uint32_t timeoutMs, NetworkMode networkMode, uint64_t diskBytes,
+    std::string *note) {
+  std::error_code ec;
+  const auto size = std::filesystem::file_size(stagedSample, ec);
+  if (ec || size == 0) {
+    if (note) {
+      *note = "disk delivery requested but the staged sample is unreadable; "
+              "falling back to healthcheck";
+    }
+    return BuildHealthcheckJobFrame(runId);
+  }
+
+  ExecuteJobRequest req;
+  req.allowSampleExecution = true;
+  req.sampleName = PathToUtf8(stagedSample.filename());
+  req.sampleBytes = size;
+  req.delivery = "disk";
+  std::wstring ext = stagedSample.extension().wstring();
+  for (wchar_t &ch : ext) {
+    if (ch >= L'A' && ch <= L'Z') {
+      ch = static_cast<wchar_t>(ch - L'A' + L'a');
+    }
+  }
+  req.sampleKind = (ext == L".iso") ? "iso" : "exe";
+  req.diskBytes = diskBytes;
+  // The guest's observation window must end before the host's overall run
+  // deadline (same rule as the serial path). The disk read is fast, so the
+  // margin only needs boot + copy/mount + launch + report slop.
+  {
+    constexpr uint64_t kDiskBytesPerSec = 128ull * 1024ull * 1024ull;
+    const uint64_t copyMs = (size / kDiskBytesPerSec) * 1000ull;
+    const uint64_t marginMs = 300000ull + copyMs;
+    req.timeoutMs = timeoutMs > marginMs + 60000ull
+                        ? static_cast<uint32_t>(timeoutMs - marginMs)
+                        : 60000u;
+  }
+  req.networkMode = ToString(networkMode);
+  req.runId = runId;
+
+  if (note) {
+    *note = "execution AUTHORIZED: delivering sample '" + req.sampleName +
+            "' (" + std::to_string(size) + " bytes, kind=" + req.sampleKind +
+            ") via the sample disk (no COM2 size cap)";
+  }
+  return HostSerialChannel::EncodeText(HostChannelMessage::JobStart,
+                                       BuildExecuteJobJson(req));
 }
 
 std::filesystem::path CurrentExecutableDir() {
@@ -10212,6 +10294,9 @@ std::string FormatVmDiagnostics(const hv::VmRunSummary &vm) {
       << vm.ahciLastCommand << std::dec << "\n";
   out << "ahciPortCmdWrites: " << vm.ahciPortCmdWrites << "\n";
   out << "ahciCiWrites: " << vm.ahciCiWrites << "\n";
+  out << "ahciSampleCommands: " << vm.ahciSampleCommandsIssued << "\n";
+  out << "ahciSampleSectorsRead: " << vm.ahciSampleSectorsRead << "\n";
+  out << "ahciSampleWriteCommands: " << vm.ahciSampleWriteCommands << "\n";
   out << "ahciInterruptsRequested: " << vm.ahciInterruptsRequested << "\n";
   out << "ahciInterruptsInjected: " << vm.ahciInterruptsInjected << "\n";
   out << "ahciInterruptsFailed: " << vm.ahciInterruptsFailed << "\n";
@@ -12378,6 +12463,38 @@ DetonationResult InHouseOrchestrator::PrepareAndRun(
       // screenshot callback in vmOptions keeps the filmstrip continuous. The one
       // --timeout-sec budget is shared across all boots via a running deadline;
       // a reboot cap is the backstop against a genuine reboot loop.
+      // Disk-backed sample delivery: samples larger than the COM2 cap are
+      // exposed as a second read-only AHCI disk (port 1) that the in-guest agent
+      // copies off the raw device. The device must outlive every boot generation
+      // (the VM is recreated per reboot), so it is created here, outside the
+      // lambda.
+      std::optional<hv::PaddedFileBlockDevice> sampleDiskDevice;
+      bool sampleDiskDelivery = false;
+      if (executionAuthorized) {
+        std::error_code sizeEc;
+        const uint64_t stagedBytes =
+            std::filesystem::file_size(stagedSample, sizeEc);
+        // Disk delivery for anything past 2 MB: it is faster than the paced
+        // COM2 channel (disk speed vs ~10 KB/s) and has no size cap, so the
+        // serial path is reserved for small samples where it is already proven.
+        constexpr uint64_t kDiskDeliveryMinBytes = 2ull * 1024ull * 1024ull;
+        if (!sizeEc && stagedBytes > kDiskDeliveryMinBytes) {
+          try {
+            sampleDiskDevice.emplace(
+                hv::PaddedFileBlockDevice::Open(stagedSample));
+            sampleDiskDelivery = true;
+            result.commands.push_back(
+                "# Disk-backed delivery: sample disk attached (" +
+                std::to_string(sampleDiskDevice->SectorCount() * 512ull) +
+                " bytes guest-visible, no COM2 size cap)");
+          } catch (const std::exception &ex) {
+            result.commands.push_back(
+                std::string("# Disk-backed delivery unavailable (") + ex.what() +
+                "); falling back to the COM2 path");
+          }
+        }
+      }
+
       auto runWithReboots = [&](hv::IBlockDevice *disk) -> hv::VmRunSummary {
         constexpr int kMaxReboots = 12;
         const auto totalTimeout =
@@ -12394,9 +12511,16 @@ DetonationResult InHouseOrchestrator::PrepareAndRun(
         // a fresh agent process, and within a generation the guest rejects a
         // duplicate execute job ("execute-already-active").
         std::string jobNote;
-        const std::vector<uint8_t> firstBootCom2 = BuildFirstBootCom2Bytes(
-            executionAuthorized, result.runId, stagedSample,
-            static_cast<uint32_t>(totalTimeout.count()), networkMode, &jobNote);
+        const std::vector<uint8_t> firstBootCom2 =
+            (sampleDiskDelivery && sampleDiskDevice)
+                ? BuildDiskDeliveryCom2Bytes(
+                      result.runId, stagedSample,
+                      static_cast<uint32_t>(totalTimeout.count()), networkMode,
+                      sampleDiskDevice->SectorCount() * 512ull, &jobNote)
+                : BuildFirstBootCom2Bytes(
+                      executionAuthorized, result.runId, stagedSample,
+                      static_cast<uint32_t>(totalTimeout.count()), networkMode,
+                      &jobNote);
         if (!jobNote.empty()) {
           fireProgress("booting", jobNote);
           // An AUTHORIZED run that fell back to a healthcheck (oversize /
@@ -12440,6 +12564,9 @@ DetonationResult InHouseOrchestrator::PrepareAndRun(
           if (reboot >= 1) {
             optsLocal.processorCount = postRebootVcpuCount;
           }
+          if (sampleDiskDelivery && sampleDiskDevice) {
+            optsLocal.sampleDisk = &*sampleDiskDevice;
+          }
           hv::VirtualMachine vm(preflight.firmwarePath, disk, optsLocal);
           // When a NIC is attached, route the guest's TX frames through the
           // contained sink (zero egress) and inject the replies into the RX ring
@@ -12469,7 +12596,8 @@ DetonationResult InHouseOrchestrator::PrepareAndRun(
                                  {{"runId", result.runId},
                                   {"generation", std::to_string(reboot)},
                                   {"bytes", std::to_string(firstBootCom2.size())},
-                                  {"mode", "paced"}}),
+                                  {"mode", sampleDiskDelivery ? "disk" : "paced"},
+                                  {"delivery", sampleDiskDelivery ? "disk" : "serial"}}),
                 &events);
           } else {
             vm.QueueCom2Bytes(firstBootCom2);

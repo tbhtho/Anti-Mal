@@ -36,6 +36,9 @@
   </ItemDefinitionGroup>
   <ItemGroup>
     <ClCompile Include="src\main.cpp" />
+    <ClCompile Include="src\VmViewer.cpp" />
+    <ClCompile Include="src\VmInput.cpp" />
+    <ClCompile Include="src\VmTools.cpp" />
   </ItemGroup>
   <ItemGroup>
     <None Include="..\..\tools\Test-AntiMalBaseBoot.ps1">

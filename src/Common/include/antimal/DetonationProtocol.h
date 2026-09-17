@@ -30,6 +30,16 @@ struct ExecuteJobRequest {
   uint32_t timeoutMs = 180000;        // bound the detonation
   std::string networkMode = "disabled";
   std::string runId;
+  // Delivery channel: "serial" = SampleChunk frames over COM2 (small samples);
+  // "disk" = the sample file is exposed as a second read-only AHCI disk and the
+  // guest copies it off the raw device (no size cap, disk-speed transfer).
+  std::string delivery = "serial";
+  // "exe" = launch the delivered file directly; "iso" = mount the delivered
+  // image and launch the installer inside it.
+  std::string sampleKind = "exe";
+  // Byte size of the guest-visible sample disk (sector-padded). The guest finds
+  // the raw device by matching this length, then reads sampleBytes from it.
+  uint64_t diskBytes = 0;
 };
 
 namespace detail {
@@ -116,6 +126,11 @@ inline std::string BuildExecuteJobJson(const ExecuteJobRequest &req) {
   if (!req.runId.empty()) {
     out += ",\"runId\":\"" + detail::JsonEscape(req.runId) + "\"";
   }
+  out += ",\"delivery\":\"" + detail::JsonEscape(req.delivery) + "\"";
+  out += ",\"sampleKind\":\"" + detail::JsonEscape(req.sampleKind) + "\"";
+  if (req.diskBytes != 0) {
+    out += ",\"diskBytes\":" + std::to_string(req.diskBytes);
+  }
   out += "}";
   return out;
 }
@@ -150,6 +165,19 @@ inline ExecuteJobRequest ParseExecuteJobJson(std::string_view payload) {
   }
   if (const auto run = detail::JsonValueToken(payload, "runId")) {
     req.runId = *run;
+  }
+  if (const auto delivery = detail::JsonValueToken(payload, "delivery")) {
+    req.delivery = *delivery;
+  }
+  if (const auto kind = detail::JsonValueToken(payload, "sampleKind")) {
+    req.sampleKind = *kind;
+  }
+  if (const auto disk = detail::JsonValueToken(payload, "diskBytes")) {
+    try {
+      req.diskBytes = std::stoull(*disk);
+    } catch (...) {
+      req.diskBytes = 0;
+    }
   }
   return req;
 }

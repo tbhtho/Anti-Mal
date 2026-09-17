@@ -8,10 +8,12 @@ namespace antimal::hv {
 namespace {
 
 // Host Capabilities (CAP): S64A (bit31) + ISS=Gen2 (bits23:20=2) + SAM (bit18,
-// AHCI-mode only) + NCS=31 (bits12:8, 32 command slots) + NP=0 (bits4:0, 1 port).
-constexpr uint32_t kCap = 0x80000000u | 0x00200000u | 0x00040000u | 0x00001F00u;
+// AHCI-mode only) + NCS=31 (bits12:8, 32 command slots) + NP=1 (bits4:0, 2 ports:
+// port 0 = boot disk, port 1 = disk-backed sample delivery).
+constexpr uint32_t kCap = 0x80000000u | 0x00200000u | 0x00040000u | 0x00001F00u |
+                          0x00000001u;
 constexpr uint32_t kVersion = 0x00010300u; // AHCI 1.3.
-constexpr uint32_t kPortsImplemented = 0x00000001u; // port 0 only.
+constexpr uint32_t kPortsImplemented = 0x00000003u; // ports 0 and 1.
 
 uint32_t LoadLe32(const uint8_t *p) {
   return static_cast<uint32_t>(p[0]) | (static_cast<uint32_t>(p[1]) << 8) |
@@ -27,12 +29,41 @@ void StoreLe32(uint8_t *p, uint32_t v) {
 
 } // namespace
 
-AhciController::AhciController(IBlockDevice *disk) : disk_(disk) {
+AhciController::AhciController(IBlockDevice *disk) {
   // Present a ready SATA disk on port 0 from the start: DET=3 (device present +
   // PHY communication established), SPD=2 (Gen2), IPM=1 (interface active).
-  pxSsts_ = 0x00000123u;
-  pxSig_ = 0x00000101u;  // Non-packet SATA device (a hard disk).
-  pxTfd_ = 0x00000050u;  // DRDY | DSC, BSY/DRQ/ERR clear -> ready.
+  // The port-0 disk pointer is kept even when null so the pre-two-port behavior
+  // (empty disk => IDENTIFY reports zero sectors) is unchanged for the tests.
+  ports_[0].disk = disk;
+  ports_[0].ssts = 0x00000123u;
+  ports_[0].sig = 0x00000101u;  // Non-packet SATA device (a hard disk).
+  ports_[0].tfd = 0x00000050u;  // DRDY | DSC, BSY/DRQ/ERR clear -> ready.
+  // Port 1 (sample delivery) starts with no device attached: the guest will not
+  // enumerate a disk there until SetPortDisk(1, ...) presents one.
+  ports_[1].ssts = 0;
+  ports_[1].sig = 0xFFFFFFFFu;
+  ports_[1].tfd = 0x0000007Fu;
+}
+
+void AhciController::Reset() noexcept {
+  ghc_ = 0;
+  hbaIs_ = 0;
+  for (PortState &p : ports_) {
+    p.clb = p.clbu = p.fb = p.fbu = 0;
+    p.is = p.ie = p.cmd = 0;
+    p.serr = p.sact = p.ci = 0;
+    if (p.disk) {
+      p.tfd = 0x00000050u; // DRDY | DSC.
+      p.sig = 0x00000101u; // SATA disk signature.
+      p.ssts = 0x00000123u; // DET=3, SPD=2, IPM=1 (device present).
+    } else {
+      p.tfd = 0x0000007Fu;
+      p.sig = 0xFFFFFFFFu;
+      p.ssts = 0;
+    }
+    p.sctl = 0;
+  }
+  interruptPending_ = false;
 }
 
 std::array<uint8_t, IBlockDevice::kSectorSize>
@@ -96,22 +127,27 @@ uint32_t AhciController::ReadReg32(uint32_t off) const {
     default: return 0;                  // CCC/EM/CAP2/BOHC: unimplemented.
     }
   }
-  if (off >= 0x100 && off < 0x180) {
-    switch (off - 0x100) {
-    case 0x00: return pxClb_;
-    case 0x04: return pxClbu_;
-    case 0x08: return pxFb_;
-    case 0x0C: return pxFbu_;
-    case 0x10: return pxIs_;
-    case 0x14: return pxIe_;
-    case 0x18: return pxCmd_;
-    case 0x20: return pxTfd_;
-    case 0x24: return pxSig_;
-    case 0x28: return pxSsts_;
-    case 0x2C: return pxSctl_;
-    case 0x30: return pxSerr_;
-    case 0x34: return pxSact_;
-    case 0x38: return pxCi_;
+  constexpr uint32_t kPortRegsBase = 0x100;
+  constexpr uint32_t kPortRegsSize = 0x80;
+  if (off >= kPortRegsBase &&
+      off < kPortRegsBase + kPortCount * kPortRegsSize) {
+    const uint32_t port = (off - kPortRegsBase) / kPortRegsSize;
+    const PortState &p = ports_[port];
+    switch ((off - kPortRegsBase) % kPortRegsSize) {
+    case 0x00: return p.clb;
+    case 0x04: return p.clbu;
+    case 0x08: return p.fb;
+    case 0x0C: return p.fbu;
+    case 0x10: return p.is;
+    case 0x14: return p.ie;
+    case 0x18: return p.cmd;
+    case 0x20: return p.tfd;
+    case 0x24: return p.sig;
+    case 0x28: return p.ssts;
+    case 0x2C: return p.sctl;
+    case 0x30: return p.serr;
+    case 0x34: return p.sact;
+    case 0x38: return p.ci;
     default: return 0;
     }
   }
@@ -123,13 +159,23 @@ void AhciController::WriteReg32(uint32_t off, uint32_t value) {
     switch (off) {
     case 0x04: // GHC.
       if (value & 0x1u) {
-        // HBA reset (HR): clear state, then self-clear HR. Keep the device
-        // present so the OS re-detects it after reset.
+        // HBA reset (HR): clear the HBA/port register state, then self-clear
+        // HR. Keep the devices present so the OS re-detects them after reset.
         ghc_ = 0;
         hbaIs_ = 0;
-        pxClb_ = pxClbu_ = pxFb_ = pxFbu_ = 0;
-        pxIs_ = pxIe_ = pxCmd_ = pxSerr_ = pxSact_ = pxCi_ = 0;
-        pxTfd_ = 0x50;
+        for (PortState &p : ports_) {
+          p.clb = p.clbu = p.fb = p.fbu = 0;
+          p.is = p.ie = p.cmd = p.serr = p.sact = p.ci = 0;
+          if (p.disk) {
+            p.tfd = 0x00000050u;
+            p.sig = 0x00000101u;
+            p.ssts = 0x00000123u;
+          } else {
+            p.tfd = 0x0000007Fu;
+            p.sig = 0xFFFFFFFFu;
+            p.ssts = 0;
+          }
+        }
         interruptPending_ = false;
         return;
       }
@@ -142,31 +188,41 @@ void AhciController::WriteReg32(uint32_t off, uint32_t value) {
       return;
     }
   }
-  if (off >= 0x100 && off < 0x180) {
-    switch (off - 0x100) {
-    case 0x00: pxClb_ = value & 0xFFFFFC00u; return;
-    case 0x04: pxClbu_ = value; return;
-    case 0x08: pxFb_ = value & 0xFFFFFF00u; return;
-    case 0x0C: pxFbu_ = value; return;
+  constexpr uint32_t kPortRegsBase = 0x100;
+  constexpr uint32_t kPortRegsSize = 0x80;
+  if (off >= kPortRegsBase &&
+      off < kPortRegsBase + kPortCount * kPortRegsSize) {
+    const uint32_t port = (off - kPortRegsBase) / kPortRegsSize;
+    PortState &p = ports_[port];
+    switch ((off - kPortRegsBase) % kPortRegsSize) {
+    case 0x00: p.clb = value & 0xFFFFFC00u; return;
+    case 0x04: p.clbu = value; return;
+    case 0x08: p.fb = value & 0xFFFFFF00u; return;
+    case 0x0C: p.fbu = value; return;
     case 0x10: // PxIS: write-1-to-clear.
-      pxIs_ &= ~value;
-      if ((pxIs_ & pxIe_) == 0) {
-        hbaIs_ &= ~0x1u;
+      p.is &= ~value;
+      if ((p.is & p.ie) == 0) {
+        hbaIs_ &= ~(1u << port);
       }
       return;
-    case 0x14: pxIe_ = value; return;
-    case 0x18: // PxCMD: reflect ST->CR (bit15) and FRE->FR (bit14).
-      ++portCmdWrites_;
-      pxCmd_ = (value & ~0x0000C000u) | ((value & 0x1u) ? 0x8000u : 0u) |
-               ((value & 0x10u) ? 0x4000u : 0u);
+    case 0x14: p.ie = value; return;
+    case 0x18: // PxCMD: reflect ST->CR (bit15) and FRE->FR (bit14). ICC (bits
+               // 31:28) is an ACTION field: the HBA performs the requested
+               // interface-power transition and self-clears it. Leaving ICC set
+               // forever makes a driver that polls for the transition (storahci
+               // starting a data port) spin indefinitely -- which wedges the
+               // guest on the second port.
+      ++p.portCmdWrites;
+      p.cmd = (value & ~0xF000C000u) | ((value & 0x1u) ? 0x8000u : 0u) |
+              ((value & 0x10u) ? 0x4000u : 0u);
       return;
-    case 0x2C: pxSctl_ = value; return;     // SATA control (keep present).
-    case 0x30: pxSerr_ &= ~value; return;   // PxSERR: write-1-to-clear.
-    case 0x34: pxSact_ = value; return;
+    case 0x2C: p.sctl = value; return;     // SATA control (keep present).
+    case 0x30: p.serr &= ~value; return;   // PxSERR: write-1-to-clear.
+    case 0x34: p.sact = value; return;
     case 0x38: // PxCI: OS sets per-slot issue bits.
-      ++ciWrites_;
-      pxCi_ |= value;
-      ProcessCommandIssue();
+      ++p.ciWrites;
+      p.ci |= value;
+      ProcessCommandIssue(port);
       return;
     default:
       return; // PxTFD/PxSIG/PxSSTS are read-only.
@@ -174,25 +230,26 @@ void AhciController::WriteReg32(uint32_t off, uint32_t value) {
   }
 }
 
-void AhciController::ProcessCommandIssue() {
-  const uint32_t issued = pxCi_;
+void AhciController::ProcessCommandIssue(uint32_t port) {
+  const uint32_t issued = ports_[port].ci;
   for (uint32_t slot = 0; slot < 32; ++slot) {
     if (issued & (1u << slot)) {
-      RunCommandSlot(slot);
+      RunCommandSlot(port, slot);
     }
   }
 }
 
-void AhciController::RunCommandSlot(uint32_t slot) {
+void AhciController::RunCommandSlot(uint32_t port, uint32_t slot) {
+  PortState &p = ports_[port];
   if (!dmaMemory_) {
-    pxCi_ &= ~(1u << slot);
+    p.ci &= ~(1u << slot);
     return;
   }
   const uint64_t clb =
-      static_cast<uint64_t>(pxClb_) | (static_cast<uint64_t>(pxClbu_) << 32);
+      static_cast<uint64_t>(p.clb) | (static_cast<uint64_t>(p.clbu) << 32);
   uint8_t *hdr = dmaMemory_(clb + static_cast<uint64_t>(slot) * 0x20, 0x20);
   if (!hdr) {
-    pxCi_ &= ~(1u << slot);
+    p.ci &= ~(1u << slot);
     return;
   }
   const uint32_t dw0 = LoadLe32(hdr);
@@ -202,7 +259,7 @@ void AhciController::RunCommandSlot(uint32_t slot) {
   const size_t ctblLen = 0x80 + static_cast<size_t>(prdtl) * 16;
   uint8_t *ctbl = dmaMemory_(ctba, ctblLen);
   if (!ctbl) {
-    pxCi_ &= ~(1u << slot);
+    p.ci &= ~(1u << slot);
     return;
   }
 
@@ -283,29 +340,29 @@ void AhciController::RunCommandSlot(uint32_t slot) {
     return total;
   };
 
-  ++commandsIssued_;
-  lastCommand_ = cmd;
+  ++p.commandsIssued;
+  p.lastCommand = cmd;
   uint8_t status = 0x50; // DRDY | DSC.
   uint8_t err = 0;
   uint32_t prdbc = 0;
 
   switch (cmd) {
   case 0xEC: { // IDENTIFY DEVICE.
-    ++identifyCommands_;
-    const auto id = BuildIdentify(disk_);
+    ++p.identifyCommands;
+    const auto id = BuildIdentify(p.disk);
     prdbc = scatter(id.data(), id.size());
     break;
   }
   case 0x25: // READ DMA EXT (48-bit).
   case 0xC8: // READ DMA (28-bit).
   case 0x24: { // READ SECTORS EXT.
-    ++readCommands_;
+    ++p.readCommands;
     std::vector<uint8_t> buf(static_cast<size_t>(count) * IBlockDevice::kSectorSize);
-    if (disk_ &&
-        disk_->ReadSectors(lba, static_cast<uint16_t>(std::min<uint32_t>(count, 0xFFFF)),
-                           buf.data())) {
-      sectorsRead_ += count;
-      RecordAccess(false, cmd, lba, count);
+    if (p.disk &&
+        p.disk->ReadSectors(lba, static_cast<uint16_t>(std::min<uint32_t>(count, 0xFFFF)),
+                            buf.data())) {
+      p.sectorsRead += count;
+      RecordAccess(port, false, cmd, lba, count);
       prdbc = scatter(buf.data(), buf.size());
     } else {
       status = 0x51; // ERR | DRDY.
@@ -316,14 +373,14 @@ void AhciController::RunCommandSlot(uint32_t slot) {
   case 0x35: // WRITE DMA EXT (48-bit).
   case 0xCA: // WRITE DMA (28-bit).
   case 0x34: { // WRITE SECTORS EXT.
-    ++writeCommands_;
+    ++p.writeCommands;
     std::vector<uint8_t> buf(static_cast<size_t>(count) * IBlockDevice::kSectorSize);
     prdbc = gather(buf.data(), buf.size());
-    if (disk_ &&
-        disk_->WriteSectors(lba, static_cast<uint16_t>(std::min<uint32_t>(count, 0xFFFF)),
-                            buf.data())) {
-      sectorsWritten_ += count;
-      RecordAccess(true, cmd, lba, count);
+    if (p.disk &&
+        p.disk->WriteSectors(lba, static_cast<uint16_t>(std::min<uint32_t>(count, 0xFFFF)),
+                             buf.data())) {
+      p.sectorsWritten += count;
+      RecordAccess(port, true, cmd, lba, count);
     } else {
       status = 0x51;
       err = 0x04;
@@ -332,8 +389,8 @@ void AhciController::RunCommandSlot(uint32_t slot) {
   }
   case 0xEA: // FLUSH CACHE EXT.
   case 0xE7: { // FLUSH CACHE.
-    if (disk_) {
-      disk_->Flush();
+    if (p.disk) {
+      p.disk->Flush();
     }
     break;
   }
@@ -351,7 +408,7 @@ void AhciController::RunCommandSlot(uint32_t slot) {
     // the device as faulty. Status stays 0x50 (DRDY | DSC), error 0.
     break;
   default:
-    ++unknownCommands_;
+    ++p.unknownCommands;
     status = 0x51; // ERR | DRDY.
     err = 0x04;    // ABRT.
     break;
@@ -363,7 +420,7 @@ void AhciController::RunCommandSlot(uint32_t slot) {
   // Post a Device-to-Host Register FIS (type 0x34) into the port's FIS-receive
   // area at PxFB + 0x40 so the OS sees the command's completion status.
   const uint64_t fb =
-      static_cast<uint64_t>(pxFb_) | (static_cast<uint64_t>(pxFbu_) << 32);
+      static_cast<uint64_t>(p.fb) | (static_cast<uint64_t>(p.fbu) << 32);
   if (fb != 0) {
     if (uint8_t *rfis = dmaMemory_(fb + 0x40, 0x14)) {
       std::memset(rfis, 0, 0x14);
@@ -383,34 +440,36 @@ void AhciController::RunCommandSlot(uint32_t slot) {
     }
   }
 
-  pxTfd_ = static_cast<uint32_t>(status) | (static_cast<uint32_t>(err) << 8);
-  pxIs_ |= 0x1u;                 // DHRS: Device-to-Host Register FIS interrupt.
-  pxCi_ &= ~(1u << slot);        // Command slot complete.
-  RaiseInterrupt();
+  p.tfd = static_cast<uint32_t>(status) | (static_cast<uint32_t>(err) << 8);
+  p.is |= 0x1u;                  // DHRS: Device-to-Host Register FIS interrupt.
+  p.ci &= ~(1u << slot);         // Command slot complete.
+  RaiseInterrupt(port);
 }
 
-void AhciController::RaiseInterrupt() {
-  if ((pxIs_ & pxIe_) != 0) {
-    hbaIs_ |= 0x1u;              // Port 0 interrupt pending in the HBA.
-    if (ghc_ & 0x2u) {          // GHC.IE: global interrupt enable.
+void AhciController::RaiseInterrupt(uint32_t port) {
+  const PortState &p = ports_[port];
+  if ((p.is & p.ie) != 0) {
+    hbaIs_ |= (1u << port);      // This port's interrupt is pending in the HBA.
+    if (ghc_ & 0x2u) {           // GHC.IE: global interrupt enable.
       interruptPending_ = true;
     }
   }
 }
 
-void AhciController::RecordAccess(bool write, uint8_t cmd, uint64_t lba,
-                                 uint32_t count) {
-  if (recentAccesses_.size() >= kRecentAccessLimit) {
+void AhciController::RecordAccess(uint32_t port, bool write, uint8_t cmd,
+                                  uint64_t lba, uint32_t count) {
+  auto &accesses = ports_[port].recentAccesses;
+  if (accesses.size() >= kRecentAccessLimit) {
     // Drop the oldest to stay bounded; a stuck boot's recent accesses are the
     // boot reads the host analysis is looking for.
-    recentAccesses_.erase(recentAccesses_.begin());
+    accesses.erase(accesses.begin());
   }
   IdeAccessRange access;
   access.write = write;
   access.command = cmd;
   access.lba = lba;
   access.count = static_cast<uint16_t>(count > 0xFFFFu ? 0xFFFFu : count);
-  recentAccesses_.push_back(access);
+  accesses.push_back(access);
 }
 
 bool AhciController::OnRead(uint64_t gpa, uint8_t accessSize, uint64_t *outValue) {

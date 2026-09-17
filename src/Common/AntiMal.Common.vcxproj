@@ -82,8 +82,10 @@
     <ClInclude Include="include\antimal\ScriptAnalyzer.h" />
     <ClInclude Include="include\antimal\ShellcodeDetector.h" />
     <ClInclude Include="include\antimal\Simulation.h" />
+    <ClInclude Include="include\antimal\LiveVm.h" />
     <ClInclude Include="include\antimal\Screenshot.h" />
     <ClInclude Include="include\antimal\ShellLinkParser.h" />
+    <ClInclude Include="include\antimal\VmPointer.h" />
     <ClInclude Include="include\antimal\Strings.h" />
     <ClInclude Include="include\antimal\Subprocess.h" />
     <ClInclude Include="include\antimal\Tagger.h" />
@@ -122,6 +124,7 @@
     <ClCompile Include="src\MitreCatalog.cpp" />
     <ClCompile Include="src\Json.cpp" />
     <ClCompile Include="src\JsonValue.cpp" />
+    <ClCompile Include="src\LiveVm.cpp" />
     <ClCompile Include="src\FileSystemTelemetry.cpp" />
     <ClCompile Include="src\NetworkCapture.cpp" />
     <ClCompile Include="src\NetworkClassifier.cpp" />
@@ -146,6 +149,7 @@
     <ClCompile Include="src\Subprocess.cpp" />
     <ClCompile Include="src\Tagger.cpp" />
     <ClCompile Include="src\UsabilityDiagnostics.cpp" />
+    <ClCompile Include="src\VmPointer.cpp" />
     <ClCompile Include="src\YaraGen.cpp" />
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
