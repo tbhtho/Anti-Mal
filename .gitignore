@@ -30,6 +30,13 @@ _vm_dimensions.txt
 # Sample-probe build outputs (source is samples/probe/*.cpp; built by tools/Build-SampleProbe.ps1)
 samples/probe/*.exe
 
+# Handoff bundle of docs for sharing with other agents (generated)
+agent-bundle/
+agent-bundle.zip
+
+# Archived build/detonation logs from earlier sessions (diagnostics only)
+logs/
+
 /docs/
 
 /ARCHITECTURE.md

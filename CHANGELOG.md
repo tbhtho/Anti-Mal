@@ -8,6 +8,56 @@ that landed on `main`.
 
 ## [Unreleased]
 
+### 2026-09-18 — Integrated AI operator, first live application execution, faster finalize
+Three threads land together: a policy-gated AI operator that drives the SAME live session the
+operator watches, the first real application launched through the manifest-bound path, and the
+storage finalization fix that cut deliberate-stop finalize from 3 min 20 s to 32 s.
+- **Integrated assistant (`src/Common/Assistant.*`, `AssistantLiveVm.cpp`):** a shared host-side
+  operator exposed by `HostCli assistant "<task>"` and the GUI/WebUI Assistant panel
+  (`assistant.ask` / `assistant.cancel` / `assistant.status`). The model *proposes*;
+  `AssistantToolRunner` validates every call against `AssistantPolicy` and the bound run id, then
+  executes through the same `LiveVm` primitives (shared framebuffer, framed `_live-input.bin`,
+  closed-loop pointer) so AI actions are visible in the live view. Lifecycle `vm_boot` /
+  `vm_attach_viewer` require operator policy AND a hash-bound `AssistantSessionPlan`; lossy
+  `vm_stop` / `vm_kill` / `vm_reboot` are never declared. No host shell/filesystem tool exists. Off
+  by default; the API key comes from the host environment (`ANTIMAL_ASSISTANT_API_KEY` /
+  `OPENAI_API_KEY`), never the repo/config/guest. Reference: `private development documentation`.
+- **Immutable sample staging (`SampleStaging.*`):** the detonation input is content-addressed
+  (`<workspace>/_cache/samples/<sha256>.bin`, published atomically and marked read-only) and
+  hardlinked into the run, so the disk-delivery device and the approval/evidence trail are bound to
+  bytes, not a mutable filename; multi-GB packages are not recopied per run. The cache is bounded
+  (`staging_cache_max_bytes`, default 8 GiB, oldest pruned first).
+- **Faster finalize + overlay index (`BlockDevice`):** one COW device now serves the whole run
+  (pre-boot patch, every boot generation, post-run diagnostics) and its `lba -> offset` index is
+  persisted to a validated sidecar (`<overlay>.idx`: magic/version/size/CRC/bounds/strictly-increasing
+  checks; stale, corrupt, or missing sidecars are rebuilt). Deliberate-stop finalize on the 4.0 GiB
+  overlay dropped from 3 min 20 s to 32 s. Measured in `private development documentation`.
+- **Live input:** large pointer deltas are split into valid PS/2 packets with an exact summed
+  displacement (kills the `vminput` int8 wrap: `300,200` no longer became `44,-56`) and screen-space
+  Y is flipped exactly once; input-lease takeover/release (`ReleaseHeldGuestInput`) plus
+  `TestLiveInputContractEndToEnd` / `TestLiveInputLeaseAndTakeover`.
+- **Behavior scoring honesty (F1 review):** an elevation is a *fact* unless consent was explicitly
+  NOT approved; unattributed autostart writes (no process id) can no longer corroborate a
+  `Malicious` verdict (capped and explained); incomplete or poorly observed runs withhold the verdict
+  as `Unknown` + `verdictInsufficientEvidence` with concrete `verdictLimitations` instead of a
+  reassuring `Clean`. Report JSON + HTML carry the evidence-quality fields; `report --why` and
+  `detonate --json` surface them.
+- **Session control:** `--timeout-sec 0|unlimited` removes the wall-clock budget ("until stopped";
+  ends only on explicit `vmfinalize`, guest shutdown, or fault); `HostCli vmfinalize` and MCP
+  `vm_finalize` finalize through the normal report path via a `finalize.request` marker.
+- **First live application execution (authorized run `98287528`):** `AntiMal.GuiProbe.exe`
+  (hash-bound, COM2-staged) launched as a real guest process (`details.sampleExecuted=true`,
+  `session=desktop`) — the first execution of an application through the manifest-bound path. The
+  window itself did not appear; the fixture now retries window creation for up to 60 s and writes a
+  telemetry-visible error file. One run is evidence, not a general claim; a re-test is not yet
+  authorized (`private development documentation`).
+- **Launchers/docs:** `AntiMal.ps1` + `AntiMal.vbs` (console-free GUI menu) and
+  `AntiMal-WaitViewer.ps1`; docs consolidated under `docs/` (root `ARCHITECTURE.md` / `list.md`
+  moved; new `private development documentation` index, `PROJECT_TREE.md`, `FIRST_INVESTIGATION.md`, `ASSISTANT.md`,
+  `PERFORMANCE.md`, `NEXT_LIVE_TEST.md`). `src/Tests` grows ~3k lines covering the assistant policy
+  loop, immutable staging, COW index/lifecycle, input contract/lease, frame retention, and the
+  scoring fixtures.
+
 ### 2026-09-17 — Agent tools: MCP server, coordinate-based pointer, evidence-first live interaction
 Agent-driven dynamic analysis gets a real tool surface over the SAME live session the GUI streams, so
 operator watchability and evidence replace guesswork.
@@ -46,7 +96,7 @@ host-driven, both still behind the execution gate:
 - **Protocol:** `ExecuteJobRequest.sampleKind` / `delivery` / `diskBytes`; both delivery paths
   share the same execute JobStart, observation window, and report pipeline.
 - **Known gap:** `PaddedFileBlockDevice` + the disk-delivery path do not yet have unit tests
-  (tracked in [`list.md`](list.md)).
+  (tracked in private development documentation (private documentation)).
 
 ### 2026-06-18 — VM frontier: readiness checklist, fast-fail subcode capture, offline base validation
 Pivot to proving/hardening the in-house VM. Grounded in a multi-pass parallel investigation of every
