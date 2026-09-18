@@ -92,22 +92,36 @@ std::filesystem::path EnvDir(const wchar_t *name) {
 
 }  // namespace
 
-std::vector<std::filesystem::path> DefaultWatchedDirs() {
+std::vector<std::filesystem::path> DefaultWatchedDirs(
+    const std::wstring &userProfile) {
   std::vector<std::filesystem::path> dirs;
   auto add = [&dirs](std::filesystem::path p) {
     if (!p.empty()) dirs.push_back(std::move(p));
   };
-  add(EnvDir(L"TEMP"));
-  const auto appData = EnvDir(L"APPDATA");
-  add(appData);
-  if (!appData.empty()) {
-    add(appData / L"Microsoft\\Windows\\Start Menu\\Programs\\Startup");
-  }
-  add(EnvDir(L"PUBLIC"));
-  const auto userProfile = EnvDir(L"USERPROFILE");
   if (!userProfile.empty()) {
-    add(userProfile / L"Downloads");
+    // Per-profile locations for the target (interactive) user. The agent's own
+    // environment is SYSTEM's profile and would miss every user drop.
+    const std::filesystem::path profile(userProfile);
+    add(profile / L"AppData\\Local\\Temp");
+    add(profile / L"AppData\\Roaming");
+    add(profile / L"AppData\\Roaming\\Microsoft\\Windows\\Start Menu\\Programs\\Startup");
+    add(profile / L"Downloads");
+    add(profile / L"Desktop");
+    add(profile / L"Documents");
+  } else {
+    add(EnvDir(L"TEMP"));
+    const auto appData = EnvDir(L"APPDATA");
+    add(appData);
+    if (!appData.empty()) {
+      add(appData / L"Microsoft\\Windows\\Start Menu\\Programs\\Startup");
+    }
+    const auto userProfileEnv = EnvDir(L"USERPROFILE");
+    if (!userProfileEnv.empty()) {
+      add(userProfileEnv / L"Downloads");
+    }
   }
+  // Public is machine-wide and is where the fixture drops its marker.
+  add(EnvDir(L"PUBLIC"));
   return dirs;
 }
 

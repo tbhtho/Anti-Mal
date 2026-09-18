@@ -554,6 +554,77 @@ bool HasInteractiveSession() {
   return true;
 }
 
+// The user identity behind a token: "DOMAIN\\user" + "S-1-5-21-...".
+bool TokenIdentity(HANDLE token, std::wstring *name, std::wstring *sidText) {
+  if (token == nullptr) {
+    return false;
+  }
+  bool ok = false;
+  DWORD len = 0;
+  GetTokenInformation(token, TokenUser, nullptr, 0, &len);
+  if (len != 0) {
+    std::vector<BYTE> buf(len);
+    if (GetTokenInformation(token, TokenUser, buf.data(), len, &len)) {
+      const auto *tu = reinterpret_cast<const TOKEN_USER *>(buf.data());
+      LPWSTR sid = nullptr;
+      if (ConvertSidToStringSidW(tu->User.Sid, &sid) && sid != nullptr) {
+        if (sidText != nullptr) {
+          *sidText = sid;
+        }
+        LocalFree(sid);
+        ok = true;
+      }
+      wchar_t user[256]{};
+      wchar_t domain[256]{};
+      DWORD userLen = 256;
+      DWORD domainLen = 256;
+      SID_NAME_USE use{};
+      if (LookupAccountSidW(nullptr, tu->User.Sid, user, &userLen, domain,
+                            &domainLen, &use)) {
+        if (name != nullptr) {
+          *name = std::wstring(domain) + L"\\" + user;
+        }
+        ok = true;
+      }
+    }
+  }
+  return ok;
+}
+
+// The interactive console user: who the sample runs AS when SP5 places it on the
+// visible desktop. A LocalSystem agent MUST resolve this (rather than trusting
+// its own SYSTEM environment) so its file/registry collectors observe the
+// SAMPLE's profile and hive, not SYSTEM's.
+struct InteractiveUserInfo {
+  bool valid = false;
+  DWORD sessionId = 0;
+  std::wstring name;    // "ANTIMAL-VM\\antimal"
+  std::wstring sid;     // "S-1-5-21-..."
+  std::wstring profile; // "C:\\Users\\antimal"
+};
+
+InteractiveUserInfo ResolveInteractiveUser() {
+  InteractiveUserInfo info;
+  const DWORD sessionId = WTSGetActiveConsoleSessionId();
+  if (sessionId == 0xFFFFFFFFu) {
+    return info;
+  }
+  HANDLE token = nullptr;
+  if (!WTSQueryUserToken(sessionId, &token)) {
+    return info;
+  }
+  info.sessionId = sessionId;
+  TokenIdentity(token, &info.name, &info.sid);
+  wchar_t profile[MAX_PATH]{};
+  DWORD profileLen = MAX_PATH;
+  if (GetUserProfileDirectoryW(token, profile, &profileLen)) {
+    info.profile = profile;
+  }
+  CloseHandle(token);
+  info.valid = !info.sid.empty();
+  return info;
+}
+
 // Resolves WHAT to launch (the sample itself, or -- for a delivered .iso -- the
 // installer inside the mounted image) and launches it INTO the active desktop
 // session. Emits process.create. Returns true and fills proc/pid/deadline on
@@ -750,6 +821,24 @@ bool LaunchPreparedSample(HANDLE com2, const antimal::ExecuteJobRequest &req,
   created.category = "process";
   created.processId = launchedPid;
   created.details["sampleExecuted"] = "true";
+  // The identity the sample ACTUALLY runs as (its own token), so the scorer can
+  // verify that per-user collector coverage targeted the same profile.
+  {
+    std::wstring sampleUser;
+    std::wstring sampleSid;
+    HANDLE sampleToken = nullptr;
+    if (OpenProcessToken(launchedProc, TOKEN_QUERY, &sampleToken)) {
+      TokenIdentity(sampleToken, &sampleUser, &sampleSid);
+      CloseHandle(sampleToken);
+    }
+    if (!sampleUser.empty()) {
+      created.userName = antimal::WideToUtf8(sampleUser);
+      created.details["sampleUser"] = created.userName;
+    }
+    if (!sampleSid.empty()) {
+      created.details["sampleSid"] = antimal::WideToUtf8(sampleSid);
+    }
+  }
   // SP5: "desktop" = launched into the active interactive session (visible on
   // the live desktop); "service" = headless session-0 fallback (no logon yet).
   created.details["session"] = interactive ? "desktop" : "service";
@@ -1227,32 +1316,31 @@ int RunHostChannelLoop(std::string reason, bool serviceMode) {
   // Each Report.wer is decoded + emitted once; keyed on its full path so a
   // crash surfaces as a single process.crash event across ticks.
   std::set<std::wstring> seenWerReports;
-  const std::vector<std::filesystem::path> watchedDirs =
-      antimal::DefaultWatchedDirs();
+  // Target-user scope (G4-03): the LocalSystem agent must observe the
+  // INTERACTIVE sample user's profile/hive, not SYSTEM's. Resolve it now; if
+  // logon has not completed yet, the loop re-resolves and switches the
+  // collectors when it appears (the sample launch is deferred until then, so
+  // sample-window coverage is user-scoped).
+  InteractiveUserInfo interactiveUser = ResolveInteractiveUser();
+  std::vector<std::filesystem::path> watchedDirs =
+      antimal::DefaultWatchedDirs(interactiveUser.profile);
   // G4 per-sensor coverage: register the collectors this agent runs and record
   // whether each succeeds and whether it hits a cap. Emitted as `agent.coverage`
   // records so the host/scorer can gate a Clean verdict on achieved coverage
   // instead of assuming healthy defaults.
   antimal::SensorCoverageTracker coverage;
   {
-    // The file collector resolves from the agent's environment; record which
-    // profile that actually is so the report can expose a service-vs-user gap.
-    std::string profile;
-    wchar_t profileBuf[MAX_PATH]{};
-    if (GetEnvironmentVariableW(L"USERPROFILE", profileBuf, MAX_PATH) > 0) {
-      profile = antimal::WideToUtf8(profileBuf);
-    }
-    wchar_t userBuf[256]{};
-    DWORD userLen = sizeof(userBuf);
-    if (GetUserNameW(userBuf, &userLen)) {
-      profile = antimal::WideToUtf8(userBuf);
-    }
-    coverage.Register("process");
-    coverage.Register("network");
-    coverage.Register("registry");
-    coverage.Register("filesystem", profile);
-    coverage.Register("image");
-    coverage.Register("wer_crash");
+    // Each collector declares the profile its data resolves from. An empty
+    // targetUser is an honest "unknown", never a healthy default.
+    const std::string targetUser =
+        interactiveUser.valid ? antimal::WideToUtf8(interactiveUser.name)
+                              : std::string();
+    coverage.Register("process", "", "system");
+    coverage.Register("network", "", "system");
+    coverage.Register("registry", targetUser, "mixed");
+    coverage.Register("filesystem", targetUser, "mixed");
+    coverage.Register("image", "", "system");
+    coverage.Register("wer_crash", "", "system");
   }
   uint32_t coverageEmitCounter = 0;
   constexpr uint32_t kCoverageEmitEveryTicks = 5; // ~5s
@@ -1520,6 +1608,31 @@ int RunHostChannelLoop(std::string reason, bool serviceMode) {
     const bool transferInFlight = executeReq && !sampleLaunched && !sampleStaged;
     const bool telemetryTick = !transferInFlight;
 
+    // Target-user tracking: once logon completes, re-scope the user-profile
+    // collectors to the interactive user and record the scope transition on the
+    // coverage record (never silently relabel earlier SYSTEM observations).
+    if (telemetryTick && tick != 0 && tick % 15 == 0) {
+      const InteractiveUserInfo fresh = ResolveInteractiveUser();
+      if (fresh.valid && (fresh.sid != interactiveUser.sid ||
+                          fresh.profile != interactiveUser.profile)) {
+        interactiveUser = fresh;
+        watchedDirs = antimal::DefaultWatchedDirs(interactiveUser.profile);
+        // Re-baseline the diff collectors for the new hive/profile: without
+        // this, every pre-existing value in the user's hive would surface as a
+        // one-tick "mutation" burst and be counted as post-launch sample
+        // activity, even though it is ordinary profile state.
+        regBaselineSent = false;
+        fileBaselineSent = false;
+        const std::string user = antimal::WideToUtf8(interactiveUser.name);
+        coverage.SetScope(
+            "registry", user, "mixed",
+            "registry collector now reads the interactive user's loaded hive");
+        coverage.SetScope(
+            "filesystem", user, "mixed",
+            "file collector now watches the interactive user's profile");
+      }
+    }
+
     if (telemetryTick) {
       const std::string heartbeat =
           "heartbeat=" + std::to_string(tick) +
@@ -1532,13 +1645,36 @@ int RunHostChannelLoop(std::string reason, bool serviceMode) {
 
     if (telemetryTick && tick % kProcessPollEveryTicks == 0) {
       auto current = antimal::CaptureProcessSnapshot();
+      // Measure the emitter caps honestly: the baseline/delta emitters truncate
+      // at their caps, so any excess is a KNOWN record loss. The poll-diff total
+      // still cannot be bounded, so lossKnown stays false.
+      size_t processDropped = 0;
+      if (!processBaselineSent && current.size() > kProcessBaselineCap) {
+        processDropped = current.size() - kProcessBaselineCap;
+      } else if (processBaselineSent) {
+        size_t newPids = 0;
+        for (const auto &entry : current) {
+          if (knownProcs.find(entry.first) == knownProcs.end()) {
+            ++newPids;
+          }
+        }
+        if (newPids > kProcessDeltaCap) {
+          processDropped = newPids - kProcessDeltaCap;
+        }
+      }
+      std::string processNote;
+      if (processDropped > 0) {
+        processNote = "process emitter cap truncated " +
+                      std::to_string(processDropped) +
+                      " record(s); poll-diff loss remains a lower bound";
+      } else if (current.empty() && !processBaselineSent) {
+        processNote = "process snapshot returned empty";
+      }
       // G4: a collector that returns an empty snapshot before its baseline has
       // run is unhealthy; after the baseline it is a legitimate "no change".
       coverage.Observe("process", !current.empty() || processBaselineSent,
-                       current.size(), 0, /*lossKnown=*/false,
-                       current.empty() && !processBaselineSent
-                           ? "process snapshot returned empty"
-                           : "");
+                       current.size(), processDropped, /*lossKnown=*/false,
+                       processNote);
       if (!current.empty() || processBaselineSent) {
         // Enrich every process in the fresh snapshot with deep detail (full
         // path, command line, integrity, user/SID, session, start time) and
@@ -1619,7 +1755,18 @@ int RunHostChannelLoop(std::string reason, bool serviceMode) {
     // local/loopback connections.
     if (telemetryTick && tick % kProcessPollEveryTicks == 0) {
       auto conns = antimal::CaptureTcpConnections();
-      coverage.Observe("network", true, conns.size(), 0, /*lossKnown=*/false);
+      const size_t netDropped =
+          (!netBaselineSent && conns.size() > kProcessBaselineCap)
+              ? conns.size() - kProcessBaselineCap
+              : 0;
+      coverage.Observe("network", true, conns.size(), netDropped,
+                       /*lossKnown=*/false,
+                       netDropped > 0
+                           ? "tcp baseline cap truncated " +
+                                 std::to_string(netDropped) +
+                                 " connection record(s); poll-diff loss remains "
+                                 "a lower bound"
+                           : "");
       if (!conns.empty() || netBaselineSent) {
         auto netEvents = antimal::DiffTcpConnections(
             knownConns, conns, !netBaselineSent, kProcessBaselineCap,
@@ -1638,8 +1785,19 @@ int RunHostChannelLoop(std::string reason, bool serviceMode) {
     // Registry-persistence telemetry: snapshot the autostart keys and stream
     // registry.set / registry.delete deltas (did the sample install persistence?).
     if (telemetryTick && tick % kProcessPollEveryTicks == 0) {
-      auto reg = antimal::CaptureRegistrySnapshot();
-      coverage.Observe("registry", true, reg.size(), 0, /*lossKnown=*/false);
+      auto reg = antimal::CaptureRegistrySnapshot(interactiveUser.sid);
+      const size_t regDropped =
+          (!regBaselineSent && reg.size() > kProcessBaselineCap)
+              ? reg.size() - kProcessBaselineCap
+              : 0;
+      coverage.Observe("registry", true, reg.size(), regDropped,
+                       /*lossKnown=*/false,
+                       regDropped > 0
+                           ? "registry baseline cap truncated " +
+                                 std::to_string(regDropped) +
+                                 " value record(s); poll-diff loss remains a "
+                                 "lower bound"
+                           : "");
       if (!reg.empty() || regBaselineSent) {
         auto regEvents = antimal::DiffRegistrySnapshots(
             knownReg, reg, !regBaselineSent, kProcessBaselineCap,
@@ -1669,11 +1827,17 @@ int RunHostChannelLoop(std::string reason, bool serviceMode) {
     // the disk I/O / hashing happens here.
     if (telemetryTick && tick % kFilePollEveryTicks == 0) {
       auto files = antimal::CaptureFileSnapshot(watchedDirs);
-      // A snapshot that hit the entry cap (4096) is lossy; the walk does not
-      // report the exact overflow, so lossKnown stays false.
-      coverage.Observe("filesystem", true, files.size(), 0, /*lossKnown=*/false,
-                       files.size() >= 4096 ? "file snapshot hit the 4096-entry cap"
-                                            : "");
+      // A snapshot that hit the entry cap (4096) is lossy: at least one entry
+      // was not inspected. The walk skips unreadable entries silently, so the
+      // total remains unknown -- record the measured lower bound and keep
+      // lossKnown=false (an honest unknown, never an optimistic default).
+      const bool fileCapHit = files.size() >= 4096;
+      coverage.Observe("filesystem", true, files.size(), fileCapHit ? 1 : 0,
+                       /*lossKnown=*/false,
+                       fileCapHit ? "file snapshot hit the 4096-entry cap; at "
+                                    "least one entry was not inspected (exact "
+                                    "count unknown)"
+                                  : "");
       if (!files.empty() || fileBaselineSent) {
         auto fileEvents = antimal::DiffFileSnapshots(
             knownFiles, files, !fileBaselineSent, kProcessBaselineCap,
@@ -1713,11 +1877,16 @@ int RunHostChannelLoop(std::string reason, bool serviceMode) {
         livePids.push_back(entry.first);
       }
       auto modules = BuildModuleSnapshot(livePids);
-      coverage.Observe("image", !livePids.empty(), modules.size(), 0,
-                       /*lossKnown=*/false,
-                       livePids.size() > 128
-                           ? "module PID pass capped at 128 (high PIDs unscanned)"
-                           : "");
+      const size_t imageSkippedPids =
+          livePids.size() > 128 ? livePids.size() - 128 : 0;
+      coverage.Observe(
+          "image", !livePids.empty(), modules.size(), imageSkippedPids,
+          /*lossKnown=*/false,
+          imageSkippedPids > 0
+              ? "module PID pass capped at 128; " +
+                    std::to_string(imageSkippedPids) +
+                    " PID(s) unscanned (their module loads were not observed)"
+              : "");
       if (!modules.empty() || moduleBaselineSent) {
         auto modEvents = antimal::DiffModuleSnapshots(
             knownModules, modules, !moduleBaselineSent, kProcessBaselineCap,

@@ -42,6 +42,25 @@ struct ExecuteJobRequest {
   uint64_t diskBytes = 0;
 };
 
+// The guest-side sample-observation window derived from the host's run budget.
+// `hostTimeoutMs == 0` means "until stopped" (the operator ends the run with
+// vm_finalize): the guest must then run UNBOUNDED, not fall back to a small
+// default -- a 0-to-60s collapse silently reaps a still-working sample (e.g. a
+// GUI fixture the operator is about to interact with) while the host keeps
+// running, which is exactly the 2026-09-18 "window never appeared" defect.
+// A finite budget reserves the boot/transfer/launch/report margin first, but
+// never hands the guest less than 60s.
+inline uint32_t GuestSampleWindowMs(uint32_t hostTimeoutMs,
+                                    uint64_t transferMs) {
+  if (hostTimeoutMs == 0) {
+    return 0; // propagate "until stopped"
+  }
+  const uint64_t marginMs = 300000ull + transferMs;
+  return hostTimeoutMs > marginMs + 60000ull
+             ? static_cast<uint32_t>(hostTimeoutMs - marginMs)
+             : 60000u;
+}
+
 namespace detail {
 
 // Returns the raw value token for "key" in a flat JSON object: the unescaped

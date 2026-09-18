@@ -488,6 +488,7 @@ DynamicRunSummary ParseDynamicSummary(const JsonValue *value) {
       c.dropped = static_cast<uint64_t>(IntValue(Member(item, "dropped")));
       c.lossKnown = BoolValue(Member(item, "lossKnown"));
       c.targetUser = StringValue(Member(item, "targetUser"));
+      c.scope = StringValue(Member(item, "scope"));
       c.note = StringValue(Member(item, "note"));
       summary.sensorCoverage.push_back(std::move(c));
     }

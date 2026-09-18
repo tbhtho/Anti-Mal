@@ -29,7 +29,15 @@ struct FileMeta {
 using FileSnapshot = std::map<std::string, FileMeta>;
 
 // The default drop directories to watch, resolved from the environment.
-std::vector<std::filesystem::path> DefaultWatchedDirs();
+// The default drop-directory watch set. With an empty `userProfile` it resolves
+// from the CALLING process's environment (the legacy behavior, correct for a
+// session-0 user agent). With `userProfile` set (e.g. C:\Users\antimal) it
+// watches THAT user's per-profile drop locations -- temp, roaming/startup,
+// downloads, desktop, documents -- which is what a LocalSystem agent must use to
+// observe the interactive sample user's files. The Public directory is always
+// watched: it is machine-wide.
+std::vector<std::filesystem::path> DefaultWatchedDirs(
+    const std::wstring &userProfile = {});
 
 // Snapshots regular files under `dirs` (recursive, permission-denied skipped),
 // capped at maxEntries so a huge %TEMP% can't stall the agent.

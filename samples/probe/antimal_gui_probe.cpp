@@ -39,6 +39,108 @@ constexpr wchar_t kWindowClass[] = L"AntiMalGuiProbeWindow";
 constexpr UINT_PTR kAutoTimerId = 0xA1;
 constexpr UINT_PTR kExitTimerId = 0xA2;
 
+void DropFile(const std::wstring &path, const char *content);
+std::wstring TempPath(const wchar_t *name);
+std::wstring PublicPath(const wchar_t *name);
+
+// --- Diagnostic channel -----------------------------------------------------
+// The 2026-09-18 live run launched this fixture, the window never appeared, and
+// the diagnostic was lost because it was written into the INTERACTIVE user's
+// %TEMP% while the LocalSystem agent's file collector watched SYSTEM's profile.
+// v2 writes the same diagnostic to BOTH the user's %TEMP% and %PUBLIC% (watched
+// machine-wide regardless of user scoping) and records the exact registration /
+// CreateWindowEx results, GetLastError values, and the session/desktop/window-
+// station identity, so a launch failure is evidence rather than an invisible
+// no-op.
+std::wstring TempDiagPath() {
+  return TempPath(L"antimal-gui-probe-diag.txt");
+}
+
+std::wstring PublicDiagPath() {
+  return PublicPath(L"antimal-gui-probe-diag.txt");
+}
+
+std::string Narrow(const std::wstring &w) {
+  std::string out;
+  for (wchar_t c : w) {
+    out.push_back(c < 128 ? static_cast<char>(c) : '?');
+  }
+  return out;
+}
+
+std::wstring ObjectName(HANDLE h) {
+  if (h == nullptr) {
+    return L"<none>";
+  }
+  DWORD needed = 0;
+  GetUserObjectInformationW(h, UOI_NAME, nullptr, 0, &needed);
+  if (needed == 0) {
+    return L"<err " + std::to_wstring(GetLastError()) + L">";
+  }
+  std::wstring buf(needed / sizeof(wchar_t), L'\0');
+  if (!GetUserObjectInformationW(h, UOI_NAME, buf.data(), needed, &needed)) {
+    return L"<err " + std::to_wstring(GetLastError()) + L">";
+  }
+  while (!buf.empty() && buf.back() == L'\0') {
+    buf.pop_back();
+  }
+  return buf;
+}
+
+std::wstring ErrorText(DWORD gle) {
+  LPWSTR msg = nullptr;
+  const DWORD n = FormatMessageW(
+      FORMAT_MESSAGE_ALLOCATE_BUFFER | FORMAT_MESSAGE_FROM_SYSTEM |
+          FORMAT_MESSAGE_IGNORE_INSERTS,
+      nullptr, gle, 0, reinterpret_cast<LPWSTR>(&msg), 0, nullptr);
+  std::wstring out;
+  if (n != 0 && msg != nullptr) {
+    out.assign(msg, n);
+    while (!out.empty() && (out.back() == L'\r' || out.back() == L'\n' ||
+                            out.back() == L' ')) {
+      out.pop_back();
+    }
+  }
+  LocalFree(msg);
+  return out;
+}
+
+std::wstring BuildDiagnostic(const std::wstring &classResult, DWORD classGle,
+                             int attempts, HWND hwnd, DWORD createGle) {
+  DWORD sessionId = 0xFFFFFFFFu;
+  ProcessIdToSessionId(GetCurrentProcessId(), &sessionId);
+  wchar_t user[256]{};
+  DWORD userLen = 256;
+  GetUserNameW(user, &userLen);
+  const std::wstring winsta =
+      ObjectName(reinterpret_cast<HANDLE>(GetProcessWindowStation()));
+  const std::wstring desktop =
+      ObjectName(reinterpret_cast<HANDLE>(GetThreadDesktop(GetCurrentThreadId())));
+
+  std::wstring d;
+  d += L"antimal-gui-probe diagnostic v2\n";
+  d += L"pid=" + std::to_wstring(GetCurrentProcessId()) + L"\n";
+  d += L"sessionId=" + std::to_wstring(sessionId) + L"\n";
+  d += L"windowStation=" + winsta + L"\n";
+  d += L"desktop=" + desktop + L"\n";
+  d += L"user=" + std::wstring(user) + L"\n";
+  d += L"classResult=" + classResult + L" gle=" + std::to_wstring(classGle) +
+       L" (" + ErrorText(classGle) + L")\n";
+  d += L"attempts=" + std::to_wstring(attempts) + L"\n";
+  d += L"window=" + std::wstring(hwnd != nullptr ? L"created" : L"not-created") +
+       L" gle=" + std::to_wstring(createGle) + L" (" + ErrorText(createGle) +
+       L")\n";
+  d += L"diagPath=" + TempDiagPath() + L"\n";
+  d += L"diagPathPublic=" + PublicDiagPath() + L"\n";
+  return d;
+}
+
+void WriteDiagnostic(const std::wstring &content) {
+  const std::string utf8 = Narrow(content);
+  DropFile(TempDiagPath(), utf8.c_str());
+  DropFile(PublicDiagPath(), utf8.c_str());
+}
+
 void DropFile(const std::wstring &path, const char *content) {
   HANDLE h = CreateFileW(path.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS,
                          FILE_ATTRIBUTE_NORMAL, nullptr);
@@ -221,17 +323,27 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int show) {
   wc.lpszClassName = kWindowClass;
   wc.hbrBackground = reinterpret_cast<HBRUSH>(COLOR_WINDOW + 1);
   wc.hCursor = LoadCursorW(nullptr, reinterpret_cast<LPCWSTR>(IDC_ARROW));
-  RegisterClassExW(&wc);
+  const BOOL classOk = RegisterClassExW(&wc);
+  const DWORD classGle = classOk ? 0 : GetLastError();
+  const std::wstring classResult =
+      classOk ? L"registered"
+              : (classGle == ERROR_CLASS_ALREADY_EXISTS
+                     ? L"already-exists"
+                     : L"register-failed");
+  WriteDiagnostic(
+      BuildDiagnostic(classResult, classGle, 0, nullptr, 0));
 
   // The agent launches this immediately after the desktop session appears, and
   // the FIRST run showed the window never came up: CreateWindowEx can fail while
   // the session/window station is still initializing, and the old code then
-  // exited silently. Retry for up to a minute and leave a telemetry-visible
-  // diagnostic when it still fails, so a launch problem is evidence rather than
-  // an invisible no-op.
+  // exited silently. Retry for up to a minute and write a telemetry-visible
+  // diagnostic (user %TEMP% + %PUBLIC%) with the exact Win32 results, so a
+  // launch problem is evidence rather than an invisible no-op.
   HWND hwnd = nullptr;
   DWORD lastError = 0;
+  int attempts = 0;
   for (int attempt = 0; attempt < 30; ++attempt) {
+    attempts = attempt + 1;
     hwnd = CreateWindowExW(0, kWindowClass, L"AntiMal GUI Probe",
                            WS_OVERLAPPEDWINDOW, 100, 100, 424, 280, nullptr,
                            nullptr, instance, nullptr);
@@ -239,13 +351,18 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int show) {
       break;
     }
     lastError = GetLastError();
+    if (attempt % 5 == 0) {
+      WriteDiagnostic(BuildDiagnostic(classResult, classGle, attempts, nullptr,
+                                      lastError));
+    }
     Sleep(2000);
   }
+  // Final state: created (gle 0) or the last CreateWindowEx failure, written to
+  // both diagnostic paths BEFORE any exit, so the collector sees it even if the
+  // process then terminates.
+  WriteDiagnostic(BuildDiagnostic(classResult, classGle, attempts, hwnd,
+                                  hwnd != nullptr ? 0 : lastError));
   if (hwnd == nullptr) {
-    char message[128]{};
-    sprintf_s(message, "antimal-gui-probe: window creation failed GLE=%lu\n",
-              static_cast<unsigned long>(lastError));
-    DropFile(TempPath(L"antimal-gui-probe-error.txt"), message);
     return 1;
   }
   ShowWindow(hwnd, show);

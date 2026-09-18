@@ -28,12 +28,14 @@ struct SensorCoverageState {
   std::string sensor;      // "process" | "network" | "registry" | "filesystem" |
                            // "image" | "wer_crash"
   bool supported = true;   // the collector exists on this agent build
-  bool healthy = false;    // last collection succeeded
+  bool healthy = false;    // no collection failure observed so far
   uint64_t samples = 0;    // successful collection cycles
   uint64_t attempts = 0;   // total cycles attempted
-  uint64_t dropped = 0;    // records dropped at a cap
+  uint64_t dropped = 0;    // records dropped at a cap (at least this many)
   bool lossKnown = true;   // false => dropped is a lower bound / unknown
   std::string targetUser;  // profile the collector resolves from ("" unknown)
+  // "system" (machine-wide) | "user" (one profile/hive) | "mixed" (both).
+  std::string scope;
   std::string note;        // human-readable limitation, if any
 };
 
@@ -42,8 +44,9 @@ class SensorCoverageTracker {
 public:
   // `sensor` is the stable collector name. Registering the same name twice is a
   // no-op (keeps the first). `targetUser` is the identity the collector's paths
-  // resolve from -- "" means unknown.
-  void Register(const std::string &sensor, const std::string &targetUser = {});
+  // resolve from -- "" means unknown. `scope` is "system", "user", or "mixed".
+  void Register(const std::string &sensor, const std::string &targetUser = {},
+                const std::string &scope = {});
 
   // A collection cycle completed without an exception. `emittedRecords` is how
   // many events the collector produced; `droppedRecords` how many it discarded
@@ -54,6 +57,13 @@ public:
 
   // Mark a collector unsupported on this agent.
   void MarkUnsupported(const std::string &sensor, const std::string &note);
+
+  // Record that a collector's profile/scope CHANGED during the run (e.g. the
+  // file collector switched from SYSTEM's environment to the interactive
+  // sample user's profile once logon completed). A change appends a note so the
+  // earlier, differently-scoped observations are not silently forgotten.
+  void SetScope(const std::string &sensor, const std::string &targetUser,
+                const std::string &scope, const std::string &note = {});
 
   // Snapshot of every registered collector, in registration order.
   std::vector<SensorCoverageState> States() const;

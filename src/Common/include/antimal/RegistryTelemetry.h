@@ -48,7 +48,13 @@ const std::vector<PersistenceLocation> &PersistenceLocations();
 std::string PersistenceMitreForKey(const std::string &snapshotKey);
 
 // Captures the autostart/persistence keys. Returns {} on a non-Windows build.
-RegistrySnapshot CaptureRegistrySnapshot();
+//
+// `userSid` selects WHICH user's hive the HKCU-family locations are read from:
+//   * empty  -> HKEY_CURRENT_USER (the calling process's own hive);
+//   * set    -> HKEY_USERS\<sid> (the interactive sample user's loaded hive),
+//               so a LocalSystem agent observes the SAMPLE's HKCU persistence
+//               instead of SYSTEM's. HKLM locations are always machine-wide.
+RegistrySnapshot CaptureRegistrySnapshot(const std::wstring &userSid = {});
 
 // Diffs two snapshots.
 //   emitBaseline == true : up to baselineCap "registry.value" events for the

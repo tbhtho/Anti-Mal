@@ -8761,10 +8761,7 @@ std::vector<uint8_t> BuildFirstBootCom2Bytes(bool executionAuthorized,
     // small (the host deadline then cuts the VM before the agent reports).
     constexpr uint64_t kPacedBytesPerSec = 6u * 1024u;
     const uint64_t transferMs = (sample.size() / kPacedBytesPerSec) * 1000ull;
-    const uint64_t marginMs = 300000ull + transferMs;
-    req.timeoutMs = timeoutMs > marginMs + 60000ull
-                        ? static_cast<uint32_t>(timeoutMs - marginMs)
-                        : 60000u;
+    req.timeoutMs = GuestSampleWindowMs(timeoutMs, transferMs);
   }
   req.networkMode = ToString(networkMode);
   req.runId = runId;
@@ -8824,10 +8821,7 @@ std::vector<uint8_t> BuildDiskDeliveryCom2Bytes(
   {
     constexpr uint64_t kDiskBytesPerSec = 128ull * 1024ull * 1024ull;
     const uint64_t copyMs = (size / kDiskBytesPerSec) * 1000ull;
-    const uint64_t marginMs = 300000ull + copyMs;
-    req.timeoutMs = timeoutMs > marginMs + 60000ull
-                        ? static_cast<uint32_t>(timeoutMs - marginMs)
-                        : 60000u;
+    req.timeoutMs = GuestSampleWindowMs(timeoutMs, copyMs);
   }
   req.networkMode = ToString(networkMode);
   req.runId = runId;

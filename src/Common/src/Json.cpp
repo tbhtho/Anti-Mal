@@ -199,8 +199,8 @@ std::string ToJson(const DynamicRunSummary &summary) {
          << (c.healthy ? "true" : "false") << ",\"samples\":" << c.samples
          << ",\"dropped\":" << c.dropped << ",\"lossKnown\":"
          << (c.lossKnown ? "true" : "false") << ",\"targetUser\":\""
-         << JsonEscape(c.targetUser) << "\",\"note\":\"" << JsonEscape(c.note)
-         << "\"}";
+         << JsonEscape(c.targetUser) << "\",\"scope\":\"" << JsonEscape(c.scope)
+         << "\",\"note\":\"" << JsonEscape(c.note) << "\"}";
     }
     sc << "]";
     obj.AddRaw("sensorCoverage", sc.str());

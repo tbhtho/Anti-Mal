@@ -196,6 +196,10 @@ struct DynamicRunSummary {
     uint64_t dropped = 0;    // records dropped at a cap (loss)
     bool lossKnown = false;  // false => dropped is a lower bound / unknown
     std::string targetUser;  // profile the collector resolved from ("" unknown)
+    // Scope of the collector's data: "system" (machine-wide tables) vs "user"
+    // (one profile/hive) vs "mixed" (both). A "user"/"mixed" collector whose
+    // targetUser is not the sample's user observed a DIFFERENT profile.
+    std::string scope;
     std::string note;        // human-readable limitation, if any
   };
   std::vector<SensorCoverage> sensorCoverage;

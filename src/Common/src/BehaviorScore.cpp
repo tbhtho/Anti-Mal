@@ -312,8 +312,42 @@ enum class Ownership {
   NoRoot,
 };
 
-const char *OwnershipLabel(Ownership o) {
-  switch (o) {
+bool EqualInsensitive(const std::string &a, const std::string &b) {
+  if (a.size() != b.size()) {
+    return false;
+  }
+  for (size_t i = 0; i < a.size(); ++i) {
+    if (std::tolower(static_cast<unsigned char>(a[i])) !=
+        std::tolower(static_cast<unsigned char>(b[i]))) {
+      return false;
+    }
+  }
+  return true;
+}
+
+// A base file name that Windows resolves through the search order and that
+// malware commonly shadows (DLL planting next to an application). A module with
+// one of these names loaded from a writable, non-system path is the classic
+// search-order-hijack shape; an arbitrary support DLL in %TEMP% is not.
+bool IsKnownShadowedDllName(const std::string &pathLower) {
+  const size_t slash = pathLower.find_last_of("\\/");
+  const std::string base =
+      slash == std::string::npos ? pathLower : pathLower.substr(slash + 1);
+  static const char *kShadowable[] = {
+      "version.dll",  "winmm.dll",    "dwmapi.dll",  "uxtheme.dll",
+      "propsys.dll",  "dbghelp.dll",  "cryptbase.dll", "secur32.dll",
+      "wtsapi32.dll", "profapi.dll",  "amsi.dll",    "mpr.dll",
+      "msimg32.dll",  "dbgcore.dll",  "d3d9.dll",    "d3d11.dll",
+      "dxgi.dll",     "textinputframework.dll"};
+  for (const char *n : kShadowable) {
+    if (base == n) {
+      return true;
+    }
+  }
+  return false;
+}
+
+const char *OwnershipLabel(Ownership o) {  switch (o) {
   case Ownership::ProcessAttributed:
     return "process-attributed";
   case Ownership::OtherProcess:
@@ -353,11 +387,31 @@ BehaviorScore ScoreSandboxBehavior(const DynamicRunSummary &summary,
   BehaviorScore out;
   out.scorerVersion = kBehaviorScorerVersion;
 
+  // Execution ground truth: the summary flag is set from the guest's completion
+  // frame, which NEVER arrives for an "until stopped" run the operator finalized
+  // while the sample was still alive. The journal's VERIFIED anchor
+  // (details.sampleExecuted) is ground truth that the sample executed, so the
+  // scorer must not report "not executed" for a fixture that clearly ran.
+  bool executed = summary.sampleExecuted;
+  if (!executed) {
+    for (const auto &e : events) {
+      if (Lower(e.category) != "process" || e.processId == 0) {
+        continue;
+      }
+      const std::string a = Lower(e.action);
+      if (Has(a, "create") && !Has(a, "failed") &&
+          DetailIsTrue(e, "sampleExecuted")) {
+        executed = true;
+        break;
+      }
+    }
+  }
+
   // Nothing ran (gated/healthcheck) or no telemetry at all -> inconclusive.
-  if (!summary.sampleExecuted || events.empty()) {
+  if (!executed || events.empty()) {
     out.verdict = Verdict::Unknown;
     out.insufficientEvidence = true;
-    if (!summary.sampleExecuted) {
+    if (!executed) {
       out.rationale.push_back(
           "Sample was not executed (gated or healthcheck-only run); no "
           "behavior to judge.");
@@ -375,10 +429,14 @@ BehaviorScore ScoreSandboxBehavior(const DynamicRunSummary &summary,
   }
 
   // ---- Pass 1: resolve the sample-launch anchor and its process identity. ----
-  // The anchor is the agent's process.create of the staged sample. Prefer the
-  // explicit details.sampleExecuted marker; fall back to any process.create so
-  // older journals still anchor. `agent.sample.received` (delivery) is NOT an
-  // execution anchor -- events between delivery and launch are baseline.
+  // The anchor is the agent's process.create of the staged sample, carrying the
+  // VERIFIED details.sampleExecuted marker the guest sets at launch.
+  // `agent.sample.received` (delivery) is NOT an execution anchor -- events
+  // between delivery and launch are baseline. There is deliberately NO
+  // "any process.create" fallback: an unrelated process cannot be promoted to
+  // the sample by being the first/only create in the journal. Without the
+  // marker the run has no anchor, ownership fails closed, and a negative verdict
+  // is withheld for uncertainty rather than attributed to a guessed process.
   const EventRecord *launch = nullptr;
   auto considerLaunch = [&](const EventRecord &e) {
     if (launch == nullptr) {
@@ -402,29 +460,26 @@ BehaviorScore ScoreSandboxBehavior(const DynamicRunSummary &summary,
       considerLaunch(e);
     }
   }
-  if (launch == nullptr) {
-    for (const auto &e : events) {
-      if (Lower(e.category) != "process" || e.processId == 0) {
-        continue;
-      }
-      const std::string a = Lower(e.action);
-      if (Has(a, "create") && !Has(a, "failed")) {
-        considerLaunch(e);
-      }
-    }
-  }
 
   const bool rootKnown = launch != nullptr;
   const uint32_t sampleRootPid = rootKnown ? launch->processId : 0;
   const std::string sampleLaunchTime = rootKnown ? launch->timestampUtc : "";
   std::string rootStartTime;
   std::string rootBootGeneration;
+  std::string rootUser; // sample's identity user; used to scope user-profile coverage
   if (rootKnown) {
     if (const std::string *st = Detail(*launch, "startTime")) {
       rootStartTime = *st;
     }
     if (const std::string *bg = Detail(*launch, "bootGeneration")) {
       rootBootGeneration = *bg;
+    }
+    if (!launch->userName.empty()) {
+      rootUser = launch->userName;
+    } else if (const std::string *su = Detail(*launch, "sampleUser")) {
+      rootUser = *su;
+    } else if (const std::string *su2 = Detail(*launch, "user")) {
+      rootUser = *su2;
     }
   }
 
@@ -487,9 +542,50 @@ BehaviorScore ScoreSandboxBehavior(const DynamicRunSummary &summary,
     return true;
   };
 
+  // PID lifetimes (behavior-score-v3). A process.stop / process.exit /
+  // process.timeout / crash records the END of the instance that owned that PID.
+  // An event claiming the PID after that recorded end belongs to a reused PID,
+  // not to the sample; when its timestamp is missing the event cannot be placed
+  // against the recorded lifetime, so attribution fails closed. A later
+  // process.create for the same PID does not re-admit it: the sample is the
+  // ANCHORED instance, and the reuse guard above already rejects a different
+  // start time / boot generation.
+  std::map<uint32_t, std::string> pidEndTime;
+  for (const auto &e : events) {
+    const std::string cat = Lower(e.category);
+    if ((cat != "process" && cat != "crash") || e.processId == 0 ||
+        e.timestampUtc.empty()) {
+      continue;
+    }
+    const std::string a = Lower(e.action);
+    if (Has(a, "stop") || Has(a, "exit") || Has(a, "terminat") ||
+        Has(a, "timeout") || Has(a, "crash")) {
+      const auto it = pidEndTime.find(e.processId);
+      if (it == pidEndTime.end() || e.timestampUtc < it->second) {
+        pidEndTime[e.processId] = e.timestampUtc; // earliest recorded end
+      }
+    }
+  }
+  const auto lifetimeAllows = [&](const EventRecord &e) {
+    if (e.processId == 0) {
+      return true; // no PID: ownership is temporal correlation, handled later
+    }
+    const auto it = pidEndTime.find(e.processId);
+    if (it == pidEndTime.end()) {
+      return true; // no recorded end: no evidence the instance is dead
+    }
+    if (e.timestampUtc.empty()) {
+      return false; // cannot place the event inside the recorded lifetime
+    }
+    return e.timestampUtc <= it->second;
+  };
+
   const auto inSampleSubtree = [&](const EventRecord &e) {
     if (!rootKnown || e.processId == 0 ||
         !sampleSubtree.count(e.processId)) {
+      return false;
+    }
+    if (!lifetimeAllows(e)) {
       return false;
     }
     if (e.processId == sampleRootPid && !sameRootInstance(e)) {
@@ -535,6 +631,7 @@ BehaviorScore ScoreSandboxBehavior(const DynamicRunSummary &summary,
   std::set<std::string> unownedEndpoints;
   std::set<std::string> suspiciousCmds;
   std::set<std::string> suspiciousModules;
+  std::set<std::string> writableModuleContext;
   std::set<std::string> persistenceTargets;
   std::set<std::string> dropTargets;
   int privEsc = 0;
@@ -724,10 +821,24 @@ BehaviorScore ScoreSandboxBehavior(const DynamicRunSummary &summary,
     }
 
     // --- Side-loaded / search-order-hijacked DLL ----------------------------
+    // A module loaded from a writable path is NOT by itself a hijack: installers
+    // and self-extractors do that routinely. It becomes a high-specificity
+    // signal only when the collector explicitly classified it as a hijack
+    // (details.suspicion names a search-order/hijack/shadowing pattern) or the
+    // module shadows a known search-order DLL from a non-system path. Otherwise
+    // it is recorded as context and is not scored.
     if (cat == "image" && Has(act, "load") && inSampleSubtree(e)) {
       const std::string *susp = Detail(e, "suspicion");
-      if ((susp && !susp->empty()) || !e.mitre.empty()) {
+      const std::string suspL = susp ? Lower(*susp) : std::string();
+      const bool hijackClassified =
+          Has(suspL, "hijack") || Has(suspL, "search-order") ||
+          Has(suspL, "search order") || Has(suspL, "shadow") ||
+          DetailIsTrue(e, "searchOrderHijack");
+      const bool shadowsKnownDll = IsKnownShadowedDllName(tgtL);
+      if (hijackClassified || shadowsKnownDll) {
         suspiciousModules.insert(tgtL.empty() ? act : tgtL);
+      } else if (!suspL.empty() || !e.mitre.empty()) {
+        writableModuleContext.insert(tgtL.empty() ? act : tgtL);
       }
     }
 
@@ -754,6 +865,7 @@ BehaviorScore ScoreSandboxBehavior(const DynamicRunSummary &summary,
   const int nTcExternal = static_cast<int>(timeCorrelatedEndpoints.size());
   const int suspCmd = static_cast<int>(suspiciousCmds.size());
   const int suspMod = static_cast<int>(suspiciousModules.size());
+  const int nWritableModules = static_cast<int>(writableModuleContext.size());
 
   // ---- Accumulate score + rationale, strongest signals first. ----
   if (nPersistence > 0) {
@@ -923,6 +1035,22 @@ BehaviorScore ScoreSandboxBehavior(const DynamicRunSummary &summary,
     out.rationale.push_back(line);
     out.positiveFindings.push_back(line);
   }
+  if (nWritableModules > 0) {
+    std::string joined;
+    int shown = 0;
+    for (const auto &m : writableModuleContext) {
+      if (shown++ >= 3) {
+        joined += ", ...";
+        break;
+      }
+      joined += (joined.empty() ? "" : ", ") + m;
+    }
+    out.rationale.push_back(
+        "Module(s) loaded from a writable, non-system path: " +
+        std::to_string(nWritableModules) + " (" + joined +
+        "). Recorded as a context observation, not scored: a writable path "
+        "alone is not a search-order hijack.");
+  }
   if (nExternal > 0) {
     const int w = 20 + std::min(nExternal - 1, 5) * 8;
     out.score += w;
@@ -1052,9 +1180,15 @@ BehaviorScore ScoreSandboxBehavior(const DynamicRunSummary &summary,
   // confirmed malware. In that shape only a HIGH-specificity signal can confirm
   // Malicious; two generic categories are no longer enough.
   const bool looksLikeOrdinaryInstall = nInstallWrites > 0;
-  const bool attributableMalice =
-      highSpecificity ||
-      (!looksLikeOrdinaryInstall && genericCategories >= 2);
+  // A generic cross-category chain (staged drops + external egress) is how many
+  // ORDINARY installers/updaters look; by itself it caps at Suspicious. It only
+  // confirms Malicious when the sample also established attributed persistence
+  // of its own (an autostart mutation by the sample's process), which is a
+  // self-establishment claim rather than an ordinary drop/connection, and even
+  // then not in the install-location shape.
+  const bool corroboratedPersistence =
+      nPersistence > 0 && genericCategories >= 2 && !looksLikeOrdinaryInstall;
+  const bool attributableMalice = highSpecificity || corroboratedPersistence;
   if (out.verdict == Verdict::Malicious && !attributableMalice) {
     out.verdict = Verdict::Suspicious;
     if (looksLikeOrdinaryInstall) {
@@ -1067,13 +1201,13 @@ BehaviorScore ScoreSandboxBehavior(const DynamicRunSummary &summary,
           "score crossed by ordinary actions.");
     } else if (nStagingDrops > 0 || nExternal > 0) {
       out.rationale.push_back(
-          "Capped at Suspicious: the score is driven by a single generic "
-          "category (staged file writes or external connections to non-loopback "
-          "endpoints). Ordinary installers do both; crossing the score "
-          "threshold by repeating one kind of ordinary action is not by itself "
-          "confirmation of malware. A high-specificity signal (anomalous "
-          "command line, DLL side-loading, attributed MITRE behavior) or "
-          "corroboration across two independent categories is required.");
+          "Capped at Suspicious: the score is driven by generic drop/connection "
+          "activity (staged file writes and/or external endpoint connections) "
+          "without a high-specificity signal (anomalous command line, DLL "
+          "side-loading, attributed MITRE behavior) or an attributed persistence "
+          "write corroborating it. Ordinary installers and updaters do all of "
+          "these; repeating one ordinary category is not confirmation of "
+          "malware.");
     } else {
       out.rationale.push_back(
           "Capped at Suspicious: the score is driven only by attributed "
@@ -1173,6 +1307,56 @@ BehaviorScore ScoreSandboxBehavior(const DynamicRunSummary &summary,
     }
     if (!detail.empty()) {
       noteLimits.push_back("sensor coverage notes: " + detail);
+    }
+    // Required capability coverage (v3): a reassuring negative must be able to
+    // deny behavior in every category the scorer considered. One healthy
+    // collector (e.g. registry) says nothing about processes, files, modules, or
+    // network, so a missing required collector withholds the negative.
+    static const char *kRequiredSensors[] = {"process", "network", "registry",
+                                             "filesystem", "image"};
+    for (const char *required : kRequiredSensors) {
+      bool present = false;
+      for (const auto &s : summary.sensorCoverage) {
+        if (s.sensor == required) {
+          present = true;
+          break;
+        }
+      }
+      if (!present) {
+        flipLimits.push_back(
+            std::string("no coverage record for the ") + required +
+            " collector, so behavior in that category was not shown to be "
+            "observable");
+      }
+    }
+    // User-scope enforcement (v3): file and registry coverage resolves from a
+    // user profile/hive. Coverage collected for a DIFFERENT user (or with no
+    // declared user) cannot deny the sample user's file/registry behavior. A
+    // collector that explicitly declares system scope is machine-wide and is
+    // exempt from the identity match.
+    for (const auto &s : summary.sensorCoverage) {
+      const bool userScopedData =
+          s.sensor == "filesystem" || s.sensor == "registry";
+      if (!userScopedData || s.scope == "system") {
+        continue;
+      }
+      if (s.targetUser.empty()) {
+        flipLimits.push_back(
+            "the " + s.sensor +
+            " collector did not record which user profile it observed, so its "
+            "coverage cannot be matched to the sample's user");
+      } else if (rootKnown && rootUser.empty()) {
+        flipLimits.push_back(
+            "the sample's user identity was not recorded, so " + s.sensor +
+            " coverage for '" + s.targetUser +
+            "' could not be verified as the sample's own profile");
+      } else if (!rootUser.empty() &&
+                 !EqualInsensitive(s.targetUser, rootUser)) {
+        flipLimits.push_back(
+            s.sensor + " coverage observed '" + s.targetUser +
+            "', not the sample's user '" + rootUser +
+            "', so the sample's own profile/hive was not monitored");
+      }
     }
   }
   if (summary.coverageIncomplete) {

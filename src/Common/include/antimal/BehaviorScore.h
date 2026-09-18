@@ -11,7 +11,22 @@ namespace antimal {
 // scored event, an attribution rule, or a verdict gate changes, so reports can
 // state which policy produced them and historical runs can be rescored
 // reproducibly.
-inline constexpr const char *kBehaviorScorerVersion = "behavior-score-v2";
+//
+// v3 (2026-09-18 boundary review):
+//   * sample-launch anchoring requires the VERIFIED details.sampleExecuted
+//     marker; the "any process.create" compatibility fallback is gone (an
+//     unrelated process can no longer be mistaken for the sample);
+//   * per-PID lifetimes: an event after the PID's recorded stop/exit is not
+//     attributed to the sample instance (PID reuse), and a recorded end with an
+//     unplaceable event time fails closed;
+//   * coverage must include the conclusion-relevant sensors (process, network,
+//     registry, filesystem, image) and user/mixed-scope collectors must target
+//     the sample's recorded user;
+//   * Malicious requires high-specificity evidence OR attributed persistence
+//     corroborated across two generic categories (ordinary-install shape still
+//     caps at Suspicious); a module loaded from a writable path is a context
+//     observation unless the collector classified it as a hijack.
+inline constexpr const char *kBehaviorScorerVersion = "behavior-score-v3";
 
 // Result of the explainable behavioral scorer. `score` is the summed weight of
 // every signal that fired; `verdict` is that score mapped through thresholds;

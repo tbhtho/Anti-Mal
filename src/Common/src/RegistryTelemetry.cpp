@@ -308,12 +308,14 @@ void CaptureIfeoDebuggers(RegistrySnapshot &out) {
 constexpr size_t kActiveSetupCap = 512;
 
 void CaptureActiveSetup(HKEY root, const std::string &hivePrefix,
-                        RegistrySnapshot &out) {
-  const wchar_t *kActiveSetup =
+                        RegistrySnapshot &out,
+                        const std::wstring &subPrefix = {}) {
+  const std::wstring kActiveSetup =
+      subPrefix +
       L"SOFTWARE\\Microsoft\\Active Setup\\Installed Components";
   HKEY comps = nullptr;
-  if (RegOpenKeyExW(root, kActiveSetup, 0, KEY_READ | KEY_WOW64_64KEY, &comps) !=
-      ERROR_SUCCESS) {
+  if (RegOpenKeyExW(root, kActiveSetup.c_str(), 0,
+                    KEY_READ | KEY_WOW64_64KEY, &comps) != ERROR_SUCCESS) {
     return;
   }
   size_t seen = 0;
@@ -330,7 +332,7 @@ void CaptureActiveSetup(HKEY root, const std::string &hivePrefix,
     }
     ++seen;
     const std::string comp = WideToUtf8(std::wstring(name, nameLen));
-    const std::wstring compSub = std::wstring(kActiveSetup) + L"\\" + name;
+    const std::wstring compSub = kActiveSetup + L"\\" + name;
     CaptureNamedValue(root, compSub.c_str(), L"StubPath",
                       hivePrefix + "\\...\\ActiveSetup\\" + comp + "\\StubPath",
                       out);
@@ -357,12 +359,13 @@ const wchar_t *const kComHijackClsids[] = {
 };
 
 void CaptureComHijacks(HKEY root, const std::string &hivePrefix,
-                       RegistrySnapshot &out) {
+                       RegistrySnapshot &out,
+                       const std::wstring &subPrefix = {}) {
   for (const wchar_t *clsid : kComHijackClsids) {
     const std::string clsidUtf8 = WideToUtf8(std::wstring(clsid));
     for (const wchar_t *server : {L"InprocServer32", L"LocalServer32"}) {
-      const std::wstring sub = std::wstring(L"SOFTWARE\\Classes\\CLSID\\") +
-                               clsid + L"\\" + server;
+      const std::wstring sub =
+          subPrefix + L"SOFTWARE\\Classes\\CLSID\\" + clsid + L"\\" + server;
       const std::string serverUtf8 = WideToUtf8(std::wstring(server));
       CaptureDefaultValue(
           root, sub.c_str(),
@@ -373,8 +376,18 @@ void CaptureComHijacks(HKEY root, const std::string &hivePrefix,
 
 }  // namespace
 
-RegistrySnapshot CaptureRegistrySnapshot() {
+RegistrySnapshot CaptureRegistrySnapshot(const std::wstring &userSid) {
   RegistrySnapshot snap;
+
+  // The HKCU-family locations are read from the SAMPLE user's loaded hive when
+  // a SID is known (a LocalSystem agent's HKCU is SYSTEM's, not the interactive
+  // user's). An empty SID keeps the legacy HKEY_CURRENT_USER behavior.
+  const HKEY userRoot = userSid.empty() ? HKEY_CURRENT_USER : HKEY_USERS;
+  const std::wstring userPrefix =
+      userSid.empty() ? std::wstring() : userSid + L"\\";
+  const auto userSub = [&userPrefix](const wchar_t *sub) {
+    return userPrefix + sub;
+  };
 
   // --- Run-key family (T1547.001) ---------------------------------------
   const wchar_t *kRun = L"SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Run";
@@ -389,10 +402,11 @@ RegistrySnapshot CaptureRegistrySnapshot() {
   EnumKeyValues(HKEY_LOCAL_MACHINE, kRunServices, "HKLM\\...\\RunServices", snap);
   EnumKeyValues(HKEY_LOCAL_MACHINE, kRunServicesOnce,
                 "HKLM\\...\\RunServicesOnce", snap);
-  EnumKeyValues(HKEY_CURRENT_USER, kRun, "HKCU\\...\\Run", snap);
-  EnumKeyValues(HKEY_CURRENT_USER, kRunOnce, "HKCU\\...\\RunOnce", snap);
-  EnumKeyValues(HKEY_CURRENT_USER, kRunServices, "HKCU\\...\\RunServices", snap);
-  EnumKeyValues(HKEY_CURRENT_USER, kRunServicesOnce,
+  EnumKeyValues(userRoot, userSub(kRun).c_str(), "HKCU\\...\\Run", snap);
+  EnumKeyValues(userRoot, userSub(kRunOnce).c_str(), "HKCU\\...\\RunOnce", snap);
+  EnumKeyValues(userRoot, userSub(kRunServices).c_str(),
+                "HKCU\\...\\RunServices", snap);
+  EnumKeyValues(userRoot, userSub(kRunServicesOnce).c_str(),
                 "HKCU\\...\\RunServicesOnce", snap);
 
   // --- Winlogon Shell / Userinit / Notify (T1547.004) -------------------
@@ -402,7 +416,7 @@ RegistrySnapshot CaptureRegistrySnapshot() {
                            L"AppSetup"}) {
     CaptureNamedValue(HKEY_LOCAL_MACHINE, kWinlogon, v,
                       std::string("HKLM\\...\\Winlogon\\") + WideToUtf8(v), snap);
-    CaptureNamedValue(HKEY_CURRENT_USER, kWinlogon, v,
+    CaptureNamedValue(userRoot, userSub(kWinlogon).c_str(), v,
                       std::string("HKCU\\...\\Winlogon\\") + WideToUtf8(v), snap);
   }
   // Winlogon\\Notify subkeys (DLL notification packages).
@@ -427,7 +441,7 @@ RegistrySnapshot CaptureRegistrySnapshot() {
 
   // --- Active Setup\\Installed Components\\*\\StubPath (T1547.014) -------
   CaptureActiveSetup(HKEY_LOCAL_MACHINE, "HKLM", snap);
-  CaptureActiveSetup(HKEY_CURRENT_USER, "HKCU", snap);
+  CaptureActiveSetup(userRoot, "HKCU", snap, userPrefix);
 
   // --- Shell Folders / common + per-user Startup approved (T1547.001) ---
   const wchar_t *kShellFoldersUser =
@@ -442,10 +456,10 @@ RegistrySnapshot CaptureRegistrySnapshot() {
     CaptureNamedValue(HKEY_LOCAL_MACHINE, kShellFolders, v,
                       std::string("HKLM\\...\\ShellFolders\\") + WideToUtf8(v),
                       snap);
-    CaptureNamedValue(HKEY_CURRENT_USER, kShellFoldersUser, v,
+    CaptureNamedValue(userRoot, userSub(kShellFoldersUser).c_str(), v,
                       std::string("HKCU\\...\\ShellFolders\\") + WideToUtf8(v),
                       snap);
-    CaptureNamedValue(HKEY_CURRENT_USER, kShellFolders, v,
+    CaptureNamedValue(userRoot, userSub(kShellFolders).c_str(), v,
                       std::string("HKCU\\...\\ShellFolders\\") + WideToUtf8(v),
                       snap);
   }
@@ -455,12 +469,12 @@ RegistrySnapshot CaptureRegistrySnapshot() {
       L"StartupApproved\\Run";
   EnumKeyValues(HKEY_LOCAL_MACHINE, kStartupApprovedRun,
                 "HKLM\\...\\StartupApproved", snap);
-  EnumKeyValues(HKEY_CURRENT_USER, kStartupApprovedRun,
+  EnumKeyValues(userRoot, userSub(kStartupApprovedRun).c_str(),
                 "HKCU\\...\\StartupApproved", snap);
 
   // --- COM hijack: bounded CLSID allow-list (T1546.015) -----------------
   CaptureComHijacks(HKEY_LOCAL_MACHINE, "HKLM", snap);
-  CaptureComHijacks(HKEY_CURRENT_USER, "HKCU", snap);
+  CaptureComHijacks(userRoot, "HKCU", snap, userPrefix);
 
   return snap;
 }

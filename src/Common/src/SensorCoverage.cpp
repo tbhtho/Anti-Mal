@@ -20,13 +20,15 @@ SensorCoverageState *Find(std::vector<SensorCoverageState> &states,
 } // namespace
 
 void SensorCoverageTracker::Register(const std::string &sensor,
-                                     const std::string &targetUser) {
+                                     const std::string &targetUser,
+                                     const std::string &scope) {
   if (sensor.empty() || Find(states_, sensor) != nullptr) {
     return;
   }
   SensorCoverageState s;
   s.sensor = sensor;
   s.targetUser = targetUser;
+  s.scope = scope;
   states_.push_back(std::move(s));
 }
 
@@ -43,16 +45,21 @@ void SensorCoverageTracker::Observe(const std::string &sensor, bool succeeded,
     }
   }
   ++s->attempts;
+  const bool firstAttempt = s->attempts == 1;
   if (succeeded) {
     ++s->samples;
-    s->healthy = true;
+    // Sticky: a sensor that failed a collection stays unhealthy for the run, so
+    // a later success cannot silently forget the earlier gap.
+    if (firstAttempt || s->healthy) {
+      s->healthy = true;
+    }
   } else {
     s->healthy = false;
   }
   (void)emittedRecords;
   s->dropped += droppedRecords;
   // If any observation could not account for its drops, the aggregate is only a
-  // lower bound.
+  // lower bound. Unknown loss is sticky for the same reason as failures.
   s->lossKnown = s->lossKnown && lossKnown;
   if (!note.empty()) {
     s->note = note;
@@ -76,13 +83,43 @@ void SensorCoverageTracker::MarkUnsupported(const std::string &sensor,
   }
 }
 
+void SensorCoverageTracker::SetScope(const std::string &sensor,
+                                     const std::string &targetUser,
+                                     const std::string &scope,
+                                     const std::string &note) {
+  SensorCoverageState *s = Find(states_, sensor);
+  if (s == nullptr) {
+    Register(sensor, targetUser, scope);
+    return;
+  }
+  const bool changed = (!s->targetUser.empty() || !s->scope.empty()) &&
+                       (s->targetUser != targetUser || s->scope != scope);
+  s->targetUser = targetUser;
+  s->scope = scope;
+  if (changed) {
+    // Honest scope transition: the collector observed more than one profile
+    // during the run. Keep the fact attached to the coverage record.
+    const std::string transition =
+        "collector scope changed during the run (earlier observations targeted a "
+        "different profile/scope)";
+    if (!note.empty()) {
+      s->note = s->note.empty() ? note : s->note + "; " + note;
+    }
+    if (s->note.find("scope changed") == std::string::npos) {
+      s->note = s->note.empty() ? transition : s->note + "; " + transition;
+    }
+  } else if (!note.empty()) {
+    s->note = note;
+  }
+}
+
 std::vector<SensorCoverageState> SensorCoverageTracker::States() const {
   return states_;
 }
 
 bool SensorCoverageTracker::Incomplete() const {
   for (const auto &s : states_) {
-    if (!s.supported || !s.healthy || s.dropped > 0) {
+    if (!s.supported || !s.healthy || s.dropped > 0 || !s.lossKnown) {
       return true;
     }
   }
@@ -107,6 +144,9 @@ std::vector<EventRecord> SensorCoverageTracker::ToEvents(
     e.details["lossKnown"] = s.lossKnown ? "true" : "false";
     if (!s.targetUser.empty()) {
       e.details["targetUser"] = s.targetUser;
+    }
+    if (!s.scope.empty()) {
+      e.details["scope"] = s.scope;
     }
     if (!s.note.empty()) {
       e.details["note"] = s.note;
@@ -151,6 +191,7 @@ void ApplyCoverageEvents(const std::vector<EventRecord> &events,
       return nullptr;
     };
     DynamicRunSummary::SensorCoverage *s = find();
+    const bool first = (s == nullptr);
     if (s == nullptr) {
       summary->sensorCoverage.push_back({});
       s = &summary->sensorCoverage.back();
@@ -160,18 +201,44 @@ void ApplyCoverageEvents(const std::vector<EventRecord> &events,
       const auto it = e.details.find(k);
       return it == e.details.end() ? std::string() : it->second;
     };
-    s->supported = truthy(get("supported"));
-    s->healthy = truthy(get("healthy"));
-    s->samples = number(get("samples"));
-    s->dropped = number(get("dropped"));
-    s->lossKnown = truthy(get("lossKnown"));
-    s->targetUser = get("targetUser");
-    s->note = get("note");
+    const bool supported = truthy(get("supported"));
+    const bool healthy = truthy(get("healthy"));
+    const uint64_t samples = number(get("samples"));
+    const uint64_t dropped = number(get("dropped"));
+    const bool lossKnown = truthy(get("lossKnown"));
+    const std::string targetUser = get("targetUser");
+    const std::string scope = get("scope");
+    const std::string note = get("note");
+    if (first) {
+      s->supported = supported;
+      s->healthy = healthy;
+      s->samples = samples;
+      s->dropped = dropped;
+      s->lossKnown = lossKnown;
+    } else {
+      // Coverage folding must never FORGET an earlier gap: a later healthy /
+      // loss-free status (or a boot-generation reset) cannot retract an earlier
+      // unsupported, unhealthy, or unknown-loss observation.
+      s->supported = s->supported && supported;
+      s->healthy = s->healthy && healthy;
+      s->samples = std::max(s->samples, samples);
+      s->dropped = std::max(s->dropped, dropped);
+      s->lossKnown = s->lossKnown && lossKnown;
+    }
+    if (!targetUser.empty()) {
+      s->targetUser = targetUser;
+    }
+    if (!scope.empty()) {
+      s->scope = scope;
+    }
+    if (!note.empty()) {
+      s->note = note;
+    }
   }
   if (sawAny) {
     bool incomplete = false;
     for (const auto &s : summary->sensorCoverage) {
-      if (!s.supported || !s.healthy || s.dropped > 0) {
+      if (!s.supported || !s.healthy || s.dropped > 0 || !s.lossKnown) {
         incomplete = true;
       }
     }

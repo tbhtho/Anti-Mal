@@ -22,6 +22,7 @@
 #include "antimal/Report.h"
 #include "antimal/ReportDiff.h"
 #include "antimal/Scanner.h"
+#include "antimal/SensorCoverage.h"
 #include "antimal/Strings.h"
 #include "antimal/Subprocess.h"
 #include "antimal/Version.h"
@@ -4413,6 +4414,11 @@ int CommandRebuildReport(int argc, wchar_t **argv) {
     }
   }
   report.events = events;
+  // Fold the journal's own `agent.coverage` records so a recovered report is
+  // scored on the coverage the guest actually reported (the live path folds
+  // these as they arrive). Without this the rebuilt verdict claimed "no
+  // per-sensor coverage record was received" for a journal that contains them.
+  antimal::ApplyCoverageEvents(events, &report.dynamicSummary);
   report.mitreTechniques =
       antimal::AggregateMitreTechniques(events, report.scannerVerdict);
   report.networkDomains = antimal::AggregateNetworkDomains(events);
@@ -4422,10 +4428,31 @@ int CommandRebuildReport(int argc, wchar_t **argv) {
   report.dynamicSummary.networkMode = config.networkMode;
   // GuestAgent telemetry proves OS-up (session-0 service), so mark the gate the
   // journal actually evidences -- honest, not inflated to "desktop".
+  const auto detailTrue = [](const antimal::EventRecord &e, const char *key) {
+    const auto it = e.details.find(key);
+    if (it == e.details.end()) {
+      return false;
+    }
+    const std::string v = antimal::ToLowerAscii(it->second);
+    return v == "true" || v == "1" || v == "yes";
+  };
   for (const auto &e : events) {
     if (e.source == "GuestAgent") {
       report.dynamicSummary.windowsUserModeGateReached = true;
-      break;
+      report.dynamicSummary.guestAgentConnected = true;
+    }
+    // Derive the VERIFIED sample-execution anchor from the journal exactly as
+    // the live path does (details.sampleExecuted). Without this a recovered
+    // report claimed "sample was not executed" for a run whose journal contains
+    // the launch. No marker -> sampleExecuted stays false and the scorer withholds
+    // the negative for uncertainty rather than guessing.
+    const std::string cat = antimal::ToLowerAscii(e.category);
+    const std::string act = antimal::ToLowerAscii(e.action);
+    if (cat == "process" && e.processId != 0 &&
+        act.find("create") != std::string::npos &&
+        act.find("failed") == std::string::npos &&
+        detailTrue(e, "sampleExecuted")) {
+      report.dynamicSummary.sampleExecuted = true;
     }
   }
   const antimal::BehaviorScore bs =

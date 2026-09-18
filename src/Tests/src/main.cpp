@@ -571,6 +571,8 @@ void PrintScoringFixtures() {
   auto root = event("process", "process.create", "installer.exe");
   root.processId = 100;
   root.integrityLevel = "Medium";
+  root.details["sampleExecuted"] = "true"; // verified launch anchor (v3)
+  root.userName = "DESKTOP\\analyst";
   auto child = event("process", "process.start", "installer-admin.exe");
   child.processId = 101;
   child.parentProcessId = 100;
@@ -1484,6 +1486,7 @@ void TestPositiveEvidenceSurvivesApprovalAndIncompleteness() {
   root.action = "process.create";
   root.processId = 100;
   root.integrityLevel = "Medium";
+  root.details["sampleExecuted"] = "true"; // verified launch anchor (v3)
   EventRecord elevated;
   elevated.timestampUtc = "2026-09-17T12:00:05Z";
   elevated.category = "process";
@@ -10279,7 +10282,10 @@ void TestImageLoadTelemetry() {
              susLoads[0].mitre.find("T1574") != std::string::npos,
          "image: temp-path DLL load tagged suspicious with T1574 technique");
 
-  // ----- (c) A suspicious image.load drives the behavior scorer -----
+  // ----- (c) Image-load evidence policy (v3): a module loaded from a writable
+  // path is CONTEXT unless the collector classified a hijack or the module
+  // shadows a known search-order DLL; a genuine shadowing module still unlocks
+  // high-specificity scoring.
   {
     antimal::DynamicRunSummary s;
     s.sampleExecuted = true;
@@ -10288,21 +10294,53 @@ void TestImageLoadTelemetry() {
     proc.action = "process.create";
     proc.processId = 2000;
     proc.imagePath = "trusted.exe";
+    proc.details["sampleExecuted"] = "true";
     std::vector<antimal::EventRecord> events = {proc, susLoads[0]};
     const antimal::BehaviorScore bs =
         antimal::ScoreSandboxBehavior(s, events);
-    Expect(bs.verdict == antimal::Verdict::Suspicious ||
-               bs.verdict == antimal::Verdict::Malicious,
-           "image: a suspicious load pushes the verdict to Suspicious/Malicious");
-    bool named = false;
+    Expect(bs.verdict != antimal::Verdict::Malicious,
+           "image: an arbitrary temp-path DLL load is not, by itself, "
+           "confirmed malware");
+    bool contextNamed = false;
     for (const auto &line : bs.rationale) {
-      if (line.find("side-loading") != std::string::npos &&
-          line.find("inject.dll") != std::string::npos) {
-        named = true;
+      if (line.find("writable, non-system path") != std::string::npos &&
+          line.find("inject.dll") != std::string::npos &&
+          line.find("not scored") != std::string::npos) {
+        contextNamed = true;
       }
     }
-    Expect(named,
-           "image: scorer rationale names the side-loaded module (inject.dll)");
+    Expect(contextNamed,
+           "image: the writable-path module is named as context, not a hijack");
+
+    // A shadowing module name (classic search-order hijack shape) is
+    // high-specificity: with attributed egress and a staging drop it confirms
+    // Malicious.
+    antimal::EventRecord shadow;
+    shadow.timestampUtc = "2026-01-01T00:10:06Z";
+    shadow.category = "image";
+    shadow.action = "image.load";
+    shadow.processId = 2000;
+    shadow.target = "C:\\Users\\v\\AppData\\Local\\Temp\\version.dll";
+    shadow.details["suspicion"] = "dll-from-writable-path";
+    shadow.mitre = "T1574.001";
+    antimal::EventRecord net;
+    net.timestampUtc = "2026-01-01T00:10:07Z";
+    net.category = "network";
+    net.action = "network.connect";
+    net.processId = 2000;
+    net.target = "198.51.100.9:443";
+    antimal::EventRecord drop;
+    drop.timestampUtc = "2026-01-01T00:10:08Z";
+    drop.category = "file";
+    drop.action = "file.create";
+    drop.processId = 2000;
+    drop.target = "C:\\Users\\v\\AppData\\Local\\Temp\\stage.exe";
+    drop.details["fileType"] = "pe";
+    const antimal::BehaviorScore hijack =
+        antimal::ScoreSandboxBehavior(s, {proc, shadow, net, drop});
+    Expect(hijack.verdict == antimal::Verdict::Malicious,
+           "image: a shadowing DLL name from a writable path is a real hijack "
+           "signal and corroborates Malicious");
   }
 
   // ----- (d) Report renders a "Module Loads" section with the suspicious DLL --
@@ -10461,6 +10499,7 @@ void TestBehaviorScoreExcludesBootBaseline() {
   launch.action = "process.create";
   launch.processId = 4242;
   launch.target = "C:\\AntiMal\\run\\sample.exe";
+  launch.details["sampleExecuted"] = "true"; // verified launch anchor (v3)
   ev.push_back(launch);
   // The sample writes ONE persistence key AFTER it runs, attributed to it. Note
   // the action: registry.value is inventory and is never scored -- the mutation
@@ -10524,6 +10563,7 @@ void TestBehaviorScoreSubtreeCmdlineAttribution() {
   std::vector<EventRecord> ev;
   // Agent launches the sample (subtree root pid 1900).
   ev.push_back(proc("2026-01-01T00:10:00Z", 1900, 0, "process.create", ""));
+  ev.back().details["sampleExecuted"] = "true"; // verified launch anchor (v3)
   // An OS process (parent = services 600, NOT the sample) runs a genuinely
   // anomalous rundll32 (a DLL masquerading as a .jpg) -- must NOT corroborate.
   ev.push_back(proc("2026-01-01T00:10:01Z", 700, 600, "process.start",
@@ -10584,6 +10624,7 @@ void TestBehaviorScoreSubtreeCmdlineAttribution() {
   // sample itself it must not corroborate Malicious on its own.
   std::vector<EventRecord> benign;
   benign.push_back(proc("2026-01-01T00:10:00Z", 2000, 0, "process.create", ""));
+  benign.back().details["sampleExecuted"] = "true"; // verified launch anchor (v3)
   benign.push_back(proc("2026-01-01T00:10:01Z", 2050, 2000, "process.start",
                         "rundll32.exe shell32.dll,Control_RunDLL"));
   for (int i = 0; i < 30; ++i) {
@@ -10631,6 +10672,7 @@ void TestBehaviorScoreSubtreeNetworkAttribution() {
   std::vector<EventRecord> ev;
   // Agent launches the sample (subtree root pid 1900).
   ev.push_back(proc("2026-01-01T00:10:00Z", 1900, 0, "process.create"));
+  ev.back().details["sampleExecuted"] = "true"; // verified launch anchor (v3)
   // Windows' OWN concurrent background egress from a non-sample svchost
   // (pid 700, parent services 600) -- e.g. telemetry / Update. External, but NOT
   // the sample, so it must NOT corroborate a Malicious verdict.
@@ -10679,7 +10721,10 @@ void TestBehaviorScoreSubtreeNetworkAttribution() {
   Expect(bsSample.verdict == Verdict::Suspicious,
          "behavior: attributed egress + one staging drop is Suspicious, not "
          "Malicious");
+  // An arbitrary support DLL loaded from a writable path is context, not a
+  // proven hijack: it must NOT flip the same evidence to Malicious.
   {
+    std::vector<EventRecord> ctx = ev;
     EventRecord load;
     load.timestampUtc = "2026-01-01T00:10:06Z";
     load.category = "image";
@@ -10688,11 +10733,30 @@ void TestBehaviorScoreSubtreeNetworkAttribution() {
     load.target = "C:\\Users\\v\\AppData\\Local\\Temp\\hijack.dll";
     load.details["suspicion"] = "dll-from-writable-path";
     load.mitre = "T1574.001";
-    ev.push_back(load);
+    ctx.push_back(load);
+    const auto bsContext = ScoreSandboxBehavior(s, ctx, false);
+    Expect(bsContext.verdict == Verdict::Suspicious,
+           "behavior: an arbitrary writable-path DLL load does not confirm "
+           "Malicious");
   }
-  const auto bsCorroborated = ScoreSandboxBehavior(s, ev, false);
-  Expect(bsCorroborated.verdict == Verdict::Malicious,
-         "behavior: attributed egress + staging drop + side-load -> Malicious");
+  // A module that SHADOWS a known search-order DLL from a writable path is the
+  // genuine hijack shape and is high-specificity, so it corroborates Malicious.
+  {
+    std::vector<EventRecord> hijack = ev;
+    EventRecord load;
+    load.timestampUtc = "2026-01-01T00:10:06Z";
+    load.category = "image";
+    load.action = "image.load";
+    load.processId = 1950;
+    load.target = "C:\\Users\\v\\AppData\\Local\\Temp\\version.dll";
+    load.details["suspicion"] = "dll-from-writable-path";
+    load.mitre = "T1574.001";
+    hijack.push_back(load);
+    const auto bsCorroborated = ScoreSandboxBehavior(s, hijack, false);
+    Expect(bsCorroborated.verdict == Verdict::Malicious,
+           "behavior: attributed egress + staging drop + shadowing DLL name -> "
+           "Malicious");
+  }
 }
 
 void TestBehaviorScoreVerdict() {
@@ -10723,13 +10787,15 @@ void TestBehaviorScoreVerdict() {
     return e;
   };
   // The sample-launch anchor: the agent emits process.create for the staged
-  // sample. Only an anchored run attributes events to the sample (v2).
+  // sample with the VERIFIED details.sampleExecuted marker (v3).
   auto procCreate = [](uint32_t pid, const char *image) {
     EventRecord e;
     e.category = "process";
     e.action = "process.create";
     e.processId = pid;
     e.imagePath = image;
+    e.userName = "DESKTOP\\tester";
+    e.details["sampleExecuted"] = "true";
     return e;
   };
 
@@ -10746,14 +10812,23 @@ void TestBehaviorScoreVerdict() {
     s.timedOut = true;
     s.completed = true;
     // Healthy, loss-free per-sensor coverage is REQUIRED for a reassuring
-    // negative under behavior-score-v2 (unknown coverage is not healthy).
-    antimal::DynamicRunSummary::SensorCoverage fs;
-    fs.sensor = "filesystem";
-    fs.supported = true;
-    fs.healthy = true;
-    fs.samples = 12;
-    fs.lossKnown = true;
-    s.sensorCoverage.push_back(fs);
+    // negative (v3): every conclusion-relevant collector must be present, and
+    // user-scoped collectors must target the sample's user.
+    for (const char *sensor : {"process", "network", "registry", "filesystem",
+                               "image", "wer_crash"}) {
+      antimal::DynamicRunSummary::SensorCoverage c;
+      c.sensor = sensor;
+      c.supported = true;
+      c.healthy = true;
+      c.samples = 12;
+      c.lossKnown = true;
+      c.targetUser = "DESKTOP\\tester";
+      c.scope = (std::string(sensor) == "filesystem" ||
+                 std::string(sensor) == "registry")
+                    ? "mixed"
+                    : "system";
+      s.sensorCoverage.push_back(c);
+    }
     std::vector<EventRecord> events = {procCreate(1000, "sample.exe"),
                                        procStart(1004, "conhost.exe")};
     const BehaviorScore bs = ScoreSandboxBehavior(s, events);
@@ -10894,6 +10969,7 @@ void TestBehaviorScoreVerdict() {
     parent.processId = 500;
     parent.imagePath = "sample.exe";
     parent.integrityLevel = "Medium";
+    parent.details["sampleExecuted"] = "true"; // verified launch anchor (v3)
     EventRecord child;
     child.category = "process";
     child.action = "process.start";
@@ -11010,6 +11086,8 @@ void TestBehaviorScoreReviewFixtures() {
   auto root = event("process", "process.create", "installer.exe");
   root.processId = 100;
   root.integrityLevel = "Medium";
+  root.details["sampleExecuted"] = "true"; // verified launch anchor (v3)
+  root.userName = "DESKTOP\\analyst";
   auto child = event("process", "process.start", "installer-admin.exe");
   child.processId = 101;
   child.parentProcessId = 100;
@@ -13620,6 +13698,8 @@ void TestBehaviorScoreCoverageGate() {
     e.action = "process.create";
     e.processId = pid;
     e.imagePath = "sample.exe";
+    e.userName = "DESKTOP\\antimal";
+    e.details["sampleExecuted"] = "true"; // verified launch anchor (v3)
     return e;
   };
   auto has = [](const std::vector<std::string> &lines, const char *needle) {
@@ -13648,16 +13728,28 @@ void TestBehaviorScoreCoverageGate() {
            "coverage: rationale names the missing coverage record");
   }
 
-  // Healthy loss-free coverage -> Clean is allowed.
+  // Healthy loss-free coverage of EVERY required collector, scoped to the
+  // sample's user -> Clean is allowed.
   {
     DynamicRunSummary s = base;
-    DynamicRunSummary::SensorCoverage c;
-    c.sensor = "registry";
-    c.supported = true;
-    c.healthy = true;
-    c.samples = 8;
-    c.lossKnown = true;
-    s.sensorCoverage.push_back(c);
+    auto addCov = [&s](const char *sensor, const char *user, const char *scope,
+                       uint64_t dropped = 0) {
+      DynamicRunSummary::SensorCoverage c;
+      c.sensor = sensor;
+      c.supported = true;
+      c.healthy = true;
+      c.samples = 8;
+      c.dropped = dropped;
+      c.lossKnown = true;
+      c.targetUser = user;
+      c.scope = scope;
+      s.sensorCoverage.push_back(c);
+    };
+    for (const char *sensor : {"process", "network", "image", "wer_crash"}) {
+      addCov(sensor, "DESKTOP\\antimal", "system");
+    }
+    addCov("registry", "DESKTOP\\antimal", "mixed");
+    addCov("filesystem", "DESKTOP\\antimal", "mixed");
     EventRecord proc;
     proc.timestampUtc = "2026-09-17T12:00:02Z";
     proc.category = "process";
@@ -13667,7 +13759,68 @@ void TestBehaviorScoreCoverageGate() {
     proc.imagePath = "conhost.exe";
     const auto bs = ScoreSandboxBehavior(s, {root(100), proc});
     Expect(bs.verdict == Verdict::Clean && !bs.insufficientEvidence,
-           "coverage: healthy, loss-free sensors permit a Clean verdict");
+           "coverage: healthy, loss-free, correctly-scoped sensors permit a "
+           "Clean verdict");
+  }
+
+  // Registry-only coverage is NOT enough: the collectors that could have denied
+  // file/process/network/module behavior never reported, so the negative is
+  // withheld (ported review case `only_registry_coverage`).
+  {
+    DynamicRunSummary s = base;
+    DynamicRunSummary::SensorCoverage c;
+    c.sensor = "registry";
+    c.supported = true;
+    c.healthy = true;
+    c.samples = 8;
+    c.lossKnown = true;
+    c.targetUser = "DESKTOP\\antimal";
+    c.scope = "mixed";
+    s.sensorCoverage.push_back(c);
+    EventRecord proc;
+    proc.timestampUtc = "2026-09-17T12:00:02Z";
+    proc.category = "process";
+    proc.action = "process.start";
+    proc.processId = 200;
+    proc.parentProcessId = 100;
+    proc.imagePath = "conhost.exe";
+    const auto bs = ScoreSandboxBehavior(s, {root(100), proc});
+    Expect(bs.verdict == Verdict::Unknown && bs.insufficientEvidence,
+           "coverage: a single healthy collector cannot support a Clean verdict");
+    Expect(has(bs.limitations, "no coverage record for the process") ||
+               has(bs.rationale, "no coverage record for the process"),
+           "coverage: rationale names a missing required collector");
+  }
+
+  // Complete-looking coverage collected for the WRONG user cannot deny the
+  // sample's own profile behavior (ported review case `wrong_user_all_sensors`).
+  {
+    DynamicRunSummary s = base;
+    for (const char *sensor : {"process", "network", "image", "wer_crash",
+                               "registry", "filesystem"}) {
+      DynamicRunSummary::SensorCoverage c;
+      c.sensor = sensor;
+      c.supported = true;
+      c.healthy = true;
+      c.samples = 8;
+      c.lossKnown = true;
+      c.targetUser = "NT AUTHORITY\\SYSTEM";
+      s.sensorCoverage.push_back(c);
+    }
+    EventRecord proc;
+    proc.timestampUtc = "2026-09-17T12:00:02Z";
+    proc.category = "process";
+    proc.action = "process.start";
+    proc.processId = 200;
+    proc.parentProcessId = 100;
+    proc.imagePath = "conhost.exe";
+    const auto bs = ScoreSandboxBehavior(s, {root(100), proc});
+    Expect(bs.verdict == Verdict::Unknown && bs.insufficientEvidence,
+           "coverage: coverage collected for a different user withholds the "
+           "negative");
+    Expect(has(bs.limitations, "not the sample's user") ||
+               has(bs.rationale, "not the sample's user"),
+           "coverage: rationale names the user-scope mismatch");
   }
 
   // Dropped records -> coverage limitation recorded, still no unsupported
@@ -13725,6 +13878,7 @@ void TestBehaviorScoreCoverageGate() {
     c.dropped = 7;
     c.lossKnown = true;
     c.targetUser = "DESKTOP\\antimal";
+    c.scope = "mixed";
     c.note = "collection failed";
     report.dynamicSummary.sensorCoverage.push_back(c);
     report.dynamicSummary.coverageIncomplete = true;
@@ -13742,6 +13896,8 @@ void TestBehaviorScoreCoverageGate() {
     Expect(loaded.dynamicSummary.sensorCoverage[0].targetUser ==
                "DESKTOP\\antimal",
            "coverage: target user round-trips");
+    Expect(loaded.dynamicSummary.sensorCoverage[0].scope == "mixed",
+           "coverage: collector scope round-trips");
     Expect(loaded.dynamicSummary.coverageIncomplete,
            "coverage: coverageIncomplete round-trips");
     Expect(loaded.dynamicSummary.bootGeneration == 2,
@@ -13821,6 +13977,8 @@ void TestBehaviorScoreCoverageRequirements() {
     e.action = "process.create";
     e.processId = pid;
     e.imagePath = "sample.exe";
+    e.userName = "DESKTOP\\antimal";
+    e.details["sampleExecuted"] = "true"; // verified launch anchor (v3)
     return e;
   };
   auto proc = []() {
@@ -13893,8 +14051,15 @@ void TestBehaviorScoreCoverageRequirements() {
   // Healthy, complete, correctly-targeted coverage -> Clean permitted.
   {
     DynamicRunSummary s = base;
-    s.sensorCoverage.push_back(covered("process", true, 4, true, "u"));
-    s.sensorCoverage.push_back(covered("filesystem", true, 3, true, "u"));
+    for (const char *sensor :
+         {"process", "network", "registry", "filesystem", "image"}) {
+      auto c = covered(sensor, true, 4, true, "DESKTOP\\antimal");
+      c.scope = (std::string(sensor) == "registry" ||
+                 std::string(sensor) == "filesystem")
+                    ? "mixed"
+                    : "system";
+      s.sensorCoverage.push_back(c);
+    }
     const auto bs = ScoreSandboxBehavior(s, {root(100), proc()});
     Expect(bs.verdict == Verdict::Clean && !bs.insufficientEvidence,
            "coverage-req: healthy complete coverage permits Clean");
@@ -13940,6 +14105,8 @@ void TestHarmlessInstallerControl() {
   events.push_back(ev("process", "process.create", 100,
                       "C:\\Users\\v\\Downloads\\setup.exe",
                       "2026-09-17T12:00:00Z"));
+  events.back().details["sampleExecuted"] = "true"; // verified anchor (v3)
+  events.back().userName = "DESKTOP\\v";
   // Install its own app files under Program Files (context, not malice).
   events.push_back(ev("file", "file.create", 100,
                       "C:\\Program Files\\Vendor\\app.exe",
@@ -13994,6 +14161,7 @@ void TestHarmlessInstallerControl() {
     repetitive.push_back(ev("process", "process.create", 100,
                             "C:\\Users\\v\\Downloads\\setup.exe",
                             "2026-09-17T12:00:00Z"));
+    repetitive.back().details["sampleExecuted"] = "true"; // anchor (v3)
     for (int i = 0; i < 10; ++i) {
       auto e = ev("file", "file.create", 100,
                   "C:\\Users\\v\\AppData\\Local\\Temp\\payload" +
@@ -14026,9 +14194,299 @@ void TestHarmlessInstallerControl() {
   }
 }
 
+// Ported from the 2026-09-18 boundary review (tests/current_boundary_probe.cpp):
+// the nine synthetic counterexamples the reviewer reproduced against the
+// unmodified scorer. Expectations below are the CORRECTED policy outcomes
+// (behavior-score-v3), each with the evidence reason it is defensible:
+//   * a negative verdict needs every conclusion-relevant collector, scoped to
+//     the sample's user;
+//   * an unrelated process.create is not a sample-launch anchor;
+//   * generic drop/connection sequences cap at Suspicious unless genuine
+//     high-specificity evidence or attributed persistence corroborates;
+//   * an arbitrary writable-path DLL is context, not a hijack;
+//   * a network event after the root's recorded exit is not attributed.
+void TestBehaviorScoreBoundaryProbeV3() {
+  using antimal::BehaviorScore;
+  using antimal::DynamicRunSummary;
+  using antimal::EventRecord;
+  using antimal::ScoreSandboxBehavior;
+  using antimal::Verdict;
+  auto ev = [](const char *cat, const char *act, uint32_t pid,
+               const std::string &target, int sec) {
+    EventRecord e;
+    e.category = cat;
+    e.action = act;
+    e.processId = pid;
+    e.target = target;
+    e.source = "GuestAgent";
+    e.timestampUtc = "2026-09-18T12:00:" +
+                     (sec < 10 ? std::string("0") : std::string()) +
+                     std::to_string(sec) + "Z";
+    return e;
+  };
+  auto root = [&](bool identified = true, uint32_t pid = 100) {
+    auto e = ev("process", "process.create", pid,
+                identified ? R"(C:\sample\installer.exe)"
+                           : R"(C:\Windows\unrelated.exe)",
+                10);
+    e.details["startTime"] = e.timestampUtc;
+    e.details["bootGeneration"] = "1";
+    e.userName = "ANTIMAL-VM\\antimal";
+    if (identified) {
+      e.details["sampleExecuted"] = "true";
+    }
+    return e;
+  };
+  auto summary = [] {
+    DynamicRunSummary s;
+    s.started = true;
+    s.completed = true;
+    s.sampleExecuted = true;
+    s.guestAgentConnected = true;
+    return s;
+  };
+  auto addCoverage = [](DynamicRunSummary &s, const std::string &sensor) {
+    DynamicRunSummary::SensorCoverage c;
+    c.sensor = sensor;
+    c.supported = true;
+    c.healthy = true;
+    c.samples = 8;
+    c.lossKnown = true;
+    c.targetUser = "ANTIMAL-VM\\antimal";
+    s.sensorCoverage.push_back(c);
+  };
+  auto has = [](const std::vector<std::string> &lines, const char *needle) {
+    for (const auto &l : lines) {
+      if (l.find(needle) != std::string::npos) {
+        return true;
+      }
+    }
+    return false;
+  };
+  auto hasFinding = [&](const BehaviorScore &bs, const char *needle) {
+    return has(bs.positiveFindings, needle) || has(bs.rationale, needle);
+  };
+
+  // 1. Registry-only coverage + a child-process event used to permit Clean with
+  // zero limitations. Coverage for the other conclusion-relevant capabilities is
+  // now checked, so the negative is withheld.
+  {
+    auto s = summary();
+    addCoverage(s, "registry");
+    auto child = ev("process", "process.start", 200, "conhost.exe", 12);
+    child.parentProcessId = 100;
+    const auto bs = ScoreSandboxBehavior(s, {root(), child});
+    Expect(bs.verdict == Verdict::Unknown && bs.insufficientEvidence,
+           "boundary: registry-only coverage cannot support Clean");
+  }
+
+  // 2. Zero successful collections (samples == 0) is not healthy coverage.
+  {
+    auto s = summary();
+    addCoverage(s, "registry");
+    s.sensorCoverage[0].samples = 0;
+    auto child = ev("process", "process.start", 200, "conhost.exe", 12);
+    child.parentProcessId = 100;
+    const auto bs = ScoreSandboxBehavior(s, {root(), child});
+    Expect(bs.verdict == Verdict::Unknown && bs.insufficientEvidence,
+           "boundary: a collector that never completed a cycle withholds the "
+           "negative");
+  }
+
+  // 3. Unknown loss (lossKnown=false) is not "no loss".
+  {
+    auto s = summary();
+    addCoverage(s, "registry");
+    s.sensorCoverage[0].lossKnown = false;
+    auto child = ev("process", "process.start", 200, "conhost.exe", 12);
+    child.parentProcessId = 100;
+    const auto bs = ScoreSandboxBehavior(s, {root(), child});
+    Expect(bs.verdict == Verdict::Unknown && bs.insufficientEvidence,
+           "boundary: unknown sensor loss withholds the negative");
+    Expect(bs.limitations.size() >= 2,
+           "boundary: the lossy-observation limits are enumerated");
+  }
+
+  // 4. Complete-looking coverage marked for SYSTEM while the sample root names a
+  // different interactive user cannot deny that user's behavior.
+  {
+    auto s = summary();
+    for (const char *sensor :
+         {"process", "network", "registry", "filesystem", "image", "wer_crash"}) {
+      addCoverage(s, sensor);
+    }
+    for (auto &c : s.sensorCoverage) {
+      c.targetUser = "NT AUTHORITY\\SYSTEM";
+    }
+    auto child = ev("process", "process.start", 200, "conhost.exe", 12);
+    child.parentProcessId = 100;
+    const auto bs = ScoreSandboxBehavior(s, {root(), child});
+    Expect(bs.verdict == Verdict::Unknown && bs.insufficientEvidence,
+           "boundary: SYSTEM-scoped coverage does not cover the sample's user");
+  }
+
+  // 5. A missing genuine launch anchor plus an unrelated process.create: the
+  // unrelated process's connection must NOT be called sample-attributed.
+  {
+    auto s = summary();
+    auto unrelated = root(false, 999);
+    auto net = ev("network", "network.connect", 999, "203.0.113.10:443", 12);
+    const auto bs = ScoreSandboxBehavior(s, {unrelated, net});
+    Expect(bs.verdict == Verdict::Unknown,
+           "boundary: no verified anchor -> no attribution, verdict withheld");
+    Expect(!hasFinding(bs, "Sample-attributed outbound network egress"),
+           "boundary: the unrelated process's connection is not sample-attributed");
+    Expect(has(bs.limitations, "no sample-launch anchor"),
+           "boundary: the missing anchor is recorded as a limit");
+  }
+
+  // 6. Three temporary helper executable writes + an update-like external
+  // connection: ordinary installer/updater shape, must cap at Suspicious.
+  {
+    auto s = summary();
+    std::vector<EventRecord> installer{root()};
+    for (int i = 0; i < 3; ++i) {
+      installer.push_back(ev(
+          "file", "file.create", 100,
+          R"(C:\Users\antimal\AppData\Local\Temp\helper)" + std::to_string(i) +
+              ".exe",
+          11 + i));
+    }
+    installer.push_back(
+        ev("network", "network.connect", 100, "203.0.113.10:443", 15));
+    const auto bs = ScoreSandboxBehavior(s, installer);
+    Expect(bs.verdict != Verdict::Malicious,
+           "boundary: temp helper drops + one external connection are not "
+           "confirmed malware");
+    Expect(bs.score >= 20, "boundary: the sequence is still scored as notable");
+  }
+
+  // 7. The same sequence plus a Program Files application write: still the
+  // ordinary-installer shape, so the verdict must not move DOWN to hide the
+  // earlier (already Suspicious) score, and must not become Malicious.
+  {
+    auto s = summary();
+    std::vector<EventRecord> installer{root()};
+    for (int i = 0; i < 3; ++i) {
+      installer.push_back(ev(
+          "file", "file.create", 100,
+          R"(C:\Users\antimal\AppData\Local\Temp\helper)" + std::to_string(i) +
+              ".exe",
+          11 + i));
+    }
+    installer.push_back(
+        ev("network", "network.connect", 100, "203.0.113.10:443", 15));
+    installer.push_back(ev("file", "file.create", 100,
+                           R"(C:\Program Files\Example\app.exe)", 16));
+    const auto bs = ScoreSandboxBehavior(s, installer);
+    Expect(bs.verdict == Verdict::Suspicious,
+           "boundary: install-location write keeps the installer shape at "
+           "Suspicious");
+  }
+
+  // 8. The same installer sequence plus a temporary support-DLL load: the
+  // supplied event does not establish a search-order hijack, so it must not
+  // become Malicious.
+  {
+    auto s = summary();
+    std::vector<EventRecord> installer{root()};
+    for (int i = 0; i < 3; ++i) {
+      installer.push_back(ev(
+          "file", "file.create", 100,
+          R"(C:\Users\antimal\AppData\Local\Temp\helper)" + std::to_string(i) +
+              ".exe",
+          11 + i));
+    }
+    installer.push_back(
+        ev("network", "network.connect", 100, "203.0.113.10:443", 15));
+    installer.push_back(ev("file", "file.create", 100,
+                           R"(C:\Program Files\Example\app.exe)", 16));
+    auto load = ev("image", "image.load", 100,
+                   R"(C:\Users\antimal\AppData\Local\Temp\support.dll)", 17);
+    load.details["suspicion"] = "dll-from-writable-path";
+    load.mitre = "T1574.001";
+    installer.push_back(load);
+    const auto bs = ScoreSandboxBehavior(s, installer);
+    Expect(bs.verdict != Verdict::Malicious,
+           "boundary: a temp support-DLL load is context, not a hijack");
+    Expect(hasFinding(bs, "writable, non-system path"),
+           "boundary: the writable-path module is recorded as context");
+  }
+
+  // 9. A network event bearing the root PID AFTER its recorded exit, with no
+  // matching new instance: the sample's lifetime ended, so the event is not
+  // attributed and cannot support a Suspicious verdict.
+  {
+    auto s = summary();
+    std::vector<EventRecord> lifetime{root()};
+    lifetime.push_back(ev("process", "process.stop", 100, "installer.exe", 13));
+    lifetime.push_back(
+        ev("network", "network.connect", 100, "203.0.113.20:443", 17));
+    const auto bs = ScoreSandboxBehavior(s, lifetime);
+    Expect(bs.verdict != Verdict::Suspicious && bs.verdict != Verdict::Malicious,
+           "boundary: a post-exit PID event is not attributed to the sample");
+    Expect(!hasFinding(bs, "Sample-attributed outbound network egress"),
+           "boundary: no attributed-egress finding for a dead PID");
+  }
+
+  // 10. A run finalized while the sample was still alive never receives the
+  // guest's completion frame (summary.sampleExecuted stays false), but the
+  // journal carries the verified launch anchor. The scorer must treat that as
+  // executed and keep the observed positive finding.
+  {
+    DynamicRunSummary s; // deliberately NOT sampleExecuted
+    s.started = true;
+    auto net = ev("network", "network.connect", 100, "185.220.101.7:443", 12);
+    const auto bs = ScoreSandboxBehavior(s, {root(), net});
+    Expect(bs.verdict == Verdict::Suspicious ||
+               bs.verdict == Verdict::Malicious,
+           "boundary: a stopped-but-alive run's journal anchor counts as "
+           "executed");
+    Expect(!bs.insufficientEvidence,
+           "boundary: the positive finding is not masked by the missing "
+           "completion frame");
+    DynamicRunSummary empty;
+    const auto none = ScoreSandboxBehavior(empty, {});
+    Expect(none.verdict == Verdict::Unknown && none.insufficientEvidence,
+           "boundary: a genuinely not-executed run still withholds");
+  }
+
+  // The policy carries its own identity.
+  {
+    auto s = summary();
+    const auto bs = ScoreSandboxBehavior(s, {root()});
+    Expect(bs.scorerVersion == "behavior-score-v3",
+           "boundary: scorer semantics version is v3");
+  }
+}
+
+// The "until stopped" host budget (timeoutMs == 0) must reach the guest as 0
+// (unbounded). The 2026-09-18 live run collapsed it to a 60-second sample
+// window, silently reaping the benign GUI fixture the operator was about to
+// interact with while the host kept running.
+void TestExecuteJobUnlimitedTimeoutPropagation() {
+  using antimal::ExecuteJobRequest;
+  using antimal::GuestSampleWindowMs;
+  Expect(GuestSampleWindowMs(0, 0) == 0,
+         "detonation: host 0 (until stopped) -> guest unbounded");
+  Expect(GuestSampleWindowMs(0, 5000000) == 0,
+         "detonation: unlimited stays unlimited regardless of transfer estimate");
+  Expect(GuestSampleWindowMs(600000, 0) == 300000,
+         "detonation: finite budget reserves the boot/transfer margin");
+  Expect(GuestSampleWindowMs(60000, 0) == 60000,
+         "detonation: a too-small budget floors at 60s, never below");
+  ExecuteJobRequest req;
+  req.allowSampleExecution = true;
+  req.sampleBytes = 10;
+  req.timeoutMs = 0;
+  const auto parsed =
+      antimal::ParseExecuteJobJson(antimal::BuildExecuteJobJson(req));
+  Expect(parsed.isExecute && parsed.timeoutMs == 0,
+         "detonation: timeoutMs=0 survives the job JSON round-trip");
+}
+
 // G2 per-control test: each REQUIRED worker-isolation control, when forced to
-// fail while the others succeed, must independently close the execution gate.
-// The report must also record what was actually established (not merely that a
+// fail while the others succeed, must independently close the execution gate.// The report must also record what was actually established (not merely that a
 // flag was requested).
 void TestWorkerIsolationPerControlFailClosed() {
   using antimal::ApplyWorkerIsolation;
@@ -15227,6 +15685,8 @@ int main() {
     TestVhdxBlockDeviceReadLocalBase();
     TestVhdxToRawConversionSkipWhenRawExists();
     TestHarmlessInstallerControl();
+    TestBehaviorScoreBoundaryProbeV3();
+    TestExecuteJobUnlimitedTimeoutPropagation();
     TestOrchestratorBootAttemptDoesNotExecuteSample();
     TestOrchestratorCreatesDifferencingOverlay();
     TestOrchestratorCreatesRawCowOverlay();
