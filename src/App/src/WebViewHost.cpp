@@ -23,6 +23,7 @@
 #include "antimal/FileUtil.h"
 #include "antimal/Json.h"
 #include "antimal/JsonValue.h"
+#include "antimal/Assistant.h"
 #include "antimal/BootReliability.h"
 #include "antimal/ConfigExtractor.h"
 #include "antimal/Report.h"
@@ -41,6 +42,8 @@ using Microsoft::WRL::Callback;
 using Microsoft::WRL::ComPtr;
 
 namespace antimal {
+// Defined in Common (LiveVm.cpp): human takeover of the shared input lease.
+bool TakeOverInputAsHuman(const std::filesystem::path &liveInputFile);
 
 namespace {
 
@@ -1255,6 +1258,138 @@ void WebViewHost::RegisterHandlers() {
     return std::string(R"({"watching":true})");
   });
 
+  // ---- Integrated assistant (AI harness) ----
+  // The AI operator runs HERE, in the host app process, over the same live
+  // session the operator watches: the Assistant core enforces policy outside
+  // the model and every action goes through the LiveVm primitives (framebuffer
+  // + `_live-input.bin`), so assistant clicks and typing appear in the live
+  // view exactly like manual ones. The model API key comes from the host
+  // environment and never enters the guest or the run directory.
+  router_.Register("assistant.status", [this](const JsonValue &) -> std::string {
+    const AppConfig config = LoadConfig(DefaultConfigPath());
+    std::string key;
+    for (const char *name : {"ANTIMAL_ASSISTANT_API_KEY", "OPENAI_API_KEY"}) {
+      char buf[8]{};
+      size_t needed = 0;
+      if (getenv_s(&needed, buf, sizeof(buf), name) == 0 && needed > 1) {
+        key = "present";
+        break;
+      }
+    }
+    return std::string("{\"ok\":true,\"enabled\":") +
+           (config.assistantEnabled ? "true" : "false") +
+           ",\"running\":" + (assistantRunning_.load() ? "true" : "false") +
+           ",\"provider\":" + JsonQuote(config.assistantProvider) +
+           ",\"model\":" + JsonQuote(config.assistantModel) +
+           ",\"apiKey\":" + JsonQuote(key) + "}";
+  });
+
+  router_.Register("assistant.ask", [this](const JsonValue &args) -> std::string {
+    const AppConfig config = LoadConfig(DefaultConfigPath());
+    const std::string task = args.At("task").AsString();
+    if (task.empty()) {
+      return R"({"ok":false,"error":"a task string is required"})";
+    }
+    if (!config.assistantEnabled) {
+      return R"({"ok":false,"error":"the assistant is disabled: set assistant_enabled = true in config/antimal.toml (and assistant_model), then reopen Settings"})";
+    }
+    if (assistantRunning_.exchange(true)) {
+      return R"({"ok":false,"error":"an assistant task is already running; cancel it first"})";
+    }
+    std::string apiKey;
+    for (const char *name : {"ANTIMAL_ASSISTANT_API_KEY", "OPENAI_API_KEY"}) {
+      char buf[4096]{};
+      size_t needed = 0;
+      if (getenv_s(&needed, buf, sizeof(buf), name) == 0 && needed > 1) {
+        apiKey = std::string(buf, needed - 1);
+        break;
+      }
+    }
+    std::string providerError;
+    std::unique_ptr<AssistantProvider> provider = CreateOpenAiCompatibleProvider(
+        config, config.assistantBaseUrl, apiKey, config.assistantModel,
+        &providerError);
+    if (!provider) {
+      assistantRunning_.store(false);
+      return std::string("{\"ok\":false,\"error\":") + JsonQuote(providerError) +
+             "}";
+    }
+
+    AssistantPolicy policy;
+    policy.allowGuestInput = true;
+    policy.allowFinalize = config.assistantAllowFinalize ||
+                           args.At("allow_finalize").AsBool();
+    if (const int64_t n = args.At("max_actions").AsInt64(); n > 0 && n <= 200) {
+      policy.maxToolCalls = static_cast<int>(n);
+    }
+
+    AssistantRunOptions options;
+    options.task = task;
+    options.boundRunId = args.At("run").AsString();
+    options.maxToolCalls = policy.maxToolCalls;
+    options.maxTurns = policy.maxTurns;
+    auto cancel = std::make_shared<std::atomic_bool>(false);
+    assistantCancel_ = cancel;
+    options.cancel = [cancel]() { return cancel->load(); };
+
+    const HWND hwnd = hwnd_;
+    auto bridge = CreateLiveVmAssistantBridge(config);
+    std::thread([this, hwnd, provider = std::move(provider),
+                 bridge = std::move(bridge), policy, options,
+                 cancel]() mutable {
+      Emit(hwnd, "assistant",
+           std::string("{\"type\":\"start\",\"task\":") + JsonQuote(options.task) +
+               "}");
+      AssistantToolRunner runner(bridge.get(), policy);
+      options.onEvent = [hwnd](const AssistantEvent &event) {
+        Emit(hwnd, "assistant",
+             std::string("{\"type\":") + JsonQuote(event.type) +
+                 ",\"text\":" + JsonQuote(event.text) + "}");
+      };
+      const AssistantRunResult result =
+          RunAssistant(*provider, runner, options);
+      std::string j = "{\"ok\":";
+      j += result.ok ? "true" : "false";
+      j += ",\"cancelled\":" + std::string(result.cancelled ? "true" : "false");
+      j += ",\"budgetExhausted\":";
+      j += result.budgetExhausted ? "true" : "false";
+      j += ",\"turns\":" + std::to_string(result.turns);
+      j += ",\"toolCalls\":" + std::to_string(result.toolCalls);
+      j += ",\"deniedCalls\":" + std::to_string(result.deniedCalls);
+      j += ",\"providerErrors\":" + std::to_string(result.providerErrors);
+      j += ",\"promptTokens\":" + std::to_string(result.usage.promptTokens);
+      j += ",\"completionTokens\":" +
+           std::to_string(result.usage.completionTokens);
+      j += ",\"summary\":" + JsonQuote(result.summary);
+      j += ",\"error\":" + JsonQuote(result.error);
+      j += ",\"actions\":[";
+      for (size_t i = 0; i < result.actions.size(); ++i) {
+        j += (i ? "," : "") + JsonQuote(result.actions[i]);
+      }
+      j += "],\"evidence\":[";
+      for (size_t i = 0; i < result.evidence.size(); ++i) {
+        j += (i ? "," : "") + JsonQuote(result.evidence[i]);
+      }
+      j += "]}";
+      Emit(hwnd, "assistant.done", j);
+      assistantRunning_.store(false);
+      if (assistantCancel_ == cancel) {
+        assistantCancel_.reset();
+      }
+    }).detach();
+
+    return R"({"ok":true,"started":true,"note":"The assistant is running; watch the live view and the assistant panel. Use assistant.cancel to stop it (the VM keeps running)."})";
+  });
+
+  router_.Register("assistant.cancel", [this](const JsonValue &) -> std::string {
+    if (assistantCancel_) {
+      assistantCancel_->store(true);
+      return R"({"ok":true,"cancelling":true,"note":"The running model call is not interrupted mid-flight; the loop stops before the next action. The VM is unaffected."})";
+    }
+    return R"({"ok":false,"error":"no assistant task is running"})";
+  });
+
+
   // ---- P1: live VM (3c). The VM runs in a SEPARATE AntiMal.HostCli process
   // (isolated from this UI process -- the escape-safety win); the UI polls
   // vm.frame for the live framebuffer served read-only via runs.antimal.local.
@@ -1560,20 +1695,25 @@ void WebViewHost::RegisterHandlers() {
       }
       rec = antimal::hv::EncodeKeyRecords(sc);
     } else if (mouse.IsObject()) {
-      auto clamp8 = [](int64_t v) -> int8_t {
-        if (v > 127) v = 127;
-        if (v < -127) v = -127;
-        return static_cast<int8_t>(v);
-      };
-      rec = antimal::hv::EncodeMouseRecord(
+      // webui already flips screen-Y to PS/2-Y (see flushLiveMouse in app.js),
+      // so this is the raw PS/2-space splitter: it preserves the full delta the
+      // viewer produced instead of the old silent +/-127 clamp.
+      rec = antimal::hv::EncodeMouseMoveRecords(
           static_cast<uint8_t>(mouse.At("buttons").AsInt64() & 0x07),
-          clamp8(mouse.At("dx").AsInt64()), clamp8(mouse.At("dy").AsInt64()));
+          static_cast<int>(mouse.At("dx").AsInt64()),
+          static_cast<int>(mouse.At("dy").AsInt64()));
     } else {
       return std::string(R"({"ok":false,"error":"no input"})");
     }
     if (rec.empty()) {
       return std::string(R"({"ok":false})");
     }
+    // GUI input is a HUMAN TAKEOVER: claims the shared actuator lease so a
+    // queued assistant action is denied at delivery, and releases anything an
+    // agent may have left held. Implemented in Common (LiveVm.cpp) and declared
+    // here to avoid pulling the whole live-VM header into this translation unit
+    // (its constants would collide with this file's own).
+    antimal::TakeOverInputAsHuman(liveInput);
     std::ofstream out(liveInput, std::ios::binary | std::ios::app);
     if (!out) {
       return std::string(R"({"ok":false})");

@@ -737,8 +737,13 @@ bool LaunchPreparedSample(HANDLE com2, const antimal::ExecuteJobRequest &req,
   }
   *proc = launchedProc;
   *pid = launchedPid;
-  *deadline = std::chrono::steady_clock::now() +
-              std::chrono::milliseconds(req.timeoutMs);
+  // timeoutMs == 0 is the "until stopped" policy: no guest-side analysis
+  // deadline at all (the host keeps observing until it is told to stop), so a
+  // time_point::max() is used rather than collapsing to "deadline now".
+  *deadline = req.timeoutMs == 0
+                  ? std::chrono::steady_clock::time_point::max()
+                  : std::chrono::steady_clock::now() +
+                        std::chrono::milliseconds(req.timeoutMs);
   auto created =
       MakeAgentEvent("process.create", antimal::PathToUtf8(launchPath));
   created.category = "process";
@@ -821,8 +826,15 @@ std::optional<std::filesystem::path> ReceiveDiskSample(
   SetFilePointerEx(disk, zero, nullptr, FILE_BEGIN);
   constexpr DWORD kChunk = 1u << 20;             // 1 MiB (sector-aligned).
   constexpr DWORD kSector = 512;
+  // Byte-level progress: a multi-GB installer copy runs for minutes with no
+  // other host-visible signal, so emit the copied/total bytes at a bounded
+  // cadence (every ~32 MiB) -- the host tails these events and renders real
+  // progress instead of an apparently idle desktop. Rate is bounded so a long
+  // copy can't flood COM2; the final event always lands.
+  constexpr uint64_t kProgressEveryBytes = 32ull * 1024ull * 1024ull;
   std::vector<uint8_t> buf(kChunk);
   uint64_t remaining = req.sampleBytes;
+  uint64_t lastProgressAt = 0;
   bool ok = true;
   while (remaining > 0) {
     // Raw-disk reads MUST be sector-aligned in both offset and length; the
@@ -846,6 +858,19 @@ std::optional<std::filesystem::path> ReceiveDiskSample(
       break;
     }
     remaining -= toWrite;
+    const uint64_t copied = req.sampleBytes - remaining;
+    if (copied - lastProgressAt >= kProgressEveryBytes) {
+      lastProgressAt = copied;
+      auto prog = MakeAgentEvent("agent.sample.progress", req.sampleName);
+      prog.details["copiedBytes"] = std::to_string(copied);
+      prog.details["totalBytes"] = std::to_string(req.sampleBytes);
+      prog.details["percent"] = std::to_string(
+          req.sampleBytes == 0
+              ? 100
+              : static_cast<int>(copied * 100ull / req.sampleBytes));
+      prog.details["delivery"] = "disk";
+      (void)SendAgentEvent(com2, prog);
+    }
   }
   if (ok) {
     // The sample disk is sector-padded; truncate to the exact byte size.
@@ -1244,6 +1269,9 @@ int RunHostChannelLoop(std::string reason, bool serviceMode) {
   // defers, so a flood can't stall the collector on a single vCPU.
   constexpr size_t kFileEnrichPerTick = 64;
   uint32_t tick = 0;
+  // Last byte mark for which an `agent.sample.progress` event was emitted on the
+  // serial (COM2) delivery path (the disk path keeps its own local counter).
+  uint64_t lastTransferProgressAt = 0;
   // Base budget: a service run lingers all day; a bare console run exits after
   // ~2 min. But once a sample is STAGED, a console run must outlast the deferred
   // manual-login wait (kLaunchWaitSec) plus a short observation tail -- otherwise
@@ -1273,6 +1301,28 @@ int RunHostChannelLoop(std::string reason, bool serviceMode) {
           executeReq.reset();
           reassembler.reset();
           continue;
+        }
+        // Byte-level transfer progress (~every 32 MiB, plus the final chunk):
+        // the host uses this to render real delivery progress for a multi-GB
+        // package instead of a silent multi-minute stall.
+        {
+          static constexpr uint64_t kReportEvery = 32ull * 1024ull * 1024ull;
+          const uint64_t receivedNow = reassembler->Received();
+          const uint64_t expectedNow = reassembler->Expected();
+          const bool complete = reassembler->Complete();
+          if (complete || receivedNow - lastTransferProgressAt >= kReportEvery) {
+            lastTransferProgressAt = receivedNow;
+            auto prog =
+                MakeAgentEvent("agent.sample.progress", executeReq->sampleName);
+            prog.details["copiedBytes"] = std::to_string(receivedNow);
+            prog.details["totalBytes"] = std::to_string(expectedNow);
+            prog.details["percent"] = std::to_string(
+                expectedNow == 0
+                    ? 100
+                    : static_cast<int>(receivedNow * 100ull / expectedNow));
+            prog.details["delivery"] = "serial";
+            (void)SendAgentEvent(com2, prog);
+          }
         }
         if (reassembler->Complete() && !sampleStaged) {
           // Transfer done. Defer the launch until a desktop session is logged in
@@ -1709,6 +1759,13 @@ int RunAuthorizedFileJob(const std::filesystem::path &jobPath) {
     ev.details["events"] = std::to_string(report.events.size());
     if (shots) {
       ev.details["screenshots"] = std::to_string(shots->FrameCount());
+      // Explicit filmstrip retention: identical consecutive frames are not
+      // re-encoded; this states how many were skipped so a still period is
+      // visible as a measured gap, not silently misrepresented.
+      ev.details["screenshotsSkippedIdentical"] =
+          std::to_string(shots->DuplicateCount());
+      ev.details["screenshotsSkippedSpanSec"] =
+          std::to_string(shots->DuplicateSpanSeconds());
     }
     journal->Append(ev);
   }

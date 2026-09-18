@@ -11,6 +11,8 @@
 #include "antimal/Json.h"
 #include "antimal/PeParser.h" // HasAuthenticodeSignature (signed-installer FP guard)
 #include "antimal/Report.h"
+#include "antimal/SampleStaging.h"
+#include "antimal/LiveVm.h"
 #include "antimal/Scanner.h"
 #include "antimal/Screenshot.h"
 #include "antimal/hv/BlockDevice.h"
@@ -9082,6 +9084,8 @@ void WriteErrorReport(const std::filesystem::path &reportPath,
   report.sandboxVerdict = behaviorScore.verdict;
   report.verdictScore = behaviorScore.score;
   report.verdictRationale = behaviorScore.rationale;
+  report.verdictInsufficientEvidence = behaviorScore.insufficientEvidence;
+  report.verdictLimitations = behaviorScore.limitations;
   report.dynamicSummary = dynamicSummary;
   report.events = events;
   // T24/T25: surface what the run actually observed. mitreTechniques unions the
@@ -9109,6 +9113,10 @@ void WriteStagedReport(const std::filesystem::path &reportPath,
   report.samplePath = samplePath;
   report.scannerVerdict = ScanFile(samplePath);
   report.sandboxVerdict = Verdict::Unknown; // staged/healthcheck: sample not run
+  report.verdictInsufficientEvidence = true;
+  report.verdictLimitations.push_back(
+      "the sample was not executed in this run (staged / prepared only), so no "
+      "behavioral evidence exists either way");
   report.dynamicSummary = dynamicSummary;
   report.events = events;
   report.artifacts = artifacts;
@@ -11295,6 +11303,12 @@ DetonationResult InHouseOrchestrator::PrepareAndRun(
     }
   }
 
+  // Stage timing: every phase message carries the elapsed milliseconds since
+  // PrepareAndRun started, so the next live run's boot/interaction timeline can
+  // be broken down from the transcript instead of inferred. (The live run's
+  // 3m51s-to-first-frame was NOT explained by instrumentation; this is the
+  // missing measurement.)
+  const auto prepareStart = std::chrono::steady_clock::now();
   auto fireProgress = [&](const std::string &phase, const std::string &msg) {
     if (!progressCallback) {
       return;
@@ -11304,6 +11318,10 @@ DetonationResult InHouseOrchestrator::PrepareAndRun(
     progress.runDir = result.runDir;
     progress.phase = phase;
     progress.message = msg;
+    progress.elapsedMs = static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - prepareStart)
+            .count());
     try {
       progressCallback(progress);
     } catch (...) {
@@ -11366,14 +11384,39 @@ DetonationResult InHouseOrchestrator::PrepareAndRun(
 
   const auto stagedSample = result.runDir / "in" / samplePath.filename();
   std::error_code ec;
-  std::filesystem::copy_file(samplePath, stagedSample,
-                             std::filesystem::copy_options::overwrite_existing, ec);
-  if (ec) {
-    result.errors.push_back("Unable to stage sample: " + ec.message());
-  } else {
-    AppendJournalEvent(result.journalPath,
-                       MakeSandboxEvent("sample.staged", stagedSample),
-                       &events);
+  {
+    // Content-addressed immutable staging: one copy into
+    // <workspace>/_cache/samples/<sha256>.bin (read-only), then a hardlink into
+    // the run (or a copy from the cache when hardlinks are unavailable). This
+    // replaces the previous per-run full copy of the package, binds the run to
+    // the BYTES that were approved, and bounds host memory by streaming the
+    // hash. See the private development documentation
+    const auto stagingCache =
+        config_.workspaceRoot / L"_cache" / L"samples";
+    const StageSampleResult staged = StageSampleImmutable(
+        samplePath, result.runDir / "in", stagingCache,
+        config_.stagingCacheMaxBytes,
+        [&fireProgress](const std::string &line) {
+          fireProgress("staging", line);
+        });
+    if (!staged.ok) {
+      result.errors.push_back("Unable to stage sample: " + staged.error);
+    } else {
+      result.stagedSampleSha256 = staged.sha256;
+      result.stagedSampleBytes = staged.bytes;
+      result.stagingCacheHit = staged.cacheHit;
+      result.stagingHardLinked = staged.hardLinked;
+      AppendJournalEvent(
+          result.journalPath,
+          MakeSandboxEvent("sample.staged", stagedSample,
+                           {{"sha256", staged.sha256},
+                            {"bytes", std::to_string(staged.bytes)},
+                            {"cacheHit", staged.cacheHit ? "true" : "false"},
+                            {"hardLinked", staged.hardLinked ? "true" : "false"},
+                            {"cache", PathToUtf8(stagingCache /
+                                                 (staged.sha256 + ".bin"))}}),
+          &events);
+    }
   }
 
   const auto agentPath = GuestAgentPath();
@@ -11465,6 +11508,36 @@ DetonationResult InHouseOrchestrator::PrepareAndRun(
               seedPath, result.overlayDiskPath,
               std::filesystem::copy_options::overwrite_existing, seedEc);
           overlaySeeded = !seedEc;
+          if (overlaySeeded) {
+            fireProgress("staging",
+                         "Seed overlay copied (" +
+                             std::to_string(
+                                 std::filesystem::file_size(
+                                     result.overlayDiskPath, seedEc) /
+                                 (1024 * 1024)) +
+                             " MiB)");
+          }
+          // If the operator has warmed a validated index sidecar for the seed
+          // (e.g. with `base inspect --overlay <seed>`), rebind it to the copy:
+          // the copy is byte-identical, so the mapping transfers, and the
+          // sidecar is rewritten with the COPY's file identity (identity is
+          // per-file: a naive sidecar copy would -- correctly -- be rejected).
+          const std::filesystem::path seedIndex =
+              seedPath.wstring() + L".idx";
+          if (overlaySeeded && std::filesystem::exists(seedIndex, seedEc)) {
+            std::string rebindError;
+            if (!hv::BindCowIndexSidecarToCopy(seedPath, result.overlayDiskPath,
+                                               &rebindError)) {
+              // Not a failure: the run simply rebuilds the index on open.
+              AppendJournalEvent(
+                  result.journalPath,
+                  MakeSandboxEvent("overlay.index.rebind-skipped",
+                                   result.overlayDiskPath,
+                                   {{"seed", PathToUtf8(seedPath)},
+                                    {"reason", rebindError}}),
+                  &events);
+            }
+          }
           AppendJournalEvent(
               result.journalPath,
               MakeSandboxEvent(overlaySeeded ? "overlay.seeded"
@@ -11638,8 +11711,17 @@ DetonationResult InHouseOrchestrator::PrepareAndRun(
       // non-interactive "is the agent alive?" probe), and its telemetry is
       // journaled live below so the UI can tail it in real time.
       const bool interactiveSession = !request.liveInputPath.empty();
+      // timeoutSec == 0 is the genuine "until stopped" policy: no host deadline
+      // (VmRunRequest::noDeadline) and no guest-side analysis budget (the job
+      // carries timeoutMs=0). A safety resource limit still exists at the
+      // engine level (the vCPU step cap / operator stop), but it is not a
+      // hidden wall-clock analysis limit.
+      const bool untilStopped = timeoutSec == 0;
+      request.noDeadline = untilStopped;
       request.timeout = std::chrono::milliseconds(
-          static_cast<int64_t>(std::max<uint32_t>(1, timeoutSec)) * 1000);
+          static_cast<int64_t>(
+              std::max<uint32_t>(untilStopped ? 24u * 60u * 60u : 1u, timeoutSec)) *
+          1000);
       // A Windows boot with CMOS/PM-timer polling spends millions of steps
       // per second of guest time, so the multiplier must be large enough
       // that the timeout — not the step cap — is the binding constraint.
@@ -12075,6 +12157,16 @@ DetonationResult InHouseOrchestrator::PrepareAndRun(
       const std::filesystem::path runDirCopy = result.runDir;
       const std::filesystem::path screenshotsDirCopy = result.screenshotsDir;
       const std::filesystem::path journalPathCopy = result.journalPath;
+      // Graceful-stop protocol: any client (CLI `vmfinalize`, the GUI Stop, the
+      // MCP `vm_finalize` tool, the AI harness) drops this marker file into the
+      // run directory. The run loop notices it on the next progress tick and
+      // exits through the NORMAL report-writing path, so a live session ends
+      // with a finalized report.json instead of a hard TerminateProcess that
+      // loses the verdict. Emergency termination (kill the worker) stays a
+      // separate, explicitly lossy action.
+      // (the path is resolved by FinalizeRequested from the run dir)
+          runDirCopy / "finalize.request";
+      auto finalizeSeen = std::make_shared<std::atomic_bool>(false);
       auto frameCounter = std::make_shared<std::atomic<uint32_t>>(0);
       auto realFrameCounter = std::make_shared<std::atomic<uint32_t>>(0);
       auto lastNumberedMs = std::make_shared<std::atomic<uint64_t>>(0);
@@ -12084,12 +12176,39 @@ DetonationResult InHouseOrchestrator::PrepareAndRun(
                                   realFrameCounter, lastNumberedMs,
                                   liveHostChannel,
                                   liveHeartbeatCount, executionAuthorized,
-                                  stopAfterGuestAgentProbe](
+                                  stopAfterGuestAgentProbe,
+                                  finalizeSeen](
                                      const hv::VmProgressSnapshot &snap) {
+          // Operator/AI finalize request: end a live session gracefully through
+          // the normal report path (checked on the progress cadence, so it lands
+          // within a couple hundred milliseconds of the request).
+          if (!finalizeSeen->load(std::memory_order_relaxed)) {
+            std::error_code fec;
+            if (FinalizeRequested(runDirCopy)) {
+              finalizeSeen->store(true, std::memory_order_relaxed);
+              stopAfterGuestAgentProbe->store(true, std::memory_order_relaxed);
+              if (progressCallback) {
+                DetonationProgress fin{};
+                fin.runId = runIdCopy;
+                fin.runDir = runDirCopy;
+                fin.phase = "finalizing";
+                fin.message =
+                    "Finalize requested: ending the run through the normal "
+                    "report path";
+                try {
+                  progressCallback(fin);
+                } catch (...) {
+                }
+              }
+            }
+          }
           DetonationProgress progress{};
           progress.runId = runIdCopy;
           progress.runDir = runDirCopy;
           progress.phase = "running";
+          // Human-readable delivery progress captured from the guest's
+          // agent.sample.progress events during this tick (empty when none).
+          std::string deliveryNotice;
           progress.steps = snap.steps;
           progress.totalHlts = snap.totalHlts;
           progress.ideSectorsRead = snap.ideSectorsRead;
@@ -12137,11 +12256,31 @@ DetonationResult InHouseOrchestrator::PrepareAndRun(
                 // real time. Only interactive sessions journal live (the
                 // post-run ProcessHostChannelOutput handles non-interactive
                 // runs and would otherwise double-write these frames).
+                const std::string payload(frame->payload.begin(),
+                                          frame->payload.end());
                 if (interactiveSession) {
-                  const std::string payload(frame->payload.begin(),
-                                            frame->payload.end());
                   AppendJournalEvent(journalPathCopy,
                                      ParseEventJsonLine(payload), nullptr);
+                }
+                // Byte-level package-delivery progress (multi-GB installers):
+                // translate the guest's agent.sample.progress into a human
+                // phase message so every client shows real movement during the
+                // long copy instead of a silent stall. Cheap substring gate --
+                // we do not re-parse the whole telemetry stream here.
+                if (payload.find("agent.sample.progress") != std::string::npos) {
+                  const EventRecord prog = ParseEventJsonLine(payload);
+                  auto detail = [&prog](const char *key) -> std::string {
+                    const auto it = prog.details.find(key);
+                    return it == prog.details.end() ? std::string() : it->second;
+                  };
+                  const std::string copied = detail("copiedBytes");
+                  const std::string total = detail("totalBytes");
+                  const std::string percent = detail("percent");
+                  if (!copied.empty() && !total.empty()) {
+                    deliveryNotice =
+                        "sample delivery " + percent + "% (" + copied + " / " +
+                        total + " bytes, " + detail("delivery") + ")";
+                  }
                 }
               } else if (frame->type == hv::HostChannelMessage::ReportComplete) {
                 if (!interactiveSession) {
@@ -12213,6 +12352,10 @@ DetonationResult InHouseOrchestrator::PrepareAndRun(
               static_cast<unsigned long long>(progress.currentRip),
               ripHex);
           progress.message = buffer;
+          if (!deliveryNotice.empty()) {
+            progress.message += " | ";
+            progress.message += deliveryNotice;
+          }
 
           // Compose a multi-line text panel and render it as a PNG into
           // runDir/screenshots/ so the GUI's filmstrip + latest-frame
@@ -12501,6 +12644,11 @@ DetonationResult InHouseOrchestrator::PrepareAndRun(
             std::chrono::duration_cast<std::chrono::milliseconds>(request.timeout);
         const auto runStart = std::chrono::steady_clock::now();
         hv::VmRunSummary s;
+        // The guest-side analysis budget: 0 in until-stopped mode, where the
+        // guest must NOT hit its own wall-clock deadline and end the sample
+        // early while the host is still observing.
+        const uint32_t guestBudgetMs =
+            untilStopped ? 0u : static_cast<uint32_t>(totalTimeout.count());
         // Build the first-boot COM2 payload ONCE (healthcheck JobStart, or -- when
         // execution is authorized -- the execute JobStart + the sample as
         // SampleChunk frames). It is (re)queued on EVERY boot generation below:
@@ -12514,13 +12662,13 @@ DetonationResult InHouseOrchestrator::PrepareAndRun(
         const std::vector<uint8_t> firstBootCom2 =
             (sampleDiskDelivery && sampleDiskDevice)
                 ? BuildDiskDeliveryCom2Bytes(
-                      result.runId, stagedSample,
-                      static_cast<uint32_t>(totalTimeout.count()), networkMode,
+                      result.runId, stagedSample, guestBudgetMs,
+                      networkMode,
                       sampleDiskDevice->SectorCount() * 512ull, &jobNote)
                 : BuildFirstBootCom2Bytes(
                       executionAuthorized, result.runId, stagedSample,
-                      static_cast<uint32_t>(totalTimeout.count()), networkMode,
-                      &jobNote);
+                      guestBudgetMs,
+                      networkMode, &jobNote);
         if (!jobNote.empty()) {
           fireProgress("booting", jobNote);
           // An AUTHORIZED run that fell back to a healthcheck (oversize /
@@ -12547,13 +12695,15 @@ DetonationResult InHouseOrchestrator::PrepareAndRun(
           const auto elapsed =
               std::chrono::duration_cast<std::chrono::milliseconds>(
                   std::chrono::steady_clock::now() - runStart);
-          if (elapsed >= totalTimeout) {
+          if (!untilStopped && elapsed >= totalTimeout) {
             s.timedOut = true;
             s.guestReboots = reboot;
             break;
           }
           hv::VmRunRequest reqLocal = request;
-          reqLocal.timeout = totalTimeout - elapsed;
+          reqLocal.noDeadline = untilStopped;
+          reqLocal.timeout =
+              untilStopped ? request.timeout : totalTimeout - elapsed;
           // First boot: configured vCPU count (1-vCPU is deterministic through
           // specialize+OOBE). Post-reboot: postRebootVcpuCount (default 2) so the
           // first-logon "Getting ready" SMP finalization isn't wedged on a
@@ -12627,33 +12777,43 @@ DetonationResult InHouseOrchestrator::PrepareAndRun(
         }
         return s;
       };
+      // ONE overlay device for the entire run: the pre-boot overlay patch, every
+      // boot generation, and the post-run overlay diagnostics. Reopening the same
+      // append-only overlay rebuilt the lba->offset index over the whole file,
+      // which was measured at 218.7 s for a 4.0 GiB overlay -- that rebuild was
+      // the finalization cost. The index is additionally persisted to
+      // <overlay>.idx (see BlockDevice.cpp) so offline opens skip the scan too.
+      std::optional<hv::VhdxBlockDevice> overlayBaseVhdx;
+      std::unique_ptr<hv::CowOverlayBlockDevice> overlayCow;
+      std::unique_ptr<hv::CowRawBlockDevice> overlayCowRaw;
+      hv::IBlockDevice *overlayDevice = nullptr;
       if (preflight.rawBaseReady) {
-        auto cow = hv::CowRawBlockDevice::Open(runConfig.baseDiskPath,
-                                               result.overlayDiskPath);
-        lastOverlayPatch = ApplyEphemeralBootOverlay(cow);
-        readAttributionCatalog = DiscoverIdeReadAttributionCatalog(cow);
-        bootReadTargets = readAttributionCatalog.windowsBootReadTargets;
-        AppendJournalEvent(
-            result.journalPath,
-            MakeSandboxEvent("vm.boot-overlay.patched", result.overlayDiskPath,
-                             BootOverlayPatchDetails(lastOverlayPatch)),
-            &events);
-        vmSummary = runWithReboots(&cow);
+        overlayCowRaw = std::make_unique<hv::CowRawBlockDevice>(
+            hv::CowRawBlockDevice::Open(runConfig.baseDiskPath,
+                                        result.overlayDiskPath));
+        overlayDevice = overlayCowRaw.get();
       } else if (preflight.baseVhdxReadable) {
-        auto base = hv::VhdxBlockDevice::Open(runConfig.baseVhdxPath);
-        auto cow = hv::CowOverlayBlockDevice::Open(&base, result.overlayDiskPath);
-        lastOverlayPatch = ApplyEphemeralBootOverlay(cow);
-        readAttributionCatalog = DiscoverIdeReadAttributionCatalog(cow);
-        bootReadTargets = readAttributionCatalog.windowsBootReadTargets;
-        AppendJournalEvent(
-            result.journalPath,
-            MakeSandboxEvent("vm.boot-overlay.patched", result.overlayDiskPath,
-                             BootOverlayPatchDetails(lastOverlayPatch)),
-            &events);
-        vmSummary = runWithReboots(&cow);
+        overlayBaseVhdx.emplace(
+            hv::VhdxBlockDevice::Open(runConfig.baseVhdxPath));
+        overlayCow = std::make_unique<hv::CowOverlayBlockDevice>(
+            hv::CowOverlayBlockDevice::Open(&*overlayBaseVhdx,
+                                            result.overlayDiskPath));
+        overlayDevice = overlayCow.get();
       } else {
         throw std::runtime_error("no bootable base disk was available");
       }
+      // One device for the entire run (see the comment above): opening it is
+      // where the index scan/build happens, so it gets its own timing line.
+      fireProgress(interactiveSession ? "booting" : "staging",
+                   "Opening the run overlay (index) and applying the boot patch");
+      lastOverlayPatch = ApplyEphemeralBootOverlay(*overlayDevice);      readAttributionCatalog = DiscoverIdeReadAttributionCatalog(*overlayDevice);
+      bootReadTargets = readAttributionCatalog.windowsBootReadTargets;
+      AppendJournalEvent(
+          result.journalPath,
+          MakeSandboxEvent("vm.boot-overlay.patched", result.overlayDiskPath,
+                           BootOverlayPatchDetails(lastOverlayPatch)),
+          &events);
+      vmSummary = runWithReboots(overlayDevice);
       vmSummary.framesCaptured =
           realFrameCounter->load(std::memory_order_relaxed);
 
@@ -12694,33 +12854,16 @@ DetonationResult InHouseOrchestrator::PrepareAndRun(
       std::string overlayBcdSummary;
       try {
         std::vector<uint8_t> bootstatRawBytes;
-      if (preflight.rawBaseReady) {
-          auto cow = hv::CowRawBlockDevice::Open(runConfig.baseDiskPath,
-                                                 result.overlayDiskPath);
-          bootstatSnapshot =
-              CaptureEspBootstatSnapshot(cow, &bootstatRawBytes);
-          ciPolicyInventory = CaptureCiPolicyInventory(cow, vmSummary);
-          overlayBootStorageInspection = InspectBaseBootStorage(cow);
-          overlaySystemBootSecurityInspection = InspectSystemBootSecurity(cow);
-          overlayBcdSummary = CaptureOverlayBcdSummary(cow);
-          if (!readAttribution.windowsResidualRanges.empty()) {
-            windowsResidualOwners = DiscoverWindowsResidualRunOwners(
-                cow, readAttribution.windowsResidualRanges);
-          }
-        } else if (preflight.baseVhdxReadable) {
-          auto base = hv::VhdxBlockDevice::Open(runConfig.baseVhdxPath);
-          auto cow =
-              hv::CowOverlayBlockDevice::Open(&base, result.overlayDiskPath);
-          bootstatSnapshot =
-              CaptureEspBootstatSnapshot(cow, &bootstatRawBytes);
-          ciPolicyInventory = CaptureCiPolicyInventory(cow, vmSummary);
-          overlayBootStorageInspection = InspectBaseBootStorage(cow);
-          overlaySystemBootSecurityInspection = InspectSystemBootSecurity(cow);
-          overlayBcdSummary = CaptureOverlayBcdSummary(cow);
-          if (!readAttribution.windowsResidualRanges.empty()) {
-            windowsResidualOwners = DiscoverWindowsResidualRunOwners(
-                cow, readAttribution.windowsResidualRanges);
-          }
+        // Reuse the SAME open device the run used: no second index rebuild.
+        bootstatSnapshot = CaptureEspBootstatSnapshot(*overlayDevice, &bootstatRawBytes);
+        ciPolicyInventory = CaptureCiPolicyInventory(*overlayDevice, vmSummary);
+        overlayBootStorageInspection = InspectBaseBootStorage(*overlayDevice);
+        overlaySystemBootSecurityInspection =
+            InspectSystemBootSecurity(*overlayDevice);
+        overlayBcdSummary = CaptureOverlayBcdSummary(*overlayDevice);
+        if (!readAttribution.windowsResidualRanges.empty()) {
+          windowsResidualOwners = DiscoverWindowsResidualRunOwners(
+              *overlayDevice, readAttribution.windowsResidualRanges);
         }
         if (!bootstatRawBytes.empty()) {
           // Save the raw bootstat.dat from the overlay-applied disk so future
@@ -12735,11 +12878,19 @@ DetonationResult InHouseOrchestrator::PrepareAndRun(
           }
         }
       } catch (...) {
-        // Best-effort overlay inspection; the IDE trace remains useful.
+        // Best-effort overlay inspection; the IDE trace remains useful. Record
+        // the skipped stage explicitly so the report never implies a complete
+        // diagnostics pass that did not happen.
+        result.errors.push_back(
+            "Overlay diagnostics were skipped: the best-effort disk inspection "
+            "stage failed (the VM run and its evidence are unaffected).");
       }
+      fireProgress("diagnosing",
+                   "Overlay diagnostics finished; persisting logs and journal");
       const auto accessTailAttribution = AnalyzeIdeAccessTailAttribution(
           vmSummary, readAttributionCatalog, windowsResidualOwners, 24);
-      fireProgress("finishing", "VM run loop returned; writing diagnostics");
+      fireProgress("finalizing",
+                   "VM stopped; persisting evidence (logs, journal, summary)");
       WriteTextFile(serialLogPath, vmSummary.serialOutput);
       WriteTextFile(firmwareLogPath, vmSummary.firmwareDebugOutput);
       WriteTextFile(kdLogPath, vmSummary.kdTranscript);
@@ -13323,6 +13474,7 @@ DetonationResult InHouseOrchestrator::PrepareAndRun(
     const bool sampleSigned = HasAuthenticodeSignature(samplePath);
     const BehaviorScore behaviorScore =
         DeriveSandboxScore(result.dynamicSummary, events, sampleSigned);
+    fireProgress("reporting", "Writing report.json and report.html");
     WriteErrorReport(result.reportPath, result.runId, samplePath, result.errors,
                      events, result.dynamicSummary, returnedArtifacts,
                      behaviorScore);

@@ -341,6 +341,12 @@ struct AnalysisReport {
   // pre-T07 reports; round-trips through the report JSON.
   int verdictScore = 0;
   std::vector<std::string> verdictRationale;
+  // F1 evidence-quality (2026-09 review): true when the sandbox verdict had to
+  // be withheld because the observation was too thin to judge. `verdictLimitations`
+  // lists the concrete coverage limits that applied (partial run, unconfirmed
+  // telemetry channel, ...) so every consumer can label a headline honestly.
+  bool verdictInsufficientEvidence = false;
+  std::vector<std::string> verdictLimitations;
   DynamicRunSummary dynamicSummary;
   std::vector<EventRecord> events;
   std::vector<std::string> mitreTechniques;

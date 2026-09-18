@@ -56,6 +56,29 @@ struct AppConfig {
   //   "manual"    — type nothing; the analyst logs in via the live console
   std::string vmLoginMode = "password";
   std::string vmLoginPassword = "AntiMal!23";
+
+  // Immutable staging cache (`<workspace>/_cache/samples/<sha256>.bin`) used to
+  // avoid copying a multi-GB package per run. 0 = unlimited.
+  uint64_t stagingCacheMaxBytes = 8ull * 1024 * 1024 * 1024;
+
+  // --- Integrated assistant (AI harness) ---
+  // Provider configuration only. The API KEY is deliberately NOT a config
+  // field: it lives in the host environment (ANTIMAL_ASSISTANT_API_KEY, falling
+  // back to OPENAI_API_KEY) so it is never written to the repository, a run
+  // directory, evidence, or a guest. Manual AntiMal use never requires any of
+  // this.
+  bool assistantEnabled = false; // master switch; a chat panel stays hidden/off
+  std::string assistantProvider = "openai-compatible";
+  std::string assistantBaseUrl = "https://api.openai.com/v1";
+  std::string assistantModel; // e.g. "gpt-4o-mini"; empty disables the provider
+  // Whether the assistant may end the live session (vm_finalize). Off by
+  // default: the operator ends investigations unless they granted it.
+  bool assistantAllowFinalize = false;
+  // Evidence-sharing policy: how much of the run leaves the host when a model
+  // call is made. "metadata" (default) sends status/events/process lists and
+  // text only; "screenshots" additionally allows the model to receive image
+  // frames. Binary uploads are never performed by the harness.
+  std::string assistantSharing = "metadata";
 };
 
 AppConfig LoadConfig(const std::filesystem::path &path);

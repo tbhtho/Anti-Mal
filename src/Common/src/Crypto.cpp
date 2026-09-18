@@ -7,8 +7,10 @@
 #include <dpapi.h>
 
 #include <iomanip>
+#include <fstream>
 #include <sstream>
 #include <stdexcept>
+#include <vector>
 
 namespace antimal {
 namespace {
@@ -40,6 +42,51 @@ std::string Hex(const std::vector<uint8_t> &bytes) {
     out << std::hex << std::setw(2) << std::setfill('0') << static_cast<int>(b);
   }
   return out.str();
+}
+
+// Streaming BCrypt file hash: reads the file in bounded chunks so hashing a
+// multi-GB installer does not require the whole file in host memory (the old
+// ReadAllBytes-based path needed 2.34 GB RAM for a 2.34 GB package). Same
+// digest as the one-shot path; throws on open/read/hash failure like before.
+std::string HashFileHex(const wchar_t *algorithm,
+                        const std::filesystem::path &path) {
+  BCryptAlg alg(algorithm);
+  DWORD hashLength = 0;
+  DWORD cbData = 0;
+  if (BCryptGetProperty(alg.get(), BCRYPT_HASH_LENGTH,
+                        reinterpret_cast<PUCHAR>(&hashLength), sizeof(hashLength),
+                        &cbData, 0) < 0) {
+    throw std::runtime_error("BCryptGetProperty(BCRYPT_HASH_LENGTH) failed");
+  }
+  std::ifstream in(path, std::ios::binary);
+  if (!in) {
+    throw std::runtime_error("unable to open file for hashing: " +
+                             PathToUtf8(path));
+  }
+  BCRYPT_HASH_HANDLE hash = nullptr;
+  if (BCryptCreateHash(alg.get(), &hash, nullptr, 0, nullptr, 0, 0) < 0) {
+    throw std::runtime_error("BCryptCreateHash failed");
+  }
+  std::vector<char> buffer(1u << 20); // 1 MiB
+  while (in) {
+    in.read(buffer.data(), static_cast<std::streamsize>(buffer.size()));
+    const std::streamsize got = in.gcount();
+    if (got <= 0) {
+      break;
+    }
+    if (BCryptHashData(hash, reinterpret_cast<PUCHAR>(buffer.data()),
+                       static_cast<ULONG>(got), 0) < 0) {
+      BCryptDestroyHash(hash);
+      throw std::runtime_error("BCryptHashData failed");
+    }
+  }
+  std::vector<uint8_t> digest(hashLength);
+  const bool ok = BCryptFinishHash(hash, digest.data(), hashLength, 0) >= 0;
+  BCryptDestroyHash(hash);
+  if (!ok) {
+    throw std::runtime_error("BCryptFinishHash failed");
+  }
+  return Hex(digest);
 }
 
 // Shared one-shot BCrypt hash: open the named algorithm, hash all of `data`,
@@ -84,7 +131,7 @@ std::string Sha256Hex(const std::vector<uint8_t> &data) {
 }
 
 std::string Sha256File(const std::filesystem::path &path) {
-  return Sha256Hex(ReadAllBytes(path));
+  return HashFileHex(BCRYPT_SHA256_ALGORITHM, path);
 }
 
 std::string Md5Hex(const std::vector<uint8_t> &data) {
@@ -92,7 +139,7 @@ std::string Md5Hex(const std::vector<uint8_t> &data) {
 }
 
 std::string Md5File(const std::filesystem::path &path) {
-  return Md5Hex(ReadAllBytes(path));
+  return HashFileHex(BCRYPT_MD5_ALGORITHM, path);
 }
 
 std::string Sha1Hex(const std::vector<uint8_t> &data) {
@@ -100,7 +147,7 @@ std::string Sha1Hex(const std::vector<uint8_t> &data) {
 }
 
 std::string Sha1File(const std::filesystem::path &path) {
-  return Sha1Hex(ReadAllBytes(path));
+  return HashFileHex(BCRYPT_SHA1_ALGORITHM, path);
 }
 
 std::optional<std::vector<uint8_t>> DpapiUnprotect(const std::vector<uint8_t> &ciphertext) {

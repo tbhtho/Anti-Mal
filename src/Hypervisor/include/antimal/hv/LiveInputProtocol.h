@@ -109,6 +109,41 @@ inline std::vector<uint8_t> EncodeMouseRecord(uint8_t buttons, int8_t dx, int8_t
           static_cast<uint8_t>(dx), static_cast<uint8_t>(dy)};
 }
 
+// Frame a mouse move/button record as one or more 'M' records, splitting a
+// displacement that exceeds the signed 8-bit PS/2 packet limit into consecutive
+// valid packets. The emitted dx/dy values sum EXACTLY to the requested
+// displacement (each record carries clamp(v,-127,127) and the remainder flows
+// into the next record), so `vminput --mouse 300,200` moves 300x200 instead of
+// the old int8 wrap to 44,-56. An all-zero displacement still emits one record
+// so a pure button press/release (dx=dy=0) has a wire representation.
+//
+// Coordinates here are PS/2-space (Y positive-up) -- EncodeMouseScreenMoveRecords
+// below is the screen-space (Y positive-down) front door every host client uses.
+inline std::vector<uint8_t> EncodeMouseMoveRecords(uint8_t buttons, int dx,
+                                                   int dy) {
+  std::vector<uint8_t> out;
+  do {
+    const int stepX = dx > 127 ? 127 : (dx < -127 ? -127 : dx);
+    const int stepY = dy > 127 ? 127 : (dy < -127 ? -127 : dy);
+    const auto rec = EncodeMouseRecord(buttons, static_cast<int8_t>(stepX),
+                                       static_cast<int8_t>(stepY));
+    out.insert(out.end(), rec.begin(), rec.end());
+    dx -= stepX;
+    dy -= stepY;
+  } while (dx != 0 || dy != 0);
+  return out;
+}
+
+// Screen-space (x right, y down) mouse move -- the ONE convention host clients
+// share (webui pointer-lock deltas, LiveVm::Mouse, `vminput --mouse`). The
+// screen Y is flipped to the PS/2 positive-up convention exactly once, here at
+// the wire boundary, and large displacements are split by EncodeMouseMoveRecords.
+inline std::vector<uint8_t> EncodeMouseScreenMoveRecords(uint8_t buttons,
+                                                         int screenDx,
+                                                         int screenDy) {
+  return EncodeMouseMoveRecords(buttons, screenDx, -screenDy);
+}
+
 // Map one ASCII character to its Set-1 make scancode (US layout), reporting
 // whether Left-Shift must wrap the tap. Returns false for characters with no
 // direct US-layout key (the caller skips them). Mirrors the UI's charToScancodes.

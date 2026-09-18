@@ -19,6 +19,7 @@
 
 #include <cstdint>
 #include <filesystem>
+#include <mutex>
 #include <string>
 #include <vector>
 
@@ -30,6 +31,8 @@ constexpr wchar_t kLiveFrameShmName[] = L"Local\\AntiMalLiveFrameV1";
 constexpr uint32_t kLiveFrameMagic = 0x414D4C46u; // 'AMLF'
 constexpr size_t kLiveFrameHeaderBytes = 64;
 constexpr wchar_t kLiveInputFileName[] = L"_live-input.bin";
+// Shared actuator-ownership record (owner + generation) used by every surface.
+constexpr wchar_t kInputLeaseFileName[] = L"_input-lease.bin";
 
 struct LiveFrame {
   bool present = false;
@@ -70,6 +73,14 @@ struct LiveRun {
 // Mirrors the GUI's discovery (App/src/WebViewHost.cpp) so agent tools and the
 // live console always agree on "the current run".
 LiveRun FindNewestRun(const std::filesystem::path &workspaceRoot);
+
+// Graceful-stop protocol (shared by `vmfinalize`, MCP `vm_finalize`, the
+// assistant's vm_finalize tool and the GUI stop): any client drops
+// `<runDir>\finalize.request`; the run loop polls this predicate and, when it
+// becomes true, ends through the NORMAL report-writing path so report.json is
+// finalized with its verdict. Pure filesystem check -- unit-testable without a
+// VM. `wasSeen` lets a caller remember it already acted on the request.
+bool FinalizeRequested(const std::filesystem::path &runDir);
 
 struct ProcessEntry {
   uint32_t pid = 0;
@@ -126,7 +137,61 @@ private:
 bool NamedKeyScancodes(const std::string &name, std::vector<uint8_t> *out);
 bool ChordScancodes(const std::string &spec, std::vector<uint8_t> *out);
 
-// ---- Coordinate-based interaction ------------------------------------------
+// ---- Input ownership (actuator lease) ---------------------------------------
+//
+// Exactly one actuator may append guest input at a time. The AI operator holds
+// the lease only while it is acting; a human takeover REVOKES it, and the
+// revoked owner's subsequent injections are rejected (stale actions cannot
+// land). Because `_live-input.bin` is append-only, "cancelling queued input"
+// means two things: stop appending (the lease), and release anything the
+// previous owner may still be holding down (keys/buttons) so the guest is not
+// left with a stuck modifier -- `ReleaseHeldGuestInput` emits those releases.
+class LiveInputLease {
+public:
+  // In-memory lease (tests, single-process callers).
+  LiveInputLease() = default;
+  // Shared lease: owner/generation live in `sharedPath`, and every operation
+  // runs under a named mutex derived from it, so GUI, CLI, MCP and the
+  // assistant all contend for the SAME lease instead of each keeping a private
+  // object. Cross-process, race-free, and observable (the file records the
+  // owner and generation).
+  explicit LiveInputLease(std::filesystem::path sharedPath);
+
+  // Returns false when another owner holds the lease.
+  bool Acquire(const std::string &owner);
+  // Only the current owner may release; a stale owner is a no-op.
+  void Release(const std::string &owner);
+  // Reassigns ownership unconditionally (human takeover) and returns the
+  // previous owner ("" when none).
+  std::string TakeOver(const std::string &newOwner);
+  bool Holds(const std::string &owner) const;
+  std::string Owner() const;
+  // Monotonic generation: increments on every ownership change so queued work
+  // tagged with an older generation can be discarded instead of replayed.
+  uint64_t Generation() const;
+
+private:
+  std::filesystem::path sharedPath_;
+  mutable std::mutex mutex_;
+  std::string owner_;
+  uint64_t generation_ = 0;
+};
+
+// Emits the release records for input the previous owner may have left held:
+// a mouse record with no buttons, plus break codes for any still-held key
+// scancodes. Returns the number of records written.
+size_t ReleaseHeldGuestInput(const LiveInputWriter &input,
+                             const std::vector<uint8_t> &heldKeyScancodes,
+                             uint8_t lastMouseButtons);
+
+// ONE human-takeover call for every human surface (GUI, CLI, MCP): claims the
+// shared actuator lease for "human" and releases mouse buttons plus the
+// Shift/Ctrl/Alt modifiers an agent may have left held. Returns true when the
+// lease was claimed. Declared separately so the GUI translation unit can call
+// it without including this header (its constants would collide there).
+bool TakeOverInputAsHuman(const std::filesystem::path &liveInputFile);
+
+
 
 struct AimOutcome {
   bool ok = false;

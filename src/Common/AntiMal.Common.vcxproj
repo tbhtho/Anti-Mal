@@ -95,6 +95,9 @@
     <ClInclude Include="include\antimal\YaraGen.h" />
   </ItemGroup>
   <ItemGroup>
+    <ClCompile Include="src\Assistant.cpp" />
+    <ClCompile Include="src\AssistantLiveVm.cpp" />
+    <ClCompile Include="src\AgentCli.cpp" />
     <ClCompile Include="src\BehaviorScore.cpp" />
     <ClCompile Include="src\BootDiagnostics.cpp" />
     <ClCompile Include="src\BootReliability.cpp" />
@@ -139,6 +142,7 @@
     <ClCompile Include="src\ProcessTelemetry.cpp" />
     <ClCompile Include="src\Report.cpp" />
     <ClCompile Include="src\ReportDiff.cpp" />
+    <ClCompile Include="src\SampleStaging.cpp" />
     <ClCompile Include="src\Scanner.cpp" />
     <ClCompile Include="src\ScriptAnalyzer.cpp" />
     <ClCompile Include="src\ShellcodeDetector.cpp" />

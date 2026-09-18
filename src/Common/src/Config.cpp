@@ -79,6 +79,20 @@ void ApplyConfigValue(AppConfig &config, std::string key, std::string value) {
     config.vmLoginMode = value;
   } else if (key == "vm_login_password") {
     config.vmLoginPassword = value;
+  } else if (key == "staging_cache_max_bytes") {
+    config.stagingCacheMaxBytes = static_cast<uint64_t>(std::stoull(value));
+  } else if (key == "assistant_enabled") {
+    config.assistantEnabled = ParseBool(value);
+  } else if (key == "assistant_provider") {
+    config.assistantProvider = value;
+  } else if (key == "assistant_base_url") {
+    config.assistantBaseUrl = value;
+  } else if (key == "assistant_model") {
+    config.assistantModel = value;
+  } else if (key == "assistant_allow_finalize") {
+    config.assistantAllowFinalize = ParseBool(value);
+  } else if (key == "assistant_sharing") {
+    config.assistantSharing = value;
   }
 }
 
@@ -157,6 +171,18 @@ std::string SerializeConfig(const AppConfig &config) {
   out << "\n# Live-VM hands-free login: password | autologon (no password) | manual.\n";
   out << "vm_login_mode = \"" << config.vmLoginMode << "\"\n";
   out << "vm_login_password = \"" << config.vmLoginPassword << "\"\n";
+  out << "\n# Immutable staging cache for large packages (0 = unlimited bytes).\n";
+  out << "staging_cache_max_bytes = " << config.stagingCacheMaxBytes << "\n";
+  out << "\n# Integrated assistant (AI harness). The API key is NOT stored here:\n";
+  out << "# it is read from ANTIMAL_ASSISTANT_API_KEY / OPENAI_API_KEY in the host\n";
+  out << "# environment. Manual AntiMal use never requires any of this.\n";
+  out << "assistant_enabled = " << boolStr(config.assistantEnabled) << "\n";
+  out << "assistant_provider = \"" << config.assistantProvider << "\"\n";
+  out << "assistant_base_url = \"" << config.assistantBaseUrl << "\"\n";
+  out << "assistant_model = \"" << config.assistantModel << "\"\n";
+  out << "assistant_allow_finalize = " << boolStr(config.assistantAllowFinalize)
+      << "\n";
+  out << "assistant_sharing = \"" << config.assistantSharing << "\"\n";
   return out.str();
 }
 

@@ -11,8 +11,10 @@
 
 #include <windows.h>
 
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
+#include <fstream>
 #include <iostream>
 #include <string>
 #include <vector>
@@ -85,6 +87,125 @@ std::string AimJson(const antimal::AimOutcome &a) {
 }
 
 } // namespace
+
+namespace {
+
+// True while some process holds the run's exclusive run.lock (i.e. a live
+// worker owns this run). Opening with share=0 fails with ERROR_SHARING_VIOLATION
+// when the worker is alive; anything else means no live worker.
+bool RunLockHeld(const std::filesystem::path &runDir) {
+  const std::filesystem::path lock = runDir / L"run.lock";
+  HANDLE h = CreateFileW(lock.c_str(), GENERIC_READ, 0 /*no share*/, nullptr,
+                         OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+  if (h != INVALID_HANDLE_VALUE) {
+    CloseHandle(h);
+    return false;
+  }
+  return GetLastError() == ERROR_SHARING_VIOLATION;
+}
+
+} // namespace
+
+// antimal vmfinalize [<run-id>] [--wait] [--timeout-sec N] [--json]
+//
+// Graceful stop for a live session: drops `<runDir>\finalize.request`, which the
+// run loop notices on its next progress tick and exits through the NORMAL
+// report-writing path. This is deliberately different from killing the worker
+// (which loses the scored verdict): the run ends with report.json finalized.
+int CommandVmFinalize(int argc, wchar_t **argv) {
+  const std::wstring explicitId = OptValue(argc, argv, L"--run");
+  const std::filesystem::path ws = WorkspaceRoot();
+  std::filesystem::path runDir;
+
+  // Positional run id (or path) and --run are equivalent.
+  std::wstring id = explicitId;
+  if (id.empty()) {
+    for (int i = 2; i < argc; ++i) {
+      const std::wstring a = argv[i];
+      if (a.rfind(L"--", 0) == 0) {
+        continue;
+      }
+      id = a;
+      break;
+    }
+  }
+  if (!id.empty()) {
+    std::filesystem::path candidate(id);
+    if (std::filesystem::is_directory(candidate)) {
+      runDir = candidate;
+    } else {
+      runDir = ws / id;
+    }
+  } else {
+    const antimal::LiveRun newest = antimal::FindNewestRun(ws);
+    runDir = newest.dir;
+  }
+  if (runDir.empty() || !std::filesystem::is_directory(runDir)) {
+    if (HasArg(argc, argv, L"--json")) {
+      std::cout << "{\"ok\":false,\"error\":\"no run directory found\"}\n";
+    } else {
+      std::cerr << "vmfinalize: no run directory found (pass a run id or boot "
+                   "a session first)\n";
+    }
+    return 2;
+  }
+
+  const bool wasLive = RunLockHeld(runDir);
+  std::error_code ec;
+  const std::filesystem::path marker = runDir / L"finalize.request";
+  {
+    std::ofstream out(marker, std::ios::binary | std::ios::trunc);
+    out << "requested=hostcli-vmfinalize\n";
+  }
+  if (!std::filesystem::exists(marker, ec)) {
+    std::cerr << "vmfinalize: could not write " << antimal::PathToUtf8(marker)
+              << "\n";
+    return 1;
+  }
+
+  const bool wait = HasArg(argc, argv, L"--wait");
+  int waitSec = 120;
+  if (const std::wstring v = OptValue(argc, argv, L"--timeout-sec");
+      !v.empty()) {
+    waitSec = _wtoi(v.c_str());
+    if (waitSec <= 0) {
+      waitSec = 120;
+    }
+  }
+  bool finalized = false;
+  if (wait) {
+    const auto deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(waitSec);
+    while (std::chrono::steady_clock::now() < deadline) {
+      if (!RunLockHeld(runDir)) {
+        break;
+      }
+      Sleep(250);
+    }
+    finalized = std::filesystem::exists(runDir / L"report.json", ec);
+  }
+
+  if (HasArg(argc, argv, L"--json")) {
+    std::cout << "{\"ok\":true,\"runDir\":"
+              << JsonQuote(antimal::PathToUtf8(runDir))
+              << ",\"wasLive\":" << (wasLive ? "true" : "false")
+              << ",\"waited\":" << (wait ? "true" : "false")
+              << ",\"reportJson\":"
+              << (std::filesystem::exists(runDir / L"report.json", ec)
+                      ? "true"
+                      : "false")
+              << "}\n";
+    return 0;
+  }
+  std::cout << "finalize requested for " << antimal::PathToUtf8(runDir)
+            << (wasLive ? " (live worker)" : " (no live worker detected)")
+            << "\n";
+  if (wait) {
+    std::cout << (finalized ? "run finalized: report.json written\n"
+                            : "waited, but report.json has not appeared yet\n");
+  }
+  return 0;
+}
 
 // antimal vmstatus [--json]
 int CommandVmStatus(int argc, wchar_t **argv) {
@@ -181,6 +302,18 @@ int CommandVmMouse(int argc, wchar_t **argv) {
   const std::wstring shm = OptValue(argc, argv, L"--shm");
   const std::wstring shmName =
       shm.empty() ? std::wstring(antimal::kLiveFrameShmName) : shm;
+
+  // Coordinate input from a person is a HUMAN TAKEOVER of actuator ownership:
+  // a queued assistant action is denied when it reaches the wire, and anything
+  // an agent left held is released before this pointer starts moving.
+  {
+    antimal::LiveInputLease lease(
+        std::filesystem::path(file).parent_path() /
+        antimal::kInputLeaseFileName);
+    lease.TakeOver("human");
+    const antimal::LiveInputWriter releaseWriter{file};
+    antimal::ReleaseHeldGuestInput(releaseWriter, {0x2A, 0x1D, 0x38}, 0x07);
+  }
 
   const antimal::LiveInputWriter input(file);
   const int tol = tolerance > 0 ? tolerance : 4;

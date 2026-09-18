@@ -170,6 +170,29 @@ const char *SuspiciousCommandLineLabel(const std::string &cmdRaw) {
   return nullptr;
 }
 
+// Consent state for an observed elevation. The collector/policy layer records
+// details["elevationApproved"] when it knows the answer; ABSENCE of that field
+// is Unknown, not "unapproved". Treating missing consent information as proof
+// of unauthorized escalation would turn every unrecorded UAC prompt into
+// evidence of malice -- exactly the false certainty the 2026-09 review flagged.
+enum class ElevationConsent { Unknown, Approved, NotApproved };
+
+ElevationConsent ElevationConsentOf(const EventRecord &e) {
+  const std::string *v = Detail(e, "elevationApproved");
+  if (v == nullptr) {
+    return ElevationConsent::Unknown;
+  }
+  const std::string l = Lower(*v);
+  if (l == "true" || l == "1" || l == "yes" || l == "approved") {
+    return ElevationConsent::Approved;
+  }
+  if (l == "false" || l == "0" || l == "no" || l == "denied" ||
+      l == "notapproved" || l == "not-approved") {
+    return ElevationConsent::NotApproved;
+  }
+  return ElevationConsent::Unknown;
+}
+
 } // namespace
 
 // Signal weights. Tuned so a single strong signal lands in Suspicious and two
@@ -197,18 +220,34 @@ BehaviorScore ScoreSandboxBehavior(const DynamicRunSummary &summary,
   // Nothing ran (gated/healthcheck) or no telemetry at all -> inconclusive.
   if (!summary.sampleExecuted || events.empty()) {
     out.verdict = Verdict::Unknown;
-    out.rationale.push_back(
-        !summary.sampleExecuted
-            ? "Sample was not executed (gated or healthcheck-only run); no "
-              "behavior to judge."
-            : "Sample executed but produced no telemetry; verdict inconclusive.");
+    // Consistent with the evidence-sufficiency contract: a run with nothing to
+    // judge is INSUFFICIENT EVIDENCE, not a negative finding. Saying so lets
+    // every consumer label it honestly instead of implying "nothing happened".
+    out.insufficientEvidence = true;
+    if (!summary.sampleExecuted) {
+      out.rationale.push_back(
+          "Sample was not executed (gated or healthcheck-only run); no "
+          "behavior to judge.");
+      out.limitations.push_back(
+          "the sample was not executed in this run, so no behavioral evidence "
+          "exists either way");
+    } else {
+      out.rationale.push_back(
+          "Sample executed but produced no telemetry; verdict inconclusive.");
+      out.limitations.push_back(
+          "the guest produced no behavioral telemetry despite the sample "
+          "launch");
+    }
     return out;
   }
 
   int persistence = 0;
+  int unattributedPersistence = 0; // registry deltas carry no PID (poll-diff)
   int exeDrops = 0;
   int dataDrops = 0;
   int privEsc = 0;
+  int approvedElevations = 0; // elevated execution approved by policy: a FACT
+  int unknownElevations = 0;  // elevated execution, consent not recorded: a FACT
   int otherMitre = 0;
   int sampleCrash = 0;
   int nonSampleCrash = 0;
@@ -299,6 +338,12 @@ BehaviorScore ScoreSandboxBehavior(const DynamicRunSummary &summary,
       if (mitreTagged || autostart) {
         if (persistenceTargets.insert(tgtL.empty() ? act : tgtL).second) {
           ++persistence;
+          // Poll-diff registry telemetry carries no owning PID, so these
+          // writes are not attributed to the sample. Still a signal, but the
+          // rationale must not imply the sample authored them.
+          if (e.processId == 0) {
+            ++unattributedPersistence;
+          }
         }
       }
     }
@@ -347,9 +392,15 @@ BehaviorScore ScoreSandboxBehavior(const DynamicRunSummary &summary,
       }
     }
 
-    // --- Privilege escalation: a child process whose integrity level is High/
-    // System while its recorded parent integrity was Medium/Low. The telemetry
-    // carries the parent's level in details["parentIntegrityLevel"] when known.
+    // --- Privilege transition: a child process whose integrity level is High/
+    // System while its recorded parent integrity was Medium/Low. Three consent
+    // states, deliberately distinct:
+    //   Approved    -> elevated execution: a recorded FACT, never scored.
+    //   NotApproved -> an explicit refusal was overridden: escalation signal.
+    //   Unknown     -> consent was simply not recorded: still a FACT (recorded
+    //                  for the analyst) but NEVER scored, because absence of
+    //                  approval information is not evidence of unauthorized
+    //                  escalation.
     if (cat == "process" &&
         (Has(act, "start") || Has(act, "create") || Has(act, "spawn"))) {
       const int childRank = IntegrityRank(e.integrityLevel);
@@ -362,9 +413,20 @@ BehaviorScore ScoreSandboxBehavior(const DynamicRunSummary &summary,
       } else if (const std::string *parentLvl = Detail(e, "parentIntegrityLevel")) {
         parentRank = IntegrityRank(*parentLvl);
       }
-      if (childRank >= 3 /* High or System */ && parentRank >= 1 &&
-          parentRank <= 2 /* Low or Medium */ && inSampleSubtree(e.processId)) {
-        ++privEsc;
+      const bool jumped = childRank >= 3 /* High or System */ &&
+                          parentRank >= 1 && parentRank <= 2 /* Low or Medium */;
+      if (jumped && inSampleSubtree(e.processId)) {
+        switch (ElevationConsentOf(e)) {
+        case ElevationConsent::Approved:
+          ++approvedElevations;
+          break;
+        case ElevationConsent::NotApproved:
+          ++privEsc;
+          break;
+        case ElevationConsent::Unknown:
+          ++unknownElevations;
+          break;
+        }
       }
     }
 
@@ -427,10 +489,25 @@ BehaviorScore ScoreSandboxBehavior(const DynamicRunSummary &summary,
     // to call persistence; real malware rarely needs more).
     const int w = std::min(35 * persistence, 105);
     out.score += w;
-    out.rationale.push_back(
-        "Persistence established: " + std::to_string(persistence) +
-        " autostart/registry-run write(s) observed (+" + std::to_string(w) +
-        ").");
+    std::string line;
+    if (unattributedPersistence == persistence) {
+      // Poll-diff registry telemetry carries no owning PID: these writes are
+      // observed, but NOT established as the sample's persistence.
+      line = "Autostart/registry-run writes observed: " +
+             std::to_string(persistence) + " (+" + std::to_string(w) +
+             "). Registry deltas carry no process id, so these writes are NOT "
+             "attributed to the sample and do NOT establish sample persistence; "
+             "they cannot alone support a Malicious verdict.";
+    } else {
+      line = "Persistence established: " + std::to_string(persistence) +
+             " autostart/registry-run write(s) attributed to the sample (+" +
+             std::to_string(w) + ").";
+      if (unattributedPersistence > 0) {
+        line += " " + std::to_string(unattributedPersistence) +
+                " further write(s) carry no process id (unattributed).";
+      }
+    }
+    out.rationale.push_back(std::move(line));
   }
   if (exeDrops > 0) {
     const int w = 30 * exeDrops;
@@ -440,12 +517,47 @@ BehaviorScore ScoreSandboxBehavior(const DynamicRunSummary &summary,
         " file(s) (+" + std::to_string(w) + ").");
   }
   if (privEsc > 0) {
-    const int w = 35 * privEsc;
+    // An explicit "not approved" consent record is an UNAPPROVED ELEVATION --
+    // an application-grant fact. It is deliberately NOT described as an
+    // exploitation mechanism: this observation shows the privilege transition,
+    // not how it was obtained (a legitimately elevated helper, a service, or an
+    // exploit all look identical here).
+    const int w = 20 * privEsc;
     out.score += w;
     out.rationale.push_back(
-        "Privilege escalation: " + std::to_string(privEsc) +
-        " High/System-integrity child spawned from a Medium/Low parent (+" +
-        std::to_string(w) + ").");
+        "Unapproved elevation: " + std::to_string(privEsc) +
+        " High/System-integrity child process(es) spawned from a Medium/Low "
+        "parent where the recorded consent state was explicitly not approved "
+        "(+" + std::to_string(w) +
+        "). This is an unapproved privilege transition, not evidence of an "
+        "exploitation mechanism -- the mechanism is not established by this "
+        "observation, and it is not sample-attributable malice on its own.");
+  }
+  if (approvedElevations > 0) {
+    // Elevated execution the run policy approved is a FACT about the run, not
+    // an exploit signal. Scoring it as escalation would turn every approved
+    // UAC prompt into "malice" -- exactly the false certainty F1 flagged.
+    out.rationale.push_back(
+        "Elevated execution observed: " + std::to_string(approvedElevations) +
+        " High/System child process(es) spawned from a Medium/Low parent with "
+        "recorded policy approval -- recorded as a fact, not scored as an "
+        "exploit.");
+  }
+  if (unknownElevations > 0) {
+    // Consent state was simply never recorded for this elevation. That is an
+    // information gap, not evidence of an unauthorized transition: record the
+    // fact and make the gap visible instead of scoring it.
+    out.rationale.push_back(
+        "Elevated execution observed: " + std::to_string(unknownElevations) +
+        " High/System child process(es) spawned from a Medium/Low parent; "
+        "consent/approval state was NOT recorded for this launch -- recorded as "
+        "a fact, not scored as escalation (missing approval information is not "
+        "evidence of unauthorized privilege escalation).");
+    out.limitations.push_back(
+        "elevation consent state was not recorded for " +
+        std::to_string(unknownElevations) +
+        " privilege transition(s); elevated execution is reported as a fact "
+        "without an attribution conclusion");
   }
   if (suspMod > 0) {
     // First side-loaded/hijacked DLL is moderate; each additional one adds less,
@@ -549,19 +661,25 @@ BehaviorScore ScoreSandboxBehavior(const DynamicRunSummary &summary,
   // they can make a clean boot look busy but must not ALONE produce a Malicious
   // verdict (the benign-probe FP: 48 OS autostart writes + 12 shell crashes =>
   // "malicious"). The stronger, rarer signals (a dropped executable, outbound
-  // egress, privilege escalation, a suspicious command line, DLL side-loading, or
-  // other MITRE-tagged behavior) are far more attributable to the sample; require
-  // at least one of them to call Malicious. Without one, cap at Suspicious.
+  // egress, a suspicious command line, DLL side-loading, or other MITRE-tagged
+  // behavior) are far more attributable to the sample; require at least one of
+  // them to call Malicious. Without one, cap at Suspicious.
+  //
+  // An UNEXPECTED elevation is deliberately NOT in this set (2026-09 review):
+  // it proves the process obtained higher privilege, not that it did anything
+  // malicious with it, and it is trivially produced by a legitimate installer's
+  // UAC prompt. It contributes weight/context, never the Malicious corroboration.
   const bool attributableMalice =
-      exeDrops || extNet || privEsc || suspCmd || suspMod || otherMitre;
+      exeDrops || extNet || suspCmd || suspMod || otherMitre;
   if (out.verdict == Verdict::Malicious && !attributableMalice) {
     out.verdict = Verdict::Suspicious;
     out.rationale.push_back(
         "Capped at Suspicious: the score is driven only by non-attributable "
-        "signals (registry persistence / file drops / host-process crashes) that "
-        "the sandbox's own boot and shell can produce; no sample-attributable "
-        "malice (dropped executable, network egress, privilege escalation, "
-        "suspicious command line, DLL side-loading) corroborated it.");
+        "signals (unattributed registry persistence / file drops / host-process "
+        "crashes) and/or an unexpected elevation that did not require or "
+        "demonstrate malicious intent; no sample-attributable malice (dropped "
+        "executable, network egress, suspicious command line, DLL side-loading) "
+        "corroborated it.");
   }
   if (sampleSigned && out.score >= 60 && out.verdict != Verdict::Malicious) {
     out.rationale.push_back(
@@ -576,12 +694,66 @@ BehaviorScore ScoreSandboxBehavior(const DynamicRunSummary &summary,
         "signature is not proof of benignity).");
   }
 
+  // ---- Evidence-sufficiency gate (2026-09 review F1). ----
+  // A reassuring negative requires an observation that could have seen the
+  // behavior it is denying: the run must have reached a declared end state
+  // (normal completion or its time budget), the guest telemetry channel must
+  // have been confirmed, and the journal must contain behavioral telemetry
+  // beyond the sample launch. Anything less is recorded as an explicit
+  // limitation; with no positive evidence the verdict is WITHHELD as
+  // insufficient evidence instead of reported Clean. Positive behavior found
+  // under partial coverage is KEPT (incomplete does not erase observed harm)
+  // and the limitation lines travel with it.
+  const bool declaredEnd =
+      summary.completed || summary.timedOut || summary.crashed;
+  const bool interrupted = summary.started && !declaredEnd;
+  std::vector<std::string> coverageLimits;
+  if (interrupted) {
+    coverageLimits.push_back(
+        "the run ended without a completion signal (interrupted, or the worker "
+        "was lost before the declared end)");
+  }
+  if (!summary.guestAgentConnected) {
+    coverageLimits.push_back(
+        "the guest telemetry channel never confirmed a healthy agent, so "
+        "collector coverage is unverified");
+  }
+  if (events.size() < 2) {
+    coverageLimits.push_back(
+        "the journal contains no behavioral telemetry beyond the sample "
+        "launch");
+  }
+  if (!coverageLimits.empty()) {
+    std::string joined;
+    for (const auto &l : coverageLimits) {
+      joined += (joined.empty() ? "" : "; ") + l;
+    }
+    const bool positiveEvidence = out.verdict == Verdict::Suspicious ||
+                                  out.verdict == Verdict::Malicious;
+    if (!positiveEvidence) {
+      out.verdict = Verdict::Unknown;
+      out.insufficientEvidence = true;
+      out.rationale.push_back(
+          "VERDICT WITHHELD -- insufficient observation: " + joined +
+          ". Absence of observed behavior under incomplete coverage is not "
+          "evidence of benignity.");
+    } else {
+      out.rationale.push_back(
+          "Partial-coverage note: observation was incomplete (" + joined +
+          "); the positive findings above stand, but they describe only what "
+          "was captured before/while coverage was limited.");
+    }
+    for (auto &l : coverageLimits) {
+      out.limitations.push_back(std::move(l));
+    }
+  }
+
   // ---- Timeout false-positive guard. ----
   // Hitting the time budget is NOT itself a malicious act. If the run merely
   // timed out without accumulating real behavior, say so explicitly and keep
   // the Clean verdict -- this is the documented "benign sample ran to timeout
   // looks Malicious" regression, killed here.
-  if (summary.timedOut) {
+  if (summary.timedOut && !out.insufficientEvidence) {
     if (!richBehavior) {
       out.rationale.push_back(
           "Run reached its time budget without exhibiting malicious behavior; "

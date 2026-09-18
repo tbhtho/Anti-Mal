@@ -585,6 +585,12 @@ using VmProgressCallback = std::function<void(const VmProgressSnapshot &)>;
 struct VmRunRequest {
   int maxSteps = 100000;
   std::chrono::milliseconds timeout{180000};
+  // Genuine "until stopped": no wall-clock deadline at all. This is NOT a giant
+  // timeout -- the run loop simply never declares `timedOut`, so the run ends
+  // only on an explicit stop request, guest shutdown, a fatal fault, or the
+  // step cap. Used by interactive sessions the operator asked to keep running.
+  // `timeout` is ignored (kept for diagnostics/reporting) when this is set.
+  bool noDeadline = false;
   VmNetworkMode networkMode = VmNetworkMode::Disabled;
   // Optional callback fired every `progressInterval` while the VM is running.
   // Callback is invoked from the host run-loop thread — keep it cheap; it

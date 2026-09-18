@@ -9,8 +9,10 @@
 #include <filesystem>
 #include <fstream>
 #include <array>
+#include <list>
 #include <map>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 namespace antimal::hv {
@@ -203,23 +205,45 @@ public:
                     const uint8_t *data) override;
   bool Flush() override;
 
-  size_t OverlaySectorCount() const noexcept { return overlaySectors_.size(); }
+  size_t OverlaySectorCount() const noexcept { return overlayIndex_.size(); }
+  // True when the last Indexed open loaded the validated <overlay>.idx
+  // sidecar instead of rescanning the records (observability for tests and
+  // diagnostics). CachedSectorCount reports the bounded LRU occupancy.
+  bool IndexLoadedFromSidecar() const noexcept { return indexFromSidecar_; }
+  size_t CachedSectorCount() const noexcept { return cache_.size(); }
 
 private:
   using Sector = std::array<uint8_t, kSectorSize>;
+  struct CacheEntry {
+    Sector data{};
+    std::list<uint64_t>::iterator lru;
+  };
 
   CowRawBlockDevice(ReadOnlyRawBlockDevice base,
                     std::filesystem::path overlayPath,
                     std::fstream overlayStream,
-                    std::map<uint64_t, Sector> overlaySectors);
+                    std::map<uint64_t, uint64_t> overlayIndex);
 
   bool RangeValid(uint64_t lba, uint16_t count) const noexcept;
-  bool AppendOverlaySector(uint64_t lba, const uint8_t *data);
+  bool AppendOverlaySectors(uint64_t lba, uint16_t count, const uint8_t *data);
+  // Sector data is fetched from the overlay file on demand and kept in a
+  // bounded LRU (not in an unbounded map -- a large install must not grow the
+  // host worker's memory by the size of everything the guest wrote).
+  const Sector *CachedSector(uint64_t lba);
+  const Sector *PutCache(uint64_t lba, const Sector &sector);
 
   ReadOnlyRawBlockDevice base_;
   std::filesystem::path overlayPath_;
   std::fstream overlayStream_;
-  std::map<uint64_t, Sector> overlaySectors_;
+  // lba -> byte offset of that sector's 512-byte payload inside the overlay
+  // file. Compact (16 bytes/sector = ~3% of the modified data) and
+  // reconstructed from the append-only records on Open (or loaded from the
+  // validated `<overlay>.idx` sidecar).
+  std::map<uint64_t, uint64_t> overlayIndex_;
+  bool indexDirty_ = false; // persisted on close so the next open skips the scan
+  bool indexFromSidecar_ = false; // last open loaded a validated sidecar
+  std::unordered_map<uint64_t, CacheEntry> cache_;
+  std::list<uint64_t> cacheLru_; // front = most recently used
 };
 
 class CowOverlayBlockDevice final : public IBlockDevice {
@@ -243,23 +267,36 @@ public:
                     const uint8_t *data) override;
   bool Flush() override;
 
-  size_t OverlaySectorCount() const noexcept { return overlaySectors_.size(); }
+  size_t OverlaySectorCount() const noexcept { return overlayIndex_.size(); }
+  bool IndexLoadedFromSidecar() const noexcept { return indexFromSidecar_; }
+  size_t CachedSectorCount() const noexcept { return cache_.size(); }
 
 private:
   using Sector = std::array<uint8_t, kSectorSize>;
+  struct CacheEntry {
+    Sector data{};
+    std::list<uint64_t>::iterator lru;
+  };
 
   CowOverlayBlockDevice(IBlockDevice *base,
                         std::filesystem::path overlayPath,
                         std::fstream overlayStream,
-                        std::map<uint64_t, Sector> overlaySectors);
+                        std::map<uint64_t, uint64_t> overlayIndex);
 
   bool RangeValid(uint64_t lba, uint16_t count) const noexcept;
-  bool AppendOverlaySector(uint64_t lba, const uint8_t *data);
+  bool AppendOverlaySectors(uint64_t lba, uint16_t count, const uint8_t *data);
+  const Sector *CachedSector(uint64_t lba);
+  const Sector *PutCache(uint64_t lba, const Sector &sector);
 
   IBlockDevice *base_ = nullptr;
   std::filesystem::path overlayPath_;
   std::fstream overlayStream_;
-  std::map<uint64_t, Sector> overlaySectors_;
+  // lba -> payload offset in the overlay file (see CowRawBlockDevice).
+  std::map<uint64_t, uint64_t> overlayIndex_;
+  bool indexDirty_ = false; // persisted on close so the next open skips the scan
+  bool indexFromSidecar_ = false; // last open loaded a validated sidecar
+  std::unordered_map<uint64_t, CacheEntry> cache_;
+  std::list<uint64_t> cacheLru_; // front = most recently used
 };
 
 struct JobMediaEntry {
@@ -286,5 +323,17 @@ private:
 
   std::vector<uint8_t> bytes_;
 };
+
+// Re-binds a VALIDATED COW index sidecar to a byte-for-byte copy of the overlay
+// it describes (the seed-snapshot carry-over path). The source sidecar must
+// validate against the source overlay first -- identity included -- and the copy
+// must be the same byte length, which is what makes the mapping transferable.
+// The destination sidecar is written with the COPY's file identity so the normal
+// loader accepts it for the copy and only for the copy. Returns false with
+// `error` set when the source sidecar is missing, stale, foreign, or corrupt;
+// callers then simply pay the rebuild.
+bool BindCowIndexSidecarToCopy(const std::filesystem::path &sourceOverlay,
+                               const std::filesystem::path &copyOverlay,
+                               std::string *error);
 
 } // namespace antimal::hv

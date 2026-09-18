@@ -17,6 +17,19 @@ struct BehaviorScore {
   int score = 0;
   Verdict verdict = Verdict::Unknown;
   std::vector<std::string> rationale;
+
+  // --- Evidence-quality bookkeeping (see the sufficiency contract below). ---
+  // True when the verdict had to be WITHHELD because the observation was too
+  // thin to judge (interrupted run / no completion signal / telemetry channel
+  // never confirmed). When this is set the verdict is Unknown and the rationale
+  // says exactly what was missing -- "we did not see" is never reported as
+  // "nothing happened".
+  bool insufficientEvidence = false;
+  // Explicit observation limits that applied to this run, whether or not a
+  // verdict was reached ("run ended without a completion signal", "guest
+  // telemetry channel unconfirmed", ...). Carried into the report so the UI can
+  // label a Clean/Suspicious/Malicious headline as partial-coverage when it is.
+  std::vector<std::string> limitations;
 };
 
 // Score a completed detonation purely from what the guest was observed to do.
@@ -31,8 +44,21 @@ struct BehaviorScore {
 //   * It NEVER returns Verdict::Error. Error is reserved for an actual run
 //     failure (VM crash, boot failure) and is set by the caller, not here.
 //   * Hitting the time budget is, by itself, NOT a malicious signal. A benign
-//     sample that idled until timeout scores Clean, and the rationale says so
-//     explicitly -- this kills the classic "ran to timeout => Malicious" FP.
+//     sample that idled to its time budget scores Clean, and the rationale says
+//     so explicitly -- this kills the classic "ran to timeout => Malicious" FP.
+//   * Evidence sufficiency gate (2026-09 review F1): a reassuring negative
+//     (Clean) requires a run that reached a declared end state AND a confirmed
+//     guest telemetry channel AND behavioral telemetry beyond the sample launch.
+//     When any of those is missing and no positive behavior was observed the
+//     verdict is WITHHELD (Unknown + insufficientEvidence) rather than reported
+//     as Clean; when positive evidence exists it is kept and the partial
+//     coverage is recorded in `limitations`. `sampleExecuted=false` stays
+//     Unknown as before.
+//   * Elevation is recorded as a FACT, not an exploit: a High/System child of a
+//     Medium/Low parent is scored as escalation ONLY when the event does not
+//     carry a policy-approval marker (`details["elevationApproved"]`), and
+//     even an unexpected elevation never counts as the sample-attributable
+//     corroboration required for Malicious (a UAC consent is not a payload).
 //   * The verdict is driven by observed behavior (persistence, drops, egress,
 //     privilege escalation, side-loaded DLLs, suspicious command lines, crashes),
 //     each of which adds weight AND a rationale line.

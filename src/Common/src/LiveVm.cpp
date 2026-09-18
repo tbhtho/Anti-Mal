@@ -11,6 +11,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <fstream>
 #include <cstring>
 #include <thread>
 
@@ -41,8 +42,6 @@ uint64_t PathMtime(const std::filesystem::path &p) {
   t.HighPart = fad.ftLastWriteTime.dwHighDateTime;
   return t.QuadPart;
 }
-
-int ClampToInt8(int v) { return v < -127 ? -127 : (v > 127 ? 127 : v); }
 
 // Best-effort command line for a running process (PEB walk). Only used to
 // distinguish the VM host (`detonate`) from an unrelated HostCli invocation
@@ -242,6 +241,14 @@ bool LiveRun::HasJournal() const {
   return std::filesystem::exists(eventsJsonl, ec);
 }
 
+bool FinalizeRequested(const std::filesystem::path &runDir) {
+  if (runDir.empty()) {
+    return false;
+  }
+  std::error_code ec;
+  return std::filesystem::exists(runDir / L"finalize.request", ec);
+}
+
 LiveRun FindNewestRun(const std::filesystem::path &workspaceRoot) {
   namespace fs = std::filesystem;
   LiveRun best;
@@ -393,10 +400,10 @@ bool LiveInputWriter::Chord(const std::string &spec) const {
 
 bool LiveInputWriter::Mouse(uint8_t buttons, int screenDx,
                             int screenDy) const {
-  // Screen space has Y down; the PS/2 packet's Y is positive-up.
-  return AppendFramed(hv::EncodeMouseRecord(
-      buttons, static_cast<int8_t>(ClampToInt8(screenDx)),
-      static_cast<int8_t>(ClampToInt8(-screenDy))));
+  // Screen space has Y down; the wire encoder flips it to PS/2 Y-up once and
+  // splits displacements beyond the signed-8-bit packet limit (a 300 px step
+  // used to wrap). No clamping here -- the splitter preserves the total.
+  return AppendFramed(hv::EncodeMouseScreenMoveRecords(buttons, screenDx, screenDy));
 }
 
 bool NamedKeyScancodes(const std::string &name, std::vector<uint8_t> *out) {
@@ -501,7 +508,25 @@ AimOutcome AimLivePointer(const LiveInputWriter &input,
     return out;
   }
 
-  // 1. Probe until the pointer demonstrably moves, then learn its sprite. The
+  // 1. Prime the pointer. Windows does not render a mouse pointer until the
+  // first mouse event, and the framebuffer shows nothing for the learner until
+  // it does -- live testing (2026-09-17) had the whole aim fail on a freshly
+  // booted guest for exactly this reason. Send a tiny wake move and settle on a
+  // frame pair that already contains the drawn pointer.
+  input.Mouse(holdButtons, 1, 0);
+  Sleep(120);
+  {
+    LiveFrame primed = WaitForLiveFrame(cur.frameSeq, shmName, 900);
+    if (primed.present) {
+      cur = std::move(primed);
+      LiveFrame settled = WaitForLiveFrame(cur.frameSeq, shmName, 700);
+      if (settled.present) {
+        cur = std::move(settled);
+      }
+    }
+  }
+
+  // 2. Probe until the pointer demonstrably moves, then learn its sprite. The
   // probe also measures the pointer's response, so a dead input channel fails
   // fast instead of silently clicking nothing.
   CursorSprite sprite;
@@ -511,7 +536,16 @@ AimOutcome AimLivePointer(const LiveInputWriter &input,
   for (const auto &probe : kProbes) {
     input.Mouse(holdButtons, probe[0], probe[1]);
     Sleep(160);
+    // Wait for TWO frames newer than the baseline: the guest may have been
+    // mid-paint when the probe landed, so the first frame we see can predate
+    // its response (live finding: the "after" frame was stale at idle cadence).
     LiveFrame next = WaitForLiveFrame(cur.frameSeq, shmName, 700);
+    if (next.present) {
+      LiveFrame newer = WaitForLiveFrame(next.frameSeq, shmName, 700);
+      if (newer.present) {
+        next = std::move(newer);
+      }
+    }
     if (!next.present) {
       break;
     }
@@ -635,6 +669,239 @@ ClickOutcome DragLivePointer(const LiveInputWriter &input,
   }
   out.ok = true;
   return out;
+}
+
+// ---- Input ownership (actuator lease) ---------------------------------------
+
+namespace {
+
+// Shared-lease record + named mutex. The record is tiny and rewritten in place
+// under the mutex; readers always see a consistent owner/generation pair.
+struct SharedLeaseRecord {
+  std::string owner;
+  uint64_t generation = 0;
+};
+
+std::wstring LeaseMutexName(const std::filesystem::path &path) {
+  const std::string text = PathToUtf8(path);
+  uint64_t hash = 1469598103934665603ull;
+  for (char c : text) {
+    hash ^= static_cast<uint8_t>(c);
+    hash *= 1099511628211ull;
+  }
+  wchar_t buf[64]{};
+  _snwprintf_s(buf, _TRUNCATE, L"Local\\AntiMalInputLease_%016llX",
+               static_cast<unsigned long long>(hash));
+  return buf;
+}
+
+class NamedLeaseLock {
+public:
+  explicit NamedLeaseLock(const std::filesystem::path &path)
+      : name_(LeaseMutexName(path)) {
+    handle_ = CreateMutexW(nullptr, FALSE, name_.c_str());
+    if (handle_ != nullptr) {
+      WaitForSingleObject(handle_, 15000);
+    }
+  }
+  ~NamedLeaseLock() {
+    if (handle_ != nullptr) {
+      ReleaseMutex(handle_);
+      CloseHandle(handle_);
+    }
+  }
+  NamedLeaseLock(const NamedLeaseLock &) = delete;
+  NamedLeaseLock &operator=(const NamedLeaseLock &) = delete;
+
+private:
+  std::wstring name_;
+  HANDLE handle_ = nullptr;
+};
+
+SharedLeaseRecord ReadSharedLease(const std::filesystem::path &path) {
+  SharedLeaseRecord record;
+  std::ifstream in(path, std::ios::binary);
+  if (!in) {
+    return record;
+  }
+  uint32_t magic = 0;
+  uint64_t generation = 0;
+  uint32_t length = 0;
+  in.read(reinterpret_cast<char *>(&magic), sizeof(magic));
+  in.read(reinterpret_cast<char *>(&generation), sizeof(generation));
+  in.read(reinterpret_cast<char *>(&length), sizeof(length));
+  if (magic != 0x4C4C4D41u /*'AMLL'*/ || length > 64) {
+    return record; // unreadable or foreign: treat as unowned
+  }
+  record.owner.assign(length, '\0');
+  if (length > 0) {
+    in.read(record.owner.data(), static_cast<std::streamsize>(length));
+    if (!in) {
+      record.owner.clear();
+      return record;
+    }
+  }
+  record.generation = generation;
+  return record;
+}
+
+void WriteSharedLease(const std::filesystem::path &path,
+                      const SharedLeaseRecord &record) {
+  const std::filesystem::path temp = path.wstring() + L".tmp";
+  {
+    std::ofstream out(temp, std::ios::binary | std::ios::trunc);
+    if (!out) {
+      return;
+    }
+    const uint32_t magic = 0x4C4C4D41u;
+    const uint32_t length = static_cast<uint32_t>(record.owner.size());
+    out.write(reinterpret_cast<const char *>(&magic), sizeof(magic));
+    out.write(reinterpret_cast<const char *>(&record.generation),
+              sizeof(record.generation));
+    out.write(reinterpret_cast<const char *>(&length), sizeof(length));
+    if (length > 0) {
+      out.write(record.owner.data(), static_cast<std::streamsize>(length));
+    }
+    if (!out) {
+      std::error_code ec;
+      std::filesystem::remove(temp, ec);
+      return;
+    }
+  }
+  std::error_code ec;
+  std::filesystem::rename(temp, path, ec);
+  if (ec) {
+    std::filesystem::remove(path, ec);
+    std::filesystem::rename(temp, path, ec);
+  }
+}
+
+} // namespace
+
+LiveInputLease::LiveInputLease(std::filesystem::path sharedPath)
+    : sharedPath_(std::move(sharedPath)) {}
+
+bool LiveInputLease::Acquire(const std::string &owner) {
+  if (sharedPath_.empty()) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (!owner_.empty() && owner_ != owner) {
+      return false;
+    }
+    if (owner_ != owner) {
+      owner_ = owner;
+      ++generation_;
+    }
+    return true;
+  }
+  NamedLeaseLock lock(sharedPath_);
+  SharedLeaseRecord record = ReadSharedLease(sharedPath_);
+  if (!record.owner.empty() && record.owner != owner) {
+    return false;
+  }
+  if (record.owner != owner) {
+    record.owner = owner;
+    record.generation += 1;
+    WriteSharedLease(sharedPath_, record);
+  }
+  return true;
+}
+
+void LiveInputLease::Release(const std::string &owner) {
+  if (sharedPath_.empty()) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (owner_ == owner) {
+      owner_.clear();
+      ++generation_;
+    }
+    return;
+  }
+  NamedLeaseLock lock(sharedPath_);
+  SharedLeaseRecord record = ReadSharedLease(sharedPath_);
+  if (record.owner == owner) {
+    record.owner.clear();
+    record.generation += 1;
+    WriteSharedLease(sharedPath_, record);
+  }
+}
+
+std::string LiveInputLease::TakeOver(const std::string &newOwner) {
+  if (sharedPath_.empty()) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    std::string previous = owner_;
+    if (previous != newOwner) {
+      owner_ = newOwner;
+      ++generation_;
+    }
+    return previous;
+  }
+  NamedLeaseLock lock(sharedPath_);
+  SharedLeaseRecord record = ReadSharedLease(sharedPath_);
+  const std::string previous = record.owner;
+  if (previous != newOwner) {
+    record.owner = newOwner;
+    record.generation += 1;
+    WriteSharedLease(sharedPath_, record);
+  }
+  return previous;
+}
+
+bool LiveInputLease::Holds(const std::string &owner) const {
+  if (sharedPath_.empty()) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return !owner_.empty() && owner_ == owner;
+  }
+  NamedLeaseLock lock(sharedPath_);
+  const SharedLeaseRecord record = ReadSharedLease(sharedPath_);
+  return !record.owner.empty() && record.owner == owner;
+}
+
+std::string LiveInputLease::Owner() const {
+  if (sharedPath_.empty()) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return owner_;
+  }
+  NamedLeaseLock lock(sharedPath_);
+  return ReadSharedLease(sharedPath_).owner;
+}
+
+uint64_t LiveInputLease::Generation() const {
+  if (sharedPath_.empty()) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return generation_;
+  }
+  NamedLeaseLock lock(sharedPath_);
+  return ReadSharedLease(sharedPath_).generation;
+}
+
+size_t ReleaseHeldGuestInput(const LiveInputWriter &input,
+                             const std::vector<uint8_t> &heldKeyScancodes,
+                             uint8_t lastMouseButtons) {
+  size_t records = 0;
+  if (lastMouseButtons != 0) {
+    if (input.Mouse(0, 0, 0)) { // release every mouse button
+      ++records;
+    }
+  }
+  for (uint8_t code : heldKeyScancodes) {
+    if (code == 0 || code >= 0x80) {
+      continue; // already a break code or a no-op
+    }
+    // Plain Set-1 break. Windows also accepts this form for the non-extended
+    // variants of the keys whose makes carry an E0 prefix.
+    std::vector<uint8_t> release{static_cast<uint8_t>(code | 0x80)};
+    if (input.KeyScancodes(release)) {
+      ++records;
+    }
+  }
+  return records;
+}
+
+bool TakeOverInputAsHuman(const std::filesystem::path &liveInputFile) {
+  LiveInputLease lease(liveInputFile.parent_path() / kInputLeaseFileName);
+  lease.TakeOver("human");
+  const LiveInputWriter releaseWriter{liveInputFile};
+  ReleaseHeldGuestInput(releaseWriter, {0x2A, 0x1D, 0x38}, 0x07);
+  return true;
 }
 
 } // namespace antimal

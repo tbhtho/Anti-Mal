@@ -755,6 +755,10 @@ AnalysisReport ParseReportJson(const std::string &text,
   report.sandboxVerdict = ParseVerdictValue(Member(root, "sandboxVerdict"));
   report.verdictScore = IntValue(Member(root, "verdictScore"), 0);
   report.verdictRationale = StringArrayValue(Member(root, "verdictRationale"));
+  report.verdictInsufficientEvidence =
+      BoolValue(Member(root, "verdictInsufficientEvidence"));
+  report.verdictLimitations =
+      StringArrayValue(Member(root, "verdictLimitations"));
   report.dynamicSummary = ParseDynamicSummary(Member(root, "dynamicSummary"));
   report.events = ParseEvents(Member(root, "events"));
   report.mitreTechniques = StringArrayValue(Member(root, "mitreTechniques"));
@@ -1703,6 +1707,8 @@ std::string BuildHtmlReportWithFrames(const AnalysisReport &report,
                          ? Verdict::Suspicious
                      : scan.verdict == Verdict::Error || report.sandboxVerdict == Verdict::Error
                          ? Verdict::Error
+                     : report.verdictInsufficientEvidence || report.sandboxVerdict == Verdict::Unknown
+                         ? Verdict::Unknown
                          : Verdict::Clean;
 
   std::ostringstream html;
@@ -1736,6 +1742,8 @@ std::string BuildHtmlReportWithFrames(const AnalysisReport &report,
       worst == Verdict::Malicious  ? "Malicious activity detected"
       : worst == Verdict::Suspicious ? "Suspicious activity detected"
       : worst == Verdict::Error      ? "Dynamic analysis unavailable or blocked"
+      : worst == Verdict::Unknown
+          ? "Insufficient evidence to judge -- no conclusion reached"
                                      : "No high-confidence threats detected";
   html << "<div class=\"banner " << HtmlEscape(ToString(worst)) << "\">"
        << HtmlEscape(banner) << "</div>";
@@ -1761,6 +1769,13 @@ std::string BuildHtmlReportWithFrames(const AnalysisReport &report,
   if (!report.verdictRationale.empty()) {
     html << "<div class=\"k\">why this verdict</div><div><ul class=\"why\">";
     for (const auto &line : report.verdictRationale) {
+      html << "<li>" << HtmlEscape(line) << "</li>";
+    }
+    html << "</ul></div>";
+  }
+  if (!report.verdictLimitations.empty()) {
+    html << "<div class=\"k\">observation limits</div><div><ul class=\"why\">";
+    for (const auto &line : report.verdictLimitations) {
       html << "<li>" << HtmlEscape(line) << "</li>";
     }
     html << "</ul></div>";

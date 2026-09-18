@@ -25,6 +25,9 @@ $src = Join-Path $root "samples\probe\antimal_probe.cpp"
 $outDir = Join-Path $root "bin\x64\$Configuration"
 $objDir = Join-Path $root "obj\SampleProbe\x64\$Configuration"
 $exe = Join-Path $outDir "AntiMal.SampleProbe.exe"
+$guiSrc = Join-Path $root "samples\probe\antimal_gui_probe.cpp"
+$guiExe = Join-Path $outDir "AntiMal.GuiProbe.exe"
+if (-not (Test-Path $guiSrc)) { throw "GUI probe source not found: $guiSrc" }
 
 if (-not (Test-Path $src)) { throw "probe source not found: $src" }
 New-Item -ItemType Directory -Force -Path $outDir | Out-Null
@@ -46,6 +49,8 @@ $bat = @"
 call "$vcvars" >nul
 if errorlevel 1 exit /b 1
 cl /nologo /EHsc /O2 /MT /W3 /std:c++17 /Fo"$objDir\\" /Fe"$exe" "$src" /link ws2_32.lib advapi32.lib
+if errorlevel 1 exit /b 1
+cl /nologo /EHsc /O2 /MT /W3 /std:c++17 /Fo"$objDir\\" /Fe"$guiExe" "$guiSrc" /link ws2_32.lib advapi32.lib user32.lib gdi32.lib /SUBSYSTEM:WINDOWS
 exit /b %errorlevel%
 "@
 Set-Content -Path $batPath -Value $bat -Encoding ASCII
@@ -56,3 +61,6 @@ if ($LASTEXITCODE -ne 0) { throw "cl.exe build failed with exit code $LASTEXITCO
 if (-not (Test-Path $exe)) { throw "build reported success but $exe is missing" }
 $fi = Get-Item $exe
 Write-Host "Built $($fi.FullName)  ($($fi.Length) bytes)"
+if (-not (Test-Path $guiExe)) { throw "build reported success but $guiExe is missing" }
+$gi = Get-Item $guiExe
+Write-Host "Built $($gi.FullName)  ($($gi.Length) bytes)"

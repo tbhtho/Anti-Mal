@@ -12,8 +12,10 @@
 //   antimal vminput --file live.bin --text "hello world" --delay 40
 //   antimal vminput --file live.bin --chord alt+f4
 //   antimal vminput --file live.bin --mouse 120,-60,1 --mouse -120,60,0
+//   (--mouse deltas are SCREEN-space: x right, y down.)
 #include <windows.h>
 
+#include "antimal/LiveVm.h"
 #include "antimal/hv/LiveInputProtocol.h"
 
 #include <cstdint>
@@ -235,9 +237,11 @@ int CommandVmInput(int argc, wchar_t **argv) {
       int dx = 0, dy = 0, buttons = 0;
       const int n = std::sscanf(spec.c_str(), "%d,%d,%d", &dx, &dy, &buttons);
       if (n >= 2) {
-        const auto rec = antimal::hv::EncodeMouseRecord(
-            static_cast<uint8_t>(buttons), static_cast<int8_t>(dx),
-            static_cast<int8_t>(dy));
+        // SCREEN-space convention (x right, y down) -- same as `vmmouse` and
+        // the webui. The encoder flips Y once and splits displacements beyond
+        // the signed-8-bit PS/2 packet limit, so large moves no longer wrap.
+        const auto rec = antimal::hv::EncodeMouseScreenMoveRecords(
+            static_cast<uint8_t>(buttons), dx, dy);
         ok = AppendBytes(file, rec) && ok;
         any = true;
       } else {
@@ -252,11 +256,25 @@ int CommandVmInput(int argc, wchar_t **argv) {
     }
   }
 
+  // Operator input is a HUMAN TAKEOVER: it claims actuator ownership in the
+  // shared lease (so a queued assistant action is denied at delivery time) and
+  // releases anything an agent may have left held (buttons/modifiers).
+  if (!file.empty()) {
+    antimal::LiveInputLease lease(
+        std::filesystem::path(file).parent_path() /
+        antimal::kInputLeaseFileName);
+    lease.TakeOver("human");
+    const antimal::LiveInputWriter releaseWriter{std::filesystem::path(file)};
+    antimal::ReleaseHeldGuestInput(releaseWriter, {0x2A, 0x1D, 0x38}, 0x07);
+  }
+
   if (file.empty() || !any) {
     std::fprintf(stderr,
                  "usage: antimal vminput --file <live-input.bin> "
                  "[--text \"...\"] [--key Enter] [--chord alt+f4] "
-                 "[--mouse dx,dy[,buttons]] [--delay ms]\n");
+                 "[--mouse dx,dy[,buttons]] [--delay ms]\n"
+                 "  --mouse is SCREEN-space (x right, y down), matching vmmouse;\n"
+                 "  large deltas are split into valid PS/2 packets, not wrapped.\n");
     return 2;
   }
   return ok ? 0 : 1;

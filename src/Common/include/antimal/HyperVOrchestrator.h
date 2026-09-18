@@ -170,6 +170,13 @@ struct DetonationResult {
   std::filesystem::path artifactsDir;
   std::filesystem::path overlayDiskPath;
   std::filesystem::path reportPath;
+  // Immutable staging identity (2026-09): the SHA-256 of the bytes the run was
+  // bound to, plus how they were staged. `stagingHardLinked` means the run got a
+  // hardlink to the read-only content-addressed cache (no data copy).
+  std::string stagedSampleSha256;
+  uint64_t stagedSampleBytes = 0;
+  bool stagingCacheHit = false;
+  bool stagingHardLinked = false;
   DynamicRunSummary dynamicSummary;
   std::vector<std::string> commands;
   std::vector<std::string> errors;

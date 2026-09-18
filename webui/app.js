@@ -90,6 +90,8 @@
       if (m.evt === 'dashboard.data' && m.data) onDashboardData(m.data);
       if (m.evt === 'run.status' && m.data) onRunStatus(m.data);
       if (m.evt === 'telemetry' && m.data) onTelemetry(m.data);
+      if (m.evt === 'assistant' && m.data) onAssistantEvent(m.data);
+      if (m.evt === 'assistant.done' && m.data) onAssistantDone(m.data);
       if (m.evt === 'vmframe' && m.w) onVmFrame(m.w, m.h);
     });
     // The host shares the VM framebuffer as a zero-copy SharedBuffer (created
@@ -188,6 +190,14 @@
         '</div>' +
         '<div class="panel"><h2>Process Telemetry <span id="vm-telemetry-status" class="page-sub" style="font-weight:400"></span></h2>' +
         '<div id="vm-events"><p class="page-sub" style="margin:0">No events yet — boot the VM to stream live process activity from the GuestAgent over COM2.</p></div></div>' +
+        '<div class="panel"><h2>Assistant <span id="assistant-status" class="page-sub" style="font-weight:400"></span></h2>' +
+        '<p class="page-sub" style="margin:0 0 8px">Ask AntiMal (AI) to operate and investigate the live VM. It acts only through the approved AntiMal tools — clicks/typing in the guest, screenshots, and the telemetry journal — and reports evidence. Pausing or cancelling the assistant never stops the VM.</p>' +
+        '<div class="actions" style="flex-wrap:wrap">' +
+        '<input id="assistant-task" class="mono" placeholder="e.g. Install the package and tell me what it launches…" style="flex:1;min-width:220px;padding:6px 8px;border-radius:6px;border:1px solid var(--border,#2a2f3a);background:var(--panel-2,#11151c);color:inherit" />' +
+        '<button class="btn primary" id="assistant-ask-btn">Ask AntiMal</button>' +
+        '<button class="btn" id="assistant-pause-btn" title="Stop the assistant before its next action. The VM keeps running; take over manually any time.">Pause AI</button>' +
+        '</div>' +
+        '<div id="assistant-log" class="mono" style="margin-top:10px;max-height:260px;overflow:auto;font-size:12px"></div></div>' +
         '<div class="row"><div class="panel" style="flex:1;min-width:280px"><h2>VM State</h2>' +
         '<div id="vm-state"><p class="page-sub" style="margin:0">Loading…</p></div>' +
         '<p class="page-sub" style="margin:8px 0 0">“Boot VM (live)” starts a clean interactive session; “Detonate Sample (live)” runs a chosen BENIGN sample inside it and streams its process / registry / file / network behavior below.</p></div>' +
@@ -580,6 +590,76 @@
     tbody.insertBefore(tr, tbody.firstChild);
     while (tbody.children.length > 500) tbody.removeChild(tbody.lastChild); // cap DOM growth on floods
   }
+  // ---------- integrated assistant (AI harness) ----------
+  // The model runs host-side; these handlers only render what it reports. The
+  // assistant acts through the AntiMal VM tools and never controls this UI, the
+  // host filesystem, or the network policy. Human takeover is always one click.
+  function assistantLine(kind, text) {
+    var box = $('#assistant-log');
+    if (!box) return;
+    var d = document.createElement('div');
+    d.style.margin = '3px 0';
+    var label = document.createElement('span');
+    label.className = 'tag';
+    label.textContent = kind;
+    d.appendChild(label);
+    d.appendChild(document.createTextNode(' ' + String(text)));
+    box.appendChild(d);
+    box.scrollTop = box.scrollHeight;
+  }
+  function onAssistantEvent(d) {
+    if (!d) return;
+    if (d.type === 'text') { assistantLine('AI', d.text); }
+    else if (d.type === 'tool') { assistantLine('act', d.text); }
+    else if (d.type === 'denied') { assistantLine('denied', d.text + ' — refused by policy'); }
+    else if (d.type === 'error') { assistantLine('error', d.text); }
+    else if (d.type === 'start') {
+      assistantLine('task', d.task || '');
+      var st = $('#assistant-status'); if (st) st.textContent = '· running';
+    }
+  }
+  function onAssistantDone(d) {
+    if (!d) return;
+    var st = $('#assistant-status'); if (st) st.textContent = '';
+    if (d.summary) assistantLine(d.ok ? 'done' : 'stopped', d.summary);
+    if (d.error) assistantLine('error', d.error);
+    if (d.actions && d.actions.length) {
+      assistantLine('audit', d.actions.length + ' action(s); ' + (d.deniedCalls || 0) + ' refused; ' + (d.providerErrors || 0) + ' provider error(s); turns ' + (d.turns || 0) + '; tokens ' + (d.promptTokens || 0) + '+' + (d.completionTokens || 0));
+    }
+  }
+  function askAssistant() {
+    var input = $('#assistant-task');
+    var task = input ? input.value : '';
+    if (!task) { appendLog('WARN', 'Type an assistant task first.'); return; }
+    var st = $('#assistant-status');
+    send('assistant.status').then(function (r) {
+      var s = r && r.result ? r.result : null;
+      if (!s || !s.enabled) {
+        assistantLine('error', 'The assistant is disabled. Set assistant_enabled = true and assistant_model in config/antimal.toml, put the API key in ANTIMAL_ASSISTANT_API_KEY, then restart AntiMal.');
+        return;
+      }
+      if (!s.apiKey) {
+        assistantLine('error', 'No API key found in the host environment (ANTIMAL_ASSISTANT_API_KEY or OPENAI_API_KEY).');
+        return;
+      }
+      if (st) st.textContent = '· starting';
+      send('assistant.ask', { task: task, max_actions: 40 }).then(function (rr) {
+        var ok = rr && rr.ok && rr.result && rr.result.started;
+        if (!ok) {
+          assistantLine('error', String((rr && rr.result && rr.result.error) || 'could not start the assistant'));
+          if (st) st.textContent = '';
+        } else if (input) {
+          input.value = '';
+        }
+      });
+    });
+  }
+  function pauseAssistant() {
+    send('assistant.cancel').then(function (r) {
+      if (r && r.ok) { assistantLine('paused', 'Taking back control before the next action; the VM keeps running.'); }
+      else { assistantLine('info', 'No assistant task is running.'); }
+    });
+  }
   function onRunStatus(d) {
     if (!d) return;
     var s = String(d.state || '');
@@ -880,6 +960,15 @@
     };
     var fsb = $('#vm-fs-btn');
     if (fsb) fsb.onclick = toggleFullscreen;
+    // Integrated assistant controls.
+    var askBtn = $('#assistant-ask-btn');
+    if (askBtn) askBtn.onclick = askAssistant;
+    var pauseBtn = $('#assistant-pause-btn');
+    if (pauseBtn) pauseBtn.onclick = pauseAssistant;
+    var taskInput = $('#assistant-task');
+    if (taskInput) taskInput.addEventListener('keydown', function (e) {
+      if (e.key === 'Enter') { e.preventDefault(); askAssistant(); }
+    });
     // Host clipboard -> guest: the host returns its clipboard text (never written,
     // capped 4096) and the paced typer types it into the guest.
     var pasteBtn = $('#vm-paste-btn');

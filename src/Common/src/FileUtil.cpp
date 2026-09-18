@@ -136,13 +136,30 @@ void WriteTextFileAtomic(const std::filesystem::path &path,
   } // stream already closed above
   // MoveFileExW with MOVEFILE_REPLACE_EXISTING is an atomic same-volume replace:
   // readers see either the whole old file or the whole new one, never a partial.
-  if (!MoveFileExW(tmp.wstring().c_str(), path.wstring().c_str(),
-                   MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
-    const DWORD err = GetLastError();
+  //
+  // Bounded retry: on Windows a replace can transiently fail with a sharing
+  // violation when AV real-time scanning, Search indexing, or a backup agent
+  // has the destination briefly open without FILE_SHARE_DELETE. That is not a
+  // permanent condition, so retry a few times with a short backoff before
+  // reporting failure -- and never leave the temp file behind on final failure.
+  DWORD lastError = ERROR_SUCCESS;
+  for (int attempt = 0; attempt < 6; ++attempt) {
+    if (MoveFileExW(tmp.wstring().c_str(), path.wstring().c_str(),
+                    MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
+      return;
+    }
+    lastError = GetLastError();
+    if (lastError != ERROR_SHARING_VIOLATION &&
+        lastError != ERROR_ACCESS_DENIED && lastError != ERROR_LOCK_VIOLATION) {
+      break; // a real failure (bad path, disk full, ...) -- do not spin
+    }
+    Sleep(static_cast<DWORD>(25 * (attempt + 1)));
+  }
+  {
     std::error_code ec;
     std::filesystem::remove(tmp, ec); // don't leave the temp behind
     throw std::runtime_error("Unable to finalize file " + PathToUtf8(path) +
-                             ": " + SystemErrorMessage(err));
+                             ": " + SystemErrorMessage(lastError));
   }
 }
 

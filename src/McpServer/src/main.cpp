@@ -157,6 +157,12 @@ bool SpawnDetached(const std::wstring &command, const std::filesystem::path &cwd
 }
 
 antimal::LiveInputWriter InputFor(const antimal::AppConfig &cfg) {
+  // MCP-driven input is a HUMAN-DELEGATED surface: the operator invoked this
+  // tool with the assistant lease in mind, so every input call claims the SAME
+  // shared lease the GUI/CLI/assistant use. A concurrent assistant action is
+  // then denied at delivery time instead of racing this one.
+  antimal::LiveInputLease lease(cfg.workspaceRoot / antimal::kInputLeaseFileName);
+  lease.TakeOver("mcp");
   return antimal::LiveInputWriter(cfg.workspaceRoot / antimal::kLiveInputFileName);
 }
 
@@ -217,7 +223,16 @@ std::string TextResult(const std::string &text, bool isError) {
 }
 
 void SendLine(const std::string &line) {
-  std::fwrite(line.data(), 1, line.size(), stdout);
+  // MCP stdio framing is newline-delimited: an embedded newline (e.g. a raw
+  // multi-line JSON literal) would truncate the message and make clients see
+  // invalid JSON. Collapse any raw CR/LF into spaces so every reply is exactly
+  // one line.
+  std::string framed;
+  framed.reserve(line.size());
+  for (char c : line) {
+    framed.push_back(c == '\n' || c == '\r' ? ' ' : c);
+  }
+  std::fwrite(framed.data(), 1, framed.size(), stdout);
   std::fputc('\n', stdout);
   std::fflush(stdout);
 }
@@ -676,7 +691,14 @@ std::string ToolVmBoot(const antimal::AppConfig &cfg, const JsonValue &args) {
            JsonQuote("sample not found: " + antimal::PathToUtf8(samplePath)) +
            "}";
   }
-  const int timeoutSec = std::max(30, ArgInt(args, "timeout_sec", 1200));
+  // timeout_sec semantics: 0 (the default) is the genuine until-stopped policy
+  // -- the VM keeps running until an explicit vm_finalize/vm_stop. No huge
+  // stand-in timeout. A positive value is an optional automatic budget; it is
+  // not the session lifetime.
+  const int timeoutSec = ArgInt(args, "timeout_sec", 0);
+  if (timeoutSec < 0) {
+    return R"({"ok":false,"error":"timeout_sec must be 0 (until stopped) or a positive number of seconds"})";
+  }
   const bool exec = ArgBool(args, "allow_execution", false);
   const bool view = ArgBool(args, "view", true);
 
@@ -793,6 +815,57 @@ std::string ToolVmView(const antimal::AppConfig &cfg, const JsonValue &args) {
          "screen; keep every action visible by taking screenshots too.\"}";
 }
 
+// Graceful session end: write `<runDir>/finalize.request`, which the live run
+// loop detects and exits through the normal report-writing path. This is the
+// NORMAL stop for an interactive/AI session; vm_stop is the emergency path.
+std::string ToolVmFinalize(const antimal::AppConfig &cfg, const JsonValue &args) {
+  using namespace antimal;
+  const LiveVmStatus status = QueryLiveVmStatus(cfg, 0);
+  LiveRun run = status.run;
+  const std::string runArg = ArgString(args, "run");
+  if (!runArg.empty()) {
+    run.dir = cfg.workspaceRoot / Utf8ToWide(runArg);
+    run.reportJson = run.dir / L"report.json";
+    run.eventsJsonl = run.dir / L"events.jsonl";
+  }
+  if (run.dir.empty() || !std::filesystem::is_directory(run.dir)) {
+    return R"({"ok":false,"error":"no run directory found; boot a session or pass run=<id>"})";
+  }
+  const std::filesystem::path marker = run.dir / L"finalize.request";
+  {
+    std::ofstream out(marker, std::ios::binary | std::ios::trunc);
+    out << "requested=mcp-vm_finalize\n";
+  }
+  std::error_code ec;
+  if (!std::filesystem::exists(marker, ec)) {
+    return std::string("{\"ok\":false,\"error\":") +
+           JsonQuote("could not write " + PathToUtf8(marker)) + "}";
+  }
+  const bool wait = ArgBool(args, "wait", false);
+  bool finalized = false;
+  if (wait) {
+    const int waitSec = ArgInt(args, "wait_sec", 120);
+    const auto deadline = std::chrono::steady_clock::now() +
+                          std::chrono::seconds(waitSec > 0 ? waitSec : 120);
+    while (std::chrono::steady_clock::now() < deadline) {
+      if (std::filesystem::exists(run.reportJson, ec)) {
+        finalized = true;
+        break;
+      }
+      Sleep(250);
+    }
+  }
+  std::ostringstream o;
+  o << "{\"ok\":true,\"runDir\":" << JsonQuote(PathToUtf8(run.dir))
+    << ",\"finalizeRequested\":true"
+    << ",\"reportJson\":" << (std::filesystem::exists(run.reportJson, ec) ? "true" : "false")
+    << ",\"waited\":" << (wait ? "true" : "false")
+    << ",\"note\":\"The run loop ends through the normal report path; poll "
+       "vm_report/vm_status for report.json. Use vm_stop only as a lossy "
+       "emergency stop.\"}";
+  return o.str();
+}
+
 std::string ToolVmStop(const antimal::AppConfig &cfg, const JsonValue &args) {
   const bool force = ArgBool(args, "force", false);
   const antimal::LiveFrame probe = antimal::ReadLiveFrame(antimal::kLiveFrameShmName);
@@ -845,9 +918,10 @@ const char *kToolsJson = R"JSON({"tools":[
 {"name":"vm_events","description":"Tail the live telemetry journal (events.jsonl) of the newest or a given run. This is raw observed behavior (process/file/registry/network/image-load events). Use since_line/nextLine to poll incrementally. Cite concrete events as evidence; do not infer intent from a single line.","inputSchema":{"type":"object","properties":{"run":{"type":"string","description":"Run id/dir or absolute path; default = newest run."},"since_line":{"type":"integer","default":0},"limit":{"type":"integer","default":200},"filter":{"type":"string","description":"Optional substring; the line must contain it."}}}},
 {"name":"vm_processes","description":"Summarize each observed process (pid, parent, image, full path, command line, user, integrity, last action, ATT&CK tag) from the live journal. Use it to answer 'what actually ran' with names and paths you can cite.","inputSchema":{"type":"object","properties":{"run":{"type":"string"}}}},
 {"name":"vm_report","description":"Read the run's report.json verdict fields AND the verdict rationale (only exists once the run completes). A verdict without rationale/evidence is not a result: cross-check it against vm_processes/vm_events and the screenshots you took.","inputSchema":{"type":"object","properties":{"run":{"type":"string"}}}},
-{"name":"vm_boot","description":"Start the interactive live VM exactly like the GUI's Boot VM (live): seed snapshot when present, live framebuffer + input channels, and (default view=true) the watchable vmview window so the operator SEES every action. Non-executing by default; allow_execution=true arms the sample-execution gate for an explicit detonation. Booting to a usable desktop can take minutes -- poll vm_status and vm_screenshot rather than assuming.","inputSchema":{"type":"object","properties":{"view":{"type":"boolean","default":true},"sample":{"type":"string","description":"Sample path; defaults to AntiMal.Tests.exe (benign)."},"timeout_sec":{"type":"integer","default":1200},"allow_execution":{"type":"boolean","default":false}}}},
+{"name":"vm_boot","description":"Start the interactive live VM exactly like the GUI's Boot VM (live): seed snapshot when present, live framebuffer + input channels, and (default view=true) the watchable vmview window so the operator SEES every action. Non-executing by default; allow_execution=true arms the sample-execution gate for an explicit detonation. Booting to a usable desktop can take minutes -- poll vm_status and vm_screenshot rather than assuming.","inputSchema":{"type":"object","properties":{"view":{"type":"boolean","default":true},"sample":{"type":"string","description":"Sample path; defaults to AntiMal.Tests.exe (benign)."},"timeout_sec":{"type":"integer","default":0,"description":"0 = until stopped (call vm_finalize to end); >0 = optional automatic analysis budget in seconds."},"allow_execution":{"type":"boolean","default":false}}}},
 {"name":"vm_view","description":"Open the watchable live VM window (vmview) so the operator can see the guest screen while you drive it.","inputSchema":{"type":"object","properties":{}}},
-{"name":"vm_stop","description":"Stop the live VM (terminates the HostCli detonate process). Only acts when a live VM is present unless force=true.","inputSchema":{"type":"object","properties":{"force":{"type":"boolean","default":false}}}}
+{"name":"vm_finalize","description":"Gracefully END the live session and finalize the evidence: the run exits through the normal report-writing path, so report.json is written with the verdict/rationale. This is the normal stop. Optional wait=true polls until report.json appears.","inputSchema":{"type":"object","properties":{"run":{"type":"string","description":"Run id/dir; default = newest live run."},"wait":{"type":"boolean","default":false},"wait_sec":{"type":"integer","default":120}}}},
+{"name":"vm_stop","description":"EMERGENCY stop: kills the HostCli VM host process. This can lose the finalized report (recover partial evidence with rebuild-report). Prefer vm_finalize for a normal end. Only acts when a live VM is present unless force=true.","inputSchema":{"type":"object","properties":{"force":{"type":"boolean","default":false}}}}
 ]})JSON";
 
 std::string DispatchTool(const antimal::AppConfig &cfg, const std::string &name,
@@ -866,6 +940,7 @@ std::string DispatchTool(const antimal::AppConfig &cfg, const std::string &name,
   if (name == "vm_report") return ToolVmReport(cfg, args);
   if (name == "vm_boot") return ToolVmBoot(cfg, args);
   if (name == "vm_view") return ToolVmView(cfg, args);
+  if (name == "vm_finalize") return ToolVmFinalize(cfg, args);
   if (name == "vm_stop") return ToolVmStop(cfg, args);
   *isError = true;
   return std::string("{\"ok\":false,\"error\":") +
@@ -874,9 +949,24 @@ std::string DispatchTool(const antimal::AppConfig &cfg, const std::string &name,
 
 } // namespace
 
+#include <fstream>
+
 int main() {
   _setmode(_fileno(stdin), _O_BINARY);
   _setmode(_fileno(stdout), _O_BINARY);
+
+  const char *tracePath = std::getenv("ANTIMAL_MCP_TRACE");
+  auto trace = [tracePath](const std::string &m) {
+    if (tracePath == nullptr) {
+      return;
+    }
+    std::ofstream f(tracePath, std::ios::app);
+    if (f) {
+      f << m << "\n";
+      f.flush();
+    }
+  };
+  trace("spawned");
 
   const antimal::AppConfig cfg =
       antimal::LoadConfig(antimal::DefaultConfigPath());
@@ -886,6 +976,7 @@ int main() {
 
   std::string line;
   while (std::getline(std::cin, line)) {
+    trace("in: " + line);
     if (!line.empty() && line.back() == '\r') {
       line.pop_back();
     }
@@ -895,10 +986,12 @@ int main() {
     const auto parsed = antimal::ParseJson(line);
     if (!parsed) {
       Log("dropped a non-JSON stdin line");
+      trace("dropped non-JSON line");
       continue;
     }
     const JsonValue &msg = *parsed;
     const std::string method = msg.At("method").AsString();
+    trace("method: " + method);
     const bool hasId = msg.Has("id");
     const JsonValue &id = msg.At("id");
 
@@ -931,6 +1024,28 @@ int main() {
       const std::string payload = DispatchTool(cfg, name, args, &isError);
       if (hasId) {
         SendResult(id, TextResult(payload, isError));
+      }
+    } else if (method == "resources/list") {
+      // AntiMal exposes tools only. Clients (opencode included) still ask for
+      // resources/prompts unconditionally, and a JSON-RPC ERROR here makes them
+      // treat the whole server as broken ("Failed to get tools"). Answer with
+      // valid empty lists instead.
+      if (hasId) {
+        SendResult(id, "{\"resources\":[]}");
+      }
+    } else if (method == "resources/templates/list") {
+      if (hasId) {
+        SendResult(id, "{\"resourceTemplates\":[]}");
+      }
+    } else if (method == "prompts/list") {
+      if (hasId) {
+        SendResult(id, "{\"prompts\":[]}");
+      }
+    } else if (method == "logging/setLevel" || method == "completion/complete" ||
+               method == "resources/subscribe" ||
+               method == "resources/unsubscribe") {
+      if (hasId) {
+        SendResult(id, "{}");
       }
     } else if (hasId) {
       SendError(id, -32601, "method not found: " + method);

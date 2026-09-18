@@ -238,9 +238,144 @@ bool CaptureScreenToPng(const std::filesystem::path &outputPath) {
   return wrote;
 }
 
+bool CaptureScreenToBgra(std::vector<uint8_t> *pixels, int *width, int *height) {
+  (void)GdiPlusInstance();
+  if (!pixels || !width || !height) {
+    return false;
+  }
+  const int x = GetSystemMetrics(SM_XVIRTUALSCREEN);
+  const int y = GetSystemMetrics(SM_YVIRTUALSCREEN);
+  const int w = GetSystemMetrics(SM_CXVIRTUALSCREEN);
+  const int h = GetSystemMetrics(SM_CYVIRTUALSCREEN);
+  if (w <= 0 || h <= 0) {
+    return false;
+  }
+  HDC screenDc = GetDC(nullptr);
+  if (!screenDc) {
+    return false;
+  }
+  HDC memDc = CreateCompatibleDC(screenDc);
+  HBITMAP bitmap =
+      memDc ? CreateCompatibleBitmap(screenDc, w, h) : nullptr;
+  if (!bitmap) {
+    if (memDc) DeleteDC(memDc);
+    ReleaseDC(nullptr, screenDc);
+    return false;
+  }
+  HGDIOBJ oldObject = SelectObject(memDc, bitmap);
+  const BOOL ok = BitBlt(memDc, 0, 0, w, h, screenDc, x, y, SRCCOPY);
+  SelectObject(memDc, oldObject);
+
+  bool copied = false;
+  if (ok) {
+    Gdiplus::Bitmap gdiBitmap(bitmap, nullptr);
+    Gdiplus::Rect rect(0, 0, w, h);
+    Gdiplus::BitmapData data{};
+    if (gdiBitmap.LockBits(&rect, Gdiplus::ImageLockModeRead,
+                           PixelFormat32bppRGB, &data) == Gdiplus::Ok) {
+      pixels->assign(static_cast<size_t>(w) * h * 4, 0);
+      const int rowBytes = w * 4;
+      for (int row = 0; row < h; ++row) {
+        const auto *src = static_cast<const uint8_t *>(data.Scan0) +
+                          static_cast<size_t>(row) * data.Stride;
+        std::memcpy(pixels->data() + static_cast<size_t>(row) * rowBytes, src,
+                    static_cast<size_t>(rowBytes));
+      }
+      gdiBitmap.UnlockBits(&data);
+      *width = w;
+      *height = h;
+      copied = true;
+    }
+  }
+  DeleteObject(bitmap);
+  DeleteDC(memDc);
+  ReleaseDC(nullptr, screenDc);
+  return copied;
+}
+
+uint64_t FrameSignature(const uint8_t *pixels, int width, int height,
+                        int bytesPerPixel, int sampleEveryNthPixel) {
+  if (!pixels || width <= 0 || height <= 0 || bytesPerPixel != 4) {
+    return 0;
+  }
+  if (sampleEveryNthPixel < 1) {
+    sampleEveryNthPixel = 1;
+  }
+  // FNV-1a over a strided sample. The per-row start offset advances by a prime
+  // so a static image cannot alias, and sampling keeps the cost proportional to
+  // pixels/sample rather than the whole 4 MB frame.
+  constexpr uint64_t kOffset = 1469598103934665603ull;
+  constexpr uint64_t kPrime = 1099511628211ull;
+  uint64_t hash = kOffset;
+  const size_t rowPixels = static_cast<size_t>(width);
+  for (int row = 0; row < height; ++row) {
+    const uint8_t *rowPtr = pixels + static_cast<size_t>(row) * rowPixels * 4;
+    const size_t start = static_cast<size_t>((row * 7) % sampleEveryNthPixel);
+    for (size_t px = start; px < rowPixels;
+         px += static_cast<size_t>(sampleEveryNthPixel)) {
+      const uint8_t *p = rowPtr + px * 4;
+      hash ^= p[0];
+      hash *= kPrime;
+      hash ^= p[1];
+      hash *= kPrime;
+      hash ^= p[2];
+      hash *= kPrime;
+    }
+  }
+  return hash == 0 ? 1 : hash; // 0 is reserved for "no signature"
+}
+
+bool DecideFrameKeep(uint64_t signature,
+                     std::chrono::steady_clock::time_point now,
+                     const FrameRetentionPolicy &policy,
+                     FrameRetentionState *state, bool forced) {
+  if (state == nullptr || signature == 0) {
+    return true; // never suppress a frame we could not signature
+  }
+  if (forced) {
+    // Action-verification capture: always keep, even when unchanged.
+    state->haveLast = true;
+    state->lastSignature = signature;
+    state->lastKept = now;
+    state->consecutiveDuplicates = 0;
+    return true;
+  }
+  const bool changed = !state->haveLast || signature != state->lastSignature;
+  const bool keyframeDue =
+      !state->haveLast ||
+      (policy.keyframeInterval.count() > 0 &&
+       now - state->lastKept >= policy.keyframeInterval);
+  const bool duplicateCapHit =
+      policy.maxConsecutiveDuplicates > 0 &&
+      state->consecutiveDuplicates >=
+          static_cast<uint64_t>(policy.maxConsecutiveDuplicates);
+  if (changed) {
+    state->haveLast = true;
+    state->lastSignature = signature;
+    state->lastKept = now;
+    state->consecutiveDuplicates = 0;
+    return true;
+  }
+  if (keyframeDue || duplicateCapHit) {
+    state->lastKept = now;
+    state->consecutiveDuplicates = 0;
+    return true;
+  }
+  if (state->consecutiveDuplicates == 0) {
+    state->firstDuplicate = now;
+  }
+  state->lastDuplicate = now;
+  ++state->consecutiveDuplicates;
+  ++state->duplicatesSkipped;
+  return false;
+}
+
 ScreenshotLoop::ScreenshotLoop(std::filesystem::path outputDir,
-                               std::chrono::milliseconds interval)
-    : outputDir_(std::move(outputDir)), interval_(interval) {}
+                               std::chrono::milliseconds interval,
+                               FrameRetentionPolicy retention)
+    : outputDir_(std::move(outputDir)),
+      interval_(interval),
+      retention_(retention) {}
 
 ScreenshotLoop::~ScreenshotLoop() {
   Stop();
@@ -251,17 +386,38 @@ void ScreenshotLoop::Start() {
   stop_.store(false);
   EnsureDirectory(outputDir_);
   thread_ = std::thread([this] {
+    FrameRetentionState retention;
+    std::vector<uint8_t> pixels;
+    int width = 0;
+    int height = 0;
     while (!stop_.load()) {
-      const uint32_t frame = frameCount_.fetch_add(1);
-      char nameBuf[32];
-      _snprintf_s(nameBuf, _TRUNCATE, "frame-%06u.png", frame);
-      const auto path = outputDir_ / nameBuf;
-      if (CaptureScreenToPng(path)) {
-        // OK
-      } else {
-        // Roll back the increment if we failed so the numbering stays
-        // contiguous on the next try.
-        frameCount_.fetch_sub(1);
+      // Capture to memory first: an unchanged frame must not pay the PNG
+      // encode or create a file (the historical 1,138 files / 341 MB per
+      // 30 min came from unconditional captures of a static desktop).
+      if (CaptureScreenToBgra(&pixels, &width, &height)) {
+        const uint64_t signature =
+            FrameSignature(pixels.data(), width, height, 4);
+        const bool forced = forceNextCapture_.exchange(false);
+        if (DecideFrameKeep(signature, std::chrono::steady_clock::now(),
+                            retention_, &retention, forced)) {
+          const uint32_t frame = frameCount_.fetch_add(1);
+          char nameBuf[32];
+          _snprintf_s(nameBuf, _TRUNCATE, "frame-%06u.png", frame);
+          const auto path = outputDir_ / nameBuf;
+          if (!EncodeFramebufferPng(path, pixels.data(), width, height, 4)) {
+            frameCount_.fetch_sub(1); // keep numbering contiguous on failure
+          }
+        } else {
+          duplicates_.fetch_add(1);
+          const int64_t nowMs =
+              std::chrono::duration_cast<std::chrono::milliseconds>(
+                  std::chrono::steady_clock::now().time_since_epoch())
+                  .count();
+          if (firstDuplicateMs_.load() == 0) {
+            firstDuplicateMs_.store(nowMs);
+          }
+          lastDuplicateMs_.store(nowMs);
+        }
       }
       // Sleep in short slices so Stop() doesn't have to wait a full interval.
       const auto end = std::chrono::steady_clock::now() + interval_;

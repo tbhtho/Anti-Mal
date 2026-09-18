@@ -244,6 +244,8 @@ void PrintUsage() {
       << "                    [--intel] [--vt-key <KEY>] [--json <out.json>]\n"
       << "  antimal triage <dir> [--threshold 70] [--json out.json]  (risk-ranked bulk scan)\n"
       << "  antimal detonate <sample> --timeout-sec 180 --network disabled|hostonly|nat\n"
+      << "                    [--timeout-sec 0|unlimited]  (run until stopped;\n"
+      << "                                          end with vmfinalize / vm-stop)\n"
       << "                    [--vcpus 1]   (1 = reliable default; >1 exercises SMP boot)\n"
       << "                    [--allow-execution]  (arms in-guest detonation; needs\n"
       << "                                          dynamic_execution_enabled=true too)\n"
@@ -257,6 +259,11 @@ void PrintUsage() {
       << "  antimal vmview [--name <shm>] [--x N --y N --w N --h N]   (live guest-screen window;\n"
       << "                                                             pair with ANTIMAL_LIVE_FRAME_SHM=<shm>)\n"
       << "  antimal vmstatus [--json]                     (live VM + newest run state)\n"
+      << "  antimal vmfinalize [<run-id>] [--wait] [--timeout-sec N] [--json]\n"
+      << "                                                (graceful stop: finalize the report)\n"
+      << "  antimal assistant \"<task>\" [--run <id>] [--model M] [--max-actions N]\n"
+      << "                    [--allow-finalize] [--no-guest-input] [--json]\n"
+      << "                                                (AI operator over the shared VM tools)\n"
       << "  antimal vmframe [--name <shm>] [--out <png>]  (capture the live guest screen)\n"
       << "  antimal vmmouse --to X,Y [--click] [--double] [--button left|right|middle]\n"
       << "                  [--file <live-input.bin>] [--shm <name>]\n"
@@ -440,6 +447,18 @@ int CommandTriage(int argc, wchar_t **argv) {
 }
 
 int CommandDetonate(int argc, wchar_t **argv) {
+  // --help / -h must never stage or boot anything: parse first, act never.
+  if (HasFlag(argc, argv, "--help") || HasFlag(argc, argv, "-h")) {
+    std::cout
+        << "usage: antimal detonate <sample> [options]\n"
+        << "  --timeout-sec <N>|0|unlimited  analysis budget; 0/unlimited keeps\n"
+        << "                                 the VM running until you stop it\n"
+        << "                                 (vmfinalize / MCP vm_finalize)\n"
+        << "  --network disabled|hostonly|nat\n"
+        << "  --vcpus N   --allow-execution   --seed <snap.cow>   --cold   --nic\n"
+        << "  --json      machine-readable result\n";
+    return 0;
+  }
   if (argc < 3) {
     PrintUsage();
     return 2;
@@ -448,14 +467,32 @@ int CommandDetonate(int argc, wchar_t **argv) {
   auto config = antimal::LoadConfig(antimal::DefaultConfigPath());
   uint32_t timeout = config.defaultTimeoutSec;
   if (const auto value = OptionValue(argc, argv, "--timeout-sec")) {
-    const auto n = ParseIntArg(*value, "--timeout-sec");
-    // Range-check against the destination type BEFORE the cast: a value like 2^32
-    // is positive as a long long but truncates to 0 (the very value we reject).
-    if (!n || *n <= 0 || *n > static_cast<long long>(UINT32_MAX)) {
-      std::cerr << "error: --timeout-sec must be a positive number of seconds\n";
-      return 2;
+    // "until stopped" is a first-class policy, not a 24h timeout: 0 (or the
+    // word "unlimited") removes the wall-clock analysis budget entirely. The
+    // session then ends only on an explicit finalize/stop, guest shutdown, or a
+    // fatal fault.
+    std::string text = *value;
+    for (char &c : text) {
+      c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
     }
-    timeout = static_cast<uint32_t>(*n);
+    if (text == "unlimited" || text == "none" || text == "infinite") {
+      timeout = 0;
+    } else {
+      const auto n = ParseIntArg(*value, "--timeout-sec");
+      // Range-check against the destination type BEFORE the cast: a value like
+      // 2^32 is positive as a long long but truncates to 0 -- the very value
+      // that now means "until stopped", so it must be rejected, not accepted.
+      // The upper bound keeps the millisecond conversions (and the guest's
+      // uint32 budget) well away from overflow.
+      constexpr long long kMaxTimeoutSec = 30ll * 24 * 3600; // 30 days
+      if (!n || *n < 0 || *n > kMaxTimeoutSec) {
+        std::cerr << "error: --timeout-sec must be 0/'unlimited' (until "
+                     "stopped) or a positive number of seconds up to " +
+                         std::to_string(kMaxTimeoutSec) + "\n";
+        return 2;
+      }
+      timeout = static_cast<uint32_t>(*n);
+    }
   }
   const auto networkText = OptionValue(argc, argv, "--network").value_or(antimal::ToString(config.networkMode));
   const auto network = antimal::ParseNetworkMode(networkText).value_or(antimal::NetworkMode::Disabled);
@@ -503,7 +540,10 @@ int CommandDetonate(int argc, wchar_t **argv) {
   antimal::HyperVOrchestrator orchestrator(config);
   auto progress = [](const antimal::DetonationProgress &snap) {
     if (!snap.message.empty()) {
-      std::cout << "[" << snap.phase << "] " << snap.message << std::endl;
+      // Stage timing: "[+123s] [booting] ..." makes the next live run's
+      // boot/interaction timeline readable straight from the transcript.
+      std::cout << "[+" << (snap.elapsedMs / 1000) << "s] [" << snap.phase
+                << "] " << snap.message << std::endl;
     }
   };
   // Drop privileges + lock down this worker process before the guest runs
@@ -3551,12 +3591,30 @@ int CommandReport(int argc, wchar_t **argv) {
       std::cout << "{\"verdict\":"
                 << JsonQuote(antimal::ToString(report.sandboxVerdict))
                 << ",\"verdictScore\":" << report.verdictScore
+                << ",\"insufficientEvidence\":"
+                << (report.verdictInsufficientEvidence ? "true" : "false")
+                << ",\"limits\":" << JsonStrArray(report.verdictLimitations)
                 << ",\"rationale\":" << JsonStrArray(report.verdictRationale)
                 << "}\n";
       return 0;
     }
     std::cout << "Verdict: " << antimal::ToString(report.sandboxVerdict)
-              << " (score " << report.verdictScore << ")\n";
+              << " (score " << report.verdictScore << ")";
+    if (report.verdictInsufficientEvidence) {
+      std::cout << "  [INSUFFICIENT EVIDENCE -- no conclusion reached]";
+    }
+    std::cout << "\n";
+    if (report.verdictInsufficientEvidence) {
+      std::cout << "Observation limits:\n";
+      for (const auto &line : report.verdictLimitations) {
+        std::cout << "  - " << line << "\n";
+      }
+    } else if (!report.verdictLimitations.empty()) {
+      std::cout << "Partial coverage:\n";
+      for (const auto &line : report.verdictLimitations) {
+        std::cout << "  - " << line << "\n";
+      }
+    }
     if (report.verdictRationale.empty()) {
       std::cout << "  (no rationale recorded -- sample may not have executed)\n";
     } else {
@@ -4358,6 +4416,8 @@ int CommandRebuildReport(int argc, wchar_t **argv) {
   report.sandboxVerdict = bs.verdict;
   report.verdictScore = bs.score;
   report.verdictRationale = bs.rationale;
+  report.verdictInsufficientEvidence = bs.insufficientEvidence;
+  report.verdictLimitations = bs.limitations;
   report.errors.push_back(
       "Report reconstructed from events.jsonl after the run ended without a "
       "finalized report.json; boot-stage/usability detail is limited to what the "
@@ -4868,6 +4928,8 @@ int CommandVmInput(int argc, wchar_t **argv);
 int CommandVmStatus(int argc, wchar_t **argv);
 int CommandVmFrame(int argc, wchar_t **argv);
 int CommandVmMouse(int argc, wchar_t **argv);
+int CommandVmFinalize(int argc, wchar_t **argv);
+int CommandAssistant(int argc, wchar_t **argv);
 
 int wmain(int argc, wchar_t **argv) {
   try {
@@ -4876,6 +4938,12 @@ int wmain(int argc, wchar_t **argv) {
       return 2;
     }
     const std::string command = Arg(argc, argv, 1);
+    if (command == "help" || command == "--help" || command == "-h" ||
+        command == "/?") {
+      // Parse-only: help must never boot, stage, or touch a run.
+      PrintUsage();
+      return 0;
+    }
     if (command == "version" || command == "--version" || command == "-v") {
       std::cout << antimal::kProductName << " " << antimal::kVersionString
                 << " (" << antimal::kProductTagline << ")\n"
@@ -4950,6 +5018,14 @@ int wmain(int argc, wchar_t **argv) {
     }
     if (command == "vmmouse") {
       return CommandVmMouse(argc, argv);
+    }
+    if (command == "vmfinalize" || command == "vm-stop") {
+      // Graceful stop (finalizes the report). Emergency termination of the
+      // worker is a separate, deliberately lossy action -- not this command.
+      return CommandVmFinalize(argc, argv);
+    }
+    if (command == "assistant" || command == "ask") {
+      return CommandAssistant(argc, argv);
     }
     if (command == "fs-ls" || command == "fs-cat" || command == "fs-find" ||
         command == "fs-scan" || command == "reg-ls") {

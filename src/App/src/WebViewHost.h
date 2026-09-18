@@ -11,6 +11,10 @@
 
 #include "antimal/BridgeRouter.h"
 
+#include <atomic>
+#include <memory>
+#include <string>
+
 namespace antimal {
 
 class WebViewHost {
@@ -67,6 +71,15 @@ private:
   Microsoft::WRL::ComPtr<ICoreWebView2Environment> env_; // for CreateSharedBuffer
   Microsoft::WRL::ComPtr<ICoreWebView2SharedBuffer> frameBuffer_; // page-shared
   BridgeRouter router_;
+
+  // ---- Integrated assistant (AI harness) ----
+  // One assistant task at a time, on its own thread, streaming {"evt":
+  // "assistant"} envelopes to the page and a final {"evt":"assistant.done"}.
+  // Cancellation is cooperative (the shared token is checked between steps and
+  // by the loop before each provider call). The policy lives in the common
+  // Assistant core; the GUI only chooses the task + the finalize grant.
+  std::shared_ptr<std::atomic_bool> assistantCancel_;
+  std::atomic_bool assistantRunning_{false};
   unsigned long vmPid_ = 0;   // PID of the spawned live-VM HostCli process (P1).
   void *vmProcess_ = nullptr; // HANDLE to that process while it runs (owned).
   void *frameShmHandle_ = nullptr;        // OpenFileMapping handle (live frame)

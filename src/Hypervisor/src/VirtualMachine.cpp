@@ -1145,8 +1145,13 @@ VmRunSummary VirtualMachine::Run(const VmRunRequest &request) {
                            : std::chrono::milliseconds{1};
   liveInputPath_ = request.liveInputPath;
   liveFrameShmName_ = request.liveFrameShmName;
-  auto summary = RunLoop(request.maxSteps,
-                         std::chrono::steady_clock::now() + timeout,
+  // "Until stopped" is a real no-deadline mode, not a 24h substitute: the loop
+  // then never sets timedOut, so the report can distinguish "operator ended a
+  // live session" from "hit the analysis budget".
+  const auto deadline = request.noDeadline
+                            ? std::chrono::steady_clock::time_point::max()
+                            : std::chrono::steady_clock::now() + timeout;
+  auto summary = RunLoop(request.maxSteps, deadline,
                          request.progressCallback, request.progressInterval,
                          request.cancelRequested, request.keyboardScancodes,
                          request.keyboardInjectAfter,
