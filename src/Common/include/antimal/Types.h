@@ -181,6 +181,31 @@ struct DynamicRunSummary {
   bool sampleExecuted = false;
   bool firmwareIdle = false;
   bool guestAgentConnected = false;
+  // G4 per-sensor coverage contract. The GuestAgent emits one `agent.coverage`
+  // journal record per collector (process/file/registry/network/image/whoami)
+  // describing what it actually observed. These are surfaced so the scorer, UI,
+  // and report can distinguish "no such behavior observed under healthy
+  // coverage" from "not instrumented / sensor loss unknown". Empty means no
+  // coverage record was received -- treated as UNKNOWN coverage, which limits a
+  // reassuring negative (never silently healthy).
+  struct SensorCoverage {
+    std::string sensor;      // "filesystem" | "registry" | "process" | ...
+    bool supported = false;  // the collector exists and ran
+    bool healthy = false;    // last collection SUCCEEDED
+    uint64_t samples = 0;    // successful collection cycles
+    uint64_t dropped = 0;    // records dropped at a cap (loss)
+    bool lossKnown = false;  // false => dropped is a lower bound / unknown
+    std::string targetUser;  // profile the collector resolved from ("" unknown)
+    std::string note;        // human-readable limitation, if any
+  };
+  std::vector<SensorCoverage> sensorCoverage;
+  // True when at least one required sensor reported loss (dropped>0) or a
+  // failure, or no coverage record arrived at all. Drives the scorer's negative
+  // coverage gate.
+  bool coverageIncomplete = false;
+  // Boot generation this summary describes (1 = first boot). Used with per-event
+  // bootGeneration/startTime to keep attribute boundaries honest across reboots.
+  uint32_t bootGeneration = 0;
   std::string status;
   NetworkMode networkMode = NetworkMode::Disabled;
   uint32_t framesCaptured = 0;
@@ -347,6 +372,17 @@ struct AnalysisReport {
   // telemetry channel, ...) so every consumer can label a headline honestly.
   bool verdictInsufficientEvidence = false;
   std::vector<std::string> verdictLimitations;
+  // Policy identity of the scorer that produced the verdict (see
+  // kBehaviorScorerVersion). Empty on reports written before versioning; a
+  // rescore writes a NEW artifact carrying both this and the input evidence
+  // hash, leaving the original run files immutable.
+  std::string scorerVersion;
+  // Supported observed findings that back the verdict (in contrast to the
+  // coverage notes in verdictLimitations). Rendered as the evidence list.
+  std::vector<std::string> verdictPositiveFindings;
+  // SHA-256 of the raw evidence artifact this verdict was computed from, when
+  // the producer recorded it (rescore/rebuild paths). Empty when not captured.
+  std::string evidenceHash;
   DynamicRunSummary dynamicSummary;
   std::vector<EventRecord> events;
   std::vector<std::string> mitreTechniques;

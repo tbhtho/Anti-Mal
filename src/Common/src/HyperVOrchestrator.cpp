@@ -15,6 +15,7 @@
 #include "antimal/LiveVm.h"
 #include "antimal/Scanner.h"
 #include "antimal/Screenshot.h"
+#include "antimal/SensorCoverage.h"
 #include "antimal/hv/BlockDevice.h"
 #include "antimal/hv/HostSerialChannel.h"
 #include "antimal/hv/LiveFrameShm.h"
@@ -9086,6 +9087,8 @@ void WriteErrorReport(const std::filesystem::path &reportPath,
   report.verdictRationale = behaviorScore.rationale;
   report.verdictInsufficientEvidence = behaviorScore.insufficientEvidence;
   report.verdictLimitations = behaviorScore.limitations;
+  report.scorerVersion = behaviorScore.scorerVersion;
+  report.verdictPositiveFindings = behaviorScore.positiveFindings;
   report.dynamicSummary = dynamicSummary;
   report.events = events;
   // T24/T25: surface what the run actually observed. mitreTechniques unions the
@@ -11113,6 +11116,39 @@ HyperVPreflight InHouseOrchestrator::Preflight() const {
   result.bootCapabilityReady =
       result.inHouseSelected && result.storageBootReady && result.networkReady;
 
+  // --- Fail-closed execution preflight (G2, 2026-09 handoff) ---------------
+  // The boot/execution decision must rest on the ACHIEVED isolation posture,
+  // not on a setting name. `safeToExecute` is therefore computed here and is
+  // authoritative: PrepareAndRun boots only when it is true. Every required
+  // control below fails CLOSED (a missing control is a blocker, never a
+  // silent best-effort fallback).
+  const bool rawSampleRequested = result.dynamicExecutionEnabled;
+  if (rawSampleRequested) {
+    // Guest input/interaction channel must exist -- without it the run is
+    // headless and cannot satisfy the "visible, interactive" product contract,
+    // but more importantly the guest cannot report behavior.
+    if (!result.guestAgentPresent) {
+      result.blockers.push_back(
+          "execution requires AntiMal.GuestAgent.exe, which was not found "
+          "beside the host executable.");
+    }
+    // Network containment: only a fully disabled NIC is an enforced posture.
+    // hostonly/nat are not implemented, so requesting them must block.
+    if (!result.networkReady) {
+      // already blocked below; keep the ordering deterministic
+    }
+    // Base/overlay identity must be resolvable: a run with neither a raw base
+    // nor a readable VHDX cannot prove which image was detonated.
+    if (!result.rawBaseReady && !result.baseVhdxReadable) {
+      // already blocked below
+    }
+    // WHP available and firmware present are hard requirements covered below.
+    // The achieved posture (all of the above plus an in-house provider) is the
+    // gate.
+    result.safeToExecute = result.inHouseSelected && result.storageBootReady &&
+                           result.networkReady && result.guestAgentPresent;
+  }
+
   if (result.provider == "inhouse") {
     if (!result.rawBaseReady && !result.baseVhdxReadable && !result.baseVhdxPresent) {
       result.blockers.push_back(
@@ -11163,6 +11199,17 @@ HyperVPreflight InHouseOrchestrator::Preflight() const {
       result.messages.push_back(
           "Host/guest channel is not implemented; staged samples are not launched inside the guest.");
     }
+    // Fail closed when execution is requested but the achieved isolation
+    // posture does not support it. This is a diagnostic that PREVENTS the
+    // sample start instead of proceeding on best-effort hardening.
+    if (result.dynamicExecutionEnabled && !result.safeToExecute) {
+      result.blockers.push_back(
+          "execution requested but the containment posture could not be "
+          "established (dynamic_execution_enabled=true; requires in-house "
+          "provider + bootable storage + network_mode=disabled + deployed "
+          "GuestAgent). Refusing to execute rather than proceeding on "
+          "best-effort isolation.");
+    }
   } else if (result.provider == "hyperv") {
     result.blockers.push_back(
         "Hyper-V VM provider support has been removed. Use vm_provider = \"inhouse\".");
@@ -11209,6 +11256,21 @@ DetonationResult InHouseOrchestrator::PrepareAndRun(
     const std::filesystem::path &samplePath, uint32_t timeoutSec,
     NetworkMode networkMode, bool executeVmCommands,
     DetonationProgressCallback progressCallback) {
+  // Back-compat overload: correlates "execution requested" with the isolation
+  // gate being unavailable -> treated as NOT established (fail closed) only when
+  // the caller explicitly requests execution. Staged/benign callers pass
+  // executeVmCommands=false and are unaffected.
+  WorkerIsolationReport none;
+  none.notes = "no worker-isolation report supplied by this caller";
+  return PrepareAndRun(samplePath, timeoutSec, networkMode, executeVmCommands,
+                       std::move(progressCallback), !executeVmCommands, none);
+}
+
+DetonationResult InHouseOrchestrator::PrepareAndRun(
+    const std::filesystem::path &samplePath, uint32_t timeoutSec,
+    NetworkMode networkMode, bool executeVmCommands,
+    DetonationProgressCallback progressCallback, bool workerIsolationOk,
+    const WorkerIsolationReport &workerIsolation) {
   DetonationResult result;
   result.runId = MakeRunId();
   result.runDir = config_.workspaceRoot / result.runId;
@@ -11576,7 +11638,7 @@ DetonationResult InHouseOrchestrator::PrepareAndRun(
   job.outputDir = result.runDir / "out";
   WriteTextFile(result.jobPath, ToJson(job));
 
-  const auto preflight = InHouseOrchestrator(runConfig).Preflight();
+  auto preflight = InHouseOrchestrator(runConfig).Preflight();
   const std::string vmName = config_.vmNamePrefix + "-" + result.runId.substr(0, 8);
   result.commands.push_back("$ErrorActionPreference='Stop'");
 
@@ -11629,6 +11691,40 @@ DetonationResult InHouseOrchestrator::PrepareAndRun(
   result.dynamicSummary.status = "staged";
   result.dynamicSummary.sampleExecuted = false;
   result.dynamicSummary.networkMode = networkMode;
+
+  // G2: record the ACHIEVED worker isolation separately from host prerequisites,
+  // and fail closed if execution was requested while a required runtime
+  // protection was not established.
+  {
+    std::map<std::string, std::string> isolationDetails = {
+        {"identity", workerIsolation.identity},
+        {"allRequiredEstablished",
+         workerIsolation.allRequiredEstablished ? "true" : "false"},
+        {"controls", std::to_string(workerIsolation.controls.size())}};
+    if (!workerIsolation.notes.empty()) {
+      isolationDetails["notes"] = workerIsolation.notes;
+    }
+    AppendJournalEvent(result.journalPath,
+                       MakeSandboxEvent("worker.isolation.checked",
+                                        workerIsolation.identity,
+                                        std::move(isolationDetails)),
+                       &events);
+    for (const auto &c : workerIsolation.controls) {
+      AppendJournalEvent(
+          result.journalPath,
+          MakeSandboxEvent("worker.isolation.control", c.id,
+                           {{"established", c.established ? "true" : "false"},
+                            {"detail", c.detail}}),
+          &events);
+    }
+  }
+  if (executeVmCommands && preflight.dynamicExecutionEnabled &&
+      !workerIsolationOk) {
+    preflight.blockers.push_back(
+        "execution requested but a required worker-isolation control was not "
+        "established (see worker.isolation.control journal records); refusing to "
+        "execute the sample rather than falling back to an unhardened worker.");
+  }
 
   if (!preflight.blockers.empty()) {
     for (const auto &message : preflight.blockers) {
@@ -13472,6 +13568,10 @@ DetonationResult InHouseOrchestrator::PrepareAndRun(
     // Malicious bar in the scorer -- the main mitigation for the benign signed-
     // installer false positive. Not a clean-list; signed malware still scores.
     const bool sampleSigned = HasAuthenticodeSignature(samplePath);
+    // G4: fold the guest's per-sensor coverage records into the summary BEFORE
+    // scoring, so the scorer's negative gate sees achieved coverage rather than
+    // assuming healthy defaults.
+    ApplyCoverageEvents(events, &result.dynamicSummary);
     const BehaviorScore behaviorScore =
         DeriveSandboxScore(result.dynamicSummary, events, sampleSigned);
     fireProgress("reporting", "Writing report.json and report.html");
@@ -13514,9 +13614,21 @@ DetonationResult HyperVOrchestrator::PrepareAndRun(
     const std::filesystem::path &samplePath, uint32_t timeoutSec,
     NetworkMode networkMode, bool executeVmCommands,
     DetonationProgressCallback progressCallback) {
+  WorkerIsolationReport none;
+  none.notes = "no worker-isolation report supplied by this caller";
   return InHouseOrchestrator(config_).PrepareAndRun(
       samplePath, timeoutSec, networkMode, executeVmCommands,
-      std::move(progressCallback));
+      std::move(progressCallback), !executeVmCommands, none);
+}
+
+DetonationResult HyperVOrchestrator::PrepareAndRun(
+    const std::filesystem::path &samplePath, uint32_t timeoutSec,
+    NetworkMode networkMode, bool executeVmCommands,
+    DetonationProgressCallback progressCallback, bool workerIsolationOk,
+    const WorkerIsolationReport &workerIsolation) {
+  return InHouseOrchestrator(config_).PrepareAndRun(
+      samplePath, timeoutSec, networkMode, executeVmCommands,
+      std::move(progressCallback), workerIsolationOk, workerIsolation);
 }
 
 } // namespace antimal

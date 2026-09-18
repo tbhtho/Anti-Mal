@@ -470,6 +470,28 @@ DynamicRunSummary ParseDynamicSummary(const JsonValue *value) {
   summary.firmwareIdle = BoolValue(Member(*value, "firmwareIdle"));
   summary.guestAgentConnected =
       BoolValue(Member(*value, "guestAgentConnected"));
+  summary.coverageIncomplete =
+      BoolValue(Member(*value, "coverageIncomplete"));
+  summary.bootGeneration =
+      static_cast<uint32_t>(IntValue(Member(*value, "bootGeneration")));
+  if (const JsonValue *cov = Member(*value, "sensorCoverage");
+      cov != nullptr && cov->type == JsonValue::Type::Array) {
+    for (const auto &item : cov->array) {
+      if (item.type != JsonValue::Type::Object) {
+        continue;
+      }
+      DynamicRunSummary::SensorCoverage c;
+      c.sensor = StringValue(Member(item, "sensor"));
+      c.supported = BoolValue(Member(item, "supported"));
+      c.healthy = BoolValue(Member(item, "healthy"));
+      c.samples = static_cast<uint64_t>(IntValue(Member(item, "samples")));
+      c.dropped = static_cast<uint64_t>(IntValue(Member(item, "dropped")));
+      c.lossKnown = BoolValue(Member(item, "lossKnown"));
+      c.targetUser = StringValue(Member(item, "targetUser"));
+      c.note = StringValue(Member(item, "note"));
+      summary.sensorCoverage.push_back(std::move(c));
+    }
+  }
   summary.status = StringValue(Member(*value, "status"));
   if (const auto network =
           ParseNetworkMode(StringValue(Member(*value, "networkMode")))) {
@@ -759,6 +781,10 @@ AnalysisReport ParseReportJson(const std::string &text,
       BoolValue(Member(root, "verdictInsufficientEvidence"));
   report.verdictLimitations =
       StringArrayValue(Member(root, "verdictLimitations"));
+  report.scorerVersion = StringValue(Member(root, "scorerVersion"));
+  report.verdictPositiveFindings =
+      StringArrayValue(Member(root, "verdictPositiveFindings"));
+  report.evidenceHash = StringValue(Member(root, "evidenceHash"));
   report.dynamicSummary = ParseDynamicSummary(Member(root, "dynamicSummary"));
   report.events = ParseEvents(Member(root, "events"));
   report.mitreTechniques = StringArrayValue(Member(root, "mitreTechniques"));
@@ -1772,6 +1798,22 @@ std::string BuildHtmlReportWithFrames(const AnalysisReport &report,
       html << "<li>" << HtmlEscape(line) << "</li>";
     }
     html << "</ul></div>";
+  }
+  if (!report.verdictPositiveFindings.empty()) {
+    html << "<div class=\"k\">supported findings</div><div><ul class=\"why\">";
+    for (const auto &line : report.verdictPositiveFindings) {
+      html << "<li>" << HtmlEscape(line) << "</li>";
+    }
+    html << "</ul></div>";
+  }
+  if (!report.scorerVersion.empty() || !report.evidenceHash.empty()) {
+    html << "<div class=\"k\">scorer</div><div class=\"mono\">";
+    html << (report.scorerVersion.empty() ? "unversioned"
+                                          : HtmlEscape(report.scorerVersion));
+    if (!report.evidenceHash.empty()) {
+      html << " &middot; evidence " << HtmlEscape(report.evidenceHash.substr(0, 16));
+    }
+    html << "</div>";
   }
   if (!report.verdictLimitations.empty()) {
     html << "<div class=\"k\">observation limits</div><div><ul class=\"why\">";

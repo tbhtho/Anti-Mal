@@ -311,6 +311,72 @@ void Enrich(ScanResult &result, const std::vector<uint8_t> &data,
 
 } // namespace
 
+// High-specificity static rules: findings that describe RECOVERED evidence of
+// malicious construction that benign software does not ordinarily produce --
+// a decoded Cobalt Strike beacon config, a known-malware hash, actual
+// shellcode, or an RC4-encrypted (base64-wrapped) C2 config. Only these can
+// justify a static Malicious verdict.
+//
+// Deliberately NOT high-specificity: the plaintext-obfuscation *lead* rules
+// (single-/multi-byte XOR-obfuscated URL, base64-wrapped IOC). Obfuscated URLs
+// and encoded blobs occur in benign packers/installers/config, so they are
+// strong triage leads that may accumulate, but must not by themselves reach
+// Malicious. Callers can still reach Malicious when one of these co-occurs with
+// a decoded config or a known-malware hash.
+bool IsHighSpecificityStaticRule(const std::string &ruleId) {
+  return ruleId == "config.cobalt_strike" || ruleId == "intel.malwarebazaar" ||
+         ruleId == "intel.virustotal" ||
+         ruleId == "strings.rc4_wrapped_config" ||
+         ruleId.rfind("shellcode.", 0) == 0;
+}
+
+// Obfuscation *leads*: evidence of obfuscation that, on its own, is not proof of
+// malice but is strong enough to justify Suspicious when combined with other
+// signals. Kept separate so the Malicious gate above stays conservative.
+bool IsStrongObfuscationLead(const std::string &ruleId) {
+  return ruleId == "strings.multibyte_xor_obfuscated_url" ||
+         ruleId == "strings.xor_obfuscated_url" ||
+         ruleId == "strings.base64_wrapped_ioc";
+}
+
+StaticEvidenceClassification
+ClassifyStaticEvidence(const std::vector<ScanFinding> &findings) {
+  StaticEvidenceClassification out;
+  for (const auto &f : findings) {
+    if (f.score <= 0) {
+      continue;
+    }
+    if (IsHighSpecificityStaticRule(f.ruleId)) {
+      out.specificScore += f.score;
+      out.specificRules.push_back(f.ruleId);
+    } else if (IsStrongObfuscationLead(f.ruleId)) {
+      // A recovered obfuscated/encoded IOC is a strong lead but not proof: it
+      // counts toward the Suspicious bar, never the Malicious one.
+      out.leadScore += f.score;
+      out.leadRules.push_back(f.ruleId);
+    } else {
+      out.genericScore += f.score;
+    }
+  }
+  return out;
+}
+
+Verdict StaticVerdictFromEvidence(int totalScore,
+                                  const StaticEvidenceClassification &c) {
+  // A verified high-specificity finding (>= 60 points, e.g. a decoded Cobalt
+  // Strike config or a known-malware hash) can justify Malicious. Recovered
+  // obfuscated/encoded IOCs are strong leads but are NOT proof on their own;
+  // generic capabilities/entropy/TLS/unsigned status, however many accumulate,
+  // cap at Suspicious.
+  if (c.specificScore >= 60) {
+    return Verdict::Malicious;
+  }
+  if (totalScore >= 50) {
+    return Verdict::Suspicious;
+  }
+  return Verdict::Clean;
+}
+
 double CalculateEntropy(const std::vector<uint8_t> &data) {
   if (data.empty()) {
     return 0.0;
@@ -922,8 +988,10 @@ ScanResult ScanFile(const std::filesystem::path &path,
       }
     }
 
+    const StaticEvidenceClassification evidence =
+        ClassifyStaticEvidence(result.findings);
     result.score = std::min(result.score, 100);
-    result.verdict = VerdictFromScore(result.score);
+    result.verdict = StaticVerdictFromEvidence(result.score, evidence);
   } catch (const std::exception &ex) {
     result.verdict = Verdict::Error;
     AddFinding(result, "scanner.error", ex.what(), 0);

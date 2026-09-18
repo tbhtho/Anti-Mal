@@ -5,6 +5,7 @@
 #include "antimal/CrashSummary.h"
 #include "antimal/BrowserImpact.h"
 #include "antimal/Config.h"
+#include "antimal/Crypto.h"
 #include "antimal/DetectionSummary.h"
 #include "antimal/EventTime.h"
 #include "antimal/UsabilityDiagnostics.h"
@@ -24,6 +25,7 @@
 #include "antimal/Strings.h"
 #include "antimal/Subprocess.h"
 #include "antimal/Version.h"
+#include "antimal/WorkerIsolation.h"
 #include "antimal/YaraGen.h"
 #include "antimal/hv/BlockDevice.h"
 #include "antimal/hv/ScreenState.h"
@@ -546,11 +548,26 @@ int CommandDetonate(int argc, wchar_t **argv) {
                 << "] " << snap.message << std::endl;
     }
   };
-  // Drop privileges + lock down this worker process before the guest runs
-  // (opt-in via ANTIMAL_VMM_LOWPRIV=1; no-op otherwise).
-  ApplyDetonationWorkerHardening();
+  // Establish the worker's runtime isolation and record what was ACTUALLY
+  // achieved (not merely requested). Required controls fail closed: if any is
+  // not established the run refuses to execute the sample rather than falling
+  // back to unsafe execution.
+  const antimal::WorkerIsolationReport isolation =
+      antimal::ApplyWorkerIsolation();
+  std::cout << "[isolation] worker identity: " << isolation.identity << "\n";
+  for (const auto &c : isolation.controls) {
+    std::cout << "[isolation]   " << (c.established ? "OK  " : "FAIL")
+              << " " << c.id
+              << (c.detail.empty() ? "" : " -- " + c.detail) << "\n";
+  }
+  const bool workerIsolationOk = antimal::WorkerIsolationPermitsExecution(isolation);
+  if (!workerIsolationOk) {
+    std::cerr << "[isolation] a required worker restriction was NOT established; "
+                 "refusing to execute the sample.\n";
+  }
   const auto result = orchestrator.PrepareAndRun(
-      std::filesystem::path(argv[2]), timeout, network, true, progress);
+      std::filesystem::path(argv[2]), timeout, network, true, progress,
+      workerIsolationOk, isolation);
 
   // Machine-readable result for automation / CI / SOAR pipelines. Stable shape;
   // exit code is still 0 (no errors) / 20 (errors) so callers can branch on it.
@@ -4418,6 +4435,11 @@ int CommandRebuildReport(int argc, wchar_t **argv) {
   report.verdictRationale = bs.rationale;
   report.verdictInsufficientEvidence = bs.insufficientEvidence;
   report.verdictLimitations = bs.limitations;
+  report.scorerVersion = bs.scorerVersion;
+  report.verdictPositiveFindings = bs.positiveFindings;
+  // Rescoring is a NEW artifact linked to the immutable raw evidence: record the
+  // journal hash so a reader can prove which bytes produced this verdict.
+  report.evidenceHash = antimal::Sha256File(journalPath);
   report.errors.push_back(
       "Report reconstructed from events.jsonl after the run ended without a "
       "finalized report.json; boot-stage/usability detail is limited to what the "

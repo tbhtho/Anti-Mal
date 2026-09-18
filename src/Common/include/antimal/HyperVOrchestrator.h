@@ -2,6 +2,7 @@
 
 #include "antimal/Config.h"
 #include "antimal/Types.h"
+#include "antimal/WorkerIsolation.h"
 
 #include <filesystem>
 #include <functional>
@@ -191,6 +192,16 @@ public:
       const std::filesystem::path &samplePath, uint32_t timeoutSec,
       NetworkMode networkMode, bool executeVmCommands,
       DetonationProgressCallback progressCallback = {});
+  // Executes only when the caller established the required worker-isolation
+  // controls. `workerIsolationOk` defaults true for staged/benign callers that
+  // never execute; the detonation CLI passes the real achieved result. When
+  // false, the run refuses to execute rather than falling back to unsafe
+  // execution.
+  DetonationResult PrepareAndRun(
+      const std::filesystem::path &samplePath, uint32_t timeoutSec,
+      NetworkMode networkMode, bool executeVmCommands,
+      DetonationProgressCallback progressCallback, bool workerIsolationOk,
+      const WorkerIsolationReport &workerIsolation);
 
 private:
   AppConfig config_;
@@ -205,6 +216,11 @@ public:
       const std::filesystem::path &samplePath, uint32_t timeoutSec,
       NetworkMode networkMode, bool executeVmCommands,
       DetonationProgressCallback progressCallback = {});
+  DetonationResult PrepareAndRun(
+      const std::filesystem::path &samplePath, uint32_t timeoutSec,
+      NetworkMode networkMode, bool executeVmCommands,
+      DetonationProgressCallback progressCallback, bool workerIsolationOk,
+      const WorkerIsolationReport &workerIsolation);
 
 private:
   AppConfig config_;

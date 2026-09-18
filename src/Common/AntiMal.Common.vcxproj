@@ -79,6 +79,8 @@
     <ClInclude Include="include\antimal\Report.h" />
     <ClInclude Include="include\antimal\ReportDiff.h" />
     <ClInclude Include="include\antimal\Scanner.h" />
+    <ClInclude Include="include\antimal\SensorCoverage.h" />
+    <ClInclude Include="include\antimal\WorkerIsolation.h" />
     <ClInclude Include="include\antimal\ScriptAnalyzer.h" />
     <ClInclude Include="include\antimal\ShellcodeDetector.h" />
     <ClInclude Include="include\antimal\Simulation.h" />
@@ -144,6 +146,8 @@
     <ClCompile Include="src\ReportDiff.cpp" />
     <ClCompile Include="src\SampleStaging.cpp" />
     <ClCompile Include="src\Scanner.cpp" />
+    <ClCompile Include="src\SensorCoverage.cpp" />
+    <ClCompile Include="src\WorkerIsolation.cpp" />
     <ClCompile Include="src\ScriptAnalyzer.cpp" />
     <ClCompile Include="src\ShellcodeDetector.cpp" />
     <ClCompile Include="src\Simulation.cpp" />

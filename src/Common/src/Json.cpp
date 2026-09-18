@@ -184,6 +184,27 @@ std::string ToJson(const DynamicRunSummary &summary) {
   obj.AddBool("sampleExecuted", summary.sampleExecuted);
   obj.AddBool("firmwareIdle", summary.firmwareIdle);
   obj.AddBool("guestAgentConnected", summary.guestAgentConnected);
+  obj.AddBool("coverageIncomplete", summary.coverageIncomplete);
+  obj.AddNumber("bootGeneration", summary.bootGeneration);
+  {
+    std::ostringstream sc;
+    sc << "[";
+    for (size_t i = 0; i < summary.sensorCoverage.size(); ++i) {
+      const auto &c = summary.sensorCoverage[i];
+      if (i) {
+        sc << ",";
+      }
+      sc << "{\"sensor\":\"" << JsonEscape(c.sensor) << "\",\"supported\":"
+         << (c.supported ? "true" : "false") << ",\"healthy\":"
+         << (c.healthy ? "true" : "false") << ",\"samples\":" << c.samples
+         << ",\"dropped\":" << c.dropped << ",\"lossKnown\":"
+         << (c.lossKnown ? "true" : "false") << ",\"targetUser\":\""
+         << JsonEscape(c.targetUser) << "\",\"note\":\"" << JsonEscape(c.note)
+         << "\"}";
+    }
+    sc << "]";
+    obj.AddRaw("sensorCoverage", sc.str());
+  }
   obj.AddString("status", summary.status);
   obj.AddString("networkMode", ToString(summary.networkMode));
   obj.AddNumber("framesCaptured", summary.framesCaptured);
@@ -615,6 +636,10 @@ std::string ToJson(const AnalysisReport &report) {
   obj.AddBool("verdictInsufficientEvidence", report.verdictInsufficientEvidence);
   obj.AddRaw("verdictLimitations",
              JsonStringArray(report.verdictLimitations));
+  obj.AddString("scorerVersion", report.scorerVersion);
+  obj.AddRaw("verdictPositiveFindings",
+             JsonStringArray(report.verdictPositiveFindings));
+  obj.AddString("evidenceHash", report.evidenceHash);
   obj.AddRaw("dynamicSummary", ToJson(report.dynamicSummary));
   obj.AddRaw("events", events.str());
   obj.AddRaw("mitreTechniques", JsonStringArray(report.mitreTechniques));

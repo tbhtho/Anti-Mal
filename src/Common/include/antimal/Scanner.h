@@ -49,6 +49,36 @@ int CountEmbeddedExecutables(const std::vector<uint8_t> &data);
 std::vector<ScanFinding>
 DetectImportCapabilities(const std::vector<std::string> &imports);
 
+// Static evidence policy (G1-09/G1-11). A static scan produces two classes of
+// signal:
+//   * GENERIC leads -- import capabilities, entropy, TLS callbacks, unsigned
+//     status, filename mismatch, packer section names. Useful for triage, but
+//     they can never accumulate into a categorical malware verdict by
+//     arithmetic alone.
+//   * HIGH-SPECIFICITY evidence -- a decoded Cobalt Strike config, shellcode
+//     stubs, recovered obfuscated C2, a known-malware threat-intel hit. These
+//     are the only static findings that can justify Malicious.
+// ClassifyStaticEvidence is pure over the finding list so the policy is
+// unit-testable without touching the disk.
+struct StaticEvidenceClassification {
+  int genericScore = 0;  // weak/ambiguous indicators (accumulation capped)
+  int specificScore = 0; // high-specificity indicators
+  int leadScore = 0;     // strong obfuscation leads (XOR/base64 IOC recovery)
+  std::vector<std::string> specificRules; // rule ids that contributed
+  std::vector<std::string> leadRules;     // obfuscation-lead rule ids
+};
+StaticEvidenceClassification
+ClassifyStaticEvidence(const std::vector<ScanFinding> &findings);
+bool IsHighSpecificityStaticRule(const std::string &ruleId);
+// Obfuscation leads (XOR/base64 URL recovery): strong enough to justify
+// Suspicious with corroboration, but NOT a Malicious verdict on their own.
+bool IsStrongObfuscationLead(const std::string &ruleId);
+// Map (total score, classification) to a verdict under the static policy:
+// Malicious requires >= 60 of HIGH-SPECIFICITY evidence; generic accumulation
+// caps at Suspicious.
+Verdict StaticVerdictFromEvidence(int totalScore,
+                                  const StaticEvidenceClassification &c);
+
 ScanResult ScanFile(const std::filesystem::path &path);
 ScanResult ScanFile(const std::filesystem::path &path,
                     const ScannerOptions &options);

@@ -12,6 +12,7 @@
 #include "antimal/ProcessTelemetry.h"
 #include "antimal/Report.h"
 #include "antimal/Screenshot.h"
+#include "antimal/SensorCoverage.h"
 #include "antimal/WerReport.h"
 
 #include <Windows.h>
@@ -1228,6 +1229,34 @@ int RunHostChannelLoop(std::string reason, bool serviceMode) {
   std::set<std::wstring> seenWerReports;
   const std::vector<std::filesystem::path> watchedDirs =
       antimal::DefaultWatchedDirs();
+  // G4 per-sensor coverage: register the collectors this agent runs and record
+  // whether each succeeds and whether it hits a cap. Emitted as `agent.coverage`
+  // records so the host/scorer can gate a Clean verdict on achieved coverage
+  // instead of assuming healthy defaults.
+  antimal::SensorCoverageTracker coverage;
+  {
+    // The file collector resolves from the agent's environment; record which
+    // profile that actually is so the report can expose a service-vs-user gap.
+    std::string profile;
+    wchar_t profileBuf[MAX_PATH]{};
+    if (GetEnvironmentVariableW(L"USERPROFILE", profileBuf, MAX_PATH) > 0) {
+      profile = antimal::WideToUtf8(profileBuf);
+    }
+    wchar_t userBuf[256]{};
+    DWORD userLen = sizeof(userBuf);
+    if (GetUserNameW(userBuf, &userLen)) {
+      profile = antimal::WideToUtf8(userBuf);
+    }
+    coverage.Register("process");
+    coverage.Register("network");
+    coverage.Register("registry");
+    coverage.Register("filesystem", profile);
+    coverage.Register("image");
+    coverage.Register("wer_crash");
+  }
+  uint32_t coverageEmitCounter = 0;
+  constexpr uint32_t kCoverageEmitEveryTicks = 5; // ~5s
+
   // Authorized-detonation state: an execute JobStart opens a transfer, the
   // SampleChunk frames fill the reassembler, then the sample launches and we
   // track it to exit/timeout. All gated on GuestExecutionAuthorized().
@@ -1503,6 +1532,13 @@ int RunHostChannelLoop(std::string reason, bool serviceMode) {
 
     if (telemetryTick && tick % kProcessPollEveryTicks == 0) {
       auto current = antimal::CaptureProcessSnapshot();
+      // G4: a collector that returns an empty snapshot before its baseline has
+      // run is unhealthy; after the baseline it is a legitimate "no change".
+      coverage.Observe("process", !current.empty() || processBaselineSent,
+                       current.size(), 0, /*lossKnown=*/false,
+                       current.empty() && !processBaselineSent
+                           ? "process snapshot returned empty"
+                           : "");
       if (!current.empty() || processBaselineSent) {
         // Enrich every process in the fresh snapshot with deep detail (full
         // path, command line, integrity, user/SID, session, start time) and
@@ -1583,6 +1619,7 @@ int RunHostChannelLoop(std::string reason, bool serviceMode) {
     // local/loopback connections.
     if (telemetryTick && tick % kProcessPollEveryTicks == 0) {
       auto conns = antimal::CaptureTcpConnections();
+      coverage.Observe("network", true, conns.size(), 0, /*lossKnown=*/false);
       if (!conns.empty() || netBaselineSent) {
         auto netEvents = antimal::DiffTcpConnections(
             knownConns, conns, !netBaselineSent, kProcessBaselineCap,
@@ -1602,6 +1639,7 @@ int RunHostChannelLoop(std::string reason, bool serviceMode) {
     // registry.set / registry.delete deltas (did the sample install persistence?).
     if (telemetryTick && tick % kProcessPollEveryTicks == 0) {
       auto reg = antimal::CaptureRegistrySnapshot();
+      coverage.Observe("registry", true, reg.size(), 0, /*lossKnown=*/false);
       if (!reg.empty() || regBaselineSent) {
         auto regEvents = antimal::DiffRegistrySnapshots(
             knownReg, reg, !regBaselineSent, kProcessBaselineCap,
@@ -1631,6 +1669,11 @@ int RunHostChannelLoop(std::string reason, bool serviceMode) {
     // the disk I/O / hashing happens here.
     if (telemetryTick && tick % kFilePollEveryTicks == 0) {
       auto files = antimal::CaptureFileSnapshot(watchedDirs);
+      // A snapshot that hit the entry cap (4096) is lossy; the walk does not
+      // report the exact overflow, so lossKnown stays false.
+      coverage.Observe("filesystem", true, files.size(), 0, /*lossKnown=*/false,
+                       files.size() >= 4096 ? "file snapshot hit the 4096-entry cap"
+                                            : "");
       if (!files.empty() || fileBaselineSent) {
         auto fileEvents = antimal::DiffFileSnapshots(
             knownFiles, files, !fileBaselineSent, kProcessBaselineCap,
@@ -1670,6 +1713,11 @@ int RunHostChannelLoop(std::string reason, bool serviceMode) {
         livePids.push_back(entry.first);
       }
       auto modules = BuildModuleSnapshot(livePids);
+      coverage.Observe("image", !livePids.empty(), modules.size(), 0,
+                       /*lossKnown=*/false,
+                       livePids.size() > 128
+                           ? "module PID pass capped at 128 (high PIDs unscanned)"
+                           : "");
       if (!modules.empty() || moduleBaselineSent) {
         auto modEvents = antimal::DiffModuleSnapshots(
             knownModules, modules, !moduleBaselineSent, kProcessBaselineCap,
@@ -1691,6 +1739,22 @@ int RunHostChannelLoop(std::string reason, bool serviceMode) {
     // on the process cadence (~2s); bounded per tick + de-duped by full path.
     if (telemetryTick && tick % kProcessPollEveryTicks == 0) {
       ScanForWerCrashes(com2, seenWerReports);
+      coverage.Observe("wer_crash", true, 0, 0, /*lossKnown=*/false);
+    }
+
+    // G4: periodically stream the accumulated per-sensor coverage so the host
+    // can gate negatives on achieved coverage. Emitted every few ticks, and
+    // always once before the sample is reported, so a short run still carries a
+    // coverage record.
+    if (telemetryTick && (tick % kCoverageEmitEveryTicks == 0 ||
+                          (sampleReported && coverageEmitCounter == 0))) {
+      ++coverageEmitCounter;
+      for (const auto &ev : coverage.ToEvents(0)) {
+        if (!SendAgentEvent(com2, ev)) {
+          CloseHandle(com2);
+          return 1;
+        }
+      }
     }
 
     if (telemetryTick) {

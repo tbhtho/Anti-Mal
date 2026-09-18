@@ -65,7 +65,7 @@ AnalysisReport RunGuestJob(const JobConfig &job) {
   report.runId = job.runId.empty() ? MakeRunId() : job.runId;
   report.samplePath = job.samplePath;
   report.scannerVerdict = ScanFile(job.samplePath);
-  report.sandboxVerdict = Verdict::Suspicious;
+  report.sandboxVerdict = Verdict::Unknown;
   report.events.push_back(MakeEvent("agent", "job-start", PathToUtf8(job.samplePath)));
 
   STARTUPINFOW startup{};
@@ -93,7 +93,19 @@ AnalysisReport RunGuestJob(const JobConfig &job) {
   const DWORD wait = WaitForSingleObject(process.hProcess, job.timeoutMs);
   if (wait == WAIT_TIMEOUT) {
     TerminateProcess(process.hProcess, 0xDEAD);
-    report.sandboxVerdict = Verdict::Malicious;
+    // Timeout, launch failure, incomplete observation, and confirmed harmful
+    // behavior are different facts. Reaching the time budget is NOT a malware
+    // signal -- this legacy route used to report Malicious here, which
+    // contradicted the main scorer's policy.
+    report.sandboxVerdict = Verdict::Unknown;
+    report.verdictInsufficientEvidence = true;
+    report.verdictRationale.push_back(
+        "Run reached its time budget with no behavioral telemetry on this "
+        "legacy monitor route; timeout alone is not a malicious signal and "
+        "there is no positive evidence to report.");
+    report.verdictLimitations.push_back(
+        "the run ended at its time budget without behavioral telemetry, so no "
+        "conclusion about the sample's behavior is supported");
     report.events.push_back(MakeEvent("process", "timeout-terminated",
                                       PathToUtf8(job.samplePath)));
   } else {
@@ -103,6 +115,15 @@ AnalysisReport RunGuestJob(const JobConfig &job) {
     exit.processId = process.dwProcessId;
     exit.details["exitCode"] = std::to_string(exitCode);
     report.events.push_back(exit);
+    // The sample launched and exited, but this route collects no behavior.
+    report.sandboxVerdict = Verdict::Unknown;
+    report.verdictInsufficientEvidence = true;
+    report.verdictRationale.push_back(
+        "Sample launched and exited on the legacy monitor route, which "
+        "collects no behavioral telemetry; the observation is insufficient "
+        "for a Clean/Suspicious/Malicious conclusion.");
+    report.verdictLimitations.push_back(
+        "no behavioral sensor observed this run (launch/exit only)");
   }
 
   CloseHandle(process.hThread);
