@@ -8624,6 +8624,13 @@ HostChannelCapture ProcessHostChannelOutput(
       break;
     case hv::HostChannelMessage::Event: {
       auto event = ParseEventJsonLine(payload);
+      // The verified launch anchor is execution evidence in its own right: a run
+      // finalized while the sample is still alive never receives ReportComplete,
+      // so deriving execution only from that frame left the summary (and every
+      // report field built from it) claiming "not executed".
+      if (!capture.sampleExecuted && JournalShowsSampleExecuted({event})) {
+        capture.sampleExecuted = true;
+      }
       // Always collect into the report's in-memory vector. Interactive sessions
       // journal events live in the progress callback (for real-time tailing), so
       // re-journaling here would duplicate journal lines -- but the report is
@@ -11769,6 +11776,9 @@ DetonationResult InHouseOrchestrator::PrepareAndRun(
     const auto kdPacketsPath = result.runDir / "kd-packets.jsonl";
     const auto vmSummaryPath = result.runDir / "vm-summary.json";
     const auto vmDiagnosticsPath = result.runDir / "vm-diagnostics.txt";
+    // Declared before the run so the finalization section (outside the try) can
+    // reload live-streamed evidence from the journal when needed.
+    bool interactiveSession = false;
     try {
       hv::VmRunRequest request;
       request.networkMode = ToHvNetworkMode(networkMode);
@@ -11800,7 +11810,7 @@ DetonationResult InHouseOrchestrator::PrepareAndRun(
       // auto-stopped when the GuestAgent first checks in (that early stop is the
       // non-interactive "is the agent alive?" probe), and its telemetry is
       // journaled live below so the UI can tail it in real time.
-      const bool interactiveSession = !request.liveInputPath.empty();
+      interactiveSession = !request.liveInputPath.empty();
       // timeoutSec == 0 is the genuine "until stopped" policy: no host deadline
       // (VmRunRequest::noDeadline) and no guest-side analysis budget (the job
       // carries timeoutMs=0). A safety resource limit still exists at the
@@ -13536,6 +13546,35 @@ DetonationResult InHouseOrchestrator::PrepareAndRun(
                          &events);
     }
 
+    // Share the evidence-derived lifecycle fact across normal finalization, not
+    // just offline recovery. An "until stopped" run finalized while the sample is
+    // alive never receives the guest's ReportComplete frame, so if any summary /
+    // error / JSON / HTML field would read sampleExecuted=false we reconstruct it
+    // from the verified journal anchor FIRST. Incomplete observation (no declared
+    // end, lossy coverage) is preserved separately by the scorer's limits.
+    if (!result.dynamicSummary.sampleExecuted) {
+      bool anchored = JournalShowsSampleExecuted(events);
+      if (!anchored && interactiveSession) {
+        // Live-streamed events may not all be in the in-memory copy; the journal
+        // is the authoritative raw evidence the recovery path reads.
+        const auto journalEvents =
+            EventJournalTailer(result.journalPath).ReadAll();
+        if (JournalShowsSampleExecuted(journalEvents)) {
+          anchored = true;
+          if (journalEvents.size() > events.size()) {
+            events = journalEvents;
+          }
+        }
+      }
+      if (anchored) {
+        result.dynamicSummary.sampleExecuted = true;
+        if (result.dynamicSummary.status.empty() ||
+            result.dynamicSummary.status == "guest agent connected") {
+          result.dynamicSummary.status = "sample executed";
+          result.status = result.dynamicSummary.status;
+        }
+      }
+    }
     // "Sample not executed" is only an ERROR when execution was actually
     // ARMED (the two-key gate held) yet the guest never confirmed a detonation.
     // A default gated run -- and any interactive boot -- deliberately does not

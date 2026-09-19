@@ -364,7 +364,21 @@ const char *OwnershipLabel(Ownership o) {  switch (o) {
 
 } // namespace
 
-// Signal weights (behavior-score-v2). Strong sample-attributable signals can
+bool JournalShowsSampleExecuted(const std::vector<EventRecord> &events) {
+  for (const auto &e : events) {
+    if (Lower(e.category) != "process" || e.processId == 0) {
+      continue;
+    }
+    const std::string a = Lower(e.action);
+    if (Has(a, "create") && !Has(a, "failed") &&
+        DetailIsTrue(e, "sampleExecuted")) {
+      return true;
+    }
+  }
+  return false;
+}
+
+// Signal weights (behavior-score-v4). Strong sample-attributable signals can
 // reach the Malicious threshold; time-correlated (poll-diff) observations
 // contribute at reduced weight and can never unlock the attributed-malice gate;
 // other-process / unanchored activity contributes nothing.
@@ -392,20 +406,8 @@ BehaviorScore ScoreSandboxBehavior(const DynamicRunSummary &summary,
   // while the sample was still alive. The journal's VERIFIED anchor
   // (details.sampleExecuted) is ground truth that the sample executed, so the
   // scorer must not report "not executed" for a fixture that clearly ran.
-  bool executed = summary.sampleExecuted;
-  if (!executed) {
-    for (const auto &e : events) {
-      if (Lower(e.category) != "process" || e.processId == 0) {
-        continue;
-      }
-      const std::string a = Lower(e.action);
-      if (Has(a, "create") && !Has(a, "failed") &&
-          DetailIsTrue(e, "sampleExecuted")) {
-        executed = true;
-        break;
-      }
-    }
-  }
+  const bool executed =
+      summary.sampleExecuted || JournalShowsSampleExecuted(events);
 
   // Nothing ran (gated/healthcheck) or no telemetry at all -> inconclusive.
   if (!executed || events.empty()) {
@@ -483,22 +485,147 @@ BehaviorScore ScoreSandboxBehavior(const DynamicRunSummary &summary,
     }
   }
 
-  // The sample's process subtree (root + descendants via parentProcessId),
-  // guarded against obvious PID reuse: a later event that claims the root PID
-  // with a different recorded start time / boot generation is a DIFFERENT
-  // process instance and is not the sample.
-  std::set<uint32_t> sampleSubtree;
-  std::map<uint32_t, std::string> pidFirstStart;
-  if (rootKnown) {
-    sampleSubtree.insert(sampleRootPid);
-    for (const auto &e : events) {
-      if (Lower(e.category) != "process" || e.processId == 0) {
-        continue;
+  // ---- Process instances and lifetimes (behavior-score-v4). ----
+  // Identity is the process INSTANCE (pid + startTime), not a numeric PID:
+  //   * an earlier unrelated instance that exited before the verified sample
+  //     launch must not poison the sample's own lifetime (its end belongs to a
+  //     different instance), and
+  //   * a child whose parent instance had already ended must not be adopted
+  //     into the sample subtree merely because the numeric PID matches.
+  struct PidInstances {
+    std::vector<std::string> starts;               // known instance start times
+    std::map<std::string, std::string> endByStart; // instance start -> end
+    std::vector<std::string> endsUnbound;          // ends with no recorded start
+  };
+  std::map<uint32_t, PidInstances> lifetimes;
+  const auto instanceStartOf = [](const EventRecord &e) -> std::string {
+    if (const std::string *st = Detail(e, "startTime");
+        st != nullptr && !st->empty()) {
+      return *st;
+    }
+    return {};
+  };
+  for (const auto &e : events) {
+    const std::string cat = Lower(e.category);
+    if ((cat != "process" && cat != "crash") || e.processId == 0 ||
+        e.timestampUtc.empty()) {
+      continue;
+    }
+    const std::string a = Lower(e.action);
+    const bool isEnd = Has(a, "stop") || Has(a, "exit") || Has(a, "terminat") ||
+                       Has(a, "timeout") || Has(a, "crash");
+    const bool isStart = !isEnd && (Has(a, "start") || Has(a, "create") ||
+                                    Has(a, "spawn") || Has(a, "running"));
+    if (!isEnd && !isStart) {
+      continue;
+    }
+    PidInstances &L = lifetimes[e.processId];
+    if (isStart) {
+      const std::string st = instanceStartOf(e);
+      const std::string start = st.empty() ? e.timestampUtc : st;
+      if (std::find(L.starts.begin(), L.starts.end(), start) == L.starts.end()) {
+        L.starts.push_back(start);
+        std::sort(L.starts.begin(), L.starts.end());
       }
-      if (const std::string *st = Detail(e, "startTime")) {
-        pidFirstStart.emplace(e.processId, *st);
+    } else {
+      const std::string st = instanceStartOf(e);
+      if (st.empty()) {
+        L.endsUnbound.push_back(e.timestampUtc);
+      } else {
+        const auto it = L.endByStart.find(st);
+        if (it == L.endByStart.end() || e.timestampUtc < it->second) {
+          L.endByStart[st] = e.timestampUtc;
+        }
       }
     }
+  }
+  // Fold unbound ends onto the latest known instance start at or before the end
+  // time, so a stop that carries no startTime still closes the instance it
+  // logically ended -- without touching any earlier/later instance of the PID.
+  for (auto &entry : lifetimes) {
+    for (const std::string &end : entry.second.endsUnbound) {
+      const std::string *owner = nullptr;
+      for (const std::string &s : entry.second.starts) {
+        if (s <= end) {
+          owner = &s;
+        } else {
+          break;
+        }
+      }
+      if (owner != nullptr) {
+        const auto it = entry.second.endByStart.find(*owner);
+        if (it == entry.second.endByStart.end() || end < it->second) {
+          entry.second.endByStart[*owner] = end;
+        }
+      }
+    }
+  }
+  // The latest instance of `pid` that started at or before `ts`, or nullptr when
+  // no known instance covers the moment.
+  const auto latestInstanceAt = [&](uint32_t pid,
+                                    const std::string &ts) -> const std::string * {
+    const auto it = lifetimes.find(pid);
+    if (it == lifetimes.end() || ts.empty()) {
+      return nullptr;
+    }
+    const std::string *latest = nullptr;
+    for (const std::string &s : it->second.starts) {
+      if (s <= ts) {
+        latest = &s;
+      } else {
+        break;
+      }
+    }
+    return latest;
+  };
+  // True when the instance of `pid` covering `ts` has not recorded an end before
+  // `ts`. No known covering instance + a recorded end <= ts fails closed (a
+  // reused PID cannot be distinguished from the ended instance).
+  const auto pidAliveAt = [&](uint32_t pid, const std::string &ts) -> bool {
+    if (pid == 0) {
+      return true;
+    }
+    const auto it = lifetimes.find(pid);
+    if (it == lifetimes.end()) {
+      return true;
+    }
+    const std::string *inst = latestInstanceAt(pid, ts);
+    if (inst != nullptr) {
+      const auto endIt = it->second.endByStart.find(*inst);
+      return endIt == it->second.endByStart.end() || ts <= endIt->second;
+    }
+    if (ts.empty()) {
+      return it->second.endByStart.empty() && it->second.endsUnbound.empty();
+    }
+    for (const std::string &end : it->second.endsUnbound) {
+      if (end <= ts) {
+        return false;
+      }
+    }
+    return true;
+  };
+
+  // The root instance start: the anchor's captured startTime, or -- when it was
+  // not captured -- the launch instant as a conservative instance start. The
+  // "start time not captured" limitation is preserved separately.
+  const bool rootStartCaptured = !rootStartTime.empty();
+  const std::string rootInstanceStart =
+      rootStartCaptured ? rootStartTime : sampleLaunchTime;
+  if (rootKnown && !rootInstanceStart.empty()) {
+    PidInstances &RL = lifetimes[sampleRootPid];
+    if (std::find(RL.starts.begin(), RL.starts.end(), rootInstanceStart) ==
+        RL.starts.end()) {
+      RL.starts.push_back(rootInstanceStart);
+      std::sort(RL.starts.begin(), RL.starts.end());
+    }
+  }
+
+  // The sample's process subtree (root + descendants via parentProcessId),
+  // validated against the instance graph: the parent must be alive when the
+  // child starts, and the child's own PID must not be a dead instance.
+  std::set<uint32_t> sampleSubtree;
+  if (rootKnown) {
+    sampleSubtree.insert(sampleRootPid);
     bool changed = true;
     while (changed) {
       changed = false;
@@ -513,16 +640,25 @@ BehaviorScore ScoreSandboxBehavior(const DynamicRunSummary &summary,
         if (!sampleSubtree.count(e.parentProcessId)) {
           continue;
         }
-        // A child cannot start before its parent. When both start times are
-        // recorded, reject a chain that would require time to run backwards
-        // (a classic PID-reuse artifact).
-        const auto childStart = pidFirstStart.find(e.processId);
-        const auto parentStart = pidFirstStart.find(e.parentProcessId);
-        if (childStart != pidFirstStart.end() &&
-            parentStart != pidFirstStart.end() && !childStart->second.empty() &&
-            !parentStart->second.empty() &&
-            childStart->second < parentStart->second) {
-          continue;
+        const std::string childTs =
+            e.timestampUtc.empty() ? instanceStartOf(e) : e.timestampUtc;
+        if (childTs.empty()) {
+          // No time on the child event. Admit it only when the parent has NO
+          // recorded end at all; otherwise a dead/reused parent cannot be
+          // distinguished and the child stays out (fail closed).
+          const auto pit = lifetimes.find(e.parentProcessId);
+          if (pit != lifetimes.end() &&
+              (!pit->second.endByStart.empty() ||
+               !pit->second.endsUnbound.empty())) {
+            continue;
+          }
+        } else {
+          if (!pidAliveAt(e.parentProcessId, childTs)) {
+            continue; // parent instance had already ended: not the sample's child
+          }
+          if (!pidAliveAt(e.processId, childTs)) {
+            continue; // child PID belongs to a dead/reused instance
+          }
         }
         sampleSubtree.insert(e.processId);
         changed = true;
@@ -542,56 +678,25 @@ BehaviorScore ScoreSandboxBehavior(const DynamicRunSummary &summary,
     return true;
   };
 
-  // PID lifetimes (behavior-score-v3). A process.stop / process.exit /
-  // process.timeout / crash records the END of the instance that owned that PID.
-  // An event claiming the PID after that recorded end belongs to a reused PID,
-  // not to the sample; when its timestamp is missing the event cannot be placed
-  // against the recorded lifetime, so attribution fails closed. A later
-  // process.create for the same PID does not re-admit it: the sample is the
-  // ANCHORED instance, and the reuse guard above already rejects a different
-  // start time / boot generation.
-  std::map<uint32_t, std::string> pidEndTime;
-  for (const auto &e : events) {
-    const std::string cat = Lower(e.category);
-    if ((cat != "process" && cat != "crash") || e.processId == 0 ||
-        e.timestampUtc.empty()) {
-      continue;
-    }
-    const std::string a = Lower(e.action);
-    if (Has(a, "stop") || Has(a, "exit") || Has(a, "terminat") ||
-        Has(a, "timeout") || Has(a, "crash")) {
-      const auto it = pidEndTime.find(e.processId);
-      if (it == pidEndTime.end() || e.timestampUtc < it->second) {
-        pidEndTime[e.processId] = e.timestampUtc; // earliest recorded end
-      }
-    }
-  }
-  const auto lifetimeAllows = [&](const EventRecord &e) {
-    if (e.processId == 0) {
-      return true; // no PID: ownership is temporal correlation, handled later
-    }
-    const auto it = pidEndTime.find(e.processId);
-    if (it == pidEndTime.end()) {
-      return true; // no recorded end: no evidence the instance is dead
-    }
-    if (e.timestampUtc.empty()) {
-      return false; // cannot place the event inside the recorded lifetime
-    }
-    return e.timestampUtc <= it->second;
-  };
-
   const auto inSampleSubtree = [&](const EventRecord &e) {
     if (!rootKnown || e.processId == 0 ||
         !sampleSubtree.count(e.processId)) {
       return false;
     }
-    if (!lifetimeAllows(e)) {
-      return false;
-    }
     if (e.processId == sampleRootPid && !sameRootInstance(e)) {
       return false;
     }
-    return true;
+    if (e.timestampUtc.empty()) {
+      // Cannot place the event in time. Any recorded end for the PID means a
+      // different (reused) instance cannot be excluded -> fail closed.
+      const auto it = lifetimes.find(e.processId);
+      if (it != lifetimes.end() &&
+          (!it->second.endByStart.empty() || !it->second.endsUnbound.empty())) {
+        return false;
+      }
+      return true;
+    }
+    return pidAliveAt(e.processId, e.timestampUtc);
   };
 
   const auto classifyOwnership = [&](const EventRecord &e) {
@@ -822,11 +927,15 @@ BehaviorScore ScoreSandboxBehavior(const DynamicRunSummary &summary,
 
     // --- Side-loaded / search-order-hijacked DLL ----------------------------
     // A module loaded from a writable path is NOT by itself a hijack: installers
-    // and self-extractors do that routinely. It becomes a high-specificity
-    // signal only when the collector explicitly classified it as a hijack
-    // (details.suspicion names a search-order/hijack/shadowing pattern) or the
-    // module shadows a known search-order DLL from a non-system path. Otherwise
-    // it is recorded as context and is not scored.
+    // and self-extractors do that routinely. Two independent facts are required
+    // for the scorer to call it a hijack on its own:
+    //   (1) the module is NOT loaded from its legitimate system location
+    //       (a normal C:\Windows\System32\version.dll load is just Windows), and
+    //   (2) it sits in a writable/staging location AND shadows a known
+    //       search-order DLL name -- the classic planting shape.
+    // An explicit collector classification (details.suspicion naming a
+    // hijack/search-order/shadowing pattern) is sensor evidence and stands on
+    // its own. Everything else is context: recorded, not scored.
     if (cat == "image" && Has(act, "load") && inSampleSubtree(e)) {
       const std::string *susp = Detail(e, "suspicion");
       const std::string suspL = susp ? Lower(*susp) : std::string();
@@ -834,7 +943,8 @@ BehaviorScore ScoreSandboxBehavior(const DynamicRunSummary &summary,
           Has(suspL, "hijack") || Has(suspL, "search-order") ||
           Has(suspL, "search order") || Has(suspL, "shadow") ||
           DetailIsTrue(e, "searchOrderHijack");
-      const bool shadowsKnownDll = IsKnownShadowedDllName(tgtL);
+      const bool shadowsKnownDll =
+          IsKnownShadowedDllName(tgtL) && IsStagingLocation(tgtL);
       if (hijackClassified || shadowsKnownDll) {
         suspiciousModules.insert(tgtL.empty() ? act : tgtL);
       } else if (!suspL.empty() || !e.mitre.empty()) {
@@ -1159,36 +1269,20 @@ BehaviorScore ScoreSandboxBehavior(const DynamicRunSummary &summary,
     out.verdict = Verdict::Clean;
   }
 
-  // Malicious requires SAMPLE-ATTRIBUTABLE and SUFFICIENTLY SPECIFIC evidence.
-  // Two distinct concerns are enforced separately:
-  //   (1) Attribution -- time-correlated / other-process / installation context
-  //       can never unlock the gate.
-  //   (2) Specificity -- a single GENERIC category (a staging drop, or an
-  //       external connection) cannot reach Malicious by repetition alone. A
-  //       benign installer commonly drops several temp helpers and contacts an
-  //       update/CDN endpoint; counting those to 60 would make ordinary software
-  //       "confirmed malware" purely by crossing a threshold. Malicious needs
-  //       either a high-specificity signal (anomalous command line, side-loaded
-  //       DLL, other attributed MITRE behavior) OR corroboration across TWO
-  //       independent categories (e.g. a staged drop AND external egress).
+  // Malicious requires SAMPLE-ATTRIBUTABLE and HIGH-SPECIFICITY evidence.
+  // Attribution alone is not enough, and neither is a count of generic
+  // categories: an ordinary updater legitimately writes a Run key, drops a
+  // temporary helper, and contacts an update endpoint. Confirmation requires a
+  // high-specificity signal -- an anomalous command line, a verified DLL
+  // search-order hijack, or other attributed MITRE-tagged behavior. Adding an
+  // installation-directory write must change neither direction of the verdict.
   const bool highSpecificity = suspCmd > 0 || suspMod > 0 || otherMitre > 0;
   const int genericCategories = (nStagingDrops > 0 ? 1 : 0) +
                                 (nExternal > 0 ? 1 : 0);
-  // Installation context changes the specificity calculus: a program that
-  // installs its OWN application files under Program Files and also drops a few
-  // temp helpers and contacts an update endpoint is a normal installer, not
-  // confirmed malware. In that shape only a HIGH-specificity signal can confirm
-  // Malicious; two generic categories are no longer enough.
+  // Installation context changes the EXPLANATION (a program installing its own
+  // files under Program Files is context), never the confirmation bar.
   const bool looksLikeOrdinaryInstall = nInstallWrites > 0;
-  // A generic cross-category chain (staged drops + external egress) is how many
-  // ORDINARY installers/updaters look; by itself it caps at Suspicious. It only
-  // confirms Malicious when the sample also established attributed persistence
-  // of its own (an autostart mutation by the sample's process), which is a
-  // self-establishment claim rather than an ordinary drop/connection, and even
-  // then not in the install-location shape.
-  const bool corroboratedPersistence =
-      nPersistence > 0 && genericCategories >= 2 && !looksLikeOrdinaryInstall;
-  const bool attributableMalice = highSpecificity || corroboratedPersistence;
+  const bool attributableMalice = highSpecificity;
   if (out.verdict == Verdict::Malicious && !attributableMalice) {
     out.verdict = Verdict::Suspicious;
     if (looksLikeOrdinaryInstall) {
@@ -1197,24 +1291,32 @@ BehaviorScore ScoreSandboxBehavior(const DynamicRunSummary &summary,
           "under an install location and showed only generic drop/connection "
           "activity. That is the shape of an ordinary installer; confirming "
           "malware in this shape requires a high-specificity signal (anomalous "
-          "command line, DLL side-loading, or attributed MITRE behavior), not a "
-          "score crossed by ordinary actions.");
+          "command line, verified DLL hijack, or attributed MITRE behavior), not "
+          "a score crossed by ordinary actions.");
+    } else if (nPersistence > 0 && (nStagingDrops > 0 || nExternal > 0)) {
+      out.rationale.push_back(
+          "Capped at Suspicious: an attributed Run-key write plus generic "
+          "staging/connection activity is the shape of an ordinary auto-updater "
+          "(self-registration, a temporary helper, an update endpoint), not "
+          "confirmation of malware. Confirming malware in this shape requires "
+          "high-specificity evidence (anomalous command line, verified DLL "
+          "hijack, or another attributed MITRE behavior); counting generic "
+          "categories is not such evidence.");
     } else if (nStagingDrops > 0 || nExternal > 0) {
       out.rationale.push_back(
           "Capped at Suspicious: the score is driven by generic drop/connection "
           "activity (staged file writes and/or external endpoint connections) "
-          "without a high-specificity signal (anomalous command line, DLL "
-          "side-loading, attributed MITRE behavior) or an attributed persistence "
-          "write corroborating it. Ordinary installers and updaters do all of "
-          "these; repeating one ordinary category is not confirmation of "
-          "malware.");
+          "without a high-specificity signal (anomalous command line, verified "
+          "DLL hijack, attributed MITRE behavior). Ordinary installers and "
+          "updaters do all of these; repeating one ordinary category is not "
+          "confirmation of malware.");
     } else {
       out.rationale.push_back(
           "Capped at Suspicious: the score is driven only by attributed "
           "persistence / installation context / time-correlated observations; no "
-          "sample-attributable malice (staged executable drop, attributed "
-          "external egress, suspicious command line, DLL side-loading, or other "
-          "attributed MITRE-tagged behavior) corroborated it.");
+          "sample-attributable high-specificity malice (suspicious command line, "
+          "verified DLL hijack, or other attributed MITRE-tagged behavior) "
+          "corroborated it.");
     }
   }
   if (sampleSigned && out.score >= 60 && out.verdict != Verdict::Malicious) {
@@ -1230,7 +1332,7 @@ BehaviorScore ScoreSandboxBehavior(const DynamicRunSummary &summary,
         "signature is not proof of benignity).");
   }
 
-  // ---- Evidence-sufficiency gate (behavior-score-v2). ----
+  // ---- Evidence-sufficiency gate (behavior-score-v4). ----
   // A reassuring negative requires an observation that could have seen the
   // behavior it is denying. Coverage limits WITHHOLD a negative verdict; they
   // never erase a positive finding that other evidence supports.

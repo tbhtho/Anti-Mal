@@ -26,7 +26,20 @@ namespace antimal {
 //     corroborated across two generic categories (ordinary-install shape still
 //     caps at Suspicious); a module loaded from a writable path is a context
 //     observation unless the collector classified it as a hijack.
-inline constexpr const char *kBehaviorScorerVersion = "behavior-score-v3";
+// v4 (2026-09-18 follow-up review):
+//   * a known shadowed DLL name is a hijack only from a writable/staging
+//     location (never from System32/Program Files), and a collector annotation
+//     must be hijack-specific to stand alone;
+//   * Malicious requires high-specificity evidence ALWAYS: attributed
+//     persistence plus generic drop/connection categories is the ordinary
+//     auto-updater shape and caps at Suspicious (an install-directory write no
+//     longer changes severity in either direction);
+//   * lifetime/attribution is bound to process INSTANCES (pid + startTime) and
+//     valid parent lifetimes, not a global earliest-end per numeric PID;
+//   * the verified journal anchor is the shared execution fact
+//     (JournalShowsSampleExecuted) used by normal finalization as well as
+//     recovery.
+inline constexpr const char *kBehaviorScorerVersion = "behavior-score-v4";
 
 // Result of the explainable behavioral scorer. `score` is the summed weight of
 // every signal that fired; `verdict` is that score mapped through thresholds;
@@ -62,13 +75,22 @@ struct BehaviorScore {
   std::string scorerVersion = kBehaviorScorerVersion;
 };
 
+// True when the journal contains the VERIFIED sample-launch anchor: an agent
+// process.create carrying details.sampleExecuted=true. This is the shared,
+// evidence-derived execution fact. Use it anywhere a summary/report claims
+// whether the sample executed, so a normal finalization that never received the
+// guest's completion frame (an "until stopped" run finalized while the sample
+// was alive) agrees with offline recovery instead of reporting "not executed".
+// It NEVER infers execution from a bare process.create.
+bool JournalShowsSampleExecuted(const std::vector<EventRecord> &events);
+
 // Score a completed detonation purely from what the guest was observed to do.
 //
 // Pure + deterministic: no I/O, no globals, no clock reads -- it is a function
 // of (summary, events) only, which is why it lives here rather than buried in
 // the 11k-line orchestrator, and why it is directly unit-testable.
 //
-// Contract (behavior-score-v2):
+// Contract (behavior-score-v4):
 //   * If the sample never executed (gated run / healthcheck / no telemetry),
 //     the verdict is Unknown -- there is nothing to judge.
 //   * It NEVER returns Verdict::Error. Error is reserved for an actual run

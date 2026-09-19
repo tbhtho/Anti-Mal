@@ -1546,6 +1546,55 @@ int RunHostChannelLoop(std::string reason, bool serviceMode) {
       reassembler.reset();
     }
 
+    // Fast-drain while a sample transfer is in flight: the paced host->guest
+    // delivery is the critical path, so pause the ~1s telemetry cadence
+    // (heartbeat + collectors + tick) and poll COM2 at ~20 Hz instead. The
+    // collectors resume the moment the transfer completes (staged/launched) or
+    // is failed by the watchdog above. Frame processing is unaffected -- the
+    // inner PopFrame loop above still drains every arrival.
+    const bool transferInFlight = executeReq && !sampleLaunched && !sampleStaged;
+    const bool telemetryTick = !transferInFlight;
+
+    // Target-user tracking MUST precede the sample launch: if the interactive
+    // user appeared after collector initialization, re-scope and re-baseline the
+    // user-profile collectors first, so the sample window is observed against
+    // the intended profile/hive. If the user is still unknown at launch, an
+    // explicit initial-coverage-gap note is recorded below -- never a healthy
+    // default.
+    if (telemetryTick) {
+      const bool loginReady = HasInteractiveSession();
+      const bool periodic = tick != 0 && tick % 15 == 0;
+      if ((loginReady && !interactiveUser.valid) || periodic) {
+        const InteractiveUserInfo fresh = ResolveInteractiveUser();
+        if (fresh.valid && (fresh.sid != interactiveUser.sid ||
+                            fresh.profile != interactiveUser.profile)) {
+          const bool initialGap = !interactiveUser.valid;
+          interactiveUser = fresh;
+          watchedDirs = antimal::DefaultWatchedDirs(interactiveUser.profile);
+          // Re-baseline the diff collectors for the new hive/profile: without
+          // this, every pre-existing value in the user's hive would surface as a
+          // one-tick "mutation" burst and be counted as post-launch sample
+          // activity, even though it is ordinary profile state.
+          regBaselineSent = false;
+          fileBaselineSent = false;
+          const std::string user = antimal::WideToUtf8(interactiveUser.name);
+          coverage.SetScope(
+              "registry", user, "mixed",
+              initialGap
+                  ? "initial coverage gap: registry collector started before the "
+                    "interactive user was known; user hive baselined at logon"
+                  : "registry collector now reads the interactive user's loaded "
+                    "hive");
+          coverage.SetScope(
+              "filesystem", user, "mixed",
+              initialGap
+                  ? "initial coverage gap: file collector started before the "
+                    "interactive user was known; profile baselined at logon"
+                  : "file collector now watches the interactive user's profile");
+        }
+      }
+    }
+
     // Deferred launch (SP5): the delivery is staged; launch the sample as soon as
     // a desktop session is logged in (so it runs VISIBLY on the live desktop), or
     // after the wait budget so a no-login boot still detonates (headless).
@@ -1553,6 +1602,20 @@ int RunHostChannelLoop(std::string reason, bool serviceMode) {
         (diskSamplePath || reassembler)) {
       if (HasInteractiveSession() ||
           std::chrono::steady_clock::now() >= launchDeadline) {
+        if (!interactiveUser.valid) {
+          // Explicit initial gap: the sample is about to run while the
+          // user-profile collectors still target the agent's own environment.
+          coverage.SetScope(
+              "registry", "", "mixed",
+              "initial coverage gap: sample launched before the interactive "
+              "user's hive could be resolved; early user-hive activity may be "
+              "missed");
+          coverage.SetScope(
+              "filesystem", "", "mixed",
+              "initial coverage gap: sample launched before the interactive "
+              "profile could be resolved; early user-profile activity may be "
+              "missed");
+        }
         sampleLaunched =
             diskSamplePath
                 ? LaunchPreparedSample(com2, *executeReq, *diskSamplePath,
@@ -1596,40 +1659,6 @@ int RunHostChannelLoop(std::string reason, bool serviceMode) {
         CloseHandle(sampleProcess);
         sampleProcess = nullptr;
         sampleReported = true;
-      }
-    }
-
-    // Fast-drain while a sample transfer is in flight: the paced host->guest
-    // delivery is the critical path, so pause the ~1s telemetry cadence
-    // (heartbeat + collectors + tick) and poll COM2 at ~20 Hz instead. The
-    // collectors resume the moment the transfer completes (staged/launched) or
-    // is failed by the watchdog above. Frame processing is unaffected -- the
-    // inner PopFrame loop above still drains every arrival.
-    const bool transferInFlight = executeReq && !sampleLaunched && !sampleStaged;
-    const bool telemetryTick = !transferInFlight;
-
-    // Target-user tracking: once logon completes, re-scope the user-profile
-    // collectors to the interactive user and record the scope transition on the
-    // coverage record (never silently relabel earlier SYSTEM observations).
-    if (telemetryTick && tick != 0 && tick % 15 == 0) {
-      const InteractiveUserInfo fresh = ResolveInteractiveUser();
-      if (fresh.valid && (fresh.sid != interactiveUser.sid ||
-                          fresh.profile != interactiveUser.profile)) {
-        interactiveUser = fresh;
-        watchedDirs = antimal::DefaultWatchedDirs(interactiveUser.profile);
-        // Re-baseline the diff collectors for the new hive/profile: without
-        // this, every pre-existing value in the user's hive would surface as a
-        // one-tick "mutation" burst and be counted as post-launch sample
-        // activity, even though it is ordinary profile state.
-        regBaselineSent = false;
-        fileBaselineSent = false;
-        const std::string user = antimal::WideToUtf8(interactiveUser.name);
-        coverage.SetScope(
-            "registry", user, "mixed",
-            "registry collector now reads the interactive user's loaded hive");
-        coverage.SetScope(
-            "filesystem", user, "mixed",
-            "file collector now watches the interactive user's profile");
       }
     }
 

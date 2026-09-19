@@ -10844,9 +10844,10 @@ void TestBehaviorScoreVerdict() {
   }
 
   // (b) Malware-like run: persistence (MITRE-tagged registry-run write) + a
-  // dropped PE + an external (public) network connection + a High-integrity
-  // child spawned from a Medium parent. Must be Malicious, and the rationale
-  // must enumerate those four specific signals.
+  // dropped PE + an external (public) network connection + an anomalous child
+  // command line. The generic persistence/drop/egress chain alone is the shape
+  // of an ordinary updater (see the follow-up control) and caps at Suspicious;
+  // the high-specificity command line is what confirms Malicious.
   {
     DynamicRunSummary s;
     s.sampleExecuted = true;
@@ -10881,12 +10882,14 @@ void TestBehaviorScoreVerdict() {
     child.imagePath = "elevated.exe";
     child.integrityLevel = "High";
     child.details["parentIntegrityLevel"] = "Medium";
+    child.commandLine =
+        "powershell.exe -nop -w hidden -enc SQBFAFgAIAAoAE4AZQB3AC0ATwBiAGoAZQBjAHQA";
 
     std::vector<EventRecord> events = {procCreate(1000, "sample.exe"), persist,
                                        drop, net, child};
     const BehaviorScore bs = ScoreSandboxBehavior(s, events);
     Expect(bs.verdict == Verdict::Malicious,
-           "behavior: persistence+drop+egress+privesc -> Malicious");
+           "behavior: persistence+drop+egress+anomalous cmdline -> Malicious");
     Expect(rationaleHas(bs.rationale, "persistence"),
            "behavior: rationale names persistence");
     Expect(rationaleHas(bs.rationale, "executable") ||
@@ -11003,11 +11006,11 @@ void TestBehaviorScoreVerdict() {
            "behavior: a lone unapproved elevation (+20) lands Suspicious");
   }
 
-  // (g) Signed-installer FP mitigation: a staged payload(+30)+run-key(+35)+
-  // external(+20)=85. Unsigned -> Malicious; a present Authenticode signature
-  // raises the Malicious bar (90) so the SAME behavior caps at Suspicious -- not
-  // a clean-list (the raw score is unchanged), with the dampener explained in
-  // the rationale.
+  // (g) Signed-installer FP mitigation: a staged payload(+15)+run-key(+35)+
+  // external(+20)+anomalous cmdline(+15)=85. Unsigned -> Malicious; a present
+  // Authenticode signature raises the Malicious bar (90) so the SAME behavior
+  // caps at Suspicious -- not a clean-list (the raw score is unchanged), with
+  // the dampener explained in the rationale.
   {
     DynamicRunSummary s;
     s.sampleExecuted = true;
@@ -11029,11 +11032,20 @@ void TestBehaviorScoreVerdict() {
     net.action = "network.connect";
     net.processId = 1000;
     net.target = "203.0.113.20:443";
+    EventRecord cmd;
+    cmd.category = "process";
+    cmd.action = "process.start";
+    cmd.processId = 3000;
+    cmd.parentProcessId = 1000;
+    cmd.imagePath = "powershell.exe";
+    cmd.commandLine =
+        "powershell.exe -nop -w hidden -enc SQBFAFgAIAAoAE4AZQB3";
     std::vector<EventRecord> events = {procCreate(1000, "installer.exe"),
-                                       persist, drop, net};
+                                       persist, drop, net, cmd};
     const BehaviorScore unsignedBs = ScoreSandboxBehavior(s, events, false);
     Expect(unsignedBs.verdict == Verdict::Malicious,
-           "behavior: unsigned installer-like behavior -> Malicious");
+           "behavior: unsigned installer-like behavior + anomalous cmdline -> "
+           "Malicious");
     const BehaviorScore signedBs = ScoreSandboxBehavior(s, events, true);
     Expect(signedBs.verdict == Verdict::Suspicious,
            "behavior: a present signature caps the same behavior at Suspicious");
@@ -14455,8 +14467,8 @@ void TestBehaviorScoreBoundaryProbeV3() {
   {
     auto s = summary();
     const auto bs = ScoreSandboxBehavior(s, {root()});
-    Expect(bs.scorerVersion == "behavior-score-v3",
-           "boundary: scorer semantics version is v3");
+    Expect(bs.scorerVersion == "behavior-score-v4",
+           "boundary: scorer semantics version is v4");
   }
 }
 
@@ -14483,6 +14495,301 @@ void TestExecuteJobUnlimitedTimeoutPropagation() {
       antimal::ParseExecuteJobJson(antimal::BuildExecuteJobJson(req));
   Expect(parsed.isExecute && parsed.timeoutMs == 0,
          "detonation: timeoutMs=0 survives the job JSON round-trip");
+}
+
+// The Windows-key chord defect: modifiers must be released in reverse ORDER,
+// but the bytes INSIDE an extended release (E0 DB for Win) must stay in order.
+// The old flat reverse emitted DB E0, a malformed release that can strand the
+// modifier in the guest.
+void TestWinChordReleaseEncoding() {
+  using antimal::ChordScancodes;
+  auto seq = [](const char *spec) {
+    std::vector<uint8_t> sc;
+    Expect(ChordScancodes(spec, &sc), (std::string("chord parses: ") + spec).c_str());
+    return sc;
+  };
+  auto eq = [](const std::vector<uint8_t> &a, const std::vector<uint8_t> &b) {
+    return a == b;
+  };
+  const auto ctrlAltDel = seq("ctrl+alt+del");
+  Expect(eq(ctrlAltDel, {0x1D, 0x38, 0xE0, 0x53, 0xE0, 0xD3, 0xB8, 0x9D}),
+         "chord: ctrl+alt+del keeps its correct single-byte releases");
+  const auto winR = seq("win+r");
+  Expect(eq(winR, {0xE0, 0x5B, 0x13, 0x93, 0xE0, 0xDB}),
+         "chord: win+r releases the Windows key as E0 DB, not DB E0");
+  const auto winShiftR = seq("win+shift+r");
+  Expect(eq(winShiftR, {0xE0, 0x5B, 0x2A, 0x13, 0x93, 0xAA, 0xE0, 0xDB}),
+         "chord: win+shift+r reverses modifier GROUPS, preserving E0 DB");
+  const auto ctrlShiftWinC = seq("ctrl+shift+win+c");
+  Expect(eq(ctrlShiftWinC,
+            {0x1D, 0x2A, 0xE0, 0x5B, 0x2E, 0xAE, 0xE0, 0xDB, 0xAA, 0x9D}),
+         "chord: three modifiers release reversed, extended group intact");
+  const auto altF4 = seq("alt+f4");
+  Expect(eq(altF4, {0x38, 0x3E, 0xBE, 0xB8}),
+         "chord: alt+f4 unchanged");
+  // The wire encoder/parser preserves every framed byte exactly (so a byte
+  // count can never prove semantic correctness -- only the sequence can).
+  for (const auto &sc : {ctrlAltDel, winR, winShiftR, ctrlShiftWinC}) {
+    auto framed = antimal::hv::EncodeKeyRecords(sc);
+    const auto framedSize = framed.size();
+    std::vector<antimal::hv::LiveInputEvent> events;
+    const auto consumed = antimal::hv::ParseLiveInput(framed, events);
+    Expect(consumed == framedSize, "chord: every framed byte consumed");
+    bool intact = events.size() == 1 && events[0].scancodes == sc;
+    Expect(intact, "chord: wire round-trip preserves the exact scancodes");
+  }
+}
+
+// Release of held keys must mirror the make's prefix: an extended key (the
+// Windows key) has no non-extended release form, so E0 DB must be emitted.
+void TestReleaseHeldGuestInputExtendedKeys() {
+  using antimal::LiveInputWriter;
+  using antimal::ReleaseHeldGuestInput;
+  const auto dir = TempRoot();
+  const auto file = dir / "release-input.bin";
+  {
+    std::ofstream trunc(file, std::ios::binary | std::ios::trunc);
+  }
+  LiveInputWriter writer(file);
+  const size_t records =
+      ReleaseHeldGuestInput(writer, {0xE0, 0x5B, 0x1D, 0x2A}, 0x02);
+  Expect(records == 4, "release: mouse + three held keys are released");
+
+  std::ifstream in(file, std::ios::binary);
+  std::vector<uint8_t> buf((std::istreambuf_iterator<char>(in)),
+                           std::istreambuf_iterator<char>());
+  std::vector<antimal::hv::LiveInputEvent> events;
+  antimal::hv::ParseLiveInput(buf, events);
+  std::vector<uint8_t> flat;
+  bool sawMouseRelease = false;
+  for (const auto &e : events) {
+    if (e.type == antimal::hv::LiveInputEvent::Type::Mouse) {
+      if (e.buttons == 0) sawMouseRelease = true;
+    } else {
+      flat.insert(flat.end(), e.scancodes.begin(), e.scancodes.end());
+    }
+  }
+  Expect(sawMouseRelease, "release: a no-buttons mouse record is emitted");
+  Expect(flat == std::vector<uint8_t>({0xE0, 0xDB, 0x9D, 0xAA}),
+         "release: Win releases as E0 DB, then Ctrl/Shift as plain breaks");
+
+  // Human takeover releases the extended modifiers too (Win included).
+  const auto file2 = dir / "takeover-input.bin";
+  {
+    std::ofstream trunc(file2, std::ios::binary | std::ios::trunc);
+  }
+  Expect(antimal::TakeOverInputAsHuman(file2), "takeover: lease claimed");
+  std::ifstream in2(file2, std::ios::binary);
+  std::vector<uint8_t> buf2((std::istreambuf_iterator<char>(in2)),
+                            std::istreambuf_iterator<char>());
+  std::vector<antimal::hv::LiveInputEvent> events2;
+  antimal::hv::ParseLiveInput(buf2, events2);
+  std::vector<uint8_t> flat2;
+  for (const auto &e : events2) {
+    if (e.type == antimal::hv::LiveInputEvent::Type::Keyboard) {
+      flat2.insert(flat2.end(), e.scancodes.begin(), e.scancodes.end());
+    }
+  }
+  bool winReleased = false;
+  for (size_t i = 0; i + 1 < flat2.size(); ++i) {
+    if (flat2[i] == 0xE0 && flat2[i + 1] == 0xDB) {
+      winReleased = true;
+    }
+  }
+  Expect(winReleased, "takeover: the Windows key is released with E0 DB");
+}
+
+// Reproduces the 2026-09-18 v3 follow-up counterexamples with the CORRECTED
+// policy:
+//   * an unflagged module load from its legitimate System32 location is normal
+//     Windows activity (never a "writable non-system hijack");
+//   * a Run-key + temp helper + update-connection chain is the ordinary
+//     auto-updater shape and caps at Suspicious; adding an install-directory
+//     write must not make it LESS severe;
+//   * lifetime attribution is instance-bound: an earlier unrelated PID end does
+//     not suppress the sample's own later events, and a child of a dead parent
+//     instance is not adopted.
+void TestBehaviorScoreFollowupV3() {
+  using antimal::BehaviorScore;
+  using antimal::DynamicRunSummary;
+  using antimal::EventRecord;
+  using antimal::JournalShowsSampleExecuted;
+  using antimal::ScoreSandboxBehavior;
+  using antimal::Verdict;
+  auto ev = [](const char *cat, const char *act, uint32_t pid,
+               const std::string &target, int sec) {
+    EventRecord e;
+    e.category = cat;
+    e.action = act;
+    e.processId = pid;
+    e.target = target;
+    e.source = "GuestAgent";
+    e.timestampUtc = "2026-09-18T12:00:" +
+                     (sec < 10 ? std::string("0") : std::string()) +
+                     std::to_string(sec) + "Z";
+    return e;
+  };
+  auto root = [&](int sec = 10) {
+    auto e = ev("process", "process.create", 100, R"(C:\sample\installer.exe)", sec);
+    e.details["startTime"] = e.timestampUtc;
+    e.details["bootGeneration"] = "1";
+    e.details["sampleExecuted"] = "true";
+    e.userName = "ANTIMAL-VM\\antimal";
+    return e;
+  };
+  auto summary = [] {
+    DynamicRunSummary s;
+    s.started = true;
+    s.completed = true;
+    s.sampleExecuted = true;
+    s.guestAgentConnected = true;
+    for (const char *n : {"process", "network", "registry", "filesystem",
+                          "image"}) {
+      DynamicRunSummary::SensorCoverage c;
+      c.sensor = n;
+      c.supported = true;
+      c.healthy = true;
+      c.samples = 8;
+      c.lossKnown = true;
+      c.targetUser = "ANTIMAL-VM\\antimal";
+      c.scope = "mixed";
+      s.sensorCoverage.push_back(c);
+    }
+    return s;
+  };
+  auto hasFinding = [](const BehaviorScore &bs, const char *needle) {
+    for (const auto &l : bs.positiveFindings) {
+      if (l.find(needle) != std::string::npos) return true;
+    }
+    for (const auto &l : bs.rationale) {
+      if (l.find(needle) != std::string::npos) return true;
+    }
+    return false;
+  };
+
+  const auto s = summary();
+
+  // Unflagged System32 module loads: normal Windows, no score, no "writable
+  // non-system" claim.
+  {
+    auto dll = ev("image", "image.load", 100, R"(C:\Windows\System32\version.dll)", 12);
+    const auto bs = ScoreSandboxBehavior(s, {root(), dll});
+    Expect(bs.verdict == Verdict::Clean && bs.score == 0,
+           "followup: an unflagged System32 version.dll load is not a hijack");
+    Expect(!hasFinding(bs, "writable"),
+           "followup: no writable-path claim for a System32 module");
+  }
+  {
+    auto d1 = ev("image", "image.load", 100, R"(C:\Windows\System32\version.dll)", 12);
+    auto d2 = ev("image", "image.load", 100, R"(C:\Windows\System32\winmm.dll)", 13);
+    auto d3 = ev("image", "image.load", 100, R"(C:\Windows\System32\dwmapi.dll)", 14);
+    auto net = ev("network", "network.connect", 100, "203.0.113.10:443", 15);
+    const auto bs = ScoreSandboxBehavior(s, {root(), d1, d2, d3, net});
+    Expect(bs.verdict == Verdict::Suspicious && bs.score == 20,
+           "followup: three System32 loads + egress score egress only (20)");
+    Expect(!hasFinding(bs, "hijack"),
+           "followup: System32 loads are never described as hijacks");
+  }
+  // A collector annotation that says "writable path" for a System32 module does
+  // not manufacture a hijack; only hijack-specific classifications do.
+  {
+    auto dll = ev("image", "image.load", 100, R"(C:\Windows\System32\version.dll)", 12);
+    dll.details["suspicion"] = "dll-from-writable-path";
+    const auto bs = ScoreSandboxBehavior(s, {root(), dll});
+    Expect(bs.verdict != Verdict::Suspicious && bs.verdict != Verdict::Malicious,
+           "followup: a contradictory annotation on System32 does not confirm a "
+           "hijack");
+  }
+  // The same shadowing DLL name in a writable staging location IS the planting
+  // shape and remains a genuine high-specificity detection.
+  {
+    auto dll = ev("image", "image.load", 100,
+                  R"(C:\Users\antimal\AppData\Local\Temp\version.dll)", 12);
+    const auto bs = ScoreSandboxBehavior(s, {root(), dll});
+    Expect(hasFinding(bs, "hijack") || hasFinding(bs, "side-loading"),
+           "followup: a shadowed DLL name in a staging location is a hijack");
+  }
+
+  // The ordinary auto-updater shape: attributed Run-key + temp helper + update
+  // connection. Generic; caps at Suspicious.
+  auto updaterEvents = [&]() {
+    std::vector<EventRecord> v{root()};
+    auto reg = ev("registry", "registry.set", 100,
+                  R"(HKCU\Software\Microsoft\Windows\CurrentVersion\Run\ExampleUpdater)", 15);
+    auto drop = ev("file", "file.create", 100,
+                   R"(C:\Users\antimal\AppData\Local\Temp\helper.exe)", 16);
+    drop.details["fileType"] = "pe";
+    auto net = ev("network", "network.connect", 100, "203.0.113.10:443", 17);
+    v.push_back(reg);
+    v.push_back(drop);
+    v.push_back(net);
+    return v;
+  };
+  {
+    const auto bs = ScoreSandboxBehavior(s, updaterEvents());
+    Expect(bs.verdict == Verdict::Suspicious,
+           "followup: Run-key + temp helper + update egress is Suspicious, not "
+           "Malicious");
+    Expect(bs.score >= 60, "followup: the updater chain still scores highly");
+    Expect(hasFinding(bs, "ordinary auto-updater") ||
+               hasFinding(bs, "Capped at Suspicious"),
+           "followup: the rationale explains the updater-shape cap");
+  }
+  {
+    auto v = updaterEvents();
+    auto install = ev("file", "file.create", 100,
+                      R"(C:\Program Files\Example\app.exe)", 18);
+    install.details["fileType"] = "pe";
+    v.push_back(install);
+    const auto bs = ScoreSandboxBehavior(s, v);
+    Expect(bs.verdict == Verdict::Suspicious,
+           "followup: adding a Program Files write keeps the updater at "
+           "Suspicious");
+  }
+
+  // Lifetime, instance-bound: an earlier unrelated instance's stop must not
+  // suppress the verified sample's later connection.
+  {
+    auto oldStop = ev("process", "process.stop", 100, "older-unrelated.exe", 8);
+    oldStop.details["startTime"] = "2026-09-18T12:00:01Z";
+    auto net = ev("network", "network.connect", 100, "203.0.113.20:443", 17);
+    const auto bs = ScoreSandboxBehavior(s, {oldStop, root(), net});
+    Expect(bs.verdict == Verdict::Suspicious,
+           "followup: the sample's post-launch egress survives an earlier "
+           "unrelated PID stop");
+    Expect(hasFinding(bs, "Sample-attributed outbound network egress"),
+           "followup: the egress is sample-attributed");
+  }
+  // A child whose parent instance had already ended is NOT adopted.
+  {
+    auto stop = ev("process", "process.stop", 100, "installer.exe", 13);
+    auto child = ev("process", "process.start", 200, "conhost.exe", 14);
+    child.parentProcessId = 100;
+    auto childNet = ev("network", "network.connect", 200, "203.0.113.20:443", 15);
+    const auto bs = ScoreSandboxBehavior(s, {root(), stop, child, childNet});
+    Expect(bs.verdict != Verdict::Suspicious && bs.verdict != Verdict::Malicious,
+           "followup: a child of the dead root instance is not adopted");
+    Expect(!hasFinding(bs, "Sample-attributed outbound network egress"),
+           "followup: its connection is not sample-attributed");
+  }
+
+  // Shared execution derivation: the verified anchor alone establishes
+  // execution (no ReportComplete needed); a bare create does not.
+  {
+    Expect(JournalShowsSampleExecuted({root()}),
+           "followup: the verified launch anchor counts as executed");
+    auto bare = ev("process", "process.create", 100, R"(C:\sample\other.exe)", 10);
+    Expect(!JournalShowsSampleExecuted({bare}),
+           "followup: a bare process.create is not an execution anchor");
+    DynamicRunSummary live;
+    live.started = true;
+    live.completed = false;
+    live.sampleExecuted = false;
+    auto net = ev("network", "network.connect", 100, "203.0.113.10:443", 17);
+    const auto bs = ScoreSandboxBehavior(live, {root(), net});
+    Expect(bs.verdict == Verdict::Suspicious,
+           "followup: the anchor is honored even when the summary flag is false");
+  }
 }
 
 // G2 per-control test: each REQUIRED worker-isolation control, when forced to
@@ -15687,6 +15994,9 @@ int main() {
     TestHarmlessInstallerControl();
     TestBehaviorScoreBoundaryProbeV3();
     TestExecuteJobUnlimitedTimeoutPropagation();
+    TestWinChordReleaseEncoding();
+    TestReleaseHeldGuestInputExtendedKeys();
+    TestBehaviorScoreFollowupV3();
     TestOrchestratorBootAttemptDoesNotExecuteSample();
     TestOrchestratorCreatesDifferencingOverlay();
     TestOrchestratorCreatesRawCowOverlay();

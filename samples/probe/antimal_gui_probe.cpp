@@ -28,6 +28,7 @@
 #include <winsock2.h>
 #include <ws2tcpip.h>
 #include <windows.h>
+#include <windowsx.h> // GET_X_LPARAM / GET_Y_LPARAM
 
 #include <cstdio>
 #include <cstring>
@@ -220,15 +221,33 @@ void LoopbackConnect() {
   WSACleanup();
 }
 
+// Application-level receipt log: the fixture records the input events and focus
+// changes the GUI actually received, so a host-side "queued/read" byte count can
+// be checked against what the APPLICATION observed. Written to the user %TEMP%
+// and %PUBLIC% (both telemetry-visible).
+std::string g_eventLog;
+
+void LogEvent(const std::string &line) {
+  g_eventLog += line;
+  g_eventLog += "\n";
+  DropFile(TempPath(L"antimal-gui-probe-events.txt"), g_eventLog.c_str());
+  DropFile(PublicPath(L"antimal-gui-probe-events.txt"), g_eventLog.c_str());
+}
+
 // All expected behaviors, in a fixed order, each self-labelled.
 void RunBehaviors(HWND hwnd) {
+  LogEvent("behavior=run");
   DropFile(TempPath(L"antimal-gui-probe.log"),
            "antimal-gui-probe: benign fixture behavior log\n");
   DropFile(PublicPath(L"antimal-gui-probe-marker.txt"),
            "antimal-gui-probe: benign dropped marker\n");
   SetAutostartValue();
+  LogEvent("behavior=autostart-written");
   SpawnChild();
+  LogEvent("behavior=child-spawned");
   LoopbackConnect();
+  LogEvent("behavior=loopback-connected");
+  LogEvent("behavior=exiting");
   SetWindowTextW(hwnd, L"AntiMal GUI Probe - done (exiting)");
   SetTimer(hwnd, kExitTimerId, 3000, nullptr);
 }
@@ -268,12 +287,52 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     }
     return 0;
   }
+  case WM_ACTIVATE:
+    LogEvent(std::string("window_active=") +
+             (LOWORD(wParam) != WA_INACTIVE ? "1" : "0"));
+    break;
+  case WM_SETFOCUS:
+    LogEvent("window_focus=1");
+    break;
+  case WM_KILLFOCUS:
+    LogEvent("window_focus=0");
+    break;
+  case WM_KEYDOWN:
+  case WM_SYSKEYDOWN:
+    LogEvent("keydown_vk=" + std::to_string(static_cast<unsigned>(wParam)));
+    break;
+  case WM_KEYUP:
+  case WM_SYSKEYUP:
+    LogEvent("keyup_vk=" + std::to_string(static_cast<unsigned>(wParam)));
+    break;
+  case WM_CHAR:
+    LogEvent("char_code=" + std::to_string(static_cast<unsigned>(wParam)));
+    break;
+  case WM_LBUTTONDOWN:
+    LogEvent("lbutton_down_x=" + std::to_string(GET_X_LPARAM(lParam)) +
+             " y=" + std::to_string(GET_Y_LPARAM(lParam)));
+    break;
+  case WM_LBUTTONUP:
+    LogEvent("lbutton_up_x=" + std::to_string(GET_X_LPARAM(lParam)) +
+             " y=" + std::to_string(GET_Y_LPARAM(lParam)));
+    break;
   case WM_COMMAND:
+    if (LOWORD(wParam) == 2 && HIWORD(wParam) == EN_CHANGE) {
+      wchar_t text[256]{};
+      GetDlgItemTextW(hwnd, 2, text, 256);
+      std::string ascii;
+      for (wchar_t c : std::wstring(text)) {
+        ascii.push_back(c < 128 ? static_cast<char>(c) : '?');
+      }
+      LogEvent("edit_text=" + ascii);
+      return 0;
+    }
     if (LOWORD(wParam) == 1) {
       RunBehaviors(hwnd);
       return 0;
     }
     if (LOWORD(wParam) == 3) {
+      LogEvent("button=show");
       // Echo the edit control's content verbatim into the label. Reading the
       // screenshot then shows exactly which characters the guest received.
       wchar_t text[256]{};

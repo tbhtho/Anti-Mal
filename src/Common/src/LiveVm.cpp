@@ -458,23 +458,26 @@ bool ChordScancodes(const std::string &spec, std::vector<uint8_t> *out) {
     return false;
   }
   std::vector<uint8_t> makes;
-  std::vector<uint8_t> breaks;
+  // Modifier RELEASE GROUPS: releases are emitted in reverse modifier order, but
+  // the bytes INSIDE an extended release (E0 DB for the Windows key) must stay in
+  // order. Flattening them and reversing every byte produced DB E0, a malformed
+  // release that can strand the modifier in the guest.
+  std::vector<std::vector<uint8_t>> releases;
   for (size_t i = 0; i + 1 < parts.size(); ++i) {
     const std::string m = ToLowerAscii(parts[i]);
     if (m == "ctrl" || m == "control") {
       makes.push_back(0x1D);
-      breaks.push_back(0x9D);
+      releases.push_back({0x9D});
     } else if (m == "alt") {
       makes.push_back(0x38);
-      breaks.push_back(0xB8);
+      releases.push_back({0xB8});
     } else if (m == "shift") {
       makes.push_back(0x2A);
-      breaks.push_back(0xAA);
+      releases.push_back({0xAA});
     } else if (m == "win" || m == "meta") {
       makes.push_back(0xE0);
       makes.push_back(0x5B);
-      breaks.push_back(0xE0);
-      breaks.push_back(0xDB);
+      releases.push_back({0xE0, 0xDB});
     } else {
       return false;
     }
@@ -489,7 +492,9 @@ bool ChordScancodes(const std::string &spec, std::vector<uint8_t> *out) {
   }
   out->insert(out->end(), makes.begin(), makes.end());
   out->insert(out->end(), tap.begin(), tap.end());
-  out->insert(out->end(), breaks.rbegin(), breaks.rend());
+  for (auto it = releases.rbegin(); it != releases.rend(); ++it) {
+    out->insert(out->end(), it->begin(), it->end());
+  }
   return true;
 }
 
@@ -882,13 +887,21 @@ size_t ReleaseHeldGuestInput(const LiveInputWriter &input,
       ++records;
     }
   }
-  for (uint8_t code : heldKeyScancodes) {
+  // Entries are MAKE sequences: a plain Set-1 code (0x2A) or an extended
+  // sequence (0xE0, 0x5B). The release must mirror the make's prefix -- the
+  // Windows key has no non-extended form, so emitting a bare DB leaves it
+  // logically down in the guest.
+  for (size_t i = 0; i < heldKeyScancodes.size(); ++i) {
+    const uint8_t code = heldKeyScancodes[i];
     if (code == 0 || code >= 0x80) {
       continue; // already a break code or a no-op
     }
-    // Plain Set-1 break. Windows also accepts this form for the non-extended
-    // variants of the keys whose makes carry an E0 prefix.
-    std::vector<uint8_t> release{static_cast<uint8_t>(code | 0x80)};
+    const bool extended = (i > 0 && heldKeyScancodes[i - 1] == 0xE0);
+    std::vector<uint8_t> release;
+    if (extended) {
+      release.push_back(0xE0);
+    }
+    release.push_back(static_cast<uint8_t>(code | 0x80));
     if (input.KeyScancodes(release)) {
       ++records;
     }
@@ -900,7 +913,13 @@ bool TakeOverInputAsHuman(const std::filesystem::path &liveInputFile) {
   LiveInputLease lease(liveInputFile.parent_path() / kInputLeaseFileName);
   lease.TakeOver("human");
   const LiveInputWriter releaseWriter{liveInputFile};
-  ReleaseHeldGuestInput(releaseWriter, {0x2A, 0x1D, 0x38}, 0x07);
+  // Release every modifier a previous actuator may have left held, including
+  // the EXTENDED variants (right Ctrl/Alt and both Windows keys): the Windows
+  // key has no plain break form, so it must be released as E0 DB/E0 DC.
+  ReleaseHeldGuestInput(
+      releaseWriter,
+      {0x2A, 0x1D, 0x38, 0xE0, 0x1D, 0xE0, 0x38, 0xE0, 0x5B, 0xE0, 0x5C},
+      0x07);
   return true;
 }
 

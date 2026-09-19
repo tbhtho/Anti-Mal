@@ -49,99 +49,17 @@ bool AppendBytes(const std::wstring &path, const std::vector<uint8_t> &bytes) {
 }
 
 bool NamedKeyTap(const std::string &name, std::vector<uint8_t> *out) {
-  struct KeyDef {
-    const char *name;
-    uint8_t code;
-    bool extended;
-  };
-  static const KeyDef kKeys[] = {
-      {"enter", 0x1C, false}, {"return", 0x1C, false}, {"tab", 0x0F, false},
-      {"esc", 0x01, false},   {"escape", 0x01, false}, {"space", 0x39, false},
-      {"backspace", 0x0E, false}, {"delete", 0x53, true}, {"del", 0x53, true},
-      {"up", 0x48, true},     {"down", 0x50, true},    {"left", 0x4B, true},
-      {"right", 0x4D, true},  {"home", 0x47, true},    {"end", 0x4F, true},
-      {"f1", 0x3B, false},    {"f2", 0x3C, false},     {"f3", 0x3D, false},
-      {"f4", 0x3E, false},    {"f5", 0x3F, false},     {"f6", 0x40, false},
-      {"f7", 0x41, false},    {"f8", 0x42, false},     {"f9", 0x43, false},
-      {"f10", 0x44, false},   {"f11", 0x57, false},    {"f12", 0x58, false},
-  };
-  std::string lower;
-  for (char c : name) {
-    lower.push_back(static_cast<char>(c >= 'A' && c <= 'Z' ? c - 'A' + 'a' : c));
-  }
-  for (const KeyDef &k : kKeys) {
-    if (lower == k.name) {
-      if (k.extended) {
-        out->push_back(0xE0);
-      }
-      out->push_back(k.code);
-      if (k.extended) {
-        out->push_back(0xE0);
-      }
-      out->push_back(static_cast<uint8_t>(k.code | 0x80));
-      return true;
-    }
-  }
-  return false;
+  // Single source of truth: Common's key table (shared with ChordScancodes).
+  return antimal::NamedKeyScancodes(name, out);
 }
 
 // Chord like "ctrl+shift+esc", "alt+f4", "win+r": hold the modifiers, tap the
 // final key, release the modifiers (modifier make/release around the tap).
+// Delegates to Common's encoder: the previous local copy here had the SAME
+// flat-reverse defect (the Windows key released as DB E0) but was not covered
+// by the LiveVm unit tests, so the CLI still emitted malformed releases.
 bool ChordTap(const std::string &spec, std::vector<uint8_t> *out) {
-  std::vector<std::string> parts;
-  std::string cur;
-  for (char c : spec) {
-    if (c == '+') {
-      parts.push_back(cur);
-      cur.clear();
-    } else {
-      cur.push_back(c);
-    }
-  }
-  parts.push_back(cur);
-  if (parts.size() < 2) {
-    return false;
-  }
-  std::vector<uint8_t> makes;
-  std::vector<uint8_t> breaks;
-  for (size_t i = 0; i + 1 < parts.size(); ++i) {
-    std::string m;
-    for (char c : parts[i]) {
-      m.push_back(static_cast<char>(c >= 'A' && c <= 'Z' ? c - 'A' + 'a' : c));
-    }
-    if (m == "ctrl" || m == "control") {
-      makes.push_back(0x1D);
-      breaks.push_back(0x9D);
-    } else if (m == "alt") {
-      makes.push_back(0x38);
-      breaks.push_back(0xB8);
-    } else if (m == "shift") {
-      makes.push_back(0x2A);
-      breaks.push_back(0xAA);
-    } else if (m == "win" || m == "meta") {
-      makes.push_back(0xE0);
-      makes.push_back(0x5B);
-      breaks.push_back(0xE0);
-      breaks.push_back(0xDB);
-    } else {
-      return false;
-    }
-  }
-  // Tap the final key (named key, or a single ASCII char).
-  std::vector<uint8_t> tap;
-  const std::string &last = parts.back();
-  if (!NamedKeyTap(last, &tap)) {
-    if (last.size() == 1) {
-      tap = antimal::hv::AsciiToSet1Tap(last[0]);
-    }
-  }
-  if (tap.empty()) {
-    return false;
-  }
-  out->insert(out->end(), makes.begin(), makes.end());
-  out->insert(out->end(), tap.begin(), tap.end());
-  out->insert(out->end(), breaks.rbegin(), breaks.rend());
-  return true;
+  return antimal::ChordScancodes(spec, out);
 }
 
 std::wstring ArgVal(int argc, wchar_t **argv, int i) {
