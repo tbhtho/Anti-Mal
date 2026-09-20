@@ -8,6 +8,7 @@
 #include "antimal/Crypto.h"
 #include "antimal/DetectionSummary.h"
 #include "antimal/EventTime.h"
+#include "antimal/EvidenceDimensions.h"
 #include "antimal/UsabilityDiagnostics.h"
 #include "antimal/EventJournal.h"
 #include "antimal/FileUtil.h"
@@ -292,15 +293,33 @@ void PrintUsage() {
 }
 
 antimal::ScannerOptions BuildScannerOptions(int argc, wchar_t **argv,
-                                            const antimal::AppConfig &config) {
+                                            const antimal::AppConfig &config,
+                                            const std::string &scope) {
   antimal::ScannerOptions opts;
-  opts.runYara = config.enrichYara && !HasFlag(argc, argv, "--no-yara");
-  opts.runCapa = config.enrichCapa && !HasFlag(argc, argv, "--no-capa");
-  opts.runDie = config.enrichDie && !HasFlag(argc, argv, "--no-die");
-  opts.applyTagger = config.enrichTagger && !HasFlag(argc, argv, "--no-tagger");
+  // Dynamic-first lock: config enrichment toggles are ADVISORY and never
+  // sufficient. Deep static analysis additionally requires an explicit operator
+  // unlock (--unlock-static) scoped to the selected target; the model cannot
+  // authorize itself and the unlock is never persisted into config.
+  const bool operatorUnlock = HasFlag(argc, argv, "--unlock-static");
+  if (operatorUnlock) {
+    opts.staticUnlock.unlocked = true;
+    opts.staticUnlock.scope = scope;
+    opts.staticUnlock.authorizedBy = "cli-operator";
+    opts.staticUnlock.mechanism = "cli:--unlock-static";
+    opts.staticUnlock.recordedAt = antimal::UtcNowIso8601();
+  }
+  opts.runYara = operatorUnlock && config.enrichYara &&
+                 !HasFlag(argc, argv, "--no-yara");
+  opts.runCapa = operatorUnlock && config.enrichCapa &&
+                 !HasFlag(argc, argv, "--no-capa");
+  opts.runDie = operatorUnlock && config.enrichDie &&
+                !HasFlag(argc, argv, "--no-die");
+  opts.applyTagger = operatorUnlock && config.enrichTagger &&
+                     !HasFlag(argc, argv, "--no-tagger");
   opts.yaraRulesDir = config.yaraRulesDir;
   opts.tagsRulesPath = config.tagsRulesPath;
-  opts.intelLookupEnabled = config.intelEnabled || HasFlag(argc, argv, "--intel");
+  opts.intelLookupEnabled =
+      operatorUnlock && (config.intelEnabled || HasFlag(argc, argv, "--intel"));
   opts.malwareBazaarEnabled = config.intelMalwareBazaar;
   opts.virusTotalApiKey =
       OptionValue(argc, argv, "--vt-key").value_or(config.virusTotalApiKey);
@@ -320,6 +339,17 @@ std::filesystem::path ResolveReportPath(const antimal::AppConfig &config,
     return asRun;
   }
   return input;
+}
+
+bool RequireStaticUnlock(int argc, wchar_t **argv,
+                         const std::filesystem::path &target) {
+  const auto config = antimal::LoadConfig(antimal::DefaultConfigPath());
+  const auto opts = BuildScannerOptions(argc, argv, config, antimal::PathToUtf8(target));
+  std::string reason;
+  if (antimal::DeepStaticAllowed(opts.staticUnlock, antimal::PathToUtf8(target), &reason))
+    return true;
+  std::cerr << "Deep static analysis: Not run - locked. " << reason << "\n";
+  return false;
 }
 
 int CommandInit() {
@@ -346,13 +376,21 @@ int CommandScan(int argc, wchar_t **argv) {
   }
 
   const auto config = antimal::LoadConfig(antimal::DefaultConfigPath());
-  const auto scannerOpts = BuildScannerOptions(argc, argv, config);
-
   const std::filesystem::path target(argv[2]);
+  const auto scannerOpts =
+      BuildScannerOptions(argc, argv, config, antimal::PathToUtf8(target));
+
   auto results = antimal::ScanPath(target, scannerOpts);
   if (results.empty()) {
     std::cout << "No scan candidates found.\n";
     return 0;
+  }
+
+  if (!scannerOpts.staticUnlock.unlocked) {
+    std::cout << "Deep static analysis: " << antimal::StaticAnalysisLockedLabel()
+              << "\n  " << antimal::StaticAnalysisLockedSummary() << "\n"
+              << "  To request deep static analysis for this target (operator "
+                 "only): antimal scan <path> --unlock-static\n";
   }
 
   int flagged = 0;
@@ -398,7 +436,8 @@ int CommandTriage(int argc, wchar_t **argv) {
     threshold = static_cast<int>(*n);
   }
   const auto config = antimal::LoadConfig(antimal::DefaultConfigPath());
-  const auto opts = BuildScannerOptions(argc, argv, config);
+  const auto opts = BuildScannerOptions(argc, argv, config,
+                                        antimal::PathToUtf8(argv[2]));
   auto results = antimal::ScanPath(std::filesystem::path(argv[2]), opts);
   if (results.empty()) {
     std::cout << "No scan candidates found.\n";
@@ -3600,6 +3639,15 @@ int CommandReport(int argc, wchar_t **argv) {
   const auto config = antimal::LoadConfig(antimal::DefaultConfigPath());
   const auto reportPath = ResolveReportPath(config, std::filesystem::path(argv[2]));
   auto report = antimal::LoadReportBestEffort(reportPath);
+  const auto dimensions = antimal::BuildEvidenceDimensions(report);
+  if (!HasFlag(argc, argv, "--json") && !HasFlag(argc, argv, "--html")) {
+    std::cout << "Security Assessment: " << dimensions.assessment << "\n"
+              << dimensions.assessmentBasis << "\n"
+              << "Provenance / Modification: " << report.scannerVerdict.provenanceState
+              << "\nSHA-256: " << report.scannerVerdict.sha256
+              << "\nVerification: " << report.scannerVerdict.signatureVerification
+              << " [" << report.scannerVerdict.signatureStatusCode << "]\n";
+  }
   if (HasFlag(argc, argv, "--why")) {
     // Explainable verdict: the per-signal "why this verdict" rationale that the
     // HTML report shows (T07), but in the terminal / for automation. The
@@ -3616,7 +3664,7 @@ int CommandReport(int argc, wchar_t **argv) {
                 << "}\n";
       return 0;
     }
-    std::cout << "Verdict: " << antimal::ToString(report.sandboxVerdict)
+    std::cout << "Legacy behavioral heuristic (not confirmation): " << antimal::ToString(report.sandboxVerdict)
               << " (score " << report.verdictScore << ")";
     if (report.verdictInsufficientEvidence) {
       std::cout << "  [INSUFFICIENT EVIDENCE -- no conclusion reached]";
@@ -3746,7 +3794,7 @@ int CommandReport(int argc, wchar_t **argv) {
       return 0;
     }
     std::cout << "Run " << report.runId << "\n";
-    std::cout << "  verdict:    " << antimal::ToString(report.sandboxVerdict)
+    std::cout << "  legacy behavioral heuristic (not confirmation): " << antimal::ToString(report.sandboxVerdict)
               << " (score " << report.verdictScore << ")\n";
     std::cout << "  boot:       " << bo.stage << " -- " << bo.detail << "\n";
     std::cout << "  sample run: "
@@ -3890,7 +3938,7 @@ int CommandReport(int argc, wchar_t **argv) {
       std::cout << "]}\n";
       return 0;
     }
-    std::cout << "Verdict: " << antimal::ToString(report.sandboxVerdict) << " (score "
+    std::cout << "Legacy behavioral heuristic (not confirmation): " << antimal::ToString(report.sandboxVerdict) << " (score "
               << report.verdictScore << ")\n";
     std::cout << "Boot: " << bo.stage << " -- " << bo.detail << "\n";
     std::cout << "Detections (" << dets.size() << "):\n";
@@ -4036,6 +4084,7 @@ int CommandExport(int argc, wchar_t **argv) {
                   << antimal::PathToUtf8(report.samplePath) << "\n";
         return 2;
       }
+      if (!RequireStaticUnlock(argc, argv, report.samplePath)) return 2;
       const auto bytes = antimal::ReadAllBytes(report.samplePath);
       body = antimal::GenerateYaraRule(report.scannerVerdict, bytes);
     }
@@ -4069,6 +4118,7 @@ int CommandSimilarity(int argc, wchar_t **argv) {
     std::cerr << "No such file: " << antimal::PathToUtf8(fileA) << "\n";
     return 2;
   }
+  if (!RequireStaticUnlock(argc, argv, fileA)) return 2;
   const std::string digestA = antimal::ComputeCtph(antimal::ReadAllBytes(fileA));
 
   std::string digestB;
@@ -4133,7 +4183,10 @@ int CommandYaraGen(int argc, wchar_t **argv) {
     std::cerr << "sample not found: " << antimal::PathToUtf8(sample) << "\n";
     return 2;
   }
-  const auto scan = antimal::ScanFile(sample);
+  if (!RequireStaticUnlock(argc, argv, sample)) return 2;
+  const auto config = antimal::LoadConfig(antimal::DefaultConfigPath());
+  const auto scan = antimal::ScanFile(sample,
+      BuildScannerOptions(argc, argv, config, antimal::PathToUtf8(sample)));
   const auto bytes = antimal::ReadAllBytes(sample);
   antimal::YaraGenOptions opts;
   if (const auto n = OptionValue(argc, argv, "--name")) opts.ruleName = *n;
@@ -4166,6 +4219,7 @@ int CommandConfig(int argc, wchar_t **argv) {
     std::cerr << "sample not found: " << antimal::PathToUtf8(sample) << "\n";
     return 2;
   }
+  if (!RequireStaticUnlock(argc, argv, sample)) return 2;
   const auto bytes = antimal::ReadAllBytes(sample);
   const auto cs = antimal::ExtractCobaltStrikeConfig(bytes);
   const auto xor1 = antimal::MineXorObfuscatedUrls(bytes);
@@ -4584,11 +4638,18 @@ int CommandFs(int argc, wchar_t **argv) {
     }
     const auto bytes = ntfs.ReadFile(*hiveEntry, 256ull * 1024 * 1024);
     const auto tmp = std::filesystem::temp_directory_path() /
-                     ("antimal-hive-" + hl + ".bin");
+                     ("antimal-hive-" + antimal::MakeRunId() + ".bin");
     {
       std::ofstream f(tmp, std::ios::binary);
       f.write(reinterpret_cast<const char *>(bytes.data()),
               static_cast<std::streamsize>(bytes.size()));
+      f.close();
+      if (!f) {
+        std::error_code cleanupError;
+        std::filesystem::remove(tmp, cleanupError);
+        std::cerr << "reg: failed to extract guest registry hive\n";
+        return 1;
+      }
     }
     int depth = 1;
     if (const auto d = OptionValue(argc, argv, "--depth")) {
@@ -4606,7 +4667,7 @@ int CommandFs(int argc, wchar_t **argv) {
               << dump;
     std::error_code ec;
     std::filesystem::remove(tmp, ec);
-    return 0;
+    return dump.rfind("ERR:", 0) == 0 ? 1 : 0;
   }
 
   if (sub == "fs-find") {
@@ -4687,7 +4748,8 @@ int CommandFs(int argc, wchar_t **argv) {
       f.write(reinterpret_cast<const char *>(bytes.data()),
               static_cast<std::streamsize>(bytes.size()));
     }
-    const auto scannerOpts = BuildScannerOptions(argc, argv, config);
+    const auto scannerOpts = BuildScannerOptions(argc, argv, config,
+                                                 antimal::PathToUtf8(tmp));
     const auto result = antimal::ScanFile(tmp, scannerOpts);
     std::cout << "Scanned guest file " << guestPath << " (" << bytes.size()
               << " bytes extracted offline)\n";
@@ -4962,8 +5024,9 @@ int CommandDumpHive(int argc, wchar_t **argv) {
   if (const auto d = OptionValue(argc, argv, "--depth")) {
     try { depth = std::stoi(*d); } catch (...) {}
   }
-  std::cout << antimal::DebugDumpHiveFile(*file, path, filter, values, depth);
-  return 0;
+  const auto dump = antimal::DebugDumpHiveFile(*file, path, filter, values, depth);
+  std::cout << dump;
+  return dump.rfind("ERR:", 0) == 0 ? 1 : 0;
 }
 
 // Defined in VmViewer.cpp: a plain Win32 window mirroring the VM's live

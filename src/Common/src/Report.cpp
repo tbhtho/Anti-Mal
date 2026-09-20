@@ -1,4 +1,5 @@
 #include "antimal/Report.h"
+#include "antimal/EvidenceDimensions.h"
 
 #include "antimal/BootDiagnostics.h"
 #include "antimal/CommandLineClassifier.h"
@@ -14,6 +15,7 @@
 #include "antimal/ProcessChainClassifier.h"
 
 #include <functional>
+#include <algorithm>
 #include <map>
 #include <regex>
 #include <set>
@@ -370,6 +372,10 @@ ScanResult ParseScan(const JsonValue *value) {
   scan.entropy = DoubleValue(Member(*value, "entropy"));
   scan.isPe = BoolValue(Member(*value, "isPe"));
   scan.authenticodeSigned = BoolValue(Member(*value, "authenticodeSigned"));
+  scan.provenanceState = StringValue(Member(*value, "provenanceState"), "unknown");
+  scan.signatureVerification = StringValue(Member(*value, "signatureVerification"), "not recorded in this artifact");
+  scan.signatureStatusCode = StringValue(Member(*value, "signatureStatusCode"));
+  scan.signatureVerificationMethod = StringValue(Member(*value, "signatureVerificationMethod"));
   scan.signerName = StringValue(Member(*value, "signerName"));
   scan.imports = StringArrayValue(Member(*value, "imports"));
   scan.peTimestamp = static_cast<uint32_t>(DoubleValue(Member(*value, "peTimestamp")));
@@ -401,6 +407,10 @@ ScanResult ParseScan(const JsonValue *value) {
   scan.findings = ParseFindings(Member(*value, "findings"));
   scan.score = IntValue(Member(*value, "score"));
   scan.verdict = ParseVerdictValue(Member(*value, "verdict"));
+  scan.staticAnalysisState = StringValue(Member(*value, "staticAnalysisState"));
+  scan.staticLockReason = StringValue(Member(*value, "staticLockReason"));
+  // Static output cannot complete a dynamic investigation, including on load.
+  scan.investigationComplete = false;
   scan.iocs = ParseIocs(Member(*value, "iocs"));
   scan.tags = ParseTags(Member(*value, "tags"));
   scan.yaraMatches = ParseYara(Member(*value, "yaraMatches"));
@@ -1247,7 +1257,7 @@ bool EmitModuleLoadsSection(std::ostringstream &html,
     if (suspicious) {
       ++suspCount;
       suspRows << "<tr class=\"bad\"><td class=\"mono\">"
-               << HtmlEscape(e.mitre.empty() ? "(hijack)" : e.mitre)
+               << HtmlEscape(e.mitre.empty() ? "(unconfirmed lead)" : e.mitre)
                << "</td><td class=\"mono\" title=\"" << HtmlEscape(e.target)
                << "\">" << HtmlEscape(TruncateForCell(e.target))
                << "</td><td class=\"mono\">" << HtmlEscape(loader)
@@ -1266,7 +1276,7 @@ bool EmitModuleLoadsSection(std::ostringstream &html,
   if (suspCount == 0 && normalTotal == 0) return false;
 
   if (suspCount > 0) {
-    html << "<h3 class=\"bad\">Side-loaded / hijacked modules (" << suspCount
+    html << "<h3 class=\"bad\">Module loading leads (unconfirmed) (" << suspCount
          << ")</h3>";
     html << "<table><thead><tr><th>Technique</th><th>Module</th>"
             "<th>Loaded by</th></tr></thead><tbody>"
@@ -1552,12 +1562,13 @@ void EmitIocList(std::ostringstream &html, const std::vector<std::string> &items
 }
 
 void EmitEventTable(std::ostringstream &html,
-                    const std::vector<EventRecord> &events) {
+                    const std::vector<EventRecord> &events,
+                    const std::vector<EventAttribution>& attribution) {
   html << "<div class=\"toolbar\">";
   html << "<input id=\"event-search\" placeholder=\"Search events (path, action, target)\">";
   html << "<span id=\"filter-status\" class=\"mono\" style=\"color:var(--muted)\">all events</span>";
   html << "</div>";
-  html << "<table><thead><tr><th>Time</th><th>PID</th><th>Source</th><th>Category</th><th>Action</th><th>Target</th><th>Type</th><th>SHA-256</th><th>User</th><th>Integ.</th><th>Cmd / Exit</th><th>MITRE</th></tr></thead>";
+  html << "<table><thead><tr><th>Time</th><th>PID</th><th>Source</th><th>Category</th><th>Action</th><th>Attribution</th><th>Target</th><th>Type</th><th>SHA-256</th><th>User</th><th>Integ.</th><th>Cmd / Exit</th><th>MITRE</th></tr></thead>";
   html << "<tbody id=\"event-tbody\">";
   // Anchor for relative timeline offsets = the earliest parseable event time.
   int64_t anchorEpoch = -1;
@@ -1612,6 +1623,8 @@ void EmitEventTable(std::ostringstream &html,
          << "<td><span class=\"chip cat-" << HtmlEscape(e.category) << "\">"
          << HtmlEscape(e.category) << "</span></td>"
          << "<td>" << HtmlEscape(e.action) << "</td>"
+         << "<td title=\"" << HtmlEscape(attribution.at(static_cast<size_t>(&e - events.data())).basis) << "\">"
+         << HtmlEscape(attribution.at(static_cast<size_t>(&e - events.data())).relationship) << "</td>"
          << "<td class=\"mono\" title=\"" << HtmlEscape(e.fullImagePath)
          << "\">" << HtmlEscape(e.target) << "</td>"
          << "<td class=\"mono\">" << HtmlEscape(fileType) << "</td>"
@@ -1728,15 +1741,14 @@ std::string BuildHtmlReportWithFrames(const AnalysisReport &report,
                                       const std::vector<std::filesystem::path> &frames) {
   const auto displayFrames = PreferGuestFrames(frames);
   const auto &scan = report.scannerVerdict;
-  const auto worst = scan.verdict == Verdict::Malicious || report.sandboxVerdict == Verdict::Malicious
-                         ? Verdict::Malicious
-                     : scan.verdict == Verdict::Suspicious || report.sandboxVerdict == Verdict::Suspicious
+  const auto dimensions = BuildEvidenceDimensions(report);
+  const auto worst = report.sandboxVerdict == Verdict::Malicious || report.sandboxVerdict == Verdict::Suspicious
                          ? Verdict::Suspicious
-                     : scan.verdict == Verdict::Error || report.sandboxVerdict == Verdict::Error
+                     : report.sandboxVerdict == Verdict::Error
                          ? Verdict::Error
                      : report.verdictInsufficientEvidence || report.sandboxVerdict == Verdict::Unknown
                          ? Verdict::Unknown
-                         : Verdict::Clean;
+                         : Verdict::Unknown;
 
   std::ostringstream html;
   html << "<!doctype html><html><head><meta charset=\"utf-8\">";
@@ -1761,32 +1773,38 @@ std::string BuildHtmlReportWithFrames(const AnalysisReport &report,
   }
   html << " &nbsp;&middot;&nbsp; run " << HtmlEscape(report.runId) << "</div></div>";
   html << "<div class=\"tags\">";
-  EmitTags(html, scan.tags);
+  html << "Evidence dimensions: provenance / behavior / attribution / coverage";
   html << "</div></header>";
 
   // Verdict banner
-  const std::string banner =
-      worst == Verdict::Malicious  ? "Malicious activity detected"
-      : worst == Verdict::Suspicious ? "Suspicious activity detected"
-      : worst == Verdict::Error      ? "Dynamic analysis unavailable or blocked"
-      : worst == Verdict::Unknown
-          ? "Insufficient evidence to judge -- no conclusion reached"
-                                     : "No high-confidence threats detected";
+  const std::string banner = dimensions.assessment;
   html << "<div class=\"banner " << HtmlEscape(ToString(worst)) << "\">"
        << HtmlEscape(banner) << "</div>";
 
   html << "<main>";
 
   // Left rail: process tree + tags + verdict summary
-  html << "<section class=\"panel\"><h2>Verdict</h2>";
+  html << "<section class=\"panel\"><h2>Security Assessment</h2>"
+       << "<p>" << HtmlEscape(dimensions.assessmentBasis) << "</p>"
+       << "<h2>Provenance / Modification</h2><p>" << HtmlEscape(scan.provenanceState)
+       << "<br>" << HtmlEscape(scan.signatureVerification)
+       << "<br>Signer: " << HtmlEscape(scan.signerName.empty() ? "unknown" : scan.signerName)
+       << "<br>Status: " << HtmlEscape(scan.signatureStatusCode)
+       << "<br>Method: " << HtmlEscape(scan.signatureVerificationMethod)
+       << "<br>SHA-256: " << HtmlEscape(scan.sha256)
+       << "</p><p>Target provenance only. Component identities require separate evidence. "
+          "Integrity failures do not establish malicious intent.</p><h2>Observed Behavior</h2>";
   html << "<div class=\"kv\">";
-  html << "<div class=\"k\">scanner</div><div><span class=\"badge "
-       << HtmlEscape(ToString(scan.verdict)) << "\">"
-       << HtmlEscape(ToString(scan.verdict)) << "</span> score " << scan.score
-       << "</div>";
-  html << "<div class=\"k\">sandbox</div><div><span class=\"badge "
-       << HtmlEscape(ToString(report.sandboxVerdict)) << "\">"
-       << HtmlEscape(ToString(report.sandboxVerdict)) << "</span>";
+  if (scan.staticAnalysisState == "locked") {
+    html << "<div class=\"k\">static analysis</div><div>Not run - locked"
+         << "<br>" << HtmlEscape(scan.staticLockReason) << "</div>";
+  } else {
+  html << "<div class=\"k\">static indicators</div><div>Supporting heuristic score " << scan.score
+       << "; not a behavioral assessment</div>";
+  }
+  html << "<div class=\"k\">legacy behavioral classifier</div><div>"
+       << HtmlEscape(ToString(report.sandboxVerdict))
+       << " (heuristic compatibility field, not a confirmed security conclusion)";
   if (report.verdictScore != 0 || !report.verdictRationale.empty()) {
     html << " score " << report.verdictScore;
   }
@@ -1794,7 +1812,7 @@ std::string BuildHtmlReportWithFrames(const AnalysisReport &report,
   // T07: explainable verdict -- the per-signal "why this verdict" list directly
   // under the sandbox badge so the conclusion is never an unexplained label.
   if (!report.verdictRationale.empty()) {
-    html << "<div class=\"k\">why this verdict</div><div><ul class=\"why\">";
+    html << "<div class=\"k\">behavioral indicator rationale</div><div><ul class=\"why\">";
     for (const auto &line : report.verdictRationale) {
       html << "<li>" << HtmlEscape(line) << "</li>";
     }
@@ -2125,23 +2143,36 @@ std::string BuildHtmlReportWithFrames(const AnalysisReport &report,
   html << "<div class=\"k\">entropy</div><div class=\"mono\">"
        << scan.entropy << "</div>";
   html << "<div class=\"k\">PE</div><div>" << (scan.isPe ? "yes" : "no")
-       << ", signed " << (scan.authenticodeSigned ? "yes" : "no");
+       << ", provenance " << HtmlEscape(scan.provenanceState);
   if (!scan.signerName.empty()) {
     html << " &middot; signer " << HtmlEscape(scan.signerName);
   }
   html << "</div>";
   html << "</div>";
 
-  // Detections — the severity-ranked behavior summary an analyst reads first.
+  html << "<h2>Coverage</h2><p>Network: " << HtmlEscape(ToString(report.dynamicSummary.networkMode))
+       << "; incomplete: " << (report.dynamicSummary.coverageIncomplete ? "yes" : "not reported")
+       << ". Only explicitly recorded workflow phases were exercised.</p>"
+       << "<table><tr><th>Sensor</th><th>Health / loss</th><th>Scope / gaps</th></tr>";
+  for (const auto& c : report.dynamicSummary.sensorCoverage) {
+    html << "<tr><td>" << HtmlEscape(c.sensor) << "</td><td>"
+         << (c.supported && c.healthy ? "active" : "unavailable/unhealthy")
+         << "; dropped " << c.dropped << "; loss known " << (c.lossKnown ? "yes" : "no")
+         << "</td><td>" << HtmlEscape(c.scope) << " / " << HtmlEscape(c.targetUser)
+         << "<br>" << HtmlEscape(c.note) << "</td></tr>";
+  }
+  html << "</table><p>Absent sensors do not imply absent behavior. Hosting-process activity does not establish module causality.</p>";
+  // Behavioral hypotheses remain separate from supporting static findings.
   {
-    const auto dets = BuildDetections(report);
+    auto dets = BuildDetections(report);
+    dets.erase(std::remove_if(dets.begin(), dets.end(), [](const auto& d){ return d.category == "static"; }), dets.end());
     if (!dets.empty()) {
       auto sevColor = [](int s) {
         return s >= 3 ? "var(--bad)"
                       : s == 2 ? "var(--warn)" : s == 1 ? "var(--accent)"
                                                         : "var(--muted)";
       };
-      html << "<h2 style=\"margin-top:14px\">Detections (" << dets.size()
+      html << "<h2 style=\"margin-top:14px\">Behavioral indicators requiring attribution (" << dets.size()
            << ")</h2><table><thead><tr><th>Severity</th><th>Category</th>"
               "<th>Detection</th><th>MITRE</th></tr></thead><tbody>";
       for (const auto &d : dets) {
@@ -2167,7 +2198,7 @@ std::string BuildHtmlReportWithFrames(const AnalysisReport &report,
 
   // Tracker tags
   if (!scan.tags.empty()) {
-    html << "<h2 style=\"margin-top:14px\">Tracker</h2><div>";
+    html << "<h2 style=\"margin-top:14px\">Static capability hypotheses</h2><p>Tags are not confirmed malware families or observed behavior.</p><div>";
     EmitTags(html, scan.tags);
     html << "</div>";
   }
@@ -2335,11 +2366,12 @@ std::string BuildHtmlReportWithFrames(const AnalysisReport &report,
   // right-rail Indicators section (EmitMitreByTactic). The former flat chip card
   // here duplicated it, so it was removed.
 
-  html << "<h2 style=\"margin-top:16px\">Full Event Timeline</h2>";
-  EmitEventTable(html, report.events);
+  html << "<h2 style=\"margin-top:16px\">Attribution / Full Event Timeline</h2><p>Process instance attribution is not proof that a particular loaded DLL caused an action. "
+          "Outside-tree processes can include service-mediated activity. Unknown attribution remains unknown.</p>";
+  EmitEventTable(html, report.events, dimensions.attribution);
 
   if (!scan.findings.empty()) {
-    html << "<h2 style=\"margin-top:16px\">Scanner findings</h2>";
+    html << "<h2 style=\"margin-top:16px\">Supporting static findings</h2><p>These are not observations of executed behavior or a final verdict.</p>";
     html << "<table><thead><tr><th>Rule</th><th>Score</th><th>Message</th></tr></thead><tbody>";
     for (const auto &f : scan.findings) {
       html << "<tr><td class=\"mono\">" << HtmlEscape(f.ruleId) << "</td><td class=\"mono\">"

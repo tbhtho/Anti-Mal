@@ -208,7 +208,7 @@
     reports: function () {
       return '<h1 class="page-title">Reports</h1><p class="page-sub">Static and dynamic analysis reports archived under the workspace.</p>' +
         '<div class="panel"><h2>Boot reliability</h2><div id="reliability-box"><p class="page-sub" style="margin:0">Loading&hellip;</p></div></div>' +
-        '<div class="panel"><table class="grid"><thead><tr><th>Run</th><th>File</th><th>Risk</th><th>Verdict</th><th>Created</th><th>Type</th><th>Actions</th></tr></thead><tbody id="reports-rows"><tr><td colspan="7" class="page-sub" style="padding:14px">Loading&hellip;</td></tr></tbody></table></div>';
+        '<div class="panel"><table class="grid"><thead><tr><th>Run</th><th>File</th><th>Behavior indicators</th><th>Security assessment</th><th>Created</th><th>Type</th><th>Actions</th></tr></thead><tbody id="reports-rows"><tr><td colspan="7" class="page-sub" style="padding:14px">Loading&hellip;</td></tr></tbody></table></div>';
     },
     base: function () {
       var steps = ['Select Windows ISO', 'Choose workspace path', 'Create or import base VHDX', 'Validate boot files', 'Install GuestAgent', 'Confirm ready state'];
@@ -240,7 +240,7 @@
   function scanRow(x) {
     var sha = String(x.sha256 || '');
     var tagNames = (x.tags || []).map(function (tg) { return tg && tg.tag; }).filter(Boolean);
-    return '<tr><td>' + riskChip(x.score | 0) + '</td><td>' + verdictBadge(x.verdict || '?') +
+    return '<tr><td>' + esc(String(x.score | 0)) + '</td><td>' + esc(x.provenanceState || 'unknown') +
       '</td><td>' + tags(tagNames) + '</td><td class="mono">' + esc(x.path || '') +
       '</td><td class="mono">' + esc(sha.slice(0, 16)) + (sha ? '…' : '') + '</td></tr>';
   }
@@ -282,7 +282,7 @@
       ['YARA matches', n(last.yaraMatches)], ['capa capabilities', n(last.capaCapabilities)],
       ['DIE detections', n(last.dieDetections)], ['Intel hits', n(last.intelHits)]
     ]);
-    box.innerHTML = '<table class="grid"><thead><tr><th>Score</th><th>Verdict</th><th>Tags</th><th>Path</th><th>SHA-256</th></tr></thead><tbody>' + rows + '</tbody></table>' +
+    box.innerHTML = '<table class="grid"><thead><tr><th>Static score</th><th>Provenance / Modification</th><th>Capability hypotheses</th><th>Path</th><th>SHA-256</th></tr></thead><tbody>' + rows + '</tbody></table>' +
       '<h2 style="margin:16px 0 8px">Latest Result Detail</h2>' + detail +
       '<div class="actions" style="margin:10px 0"><button class="btn" id="yara-gen-btn">Generate YARA rule</button><button class="btn" id="yara-copy-btn" style="display:none">Copy</button><button class="btn" id="cfg-btn">Recover config / C2</button></div>' +
       '<pre id="yara-out" class="mono" style="display:none;white-space:pre-wrap;background:var(--panel-2,#11151c);padding:10px;border-radius:6px;overflow:auto;max-height:340px"></pre>' +
@@ -464,7 +464,7 @@
     body.innerHTML = list.map(function (x) {
       var folder = String(x.runDir || '').split(/[\\/]/).filter(Boolean).pop() || '';
       var viewBtn = (x.type && x.type.indexOf('HTML') >= 0 && folder) ? '<button class="iconbtn" title="View report in-app" data-view="' + esc(folder) + '">&#128065;</button> ' : '';
-      return '<tr><td class="mono">' + esc(String(x.id || '').slice(0, 8)) + '</td><td>' + esc(x.file || '—') + '</td><td>' + riskChip(x.score | 0) + '</td><td>' + verdictBadge(x.verdict || '?') +
+      return '<tr><td class="mono">' + esc(String(x.id || '').slice(0, 8)) + '</td><td>' + esc(x.file || '—') + '</td><td>' + esc(String(x.score | 0)) + '</td><td>' + esc(x.verdict || 'Insufficient observation') +
         '</td><td class="mono">' + esc(x.created || '—') + '</td><td>' + esc(x.type || '—') + '</td><td>' + viewBtn + '<button class="iconbtn" title="Open run folder" data-open="' + esc(x.runDir || '') + '">▤</button></td></tr>';
     }).join('');
     $all('#reports-rows [data-view]').forEach(function (b) {
@@ -485,7 +485,7 @@
   function renderDashResults() {
     var box = $('#dash-results'); if (!box) return;
     if (!state.scans.length) { box.innerHTML = '<p class="page-sub" style="margin:0">No scans this session. Use Scan File to analyze a sample.</p>'; return; }
-    box.innerHTML = '<table class="grid"><thead><tr><th>Score</th><th>Verdict</th><th>Tags</th><th>Path</th><th>SHA-256</th></tr></thead><tbody>' + state.scans.map(scanRow).join('') + '</tbody></table>';
+    box.innerHTML = '<table class="grid"><thead><tr><th>Static score</th><th>Provenance / Modification</th><th>Capability hypotheses</th><th>Path</th><th>SHA-256</th></tr></thead><tbody>' + state.scans.map(scanRow).join('') + '</tbody></table>';
   }
   // Renders the dropped-file enrichment cell: the magic-byte type plus a short
   // sha256 (full hash in the tooltip), or the skip marker the agent set when it
@@ -535,7 +535,7 @@
       // verdict for the bundled test binary (it was 'malicious (100)' noise).
       var rows = (lr.kind === 'boot')
         ? [['Verdict', lr.verdict || 'boot session'], ['Run ID', lr.runId || '—'], ['When', lr.when || '—']]
-        : [['Verdict', lr.verdict || '—'], ['Scanner', (lr.scannerVerdict || '—') + ' (' + (lr.score | 0) + ')'], ['Run ID', lr.runId || '—'], ['When', lr.when || '—']];
+        : [['Security assessment', lr.verdict || 'Insufficient observation'], ['Provenance / Modification', lr.provenance || 'unknown'], ['Run ID', lr.runId || '—'], ['When', lr.when || '—']];
       run.innerHTML = kv(rows) +
         '<div class="actions" style="margin-top:12px"><button class="btn" data-open-run="' + esc(lr.runDir || '') + '">Open Run Folder</button></div>';
       var ob = run.querySelector('[data-open-run]');

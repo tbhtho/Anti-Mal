@@ -118,6 +118,7 @@
     <ClCompile Include="src\FileUtil.cpp" />
     <ClCompile Include="src\FakeInternet.cpp" />
     <ClCompile Include="src\FuzzyHash.cpp" />
+    <ClCompile Include="src\GuestArtifactStore.cpp" />
     <ClCompile Include="src\GuestMonitor.cpp" />
     <ClCompile Include="src\Http.cpp" />
     <ClCompile Include="src\HyperVOrchestrator.cpp" />
@@ -147,6 +148,7 @@
     <ClCompile Include="src\SampleStaging.cpp" />
     <ClCompile Include="src\Scanner.cpp" />
     <ClCompile Include="src\SensorCoverage.cpp" />
+    <ClCompile Include="src\StaticPolicy.cpp" />
     <ClCompile Include="src\WorkerIsolation.cpp" />
     <ClCompile Include="src\ScriptAnalyzer.cpp" />
     <ClCompile Include="src\ShellcodeDetector.cpp" />

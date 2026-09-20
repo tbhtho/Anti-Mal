@@ -33,6 +33,8 @@
 #include <cstdio>
 #include <cstring>
 #include <string>
+#include "containment_checks.h"
+#include "telemetry_checks.h"
 
 namespace {
 
@@ -133,6 +135,24 @@ std::wstring BuildDiagnostic(const std::wstring &classResult, DWORD classGle,
        L")\n";
   d += L"diagPath=" + TempDiagPath() + L"\n";
   d += L"diagPathPublic=" + PublicDiagPath() + L"\n";
+  // Record reset evidence BEFORE RunBehaviors creates this fixture's state.
+  // Absence is asserted only for these known fixture markers, never for malware.
+  for (const auto &path : {TempPath(L"antimal-gui-probe.log"),
+                          PublicPath(L"antimal-gui-probe-marker.txt")}) {
+    const DWORD attributes = GetFileAttributesW(path.c_str());
+    const DWORD error = attributes == INVALID_FILE_ATTRIBUTES ? GetLastError() : 0;
+    d += L"preexistingMarker=" + path + L" status=" +
+         (attributes != INVALID_FILE_ATTRIBUTES ? L"present" :
+          (error == ERROR_FILE_NOT_FOUND || error == ERROR_PATH_NOT_FOUND) ?
+              L"absent" : L"unknown") + L" error=" + std::to_wstring(error) + L"\n";
+  }
+  DWORD type = 0, size = 0;
+  const LSTATUS registry = RegGetValueW(HKEY_CURRENT_USER,
+      L"Software\\Microsoft\\Windows\\CurrentVersion\\Run", L"AntiMalGuiProbe",
+      RRF_RT_ANY, &type, nullptr, &size);
+  d += L"preexistingAutostart=" + std::wstring(registry == ERROR_SUCCESS ? L"present" :
+      registry == ERROR_FILE_NOT_FOUND ? L"absent" : L"unknown") +
+      L" error=" + std::to_wstring(registry) + L"\n";
   return d;
 }
 
@@ -236,6 +256,8 @@ void LogEvent(const std::string &line) {
 
 // All expected behaviors, in a fixed order, each self-labelled.
 void RunBehaviors(HWND hwnd) {
+  RunContainmentChecks();
+  RunTelemetryChecks();
   LogEvent("behavior=run");
   DropFile(TempPath(L"antimal-gui-probe.log"),
            "antimal-gui-probe: benign fixture behavior log\n");
@@ -375,6 +397,30 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
 } // namespace
 
 int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int show) {
+  // Immediate startup changes exercise the pre-launch baseline barrier. The
+  // previous-state records also let a second fresh-overlay run prove reset.
+  const auto startupMarker = PublicPath(L"antimal-baseline-probe-20260919.txt");
+  const DWORD priorAttrs = GetFileAttributesW(startupMarker.c_str());
+  const DWORD priorError = priorAttrs == INVALID_FILE_ATTRIBUTES ? GetLastError() : 0;
+  LogEvent("baseline_prior_file_error=" + std::to_string(priorError));
+  DWORD priorSize = 0;
+  const auto priorReg = RegGetValueW(HKEY_CURRENT_USER,
+      L"Software\\Microsoft\\Windows\\CurrentVersion\\Run",
+      L"AntiMalBaselineProbe", RRF_RT_REG_SZ, nullptr, nullptr, &priorSize);
+  LogEvent("baseline_prior_registry_status=" + std::to_string(priorReg));
+  DropFile(startupMarker, "Immediate startup marker for baseline verification\n");
+  HKEY baselineKey = nullptr;
+  const auto opened = RegCreateKeyExW(HKEY_CURRENT_USER,
+      L"Software\\Microsoft\\Windows\\CurrentVersion\\Run", 0, nullptr, 0,
+      KEY_SET_VALUE, nullptr, &baselineKey, nullptr);
+  LONG written = opened;
+  if (opened == ERROR_SUCCESS) {
+    const wchar_t value[] = L"cmd.exe /c exit 0";
+    written = RegSetValueExW(baselineKey, L"AntiMalBaselineProbe", 0, REG_SZ,
+        reinterpret_cast<const BYTE *>(value), sizeof(value));
+    RegCloseKey(baselineKey);
+  }
+  LogEvent("baseline_startup_registry_write=" + std::to_string(written));
   WNDCLASSEXW wc{};
   wc.cbSize = sizeof(wc);
   wc.lpfnWndProc = WndProc;

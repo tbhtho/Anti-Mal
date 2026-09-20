@@ -16,7 +16,9 @@
 #>
 [CmdletBinding()]
 param(
-  [string]$Configuration = "Release"
+  [string]$Configuration = "Release",
+  [string]$OutputDirectory,
+  [string]$IntermediateDirectory
 )
 
 $ErrorActionPreference = "Stop"
@@ -24,9 +26,13 @@ $root = Split-Path -Parent $PSScriptRoot
 $src = Join-Path $root "samples\probe\antimal_probe.cpp"
 $outDir = Join-Path $root "bin\x64\$Configuration"
 $objDir = Join-Path $root "obj\SampleProbe\x64\$Configuration"
+if ($OutputDirectory) { $outDir = [IO.Path]::GetFullPath($OutputDirectory) }
+if ($IntermediateDirectory) { $objDir = [IO.Path]::GetFullPath($IntermediateDirectory) }
 $exe = Join-Path $outDir "AntiMal.SampleProbe.exe"
 $guiSrc = Join-Path $root "samples\probe\antimal_gui_probe.cpp"
 $guiExe = Join-Path $outDir "AntiMal.GuiProbe.exe"
+$workflowSrc = Join-Path $root "samples\probe\afterfx_workflow_probe.cpp"
+$workflowExe = Join-Path $outDir "AntiMal.AfterFxWorkflowProbe.exe"
 if (-not (Test-Path $guiSrc)) { throw "GUI probe source not found: $guiSrc" }
 
 if (-not (Test-Path $src)) { throw "probe source not found: $src" }
@@ -50,7 +56,9 @@ call "$vcvars" >nul
 if errorlevel 1 exit /b 1
 cl /nologo /EHsc /O2 /MT /W3 /std:c++17 /Fo"$objDir\\" /Fe"$exe" "$src" /link ws2_32.lib advapi32.lib
 if errorlevel 1 exit /b 1
-cl /nologo /EHsc /O2 /MT /W3 /std:c++17 /Fo"$objDir\\" /Fe"$guiExe" "$guiSrc" /link ws2_32.lib advapi32.lib user32.lib gdi32.lib /SUBSYSTEM:WINDOWS
+cl /nologo /EHsc /O2 /MT /W3 /std:c++17 /Fo"$objDir\\" /Fe"$guiExe" "$guiSrc" /link winhttp.lib ws2_32.lib iphlpapi.lib advapi32.lib user32.lib gdi32.lib /SUBSYSTEM:WINDOWS
+if errorlevel 1 exit /b 1
+cl /nologo /EHsc /O2 /MT /W3 /std:c++17 /Fo"$objDir\\" /Fe"$workflowExe" "$workflowSrc" /link winsqlite3.lib crypt32.lib user32.lib /SUBSYSTEM:WINDOWS
 exit /b %errorlevel%
 "@
 Set-Content -Path $batPath -Value $bat -Encoding ASCII

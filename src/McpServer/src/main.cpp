@@ -702,8 +702,24 @@ std::string ToolVmBoot(const antimal::AppConfig &cfg, const JsonValue &args) {
   const bool exec = ArgBool(args, "allow_execution", false);
   const bool view = ArgBool(args, "view", true);
 
-  const std::filesystem::path seed =
+  std::filesystem::path seed =
       cfg.workspaceRoot / L"_base" / L"AntiMalDesktop.cow";
+  // Preserve an explicit operator-selected retained snapshot. The orchestrator
+  // copies it into a new run; silently substituting the desktop loses the
+  // installed application and makes subsequent workflow claims invalid.
+  const DWORD seedChars = GetEnvironmentVariableW(L"ANTIMAL_SEED_OVERLAY", nullptr, 0);
+  if (seedChars) {
+    std::wstring selected(seedChars, L'\0');
+    const DWORD copied = GetEnvironmentVariableW(L"ANTIMAL_SEED_OVERLAY", selected.data(), seedChars);
+    if (!copied || copied >= seedChars) {
+      return R"({"ok":false,"error":"Could not read explicit seed overlay"})";
+    }
+    selected.resize(copied); seed = selected;
+    std::error_code seedError;
+    if (!std::filesystem::is_regular_file(seed, seedError)) {
+      return R"({"ok":false,"error":"Explicit seed overlay is not a readable file; refusing fallback"})";
+    }
+  }
   const std::filesystem::path liveInput =
       cfg.workspaceRoot / kLiveInputFileName;
   std::error_code ec;

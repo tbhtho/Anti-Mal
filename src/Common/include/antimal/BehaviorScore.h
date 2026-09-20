@@ -39,7 +39,10 @@ namespace antimal {
 //   * the verified journal anchor is the shared execution fact
 //     (JournalShowsSampleExecuted) used by normal finalization as well as
 //     recovery.
-inline constexpr const char *kBehaviorScorerVersion = "behavior-score-v4";
+// v4.2: duplicate crash observations collapse; crashes outside the sample are
+// context, not scored as evidence of injection.
+// v4.3: signature state has no effect on behavioral score, threshold or rationale.
+inline constexpr const char *kBehaviorScorerVersion = "behavior-score-v4.3";
 
 // Result of the explainable behavioral scorer. `score` is the summed weight of
 // every signal that fired; `verdict` is that score mapped through thresholds;

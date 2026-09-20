@@ -1,4 +1,5 @@
 #include "WebViewHost.h"
+#include "antimal/EvidenceDimensions.h"
 
 #include <dwmapi.h>
 #include <shellapi.h> // ShellExecuteW (open run folder in Explorer)
@@ -903,8 +904,9 @@ void WebViewHost::RegisterHandlers() {
                               ? Narrow(entries[i].dir.filename().wstring().c_str())
                               : r.runId);
         o.AddString("file", Narrow(r.samplePath.filename().wstring().c_str()));
-        o.AddNumber("score", r.scannerVerdict.score);
-        o.AddString("verdict", ToString(r.scannerVerdict.verdict));
+        o.AddNumber("score", r.verdictScore);
+        o.AddString("verdict", BuildEvidenceDimensions(r).assessment);
+        o.AddString("provenance", r.scannerVerdict.provenanceState);
         o.AddString("created", FormatFileTime(entries[i].json));
         o.AddString("type", hasHtml ? "HTML+JSON" : "JSON");
         o.AddString("runDir", Narrow(entries[i].dir.wstring().c_str()));
@@ -1080,10 +1082,11 @@ void WebViewHost::RegisterHandlers() {
       lr.AddString("file", bootRun ? std::string() : sampleFile);
       lr.AddString("verdict",
                    bootRun ? std::string("boot session")
-                           : ToString(r.sandboxVerdict));
+                           : BuildEvidenceDimensions(r).assessment);
       if (!bootRun) {
         lr.AddNumber("score", r.scannerVerdict.score);
         lr.AddString("scannerVerdict", ToString(r.scannerVerdict.verdict));
+        lr.AddString("provenance", r.scannerVerdict.provenanceState);
       }
       lr.AddString("when", FormatFileTime(whenPath));
       lr.AddString("runDir", Narrow(bestDir.wstring().c_str()));

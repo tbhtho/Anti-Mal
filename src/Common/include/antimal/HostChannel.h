@@ -31,6 +31,7 @@ enum class HostChannelMessage : uint16_t {
   // so an older decoder rejects it as an unknown type and never executes
   // (fail-safe). The wire version is unchanged.
   SampleChunk = 11,
+  FlushStorage = 12, // host requests a guest filesystem flush before VM stop
 };
 
 struct HostChannelFrame {
@@ -133,7 +134,7 @@ private:
 
   static bool ValidType(uint16_t type) {
     return type >= static_cast<uint16_t>(HostChannelMessage::Hello) &&
-           type <= static_cast<uint16_t>(HostChannelMessage::SampleChunk);
+           type <= static_cast<uint16_t>(HostChannelMessage::FlushStorage);
   }
 
   void TryDecode() {

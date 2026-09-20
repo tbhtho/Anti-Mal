@@ -18,7 +18,7 @@ constexpr int kShiftTolerance = 20;
 // over different backgrounds.
 constexpr int kTrackTolerance = 32;
 // A track is only believed when this fraction of mask pixels agree.
-constexpr double kTrackMinScore = 0.6;
+constexpr double kTrackMinScore = 0.9;
 // The pointer sprite is small; anything larger that moved by exactly the probe
 // delta is something else (a scrolling pane, a video).
 constexpr int kMaxSpriteDim = 80;
@@ -91,7 +91,7 @@ std::vector<Component> FindComponents(const std::vector<uint8_t> &mask, int w,
 
 } // namespace
 
-ShiftLearnResult LearnCursorByKnownShift(const BgrxFrame &before,
+static ShiftLearnResult LearnCursorAtShift(const BgrxFrame &before,
                                          const BgrxFrame &after, int dx,
                                          int dy) {
   ShiftLearnResult r;
@@ -127,6 +127,12 @@ ShiftLearnResult LearnCursorByKnownShift(const BgrxFrame &before,
       }
       if (MaxChannelDiff(a, before.At(sx, sy)) > kShiftTolerance) {
         continue; // changed, but not by exactly the injected delta
+      }
+      // The source must have changed too. Otherwise the desktop uncovered by
+      // the OLD pointer can masquerade as a moving sprite on a smooth wall.
+      if (MaxChannelDiff(before.At(sx, sy), after.At(sx, sy)) <=
+          kMotionThreshold) {
+        continue;
       }
       cand[static_cast<size_t>(y) * w + x] = 1;
     }
@@ -174,57 +180,85 @@ ShiftLearnResult LearnCursorByKnownShift(const BgrxFrame &before,
     std::copy(src, src + static_cast<size_t>(sprite.width) * 4,
               sprite.pixels.begin() + static_cast<size_t>(y) * sprite.width * 4);
   }
-  // Dilate the foreground mask by one 4-neighbour ring: the candidate set is
-  // biased toward high-contrast pixels, and a slightly fatter mask tracks the
-  // anti-aliased outline better.
-  std::vector<uint8_t> grown(static_cast<size_t>(sprite.width) * sprite.height,
-                             0);
-  for (int y = best->minY; y <= best->maxY; ++y) {
-    for (int x = best->minX; x <= best->maxX; ++x) {
-      if (!cand[static_cast<size_t>(y) * w + x]) {
-        continue;
-      }
+  // Add a one-pixel outline only when it agrees at BOTH endpoints of the
+  // confirmed move. This distinguishes a black I-beam from static dark text
+  // without importing an arbitrary patch of uncovered wallpaper.
+  for (int y = by0; y <= by1; ++y) {
+    for (int x = bx0; x <= bx1; ++x) {
+      if (!cand[static_cast<size_t>(y) * w + x]) continue;
       for (int oy = -1; oy <= 1; ++oy) {
         for (int ox = -1; ox <= 1; ++ox) {
-          const int lx = x + ox - bx0;
-          const int ly = y + oy - by0;
-          if (lx < 0 || ly < 0 || lx >= sprite.width || ly >= sprite.height) {
-            continue;
+          const int nx = x + ox, ny = y + oy;
+          if (nx < bx0 || nx > bx1 || ny < by0 || ny > by1 ||
+              !before.Contains(nx - dx, ny - dy)) continue;
+          if (MaxChannelDiff(after.At(nx, ny), before.At(nx - dx, ny - dy)) <=
+              kShiftTolerance) {
+            sprite.mask[static_cast<size_t>(ny - by0) * sprite.width + nx - bx0] = 1;
           }
-          grown[static_cast<size_t>(ly) * sprite.width + lx] = 1;
         }
       }
     }
   }
-  std::copy(grown.begin(), grown.end(), sprite.mask.begin());
   if (!sprite.Valid()) {
-    r.failure = "pointer mask too small after dilation";
+    r.failure = "pointer mask too small";
+    return r;
+  }
+
+  int minColor = 255, maxColor = 0;
+  for (size_t i = 0; i < sprite.mask.size(); ++i) {
+    if (!sprite.mask[i]) continue;
+    for (int c = 0; c < 3; ++c) {
+      minColor = std::min(minColor, static_cast<int>(sprite.pixels[i * 4 + c]));
+      maxColor = std::max(maxColor, static_cast<int>(sprite.pixels[i * 4 + c]));
+    }
+  }
+  if (sprite.MaskPixels() < 20 || maxColor - minColor < 96) {
+    r.failure = "moving fragment lacks a distinctive pointer outline";
     return r;
   }
 
   // Refine the ACTUAL delta by locating the sprite in the pre-move frame:
   // measured gain (acceleration) comes straight from this pair.
   const CursorMatch pre =
-      TrackCursor(before, sprite, bx0 - dx, by0 - dy,
-                  std::max(24, std::max(std::abs(dx), std::abs(dy)) + 16));
+      TrackCursor(before, sprite, bx0 - dx, by0 - dy, 0);
   const double density = static_cast<double>(best->count) /
                          std::max(1, best->Area());
-  if (pre.valid) {
+  if (pre.valid &&
+      (dx == 0 ? std::abs(bx0 - pre.x) <= 2 : (bx0 - pre.x) * dx > 0) &&
+      (dy == 0 ? std::abs(by0 - pre.y) <= 2 : (by0 - pre.y) * dy > 0)) {
     r.actualDx = bx0 - pre.x;
     r.actualDy = by0 - pre.y;
     r.confidence = pre.score * density;
   } else {
-    // Trust the probe's delta; confidence is lower because the refinement
-    // could not confirm it.
-    r.actualDx = dx;
-    r.actualDy = dy;
-    r.confidence = density * 0.5;
+    r.failure = "sprite motion could not be confirmed in the pre-move frame";
+    return r;
   }
   r.valid = true;
   r.sprite = std::move(sprite);
   r.x = bx0;
   r.y = by0;
   return r;
+}
+
+ShiftLearnResult LearnCursorByKnownShift(const BgrxFrame &before,
+                                         const BgrxFrame &after, int dx, int dy) {
+  // PS/2 counts are not screen pixels. Search bounded gains for small axis
+  // probes, retaining the most complete confirmed sprite rather than a tiny
+  // fragment that happens to match the requested count.
+  ShiftLearnResult best = LearnCursorAtShift(before, after, dx, dy);
+  if ((dx == 0) != (dy == 0) && std::max(std::abs(dx), std::abs(dy)) <= 16) {
+    for (int distance = 1; distance <= 32; ++distance) {
+      const int sx = dx == 0 ? 0 : (dx > 0 ? distance : -distance);
+      const int sy = dy == 0 ? 0 : (dy > 0 ? distance : -distance);
+      if (sx == dx && sy == dy) continue;
+      auto candidate = LearnCursorAtShift(before, after, sx, sy);
+      if (candidate.valid && (!best.valid ||
+          candidate.sprite.MaskPixels() > best.sprite.MaskPixels())) {
+        best = std::move(candidate);
+      }
+    }
+  }
+  return best;
 }
 
 CursorMatch TrackCursor(const BgrxFrame &frame, const CursorSprite &sprite,

@@ -1,3 +1,6 @@
+#include "antimal/AgentBootstrapPolicy.h"
+#include "antimal/GuestFlushGate.h"
+#include "antimal/GuestArtifactStore.h"
 #include "antimal/HyperVOrchestrator.h"
 
 #include "antimal/BehaviorScore.h"
@@ -4574,6 +4577,8 @@ bool PatchOverlayBlankAntimalPassword(hv::IBlockDevice &disk,
                                       BootOverlayPatchResult *result);
 bool PatchOverlayDesktopStability(hv::IBlockDevice &disk,
                                   BootOverlayPatchResult *result);
+bool SuppressDuplicateAgentAutorun(hv::IBlockDevice &disk, BootOverlayPatchResult *result);
+
 bool PatchOverlaySetShellCmd(hv::IBlockDevice &disk,
                              BootOverlayPatchResult *result);
 bool PatchOverlayDisableAppLocker(hv::IBlockDevice &disk,
@@ -6443,6 +6448,9 @@ BootOverlayPatchResult ApplyEphemeralBootOverlay(hv::IBlockDevice &disk) {
             result.freshAgentDeployed
                 ? "fresh-agent deploy: current build deployed (default-on)"
                 : "fresh-agent deploy: deploy failed; using the snapshot's agent");
+        if (result.freshAgentDeployed) {
+          SuppressDuplicateAgentAutorun(disk, &result);
+        }
       }
     }
   }
@@ -7803,6 +7811,49 @@ bool PatchOverlayDesktopStability(hv::IBlockDevice &disk,
 // REG_SZ edit: "cmd.exe" (UTF-16LE + NUL) is shorter than "explorer.exe", so we
 // zero-pad to the original value length (the hive/NTFS writer is same-size only).
 // Overlay-only; base untouched. Opt-in via ANTIMAL_PROBE_SHELL_CMD.
+// The seeded image has an old logon fallback in addition to the real service.
+// Disable ONLY that exact AntiMal-owned command after fresh service deployment.
+// Otherwise the stale console steals focus and competes for COM2 at logon.
+bool SuppressDuplicateAgentAutorun(hv::IBlockDevice &disk,
+                                   BootOverlayPatchResult *result) {
+  auto note = [&](const char *message) {
+    if (result) result->notes.push_back(message);
+  };
+  const auto parts = ReadGptPartitionsLite(disk);
+  const auto windows = std::find_if(parts.begin(), parts.end(),
+      [](const GptPartitionLite &p) { return IsWindowsBasicDataGuid(p.typeGuid); });
+  if (windows == parts.end()) return false;
+  NtfsBootFileLocator ntfs(disk, windows->firstLba);
+  if (!ntfs.Init()) return false;
+  const auto entry = ntfs.FindPath("Windows\\System32\\config\\SOFTWARE");
+  if (!entry) return false;
+  auto bytes = ntfs.ReadFile(*entry, 256u * 1024u * 1024u);
+  MutableHiveView hive(bytes);
+  if (!hive.IsValid()) return false;
+  auto key = hive.RootIndex();
+  for (const char *part : {"Microsoft", "Windows", "CurrentVersion", "Run"}) {
+    if (!key) return false;
+    key = hive.FindSubkey(*key, part);
+  }
+  if (!key) return true;
+  const auto value = hive.FindValue(*key, "AntiMalGuestAgent");
+  if (!value) return true;
+  const auto old = hive.ValueBytes(*value);
+  if (!IsSeededAgentAutorun(value->type, old)) {
+    note("agent-autorun: nonstandard fallback preserved");
+    return false;
+  }
+  if (!hive.UpsertBinaryValueSameSize(*key, "AntiMalGuestAgent", 1,
+                                     std::vector<uint8_t>(old.size(), 0))) return false;
+  RefreshRegistryHiveHeader(bytes);
+  if (!ntfs.WriteFileSameSize(*entry, bytes)) {
+    note("agent-autorun: failed to suppress duplicate fallback");
+    return false;
+  }
+  note("agent-autorun: exact stale logon fallback disabled in overlay; fresh service retained");
+  return true;
+}
+
 bool PatchOverlaySetShellCmd(hv::IBlockDevice &disk,
                              BootOverlayPatchResult *result) {
   const auto parts = ReadGptPartitionsLite(disk);
@@ -8588,18 +8639,6 @@ BootSignalSummary AnalyzeBootSignals(const hv::VmRunSummary &vm) {
   return signals;
 }
 
-std::string SanitizedArtifactName(std::string_view name) {
-  std::string cleaned(name.begin(), name.end());
-  for (char &ch : cleaned) {
-    const unsigned char c = static_cast<unsigned char>(ch);
-    if (!(std::isalnum(c) || ch == '.' || ch == '_' || ch == '-')) {
-      ch = '_';
-    }
-  }
-  const auto filename = std::filesystem::path(cleaned).filename().string();
-  return filename.empty() ? "artifact.bin" : filename;
-}
-
 HostChannelCapture ProcessHostChannelOutput(
     const std::string &hostChannelOutput,
     const std::filesystem::path &journalPath,
@@ -8654,21 +8693,23 @@ HostChannelCapture ProcessHostChannelOutput(
     case hv::HostChannelMessage::ArtifactChunk: {
       const auto split = payload.find('\n');
       const std::string name = split == std::string::npos
-                                   ? SanitizedArtifactName("artifact.bin")
-                                   : SanitizedArtifactName(
-                                         std::string_view(payload).substr(0, split));
-      const std::string_view bytes =
-          split == std::string::npos
-              ? std::string_view(payload)
-              : std::string_view(payload).substr(split + 1);
-      const auto outPath = artifactsDir / name;
-      WriteTextFile(outPath, bytes);
-      capture.artifacts.push_back(outPath);
+                                   ? std::string{}
+                                   : payload.substr(0, split);
+      const std::string_view bytes = split == std::string::npos
+          ? std::string_view{} : std::string_view(payload).substr(split + 1);
+      const auto stored = StoreGuestArtifact(artifactsDir, name, bytes);
+      if (!stored.written) {
+        AppendJournalEvent(journalPath,
+            MakeSandboxEvent("artifact.rejected", artifactsDir,
+                {{"channel", "COM2"}, {"reason", stored.error},
+                 {"bytes", std::to_string(bytes.size())}}), events);
+        break;
+      }
+      capture.artifacts.push_back(stored.path);
       AppendJournalEvent(journalPath,
-                         MakeSandboxEvent("artifact.received", outPath,
-                                          {{"channel", "COM2"},
-                                           {"bytes", std::to_string(bytes.size())}}),
-                         events);
+          MakeSandboxEvent("artifact.received", stored.path,
+              {{"channel", "COM2"}, {"guestName", name},
+               {"bytes", std::to_string(bytes.size())}}), events);
       break;
     }
     case hv::HostChannelMessage::ReportComplete:
@@ -8756,6 +8797,7 @@ std::vector<uint8_t> BuildFirstBootCom2Bytes(bool executionAuthorized,
   req.allowSampleExecution = true;
   req.sampleName = PathToUtf8(stagedSample.filename());
   req.sampleBytes = sample.size();
+  req.sampleKind = SampleKindForName(req.sampleName);
   // The guest's sample-observation window MUST end before the host's overall
   // run deadline: otherwise a sample that never exits on its own (a UI dialog,
   // a hung installer) gets the VM stopped out from under the agent, and the
@@ -8814,13 +8856,7 @@ std::vector<uint8_t> BuildDiskDeliveryCom2Bytes(
   req.sampleName = PathToUtf8(stagedSample.filename());
   req.sampleBytes = size;
   req.delivery = "disk";
-  std::wstring ext = stagedSample.extension().wstring();
-  for (wchar_t &ch : ext) {
-    if (ch >= L'A' && ch <= L'Z') {
-      ch = static_cast<wchar_t>(ch - L'A' + L'a');
-    }
-  }
-  req.sampleKind = (ext == L".iso") ? "iso" : "exe";
+  req.sampleKind = SampleKindForName(req.sampleName);
   req.diskBytes = diskBytes;
   // The guest's observation window must end before the host's overall run
   // deadline (same rule as the serial path). The disk read is fast, so the
@@ -10748,6 +10784,11 @@ std::string DebugDumpHiveFile(const std::string &hiveFilePath,
     return "ERR: not a valid regf hive (size=" + std::to_string(bytes.size()) +
            "): " + hiveFilePath + "\n";
   }
+  if (ReadLe32(bytes.data() + 4) != ReadLe32(bytes.data() + 8)) {
+    return "ERR: registry hive requires transaction-log recovery; this main hive "
+           "is not a current registry view. Preserve its .LOG1 and .LOG2 files "
+           "with the disk image. Offline log replay is not implemented.\n";
+  }
   auto lower = [](std::string s) {
     for (auto &c : s) c = static_cast<char>(std::tolower((unsigned char)c));
     return s;
@@ -11275,10 +11316,11 @@ DetonationResult InHouseOrchestrator::PrepareAndRun(
   DetonationResult result;
   result.runId = MakeRunId();
   result.runDir = config_.workspaceRoot / result.runId;
-  // QoL + disk safety: reclaim the disposable overlays from PAST runs (each up to
-  // ~3 GB and only needed during its own run). Analysis artifacts (report.json,
-  // events.jsonl, screenshots) are kept. Opt out with ANTIMAL_KEEP_OVERLAYS=1.
-  if (!EnvFlagEnabled("ANTIMAL_KEEP_OVERLAYS")) {
+  // A completed VM disk is evidence, including files not exported as artifacts.
+  // Preserve it by default. Reclaiming past disks requires an explicit opt-in;
+  // starting another investigation must not silently erase them.
+  if (EnvFlagEnabled("ANTIMAL_RECLAIM_PAST_OVERLAYS") &&
+      !EnvFlagEnabled("ANTIMAL_KEEP_OVERLAYS")) {
     std::error_code wec;
     if (std::filesystem::is_directory(config_.workspaceRoot, wec)) {
       for (const auto &entry :
@@ -11903,8 +11945,7 @@ DetonationResult InHouseOrchestrator::PrepareAndRun(
       // offsets so it lands once the Win11 login password field is focused.
       // Win11 25H2 ignores plaintext autologon (the lock screen intercepts; the
       // LSA secret is required), so injected-input login is the proven path to
-      // the desktop on a seeded fast-boot. Extra firings on an already
-      // logged-in desktop are inert. Does NOT authorize sample execution.
+      // the desktop on a seeded fast-boot. Pending retries are cancelled on verified sample launch or live takeover. Does NOT authorize sample execution.
       {
         const std::string &pwd = effectiveLoginPwd;
         const size_t pwdNeeded = pwd.size() + 1; // mirror the old getenv_s len
@@ -11998,7 +12039,7 @@ DetonationResult InHouseOrchestrator::PrepareAndRun(
           keys.push_back({0x1C, 0x9C}); // Enter: submit
           // Fire several attempts across a wide, late window because the sign-in
           // field appears late (~t+245s observed); only an attempt that lands on
-          // the focused field logs in. Extra attempts after login are inert.
+          // the focused field logs in. The run loop cancels pending attempts after launch/takeover.
           const int64_t spacingMs = 80;
           for (int off : {120, 180, 240, 300, 360}) {
             for (size_t k = 0; k < keys.size(); ++k) {
@@ -12014,8 +12055,7 @@ DetonationResult InHouseOrchestrator::PrepareAndRun(
       // the account was blanked offline, so login is just "dismiss the lock
       // screen, submit the empty password" -- two Enters ~700ms apart, fired
       // across a wide window so one pair lands once the sign-in field is
-      // focused. No password is ever typed. Extra firings on the desktop are
-      // inert.
+      // focused. No password is typed; pending retries stop on launch/takeover.
       if (effectiveNoPassword) {
         using namespace std::chrono;
         const std::vector<uint8_t> enter = {0x1C, 0x9C};
@@ -12251,6 +12291,11 @@ DetonationResult InHouseOrchestrator::PrepareAndRun(
           PerRunExecutionAuthorized();
       auto stopAfterGuestAgentProbe = std::make_shared<std::atomic_bool>(false);
       request.cancelRequested = stopAfterGuestAgentProbe;
+      auto bootstrapInputCancelled = std::make_shared<std::atomic_bool>(false);
+      request.bootstrapInputCancelled = bootstrapInputCancelled;
+      auto guestStorageFlushRequested = std::make_shared<std::atomic_bool>(false);
+      request.guestStorageFlushRequested = guestStorageFlushRequested;
+      auto guestFlushGate = std::make_shared<GuestFlushGate>();
       auto liveHostChannel = std::make_shared<hv::HostSerialChannel>();
       auto liveHeartbeatCount = std::make_shared<std::atomic<uint32_t>>(0);
       const std::string runIdCopy = result.runId;
@@ -12276,9 +12321,16 @@ DetonationResult InHouseOrchestrator::PrepareAndRun(
                                   realFrameCounter, lastNumberedMs,
                                   liveHostChannel,
                                   liveHeartbeatCount, executionAuthorized,
-                                  stopAfterGuestAgentProbe,
-                                  finalizeSeen](
+                                  stopAfterGuestAgentProbe, bootstrapInputCancelled,
+                                  finalizeSeen, guestStorageFlushRequested,
+                                  guestFlushGate](
                                      const hv::VmProgressSnapshot &snap) {
+          const uint64_t nowMs = static_cast<uint64_t>(
+              std::chrono::duration_cast<std::chrono::milliseconds>(
+                  std::chrono::steady_clock::now().time_since_epoch()).count());
+          if (guestFlushGate->ShouldStop(nowMs)) {
+            stopAfterGuestAgentProbe->store(true, std::memory_order_relaxed);
+          }
           // Operator/AI finalize request: end a live session gracefully through
           // the normal report path (checked on the progress cadence, so it lands
           // within a couple hundred milliseconds of the request).
@@ -12286,15 +12338,17 @@ DetonationResult InHouseOrchestrator::PrepareAndRun(
             std::error_code fec;
             if (FinalizeRequested(runDirCopy)) {
               finalizeSeen->store(true, std::memory_order_relaxed);
-              stopAfterGuestAgentProbe->store(true, std::memory_order_relaxed);
+              guestFlushGate->Request(nowMs);
+              guestStorageFlushRequested->store(true, std::memory_order_relaxed);
+              bootstrapInputCancelled->store(true, std::memory_order_relaxed);
               if (progressCallback) {
                 DetonationProgress fin{};
                 fin.runId = runIdCopy;
                 fin.runDir = runDirCopy;
                 fin.phase = "finalizing";
                 fin.message =
-                    "Finalize requested: ending the run through the normal "
-                    "report path";
+                    "Finalizing: waiting up to 30 seconds for guest filesystem "
+                    "flush before saving the report";
                 try {
                   progressCallback(fin);
                 } catch (...) {
@@ -12358,9 +12412,20 @@ DetonationResult InHouseOrchestrator::PrepareAndRun(
                 // runs and would otherwise double-write these frames).
                 const std::string payload(frame->payload.begin(),
                                           frame->payload.end());
+                const EventRecord liveEvent = ParseEventJsonLine(payload);
+                const auto &detail = liveEvent.details;
+                if (liveEvent.action == "agent.storage.flush.complete" &&
+                    detail.contains("runId") && detail.at("runId") == runIdCopy &&
+                    detail.contains("reason") &&
+                    detail.at("reason") == "operator-finalize") {
+                  guestFlushGate->Reply(detail.contains("success") &&
+                                        detail.at("success") == "true");
+                }
+                if (JournalShowsSampleExecuted({liveEvent})) {
+                  bootstrapInputCancelled->store(true, std::memory_order_relaxed);
+                }
                 if (interactiveSession) {
-                  AppendJournalEvent(journalPathCopy,
-                                     ParseEventJsonLine(payload), nullptr);
+                  AppendJournalEvent(journalPathCopy, liveEvent, nullptr);
                 }
                 // Byte-level package-delivery progress (multi-GB installers):
                 // translate the guest's agent.sample.progress into a human
@@ -12720,8 +12785,7 @@ DetonationResult InHouseOrchestrator::PrepareAndRun(
         // Disk delivery for anything past 2 MB: it is faster than the paced
         // COM2 channel (disk speed vs ~10 KB/s) and has no size cap, so the
         // serial path is reserved for small samples where it is already proven.
-        constexpr uint64_t kDiskDeliveryMinBytes = 2ull * 1024ull * 1024ull;
-        if (!sizeEc && stagedBytes > kDiskDeliveryMinBytes) {
+        if (!sizeEc && PreferSampleDisk(PathToUtf8(stagedSample.filename()), stagedBytes)) {
           try {
             sampleDiskDevice.emplace(
                 hv::PaddedFileBlockDevice::Open(stagedSample));
@@ -12914,6 +12978,19 @@ DetonationResult InHouseOrchestrator::PrepareAndRun(
                            BootOverlayPatchDetails(lastOverlayPatch)),
           &events);
       vmSummary = runWithReboots(overlayDevice);
+      if (finalizeSeen->load(std::memory_order_relaxed)) {
+        const bool flushed = guestFlushGate->GetState() == GuestFlushGate::State::Complete;
+        AppendJournalEvent(result.journalPath,
+            MakeSandboxEvent("vm.storage.flush", result.overlayDiskPath,
+                {{"acknowledged", flushed ? "true" : "false"},
+                 {"outcome", flushed ? "complete" :
+                    (guestFlushGate->GetState() == GuestFlushGate::State::Failed
+                         ? "guest-error" : "timeout-or-interrupted")}}), &events);
+        if (!flushed) {
+          result.errors.push_back("Guest filesystem flush was not confirmed before VM stop; "
+                                  "saved disk artifacts may be incomplete.");
+        }
+      }
       vmSummary.framesCaptured =
           realFrameCounter->load(std::memory_order_relaxed);
 

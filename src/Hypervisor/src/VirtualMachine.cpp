@@ -1,6 +1,7 @@
 ﻿#include "antimal/hv/VirtualMachine.h"
 
 #include "antimal/hv/FramePacing.h"
+#include "antimal/hv/HostSerialChannel.h"
 #include "antimal/hv/KdPipeBridge.h"
 #include "antimal/hv/LiveFrameShm.h"
 #include "antimal/hv/ScreenState.h"
@@ -16,6 +17,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <sstream>
+#include <stdexcept>
 #include <stop_token>
 #include <string_view>
 #include <thread>
@@ -404,7 +406,7 @@ VirtualMachine::VirtualMachine(const std::filesystem::path &firmwarePath,
   if (options.sampleDisk && ahci_) {
     ahci_->SetPortDisk(1, options.sampleDisk);
   }
-  MaybeAttachNic();
+  MaybeAttachNic(options.networkMode);
 }
 
 bool VirtualMachine::DeliverIoApicVector(void *context, uint32_t destination,
@@ -498,10 +500,11 @@ void VirtualMachine::AttachAhciDisk(IBlockDevice *disk) {
   pcIo_.ConsumeAhciAbarDirty();
 }
 
-void VirtualMachine::MaybeAttachNic() {
+void VirtualMachine::MaybeAttachNic(VmNetworkMode mode) {
   // Default OFF: no NIC at all, so PCI enumeration + the boot path are
   // byte-identical to today. Enabled explicitly for the network-observation
   // path (ANTIMAL_ENABLE_NIC=1): an e1000 whose TX ring we DMA-capture.
+  if (mode == VmNetworkMode::Disabled) return;
   const char *enabled = std::getenv("ANTIMAL_ENABLE_NIC");
   if (!enabled || enabled[0] != '1') {
     return;
@@ -1140,6 +1143,9 @@ VmRunSummary VirtualMachine::BootForSteps(int maxSteps) {
 }
 
 VmRunSummary VirtualMachine::Run(const VmRunRequest &request) {
+  if (request.networkMode == VmNetworkMode::Disabled && nic_) {
+    throw std::invalid_argument("disabled-network run cannot use a VM with a network device");
+  }
   const auto timeout = request.timeout.count() > 0
                            ? request.timeout
                            : std::chrono::milliseconds{1};
@@ -1155,7 +1161,8 @@ VmRunSummary VirtualMachine::Run(const VmRunRequest &request) {
                          request.progressCallback, request.progressInterval,
                          request.cancelRequested, request.keyboardScancodes,
                          request.keyboardInjectAfter,
-                         request.keyboardBursts);
+                         request.keyboardBursts, request.bootstrapInputCancelled,
+                         request.guestStorageFlushRequested);
   summary.networkMode = request.networkMode;
   return summary;
 }
@@ -1167,7 +1174,9 @@ VmRunSummary VirtualMachine::RunLoop(
     std::shared_ptr<std::atomic_bool> cancelRequested,
     std::vector<uint8_t> keyboardScancodes,
     std::chrono::milliseconds keyboardInjectAfter,
-    std::vector<VmRunRequest::KeyboardBurst> keyboardBursts) {
+    std::vector<VmRunRequest::KeyboardBurst> keyboardBursts,
+    std::shared_ptr<std::atomic_bool> bootstrapInputCancelled,
+    std::shared_ptr<std::atomic_bool> guestStorageFlushRequested) {
   VmRunSummary summary;
   summary.started = true;
   summary.processorCount = host_.ProcessorCount();
@@ -1407,7 +1416,9 @@ VmRunSummary VirtualMachine::RunLoop(
   uint64_t lastIdeCommands = 0;
   const auto runStarted = std::chrono::steady_clock::now();
   auto lastProgressFire = runStarted;
-  bool keyboardInjected = keyboardScancodes.empty();
+  BootstrapInputSchedule bootstrapInput(std::move(keyboardScancodes),
+                                        keyboardInjectAfter,
+                                        std::move(keyboardBursts));
   std::uintmax_t liveInputCursor = 0;     // bytes consumed from liveInputPath_
   if (!liveInputPath_.empty()) {          // skip input that predates this run
     std::error_code lec0;
@@ -1417,6 +1428,7 @@ VmRunSummary VirtualMachine::RunLoop(
     }
   }
   auto lastLiveInputPoll = runStarted;    // throttle the live-input file poll
+  bool guestStorageFlushSent = false;
   auto lastPacedCom2 = runStarted;        // throttle paced host->guest delivery
   // Live framebuffer mirror -> named shm (production <canvas> display path).
   auto lastFramePublish = runStarted;
@@ -2710,24 +2722,24 @@ VmRunSummary VirtualMachine::RunLoop(
     }
 
     const auto now = std::chrono::steady_clock::now();
-    if (!keyboardInjected && now - runStarted >= keyboardInjectAfter) {
-      ps2_.InjectKeyboardScancodes(keyboardScancodes.data(),
-                                   keyboardScancodes.size());
-      summary.keyboardScancodesInjected +=
-          static_cast<int>(keyboardScancodes.size());
-      keyboardInjected = true;
-      madeProgress = true;
-    }
-    for (auto &burst : keyboardBursts) {
-      if (!burst.scancodes.empty() && now - runStarted >= burst.delay) {
-        ps2_.InjectKeyboardScancodes(burst.scancodes.data(),
-                                     burst.scancodes.size());
-        summary.keyboardScancodesInjected +=
-            static_cast<int>(burst.scancodes.size());
-        burst.scancodes.clear();
-        madeProgress = true;
-      }
-    }
+    // Check takeover BEFORE scheduled input, including when both become due
+    // on the same tick. Once stopped, retries cannot resume on an idle desktop.
+    std::error_code inputSizeError;
+    const bool liveTakeover = !liveInputPath_.empty() &&
+        now - lastLiveInputPoll >= std::chrono::milliseconds{100} &&
+        std::filesystem::file_size(liveInputPath_, inputSizeError) > liveInputCursor &&
+        !inputSizeError;
+    if (liveTakeover && bootstrapInputCancelled)
+      bootstrapInputCancelled->store(true, std::memory_order_relaxed);
+    bootstrapInput.Tick(
+        std::chrono::duration_cast<std::chrono::milliseconds>(now - runStarted),
+        liveTakeover || (bootstrapInputCancelled &&
+            bootstrapInputCancelled->load(std::memory_order_relaxed)),
+        [&](const std::vector<uint8_t> &keys) {
+          ps2_.InjectKeyboardScancodes(keys.data(), keys.size());
+          summary.keyboardScancodesInjected += static_cast<int>(keys.size());
+          madeProgress = true;
+        });
     // Paced host->guest delivery of the detonation execute payload. A one-shot
     // ~100 KB QueueCom2Bytes overruns the guest serial driver's RX in-queue
     // before the agent reads it, dropping the front (JobStart) frame -- which is
@@ -2752,6 +2764,16 @@ VmRunSummary VirtualMachine::RunLoop(
       pacedCom2Cursor_ += n;
       lastPacedCom2 = now;
       madeProgress = true;
+    }
+    // Never interleave a control frame with a partially delivered sample frame.
+    if (!guestStorageFlushSent && guestStorageFlushRequested &&
+        guestStorageFlushRequested->load(std::memory_order_relaxed) &&
+        pacedCom2Cursor_ >= pacedCom2Payload_.size() &&
+        com2_.RxQueuedBytes() == 0) {
+      const auto bytes = HostSerialChannel::EncodeText(
+          HostChannelMessage::FlushStorage, "operator-finalize");
+      com2_.QueueRxBytes(bytes.data(), bytes.size());
+      guestStorageFlushSent = true;
     }
     // Classify the guest screen state ~4x/s, INDEPENDENT of the live-canvas
     // mirror below (which only runs when an shm consumer is attached). This makes

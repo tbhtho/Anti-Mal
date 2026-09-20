@@ -132,6 +132,11 @@ struct ScanResult {
   bool isPe = false;
   bool isDll = false;                // IMAGE_FILE_DLL in the file header
   bool authenticodeSigned = false;
+  // Provenance only. Neither failure nor success is a behavioral conclusion.
+  std::string provenanceState = "unknown";
+  std::string signatureVerification = "not checked";
+  std::string signatureStatusCode;
+  std::string signatureVerificationMethod;
   std::string signerName; // Authenticode signer display name (CN); "" if unsigned
   uint32_t peTimestamp = 0;          // PE compile timestamp (unix epoch secs)
   std::vector<PeSection> peSections; // section table + per-section entropy
@@ -151,6 +156,15 @@ struct ScanResult {
   std::vector<ScanFinding> findings;
   int score = 0;
   Verdict verdict = Verdict::Clean;
+  // Dynamic-first policy state: "locked" (deep static enrichment did not run;
+  // verdict is Unknown with a "Not run - locked" note) or "unlocked" (an
+  // explicit, scoped operator authorization covered this target).
+  std::string staticAnalysisState;
+  std::string staticLockReason;
+  // A static scan NEVER completes a dynamic investigation. Only a finalized
+  // dynamic run (report.level) marks an investigation complete; this stays
+  // false so no entry point can present static output as a completed analysis.
+  bool investigationComplete = false;
 
   // Enrichment outputs. Empty when the corresponding analyzer was
   // disabled or not available on this host.
@@ -360,7 +374,7 @@ struct DynamicRunSummary {
 };
 
 struct AnalysisReport {
-  int schemaVersion = 1;
+  int schemaVersion = 2;
   std::string runId;
   std::filesystem::path samplePath;
   ScanResult scannerVerdict;

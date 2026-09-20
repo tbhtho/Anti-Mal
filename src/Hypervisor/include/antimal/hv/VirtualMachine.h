@@ -1,4 +1,5 @@
 #pragma once
+#include "antimal/hv/BootstrapInput.h"
 
 // First reusable in-house VM runner. This factors the OVMF smoke-test run loop
 // out of the test harness and composes the WHP partition, RAM, firmware, basic
@@ -608,11 +609,11 @@ struct VmRunRequest {
   // fired exactly once when its delay (relative to run start) has elapsed.
   // Use this to step through multi-screen boot UIs (e.g. recovery screen
   // F8 -> Startup Settings 7 -> disable driver signature enforcement).
-  struct KeyboardBurst {
-    std::chrono::milliseconds delay{0};
-    std::vector<uint8_t> scancodes;
-  };
+  using KeyboardBurst = BootstrapKeyboardBurst;
   std::vector<KeyboardBurst> keyboardBursts;
+  // Stops bootstrap keystrokes after verified launch; shared across reboots.
+  std::shared_ptr<std::atomic_bool> bootstrapInputCancelled;
+  std::shared_ptr<std::atomic_bool> guestStorageFlushRequested;
   // Live interactive input (host->guest). When set, the run loop polls this file
   // for newly-appended raw Set-1 keyboard scancodes and injects them into the
   // PS/2 controller, giving the UI process real-time keyboard control of the VM.
@@ -632,6 +633,7 @@ public:
 
   VmRunSummary BootForSteps(int maxSteps = 100000);
   VmRunSummary Run(const VmRunRequest &request);
+  bool HasNetworkDevice() const noexcept { return nic_ != nullptr; }
   void QueueCom2Bytes(const std::vector<uint8_t> &bytes) {
     com2_.QueueRxBytes(bytes);
   }
@@ -673,11 +675,13 @@ private:
                        std::chrono::milliseconds keyboardInjectAfter =
                            std::chrono::milliseconds{0},
                        std::vector<VmRunRequest::KeyboardBurst>
-                           keyboardBursts = {});
+                           keyboardBursts = {},
+                       std::shared_ptr<std::atomic_bool> bootstrapInputCancelled = {},
+                       std::shared_ptr<std::atomic_bool> guestStorageFlushRequested = {});
   void AttachDefaultDevices();
   void AttachIdeDisk(IBlockDevice *disk);
   void AttachAhciDisk(IBlockDevice *disk);
-  void MaybeAttachNic();  // gated on ANTIMAL_ENABLE_NIC; default no-op.
+  void MaybeAttachNic(VmNetworkMode mode); // Disabled overrides diagnostic opt-in.
   uint8_t *HostPointerForGpa(uint64_t gpa, size_t length) noexcept;
   bool ReadGuestMemory(uint64_t gva, void *buffer, size_t length);
   bool ReadGuestMemoryFor(Vcpu &vcpu, uint64_t gva, void *buffer,

@@ -27,12 +27,6 @@ std::filesystem::path UniqueTempPath(const std::filesystem::path &cacheDir,
                      std::to_string(n) + ".tmp");
 }
 
-bool IsReadOnly(const std::filesystem::path &path) {
-  const DWORD attrs = GetFileAttributesW(path.c_str());
-  return attrs != INVALID_FILE_ATTRIBUTES &&
-         (attrs & FILE_ATTRIBUTE_READONLY) != 0;
-}
-
 bool SetReadOnly(const std::filesystem::path &path, bool readOnly) {
   DWORD attrs = GetFileAttributesW(path.c_str());
   if (attrs == INVALID_FILE_ATTRIBUTES) {
@@ -167,11 +161,12 @@ StageSampleResult StageSampleImmutable(
       haveEntry = false; // size mismatch: not the content its name claims
       SetReadOnly(cachePath, false);
       std::filesystem::remove(cachePath, ec);
-    } else if (!IsReadOnly(cachePath)) {
-      // The read-only marker is how an untouched entry is recognized. Without
-      // it, verify the actual bytes before trusting the name.
+    } else {
+      // A read-only attribute is mutable metadata, not proof of identity.
+      // Recheck bytes on every reuse, including entries with the marker intact.
       if (Sha256File(cachePath) != out.sha256) {
         haveEntry = false;
+        SetReadOnly(cachePath, false);
         std::filesystem::remove(cachePath, ec);
       } else {
         SetReadOnly(cachePath, true);
@@ -237,6 +232,13 @@ StageSampleResult StageSampleImmutable(
       out.error = "staging from the cache into the run failed";
       return out;
     }
+  }
+  // Verify the actual delivered path too: another stager can win publication,
+  // and a cross-volume copy can fail or race independently of cache validation.
+  const auto stagedBytes = std::filesystem::file_size(out.stagedPath, ec);
+  if (ec || stagedBytes != out.bytes || Sha256File(out.stagedPath) != out.sha256) {
+    out.error = "staged sample identity mismatch; execution refused";
+    return out;
   }
   out.ok = true;
   return out;

@@ -10,7 +10,7 @@
 //
 // Everything here is pure arithmetic over BGRX frames -- no Windows APIs, no
 // VM. The sprite learn/track/aim pipeline is unit-tested with synthetic frames
-// and a fake accelerated guest, so the live code path is only wiring.
+// and a fake accelerated guest. Real guest input still requires live acceptance.
 
 #include <cstdint>
 #include <string>
@@ -85,11 +85,11 @@ struct ShiftLearnResult {
   std::string failure;
 };
 
-// Learns the pointer sprite from a frame pair where the pointer moved by the
-// known injected PS/2 delta (dx, dy). The pointer is the small region in
-// `after` that `before` explains by shifting exactly (dx, dy): content that
-// moved by that delta matches, everything else does not. `dx`/`dy` are in
-// SCREEN space (x right, y down) -- the same space the caller injects.
+// Learns a pointer from confirmed source/destination changes. For small axis
+// probes, searches up to 32 screen pixels because input counts and pixels differ
+// with guest acceleration. Missing, ambiguous, or unconfirmed sprites fail.
+// Coordinates use x right, y down. A sprite origin approximates the hotspot;
+// custom cursors and transitions can require another supervised attempt.
 ShiftLearnResult LearnCursorByKnownShift(const BgrxFrame &before,
                                          const BgrxFrame &after, int dx, int dy);
 

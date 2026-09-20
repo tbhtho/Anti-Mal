@@ -14,8 +14,11 @@
 #include "antimal/Screenshot.h"
 #include "antimal/SensorCoverage.h"
 #include "antimal/WerReport.h"
+#include "GuestEtw.h"
 
 #include <Windows.h>
+#include <initguid.h>
+#include <virtdisk.h>
 #include <winioctl.h>  // IOCTL_DISK_GET_LENGTH_INFO (raw sample-disk delivery)
 #include <tlhelp32.h>  // CreateToolhelp32Snapshot (per-process module enumeration)
 #include <UserEnv.h>   // CreateEnvironmentBlock (visible-session launch)
@@ -671,42 +674,60 @@ bool LaunchExecuteJob(HANDLE com2, const antimal::ExecuteJobRequest &req,
 bool MountIsoAndFindInstaller(HANDLE com2, const std::filesystem::path &isoPath,
                               std::filesystem::path *launchPath,
                               std::wstring *mountRoot) {
-  const std::filesystem::path letterFile =
-      isoPath.parent_path() / L"iso-letter.txt";
   std::error_code ec;
-  std::filesystem::remove(letterFile, ec);
-  std::wstring cmd =
-      L"powershell.exe -NoProfile -NonInteractive -Command \""
-      L"$v = Mount-DiskImage -ImagePath '" + isoPath.wstring() +
-      L"' -PassThru | Get-Volume; "
-      L"if ($v) { Set-Content -LiteralPath '" + letterFile.wstring() +
-      L"' -Value $v.DriveLetter }\"";
-  cmd.push_back(L'\0');
-  STARTUPINFOW si{};
-  si.cb = sizeof(si);
-  PROCESS_INFORMATION pi{};
-  if (!CreateProcessW(nullptr, cmd.data(), nullptr, nullptr, FALSE,
-                      CREATE_NO_WINDOW, nullptr, nullptr, &si, &pi)) {
-    return false;
-  }
-  WaitForSingleObject(pi.hProcess, 120000);
-  DWORD psExit = 1;
-  GetExitCodeProcess(pi.hProcess, &psExit);
-  CloseHandle(pi.hThread);
-  CloseHandle(pi.hProcess);
-
-  std::ifstream letterIn(letterFile);
-  std::string letter;
-  std::getline(letterIn, letter);
-  if (letter.empty()) {
+  auto mountFailure = [&](const char *phase, DWORD error) {
     auto fail = MakeAgentEvent("agent.sample.mount-failed", antimal::PathToUtf8(isoPath.filename()));
-    fail.details["powershellExit"] = std::to_string(psExit);
-    fail.details["error"] = std::to_string(GetLastError());
+    fail.details["phase"] = phase;
+    fail.details["error"] = std::to_string(error);
     (void)SendAgentEvent(com2, fail);
     return false;
+  };
+  VIRTUAL_STORAGE_TYPE storage{VIRTUAL_STORAGE_TYPE_DEVICE_ISO,
+                               VIRTUAL_STORAGE_TYPE_VENDOR_MICROSOFT};
+  OPEN_VIRTUAL_DISK_PARAMETERS open{};
+  open.Version = OPEN_VIRTUAL_DISK_VERSION_1;
+  open.Version1.RWDepth = OPEN_VIRTUAL_DISK_RW_DEPTH_DEFAULT;
+  struct DiskHandle {
+    HANDLE value = INVALID_HANDLE_VALUE;
+    ~DiskHandle() { if (value != INVALID_HANDLE_VALUE) CloseHandle(value); }
+  } disk;
+  DWORD error = OpenVirtualDisk(&storage, isoPath.c_str(), VIRTUAL_DISK_ACCESS_READ,
+      OPEN_VIRTUAL_DISK_FLAG_NONE, &open, &disk.value);
+  if (error != ERROR_SUCCESS) return mountFailure("open-native-iso", error);
+  ATTACH_VIRTUAL_DISK_PARAMETERS attach{};
+  attach.Version = ATTACH_VIRTUAL_DISK_VERSION_1;
+  error = AttachVirtualDisk(disk.value, nullptr,
+      static_cast<ATTACH_VIRTUAL_DISK_FLAG>(ATTACH_VIRTUAL_DISK_FLAG_READ_ONLY |
+          ATTACH_VIRTUAL_DISK_FLAG_PERMANENT_LIFETIME), 0, &attach, nullptr);
+  if (error != ERROR_SUCCESS) return mountFailure("attach-native-iso", error);
+  // Correlate the mounted CD device to its DOS drive letter, without WMI or a
+  // PowerShell subprocess. The permanent attachment lives only in this guest.
+  std::wstring root;
+  const auto until = std::chrono::steady_clock::now() + std::chrono::seconds(30);
+  do {
+    wchar_t physical[1024]{}; ULONG bytes = sizeof(physical);
+    error = GetVirtualDiskPhysicalPath(disk.value, &bytes, physical);
+    if (error == ERROR_SUCCESS) {
+      const auto deviceName = std::filesystem::path(physical).filename().wstring();
+      wchar_t target[2048]{};
+      if (QueryDosDeviceW(deviceName.c_str(), target, 2048)) {
+        DWORD drives = GetLogicalDrives();
+        for (unsigned i = 0; i < 26; ++i) if (drives & (1u << i)) {
+          wchar_t drive[] = L"A:"; drive[0] += static_cast<wchar_t>(i);
+          wchar_t mapping[2048]{};
+          if (QueryDosDeviceW(drive, mapping, 2048) && _wcsicmp(target, mapping) == 0) {
+            root = std::wstring(drive) + L"\\"; break;
+          }
+        }
+      }
+    }
+    if (!root.empty()) break;
+    std::this_thread::sleep_for(std::chrono::milliseconds(200));
+  } while (std::chrono::steady_clock::now() < until && !g_stopRequested.load());
+  if (root.empty()) {
+    (void)DetachVirtualDisk(disk.value, DETACH_VIRTUAL_DISK_FLAG_NONE, 0);
+    return mountFailure("find-mounted-drive", error == ERROR_SUCCESS ? ERROR_TIMEOUT : error);
   }
-  const std::wstring root =
-      std::wstring(letter.begin(), letter.end()) + L":\\";
   auto lowerExt = [](std::wstring ext) {
     for (wchar_t &c : ext) {
       if (c >= L'A' && c <= L'Z') {
@@ -820,6 +841,11 @@ bool LaunchPreparedSample(HANDLE com2, const antimal::ExecuteJobRequest &req,
       MakeAgentEvent("process.create", antimal::PathToUtf8(launchPath));
   created.category = "process";
   created.processId = launchedPid;
+  created.fullImagePath = antimal::PathToUtf8(launchPath);
+  created.imagePath = antimal::PathToUtf8(launchPath.filename());
+  FILETIME creationTime{}, exitTime{}, kernelTime{}, userTime{};
+  if (GetProcessTimes(launchedProc, &creationTime, &exitTime, &kernelTime, &userTime))
+    created.details["startTime"] = FileTimeToIso8601Utc(creationTime);
   created.details["sampleExecuted"] = "true";
   // The identity the sample ACTUALLY runs as (its own token), so the scorer can
   // verify that per-user collector coverage targeted the same profile.
@@ -985,6 +1011,54 @@ std::optional<std::filesystem::path> ReceiveDiskSample(
   received.details["physicalDrive"] = std::to_string(selectedDrive);
   (void)SendAgentEvent(com2, received);
   return samplePath;
+}
+
+void FlushGuestStorage(HANDLE com2, const std::string &runId,
+                       const char *reason, const std::wstring &targetSid) {
+  const auto began = std::chrono::steady_clock::now();
+  // Flush the registry manager's caches before the underlying volume cache.
+  // HKCU here belongs to SYSTEM, so use the sample's resolved HKU SID instead.
+  LSTATUS registryError = ERROR_SUCCESS;
+  auto flushHive = [&](HKEY root, const wchar_t *path) {
+    HKEY key = nullptr;
+    LSTATUS rc = RegOpenKeyExW(root, path, 0, KEY_READ, &key);
+    if (rc == ERROR_SUCCESS) {
+      rc = RegFlushKey(key);
+      RegCloseKey(key);
+    }
+    if (rc != ERROR_SUCCESS && registryError == ERROR_SUCCESS) registryError = rc;
+  };
+  flushHive(HKEY_LOCAL_MACHINE, L"SOFTWARE");
+  flushHive(HKEY_LOCAL_MACHINE, L"SYSTEM");
+  if (!targetSid.empty()) flushHive(HKEY_USERS, targetSid.c_str());
+  else registryError = ERROR_NOT_FOUND;
+  // This runs INSIDE the guest, on its Windows volume. No host volume is opened.
+  wchar_t windowsDir[MAX_PATH]{};
+  DWORD error = ERROR_PATH_NOT_FOUND;
+  bool ok = false;
+  if (GetWindowsDirectoryW(windowsDir, MAX_PATH) && windowsDir[1] == L':') {
+    const std::wstring volume = std::wstring(L"\\\\.\\") + windowsDir[0] + L":";
+    HANDLE h = CreateFileW(volume.c_str(), GENERIC_READ | GENERIC_WRITE,
+        FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_EXISTING, 0, nullptr);
+    if (h != INVALID_HANDLE_VALUE) {
+      ok = FlushFileBuffers(h) != FALSE;
+      error = ok ? ERROR_SUCCESS : GetLastError();
+      CloseHandle(h);
+    } else {
+      error = GetLastError();
+    }
+  }
+  auto event = MakeAgentEvent("agent.storage.flush.complete", "Windows volume");
+  event.details["runId"] = runId;
+  event.details["reason"] = reason;
+  event.details["success"] = ok && registryError == ERROR_SUCCESS ? "true" : "false";
+  event.details["registryError"] = std::to_string(registryError);
+  event.details["targetSid"] = antimal::WideToUtf8(targetSid);
+  event.details["error"] = std::to_string(error);
+  event.details["elapsedMs"] = std::to_string(
+      std::chrono::duration_cast<std::chrono::milliseconds>(
+          std::chrono::steady_clock::now() - began).count());
+  (void)SendAgentEvent(com2, event);
 }
 
 // Terminal failure of an execute job: an agent.job.rejected Event AND a
@@ -1301,6 +1375,7 @@ int RunHostChannelLoop(std::string reason, bool serviceMode) {
   // cross-session processes.
   std::map<uint32_t, HANDLE> procHandles;
   EnableDebugPrivilege();
+  GuestEtw etw;
   antimal::TcpSnapshot knownConns;
   bool netBaselineSent = false;
   antimal::RegistrySnapshot knownReg;
@@ -1404,6 +1479,18 @@ int RunHostChannelLoop(std::string reason, bool serviceMode) {
       return 1;
     }
     while (const auto frame = incoming.PopFrame()) {
+      if (frame->type == antimal::HostChannelMessage::FlushStorage) {
+        etw.Stop();
+        for (size_t batch = 0; batch < 16; ++batch) {
+          auto events = etw.Drain();
+          if (events.empty()) break;
+          for (const auto& ev : events) (void)SendAgentEvent(com2, ev);
+        }
+        for (const auto& ev : etw.Coverage()) (void)SendAgentEvent(com2, ev);
+        FlushGuestStorage(com2, executeReq ? executeReq->runId : "",
+                          "operator-finalize", interactiveUser.sid);
+        continue;
+      }
       if (frame->type == antimal::HostChannelMessage::SampleChunk) {
         // Sample bytes for an authorized execute job, arriving after the
         // JobStart. Collect until complete, then write + launch. Once staged
@@ -1616,6 +1703,69 @@ int RunHostChannelLoop(std::string reason, bool serviceMode) {
               "profile could be resolved; early user-profile activity may be "
               "missed");
         }
+        // Baseline barrier (v4): a reset flag is NOT a baseline. Capture the
+        // intended identity's registry and file state HERE, before the sample
+        // can run, so an immediate startup marker is a recorded delta rather
+        // than being absorbed into the first snapshot. A capture failure is
+        // recorded as an explicit limited-observation state, never a healthy
+        // default, and never blocks the launch (execution controls unchanged).
+        {
+          std::vector<std::string> baselineFailures;
+          if (!interactiveUser.valid) baselineFailures.push_back("target-user-unresolved");
+          {
+            auto reg = antimal::CaptureRegistrySnapshot(interactiveUser.sid);
+            if (reg.empty()) {
+              baselineFailures.push_back("registry");
+            } else {
+              knownReg = std::move(reg);
+              regBaselineSent = true;
+            }
+          }
+          {
+            auto files = antimal::CaptureFileSnapshot(watchedDirs);
+            if (files.size() >= 4096) baselineFailures.push_back("filesystem-cap");
+            if (files.empty()) {
+              baselineFailures.push_back("filesystem");
+            } else {
+              knownFiles = std::move(files);
+              fileBaselineSent = true;
+            }
+          }
+          std::string failureText;
+          for (const auto &f : baselineFailures) {
+            failureText += (failureText.empty() ? "" : ",") + f;
+          }
+          const bool baselineReady = baselineFailures.empty();
+          auto ready = MakeAgentEvent("agent.baseline.ready",
+                                      baselineReady ? "ready" : "limited");
+          ready.details["phase"] = "pre-launch";
+          ready.details["sampleLaunched"] = "false";
+          ready.details["targetUser"] =
+              interactiveUser.valid ? antimal::WideToUtf8(interactiveUser.name)
+                                    : std::string();
+          ready.details["targetSid"] = antimal::WideToUtf8(interactiveUser.sid);
+          ready.details["registryEntries"] = std::to_string(knownReg.size());
+          ready.details["fileEntries"] = std::to_string(knownFiles.size());
+          if (!baselineReady) {
+            ready.details["failures"] = failureText;
+            coverage.Observe("registry", false, 0, 0, false,
+                             "pre-launch baseline incomplete: " + failureText);
+            coverage.Observe("filesystem", false, 0, 0, false,
+                             "pre-launch baseline incomplete: " + failureText);
+            const std::string user =
+                interactiveUser.valid ? antimal::WideToUtf8(interactiveUser.name)
+                                      : std::string();
+            coverage.SetScope(
+                "registry", user, "mixed",
+                "baseline capture failed before launch (" + failureText +
+                    "): the initial interval is explicitly limited");
+            coverage.SetScope(
+                "filesystem", user, "mixed",
+                "baseline capture failed before launch (" + failureText +
+                    "): the initial interval is explicitly limited");
+          }
+          (void)SendAgentEvent(com2, ready);
+        }
         sampleLaunched =
             diskSamplePath
                 ? LaunchPreparedSample(com2, *executeReq, *diskSamplePath,
@@ -1653,6 +1803,8 @@ int RunHostChannelLoop(std::string reason, bool serviceMode) {
         done.processId = samplePid;
         done.details["exitCode"] = std::to_string(exitCode);
         (void)SendAgentEvent(com2, done);
+        FlushGuestStorage(com2, executeReq ? executeReq->runId : "", "sample-exit",
+                          interactiveUser.sid);
         (void)SendFrame(com2, antimal::HostChannelMessage::ReportComplete,
                         std::string("status=ok\nsampleExecuted=true\nexitCode=") +
                             std::to_string(exitCode) + "\n");
@@ -1672,6 +1824,14 @@ int RunHostChannelLoop(std::string reason, bool serviceMode) {
       }
     }
 
+    if (telemetryTick) {
+      for (const auto& ev : etw.Drain()) {
+        if (!SendAgentEvent(com2, ev)) { CloseHandle(com2); return 1; }
+      }
+      if (tick % kCoverageEmitEveryTicks == 0)
+        for (const auto& ev : etw.Coverage())
+          if (!SendAgentEvent(com2, ev)) { CloseHandle(com2); return 1; }
+    }
     if (telemetryTick && tick % kProcessPollEveryTicks == 0) {
       auto current = antimal::CaptureProcessSnapshot();
       // Measure the emitter caps honestly: the baseline/delta emitters truncate

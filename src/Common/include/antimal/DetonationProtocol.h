@@ -22,6 +22,17 @@
 
 namespace antimal {
 
+inline std::string SampleKindForName(std::string_view name) {
+  if (name.size() < 4) return "exe";
+  std::string suffix(name.substr(name.size() - 4));
+  for (char &c : suffix) if (c >= 'A' && c <= 'Z') c += 'a' - 'A';
+  return suffix == ".iso" ? "iso" : "exe";
+}
+
+inline bool PreferSampleDisk(std::string_view name, uint64_t bytes) {
+  return SampleKindForName(name) == "iso" || bytes > 2ull * 1024 * 1024;
+}
+
 struct ExecuteJobRequest {
   bool isExecute = false;             // kind == "execute"
   bool allowSampleExecution = false;  // host authorized execution

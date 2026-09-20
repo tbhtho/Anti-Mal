@@ -611,6 +611,17 @@ PeInfo ParsePe(const std::vector<uint8_t> &data) {
   // T47 depth: the remaining data directories are parsed regardless of whether
   // the file imports anything (a packed stub or a resource-only DLL may not).
   const OptHeaderView opt = ViewOptHeader(nt);
+  const auto certificate = DirOf(opt, IMAGE_DIRECTORY_ENTRY_SECURITY);
+  if (info.overlaySize >= 8 && certificate.VirtualAddress == info.overlayOffset &&
+      certificate.Size == info.overlaySize && certificate.VirtualAddress < data.size() &&
+      certificate.Size <= data.size() - certificate.VirtualAddress) {
+    // SECURITY.VirtualAddress is a file offset, unlike other directories.
+    const auto* bytes = data.data() + certificate.VirtualAddress;
+    uint32_t length = 0; uint16_t revision = 0, kind = 0;
+    std::memcpy(&length, bytes, 4); std::memcpy(&revision, bytes + 4, 2); std::memcpy(&kind, bytes + 6, 2);
+    info.overlayIsCertificateOnly = length >= 8 && length <= certificate.Size &&
+        ((static_cast<uint64_t>(length) + 7) & ~7ull) == certificate.Size && revision == 0x200 && kind == 2;
+  }
   ParseExports(data, nt, opt, info);
   ParseTls(data, nt, opt, info);
   ParseDotNet(data, nt, opt, info);
@@ -698,7 +709,7 @@ PeInfo ParsePeFile(const std::filesystem::path &path) {
   return ParsePe(ReadAllBytes(path));
 }
 
-bool HasAuthenticodeSignature(const std::filesystem::path &path) {
+uint32_t AuthenticodeVerificationStatus(const std::filesystem::path &path) {
   WINTRUST_FILE_INFO fileInfo{};
   fileInfo.cbStruct = sizeof(fileInfo);
   const std::wstring wide = path.wstring();
@@ -717,7 +728,11 @@ bool HasAuthenticodeSignature(const std::filesystem::path &path) {
   const LONG status = WinVerifyTrust(nullptr, &action, &trustData);
   trustData.dwStateAction = WTD_STATEACTION_CLOSE;
   WinVerifyTrust(nullptr, &action, &trustData);
-  return status == ERROR_SUCCESS;
+  return static_cast<uint32_t>(status);
+}
+
+bool HasAuthenticodeSignature(const std::filesystem::path &path) {
+  return AuthenticodeVerificationStatus(path) == ERROR_SUCCESS;
 }
 
 std::string AuthenticodeSignerName(const std::filesystem::path &path) {

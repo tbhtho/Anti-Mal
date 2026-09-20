@@ -399,6 +399,7 @@ BehaviorScore ScoreSandboxBehavior(const DynamicRunSummary &summary,
                                    const std::vector<EventRecord> &events,
                                    bool sampleSigned) {
   BehaviorScore out;
+  (void)sampleSigned; // Kept for call-site compatibility; provenance never changes behavior scoring.
   out.scorerVersion = kBehaviorScorerVersion;
 
   // Execution ground truth: the summary flag is set from the guest's completion
@@ -485,13 +486,20 @@ BehaviorScore ScoreSandboxBehavior(const DynamicRunSummary &summary,
     }
   }
 
-  // ---- Process instances and lifetimes (behavior-score-v4). ----
-  // Identity is the process INSTANCE (pid + startTime), not a numeric PID:
-  //   * an earlier unrelated instance that exited before the verified sample
-  //     launch must not poison the sample's own lifetime (its end belongs to a
-  //     different instance), and
-  //   * a child whose parent instance had already ended must not be adopted
-  //     into the sample subtree merely because the numeric PID matches.
+  const auto bootMatches = [&](const EventRecord &e) {
+    const auto *bg = Detail(e, "bootGeneration");
+    return bg == nullptr || rootBootGeneration.empty() || *bg == rootBootGeneration;
+  };
+  // ---- Process instances and lifetimes (behavior-score-v4.1). ----
+  // Identity is the process INSTANCE (pid + CAPTURED creation time), not a
+  // numeric PID:
+  //   * an unrelated process that reuses the root/child PID -- and its own
+  //     descendants -- must not inherit sample membership;
+  //   * a child is bound to the PARENT INSTANCE that existed at the child's
+  //     captured creation time (a delayed observation of an older child is
+  //     still the sample's child);
+  //   * an already-created child keeps its membership after its parent exits;
+  //   * events whose instance cannot be bound stay unknown (not attributed).
   struct PidInstances {
     std::vector<std::string> starts;               // known instance start times
     std::map<std::string, std::string> endByStart; // instance start -> end
@@ -508,7 +516,7 @@ BehaviorScore ScoreSandboxBehavior(const DynamicRunSummary &summary,
   for (const auto &e : events) {
     const std::string cat = Lower(e.category);
     if ((cat != "process" && cat != "crash") || e.processId == 0 ||
-        e.timestampUtc.empty()) {
+        e.timestampUtc.empty() || !bootMatches(e)) {
       continue;
     }
     const std::string a = Lower(e.action);
@@ -578,31 +586,23 @@ BehaviorScore ScoreSandboxBehavior(const DynamicRunSummary &summary,
     }
     return latest;
   };
-  // True when the instance of `pid` covering `ts` has not recorded an end before
-  // `ts`. No known covering instance + a recorded end <= ts fails closed (a
-  // reused PID cannot be distinguished from the ended instance).
-  const auto pidAliveAt = [&](uint32_t pid, const std::string &ts) -> bool {
-    if (pid == 0) {
-      return true;
-    }
+  // True when any recorded end for `pid` is at or before `ts`.
+  const auto anyEndAtOrBefore = [&](uint32_t pid, const std::string &ts) -> bool {
     const auto it = lifetimes.find(pid);
-    if (it == lifetimes.end()) {
-      return true;
+    if (it == lifetimes.end() || ts.empty()) {
+      return false;
     }
-    const std::string *inst = latestInstanceAt(pid, ts);
-    if (inst != nullptr) {
-      const auto endIt = it->second.endByStart.find(*inst);
-      return endIt == it->second.endByStart.end() || ts <= endIt->second;
-    }
-    if (ts.empty()) {
-      return it->second.endByStart.empty() && it->second.endsUnbound.empty();
+    for (const auto &kv : it->second.endByStart) {
+      if (kv.second <= ts) {
+        return true;
+      }
     }
     for (const std::string &end : it->second.endsUnbound) {
       if (end <= ts) {
-        return false;
+        return true;
       }
     }
-    return true;
+    return false;
   };
 
   // The root instance start: the anchor's captured startTime, or -- when it was
@@ -611,6 +611,33 @@ BehaviorScore ScoreSandboxBehavior(const DynamicRunSummary &summary,
   const bool rootStartCaptured = !rootStartTime.empty();
   const std::string rootInstanceStart =
       rootStartCaptured ? rootStartTime : sampleLaunchTime;
+
+  // Sample instances: (pid, captured creation time) pairs established from the
+  // verified anchor plus children admitted against a sample PARENT INSTANCE.
+  std::set<std::pair<uint32_t, std::string>> sampleInstances;
+  const auto isSampleInstance = [&](uint32_t pid, const std::string &start) {
+    return sampleInstances.count({pid, start}) > 0;
+  };
+  // The root PID hosts exactly one sample instance per run. When the anchor did
+  // not capture its creation time, membership falls back to "no recorded end at
+  // or before the event"; a recorded end closes it definitively.
+  const auto rootInstanceAliveAt = [&](const std::string &ts) {
+    return !anyEndAtOrBefore(sampleRootPid, ts);
+  };
+  // True when the named instance has not recorded an end at or before `ts`.
+  const auto instanceAliveAt = [&](uint32_t pid, const std::string &start,
+                                   const std::string &ts) {
+    const auto it = lifetimes.find(pid);
+    if (it == lifetimes.end()) {
+      return true;
+    }
+    const auto endIt = it->second.endByStart.find(start);
+    return endIt == it->second.endByStart.end() || ts <= endIt->second;
+  };
+
+  if (rootKnown) {
+    sampleInstances.insert({sampleRootPid, rootInstanceStart});
+  }
   if (rootKnown && !rootInstanceStart.empty()) {
     PidInstances &RL = lifetimes[sampleRootPid];
     if (std::find(RL.starts.begin(), RL.starts.end(), rootInstanceStart) ==
@@ -620,83 +647,166 @@ BehaviorScore ScoreSandboxBehavior(const DynamicRunSummary &summary,
     }
   }
 
-  // The sample's process subtree (root + descendants via parentProcessId),
-  // validated against the instance graph: the parent must be alive when the
-  // child starts, and the child's own PID must not be a dead instance.
-  std::set<uint32_t> sampleSubtree;
+  // Admit children by parent INSTANCE at the child's captured creation time.
+  // Iterate to a fixed point so deeper generations join once their parent does.
   if (rootKnown) {
-    sampleSubtree.insert(sampleRootPid);
     bool changed = true;
     while (changed) {
       changed = false;
       for (const auto &e : events) {
-        if (Lower(e.category) != "process" || e.processId == 0 ||
-            e.parentProcessId == 0) {
+        if (Lower(e.category) != "process" || e.processId == 0 || !bootMatches(e)) {
           continue;
         }
-        if (sampleSubtree.count(e.processId)) {
+        const std::string captured = instanceStartOf(e);
+        if (e.processId == sampleRootPid) {
+          // Learn the root's real creation time when the anchor lacked it, as
+          // long as no recorded end contradicts this instance.
+          const auto *atLaunch = latestInstanceAt(sampleRootPid, sampleLaunchTime);
+          if (!rootStartCaptured && !captured.empty() && atLaunch != nullptr &&
+              *atLaunch == captured && captured <= sampleLaunchTime &&
+              instanceAliveAt(sampleRootPid, captured, sampleLaunchTime)) {
+            sampleInstances.insert({sampleRootPid, captured});
+          }
           continue;
         }
-        if (!sampleSubtree.count(e.parentProcessId)) {
+        if (e.parentProcessId == 0) {
           continue;
         }
-        const std::string childTs =
-            e.timestampUtc.empty() ? instanceStartOf(e) : e.timestampUtc;
-        if (childTs.empty()) {
-          // No time on the child event. Admit it only when the parent has NO
-          // recorded end at all; otherwise a dead/reused parent cannot be
-          // distinguished and the child stays out (fail closed).
+        // Parentage uses CAPTURED creation time; the observation time is a
+        // fallback only when creation time was not captured.
+        const std::string childCreated =
+            captured.empty() ? e.timestampUtc : captured;
+        if (childCreated.empty()) {
+          // No creation time and no observation time at all. Admit only when
+          // the parent has no recorded end (no evidence of a dead/reused
+          // parent) and the child's own PID has no recorded end either; the
+          // instance is recorded with an empty identity ("unknown creation
+          // time") and later timestamp-less events for it are attributed only
+          // while no end exists. A recorded end closes it (fail closed).
           const auto pit = lifetimes.find(e.parentProcessId);
-          if (pit != lifetimes.end() &&
-              (!pit->second.endByStart.empty() ||
-               !pit->second.endsUnbound.empty())) {
+          const bool parentEnded =
+              pit != lifetimes.end() &&
+              (!pit->second.endByStart.empty() || !pit->second.endsUnbound.empty());
+          const bool parentIsRootUnknownTime =
+              e.parentProcessId == sampleRootPid && !parentEnded;
+          bool parentIsKnownSample =
+              parentIsRootUnknownTime;
+          if (!parentIsKnownSample) {
+            for (const auto &key : sampleInstances) {
+              if (key.first == e.parentProcessId) {
+                parentIsKnownSample = true;
+                break;
+              }
+            }
+          }
+          const auto cit = lifetimes.find(e.processId);
+          const bool childEnded =
+              cit != lifetimes.end() &&
+              (!cit->second.endByStart.empty() || !cit->second.endsUnbound.empty());
+          if (!parentIsKnownSample || childEnded) {
             continue;
           }
-        } else {
-          if (!pidAliveAt(e.parentProcessId, childTs)) {
-            continue; // parent instance had already ended: not the sample's child
+          // Insert only once: the fixed-point loop must terminate when the
+          // event is re-examined on the next pass.
+          const auto ins = sampleInstances.insert({e.processId, ""});
+          if (!ins.second) {
+            continue;
           }
-          if (!pidAliveAt(e.processId, childTs)) {
-            continue; // child PID belongs to a dead/reused instance
-          }
+          changed = true;
+          continue;
         }
-        sampleSubtree.insert(e.processId);
+        if (isSampleInstance(e.processId, childCreated)) {
+          continue;
+        }
+        // A new instance can legitimately reuse a PID. Its parent instance,
+        // rather than previous users of that PID, determines membership.
+        const std::string *cover =
+            latestInstanceAt(e.parentProcessId, childCreated);
+        bool parentIsSample = false;
+        if (cover != nullptr && isSampleInstance(e.parentProcessId, *cover)) {
+          // The parent instance must still be alive when the child is created.
+          parentIsSample =
+              instanceAliveAt(e.parentProcessId, *cover, childCreated);
+        }
+        if (!parentIsSample && cover == nullptr &&
+            e.parentProcessId == sampleRootPid && !rootStartCaptured) {
+          // The anchor's creation time was never captured, but the root is the
+          // unique sample root until a recorded end closes it.
+          parentIsSample = rootInstanceAliveAt(childCreated);
+        }
+        if (!parentIsSample) {
+          continue;
+        }
+        const auto ins = sampleInstances.insert({e.processId, childCreated});
+        if (!ins.second) {
+          continue; // already admitted; keep the fixed-point loop terminating
+        }
         changed = true;
       }
     }
   }
 
-  const auto sameRootInstance = [&](const EventRecord &e) {
-    if (const std::string *bg = Detail(e, "bootGeneration");
-        bg != nullptr && !rootBootGeneration.empty() && *bg != rootBootGeneration) {
-      return false;
-    }
-    if (const std::string *st = Detail(e, "startTime");
-        st != nullptr && !rootStartTime.empty() && *st != rootStartTime) {
-      return false;
-    }
-    return true;
-  };
-
-  const auto inSampleSubtree = [&](const EventRecord &e) {
-    if (!rootKnown || e.processId == 0 ||
-        !sampleSubtree.count(e.processId)) {
-      return false;
-    }
-    if (e.processId == sampleRootPid && !sameRootInstance(e)) {
-      return false;
+  // 1 = sample instance, 0 = known non-sample / unbound, for this event.
+  const auto instanceCoveringSample = [&](const EventRecord &e) -> int {
+    const std::string captured = instanceStartOf(e);
+    if (!captured.empty()) {
+      if (isSampleInstance(e.processId, captured)) {
+        // The matched sample instance must still be alive at the event time
+        // (an empty time cannot contradict a recorded end).
+        return instanceAliveAt(e.processId, captured, e.timestampUtc) ? 1 : 0;
+      }
+      return 0;
     }
     if (e.timestampUtc.empty()) {
-      // Cannot place the event in time. Any recorded end for the PID means a
-      // different (reused) instance cannot be excluded -> fail closed.
+      // No time at all: attribute only when the PID has a sample instance and
+      // no recorded end contradicts it; otherwise unknown (not attributed).
+      bool hasSample = false;
+      for (const auto &key : sampleInstances) {
+        if (key.first == e.processId) {
+          hasSample = true;
+          break;
+        }
+      }
+      if (!hasSample) {
+        return -1;
+      }
       const auto it = lifetimes.find(e.processId);
       if (it != lifetimes.end() &&
           (!it->second.endByStart.empty() || !it->second.endsUnbound.empty())) {
-        return false;
+        return 0;
       }
-      return true;
+      return 1;
     }
-    return pidAliveAt(e.processId, e.timestampUtc);
+    const std::string *cover = latestInstanceAt(e.processId, e.timestampUtc);
+    if (cover != nullptr) {
+      if (isSampleInstance(e.processId, *cover)) {
+        return instanceAliveAt(e.processId, *cover, e.timestampUtc) ? 1 : 0;
+      }
+      return 0;
+    }
+    if (e.processId == sampleRootPid) {
+      return rootInstanceAliveAt(e.timestampUtc) ? 1 : 0;
+    }
+    // A child PID with sample instance(s) but no covering start: attribute only
+    // when no recorded end contradicts the moment.
+    bool hasSampleInstance = false;
+    for (const auto &key : sampleInstances) {
+      if (key.first == e.processId) {
+        hasSampleInstance = true;
+        break;
+      }
+    }
+    if (!hasSampleInstance) {
+      return 0;
+    }
+    return anyEndAtOrBefore(e.processId, e.timestampUtc) ? 0 : 1;
+  };
+
+  const auto inSampleSubtree = [&](const EventRecord &e) {
+    if (!rootKnown || e.processId == 0 || !bootMatches(e)) {
+      return false;
+    }
+    return instanceCoveringSample(e) == 1;
   };
 
   const auto classifyOwnership = [&](const EventRecord &e) {
@@ -735,7 +845,7 @@ BehaviorScore ScoreSandboxBehavior(const DynamicRunSummary &summary,
   std::set<std::string> timeCorrelatedEndpoints;
   std::set<std::string> unownedEndpoints;
   std::set<std::string> suspiciousCmds;
-  std::set<std::string> suspiciousModules;
+  std::set<std::string> hijackLeads;
   std::set<std::string> writableModuleContext;
   std::set<std::string> persistenceTargets;
   std::set<std::string> dropTargets;
@@ -745,6 +855,7 @@ BehaviorScore ScoreSandboxBehavior(const DynamicRunSummary &summary,
   int otherMitre = 0;
   int sampleCrash = 0;
   int nonSampleCrash = 0;
+  std::set<std::string> crashObservations;
 
   std::map<uint32_t, int> pidIntegrity;
   for (const auto &e : events) {
@@ -881,6 +992,10 @@ BehaviorScore ScoreSandboxBehavior(const DynamicRunSummary &summary,
     // --- Processes ----------------------------------------------------------
     if (cat == "process" || cat == "crash") {
       if (Has(act, "crash")) {
+        std::string crashKey = e.timestampUtc + "|" + std::to_string(e.processId) +
+            "|" + e.imagePath + "|" + e.target;
+        for (const auto& field : e.details) crashKey += "|" + field.first + "=" + field.second;
+        if (!crashObservations.insert(crashKey).second) continue;
         const bool sampleSelf =
             DetailIsTrue(e, "isSample") || Has(Lower(e.imagePath), "sample") ||
             Has(tgtL, "sample");
@@ -926,27 +1041,36 @@ BehaviorScore ScoreSandboxBehavior(const DynamicRunSummary &summary,
     }
 
     // --- Side-loaded / search-order-hijacked DLL ----------------------------
-    // A module loaded from a writable path is NOT by itself a hijack: installers
-    // and self-extractors do that routinely. Two independent facts are required
-    // for the scorer to call it a hijack on its own:
-    //   (1) the module is NOT loaded from its legitimate system location
-    //       (a normal C:\Windows\System32\version.dll load is just Windows), and
-    //   (2) it sits in a writable/staging location AND shadows a known
-    //       search-order DLL name -- the classic planting shape.
-    // An explicit collector classification (details.suspicion naming a
-    // hijack/search-order/shadowing pattern) is sensor evidence and stands on
-    // its own. Everything else is context: recorded, not scored.
+    // Three distinct evidence levels, never collapsed:
+    //   (1) CONTEXT: a module loaded from a writable path (installers and
+    //       self-extractors do this routinely) -- recorded, not scored.
+    //   (2) LEAD: a search-order-relevant NAME in a writable/staging location.
+    //       This is an investigation lead, not proof: a familiar filename does
+    //       not establish replacement, a hijacked search order, or malicious
+    //       module contents. Scored as a weak lead only.
+    //   (3) VALIDATED HIJACK: a defined detector classification
+    //       (details.hijackDetector naming a validated detector) PLUS concrete
+    //       evidence references (details.hijackEvidence with at least one
+    //       file/pair reference). Only this satisfies the high-specificity gate.
+    // A bare tag, an alarming filename, or an unverified boolean annotation is
+    // never a validated hijack finding.
     if (cat == "image" && Has(act, "load") && inSampleSubtree(e)) {
       const std::string *susp = Detail(e, "suspicion");
       const std::string suspL = susp ? Lower(*susp) : std::string();
-      const bool hijackClassified =
-          Has(suspL, "hijack") || Has(suspL, "search-order") ||
-          Has(suspL, "search order") || Has(suspL, "shadow") ||
-          DetailIsTrue(e, "searchOrderHijack");
-      const bool shadowsKnownDll =
-          IsKnownShadowedDllName(tgtL) && IsStagingLocation(tgtL);
-      if (hijackClassified || shadowsKnownDll) {
-        suspiciousModules.insert(tgtL.empty() ? act : tgtL);
+      const std::string detector =
+          Detail(e, "hijackDetector") ? Lower(*Detail(e, "hijackDetector"))
+                                      : std::string();
+      const std::string evidence =
+          Detail(e, "hijackEvidence") ? *Detail(e, "hijackEvidence")
+                                      : std::string();
+      // No collector implements the claimed validation detectors. Arbitrary
+      // event strings and unresolved references cannot establish a hijack.
+      // Preserve them as leads until an evidence-validating detector exists.
+      const bool hijackLead =
+          (IsKnownShadowedDllName(tgtL) && IsStagingLocation(tgtL)) ||
+          !detector.empty() || !evidence.empty();
+      if (hijackLead) {
+        hijackLeads.insert(tgtL.empty() ? act : tgtL);
       } else if (!suspL.empty() || !e.mitre.empty()) {
         writableModuleContext.insert(tgtL.empty() ? act : tgtL);
       }
@@ -974,7 +1098,7 @@ BehaviorScore ScoreSandboxBehavior(const DynamicRunSummary &summary,
   const int nExternal = static_cast<int>(externalEndpoints.size());
   const int nTcExternal = static_cast<int>(timeCorrelatedEndpoints.size());
   const int suspCmd = static_cast<int>(suspiciousCmds.size());
-  const int suspMod = static_cast<int>(suspiciousModules.size());
+  const int nHijackLeads = static_cast<int>(hijackLeads.size());
   const int nWritableModules = static_cast<int>(writableModuleContext.size());
 
   // ---- Accumulate score + rationale, strongest signals first. ----
@@ -1126,24 +1250,27 @@ BehaviorScore ScoreSandboxBehavior(const DynamicRunSummary &summary,
         "a fact, not scored as escalation (missing approval information is not "
         "evidence of unauthorized privilege escalation).");
   }
-  if (suspMod > 0) {
-    const int w = 25 + std::min(suspMod - 1, 5) * 8;
+
+  if (nHijackLeads > 0) {
+    const int w = std::min(5 * nHijackLeads, 15);
     out.score += w;
     std::string joined;
     int shown = 0;
-    for (const auto &m : suspiciousModules) {
+    for (const auto &m : hijackLeads) {
       if (shown++ >= 3) {
         joined += ", ...";
         break;
       }
       joined += (joined.empty() ? "" : ", ") + m;
     }
-    std::string line =
-        "DLL side-loading / search-order hijack: " + std::to_string(suspMod) +
-        " module(s) loaded from a writable, non-system path (" + joined +
-        ") (+" + std::to_string(w) + ").";
-    out.rationale.push_back(line);
-    out.positiveFindings.push_back(line);
+    out.rationale.push_back(
+        "DLL name/location lead(s): " + std::to_string(nHijackLeads) +
+        " search-order-relevant module name(s) loaded from a writable/staging "
+        "path (" +
+        joined + ") (+" + std::to_string(w) +
+        "). Recorded as an investigation lead, NOT a confirmed hijack: a "
+        "familiar DLL name in a writable path does not establish replacement, "
+        "a hijacked search order, or malicious module contents.");
   }
   if (nWritableModules > 0) {
     std::string joined;
@@ -1218,13 +1345,10 @@ BehaviorScore ScoreSandboxBehavior(const DynamicRunSummary &summary,
         std::to_string(w) + ").");
   }
   if (nonSampleCrash > 0) {
-    const int w = std::min(nonSampleCrash, 3) * 6;
-    out.score += w;
     out.rationale.push_back(
-        "Crash of " + std::to_string(nonSampleCrash) +
-        " non-sample process(es) -- possible injection target or host "
-        "instability (+" +
-        std::to_string(w) + ").");
+        std::to_string(nonSampleCrash) +
+        " distinct non-sample crash observation(s). Context only, not scored: "
+        "a crash alone does not establish injection or sample causation.");
   }
   if (nDataDrops > 0) {
     const int w = std::min(3 * nDataDrops, 12);
@@ -1260,7 +1384,7 @@ BehaviorScore ScoreSandboxBehavior(const DynamicRunSummary &summary,
   //           (>= 90 when the sample carries an Authenticode signature)
   //   >= 20 : at least one noteworthy signal                    -> Suspicious
   //   else  : nothing noteworthy observed                       -> Clean
-  const int maliciousThreshold = sampleSigned ? 90 : 60;
+  const int maliciousThreshold = 60;
   if (out.score >= maliciousThreshold) {
     out.verdict = Verdict::Malicious;
   } else if (out.score >= 20) {
@@ -1276,7 +1400,7 @@ BehaviorScore ScoreSandboxBehavior(const DynamicRunSummary &summary,
   // high-specificity signal -- an anomalous command line, a verified DLL
   // search-order hijack, or other attributed MITRE-tagged behavior. Adding an
   // installation-directory write must change neither direction of the verdict.
-  const bool highSpecificity = suspCmd > 0 || suspMod > 0 || otherMitre > 0;
+  const bool highSpecificity = suspCmd > 0 || otherMitre > 0;
   const int genericCategories = (nStagingDrops > 0 ? 1 : 0) +
                                 (nExternal > 0 ? 1 : 0);
   // Installation context changes the EXPLANATION (a program installing its own
@@ -1318,18 +1442,6 @@ BehaviorScore ScoreSandboxBehavior(const DynamicRunSummary &summary,
           "verified DLL hijack, or other attributed MITRE-tagged behavior) "
           "corroborated it.");
     }
-  }
-  if (sampleSigned && out.score >= 60 && out.verdict != Verdict::Malicious) {
-    out.rationale.push_back(
-        "Sample is Authenticode-signed: the Malicious threshold was raised to " +
-        std::to_string(maliciousThreshold) + " (behavior scored " +
-        std::to_string(out.score) +
-        "), capping the verdict at Suspicious -- a present signature is not "
-        "proof of benignity, but reduces confidence in a Malicious call.");
-  } else if (sampleSigned && richBehavior) {
-    out.rationale.push_back(
-        "Sample is Authenticode-signed (factored into the verdict; a present "
-        "signature is not proof of benignity).");
   }
 
   // ---- Evidence-sufficiency gate (behavior-score-v4). ----

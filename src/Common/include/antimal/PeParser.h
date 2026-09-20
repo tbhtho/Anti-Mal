@@ -48,6 +48,7 @@ struct PeInfo {
   uint64_t overlayOffset = 0;  // file offset where post-last-section data begins
   uint64_t overlaySize = 0;    // appended bytes (includes any Authenticode cert)
   double overlayEntropy = 0.0; // Shannon entropy of the overlay region
+  bool overlayIsCertificateOnly = false; // Structural layout, independent of signature validity
   std::vector<std::string> imports;
   // pefile-compatible import hash: MD5 of the comma-joined, lowercased
   // "libname_no_ext.funcname" tokens in import-table order (ordinal imports
@@ -106,6 +107,8 @@ std::string DetectPackerFromSections(const std::vector<PeSection> &sections);
 // unsigned or the signer cannot be extracted. Does NOT itself verify trust (use
 // HasAuthenticodeSignature for that) — it only names who signed it.
 std::string AuthenticodeSignerName(const std::filesystem::path &path);
+// Exact offline WinVerifyTrust result. Does not load or execute the file.
+uint32_t AuthenticodeVerificationStatus(const std::filesystem::path &path);
 
 // Pure imphash core, exposed for testing. `imports` is the ordered list of
 // (dllName, importName) exactly as they appear in the import table; importName

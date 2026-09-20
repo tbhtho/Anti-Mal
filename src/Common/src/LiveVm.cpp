@@ -89,37 +89,19 @@ std::wstring ReadProcessCommandLine(uint32_t pid) {
   return out;
 }
 
-// Measures what an injected (injX, injY) screen-space move actually did.
-// Prefers LearnCursorByKnownShift (it both measures and re-validates the
-// sprite against the frame pair); falls back to masked tracking at the
-// predicted position when the shift assumption does not hold.
+// Track the established sprite across a move. Learning is reserved for bounded
+// probes, so unrelated changing content cannot silently replace the pointer.
 struct MoveMeasure {
   bool valid = false;
   int x = 0, y = 0; // pointer top-left after the move
   int dx = 0, dy = 0; // measured screen-space delta
-  bool learnedNew = false;
-  CursorSprite sprite;
 };
 
-MoveMeasure MeasureMove(const BgrxFrame &prev, const BgrxFrame &cur, int prevX,
+MoveMeasure MeasureMove(const BgrxFrame &cur, int prevX,
                         int prevY, int injX, int injY,
                         const CursorSprite &sprite) {
   MoveMeasure m;
-  if (injX != 0 || injY != 0) {
-    const ShiftLearnResult learn =
-        LearnCursorByKnownShift(prev, cur, injX, injY);
-    if (learn.valid) {
-      m.valid = true;
-      m.x = learn.x;
-      m.y = learn.y;
-      m.dx = learn.actualDx;
-      m.dy = learn.actualDy;
-      m.learnedNew = true;
-      m.sprite = learn.sprite;
-      return m;
-    }
-  }
-  const int radius = std::max(48, std::max(std::abs(injX), std::abs(injY)) + 32);
+  const int radius = std::max(48, std::max(std::abs(injX), std::abs(injY)) * 4 + 32);
   const CursorMatch hit =
       TrackCursor(cur, sprite, prevX + injX, prevY + injY, radius);
   if (hit.valid) {
@@ -188,22 +170,15 @@ LiveFrame WaitForLiveFrame(uint64_t prevSeq, const std::wstring &shmName,
                            int timeoutMs) {
   const auto deadline =
       std::chrono::steady_clock::now() + std::chrono::milliseconds(timeoutMs);
-  LiveFrame latest;
   for (;;) {
-    LiveFrame f = ReadLiveFrame(shmName);
-    if (f.present) {
-      if (latest.present || f.frameSeq != prevSeq) {
-        latest = std::move(f);
-      }
-      if (latest.frameSeq != prevSeq) {
-        return latest;
-      }
+    LiveFrame frame = ReadLiveFrame(shmName);
+    if (frame.present && frame.frameSeq != prevSeq) {
+      return frame;
     }
     if (std::chrono::steady_clock::now() >= deadline) {
-      if (latest.present) {
-        return latest; // stale frame beats blindness; callers detect the stall
-      }
-      return ReadLiveFrame(shmName);
+      LiveFrame missing;
+      missing.error = "no newer VM frame within wait budget";
+      return missing;
     }
     Sleep(20);
   }
@@ -513,13 +488,26 @@ AimOutcome AimLivePointer(const LiveInputWriter &input,
     return out;
   }
 
+  // Optional bounded diagnostic capture for investigating guest pointer feedback.
+  wchar_t diagnosticDir[32768]{};
+  const DWORD diagnosticLength = GetEnvironmentVariableW(
+      L"ANTIMAL_POINTER_DIAGNOSTICS", diagnosticDir, 32768);
+  int diagnosticSequence = 0;
+  auto captureDiagnostic = [&](const LiveFrame &frame) {
+    if (!diagnosticLength || diagnosticLength >= 32768 || !frame.present ||
+        diagnosticSequence >= 40) return;
+    const auto path = std::filesystem::path(diagnosticDir) /
+        (std::to_wstring(++diagnosticSequence) + L".png");
+    EncodeFramebufferPng(path, frame.frame.pixels.data(), frame.frame.width,
+                         frame.frame.height, 4);
+  };
   // 1. Prime the pointer. Windows does not render a mouse pointer until the
   // first mouse event, and the framebuffer shows nothing for the learner until
   // it does -- live testing (2026-09-17) had the whole aim fail on a freshly
   // booted guest for exactly this reason. Send a tiny wake move and settle on a
   // frame pair that already contains the drawn pointer.
   input.Mouse(holdButtons, 1, 0);
-  Sleep(120);
+  Sleep(800);
   {
     LiveFrame primed = WaitForLiveFrame(cur.frameSeq, shmName, 900);
     if (primed.present) {
@@ -531,6 +519,8 @@ AimOutcome AimLivePointer(const LiveInputWriter &input,
     }
   }
 
+  captureDiagnostic(cur);
+
   // 2. Probe until the pointer demonstrably moves, then learn its sprite. The
   // probe also measures the pointer's response, so a dead input channel fails
   // fast instead of silently clicking nothing.
@@ -538,25 +528,31 @@ AimOutcome AimLivePointer(const LiveInputWriter &input,
   int px = 0, py = 0;
   bool havePos = false;
   static const int kProbes[4][2] = {{12, 0}, {-12, 0}, {0, 12}, {0, -12}};
-  for (const auto &probe : kProbes) {
-    input.Mouse(holdButtons, probe[0], probe[1]);
-    Sleep(160);
-    // Wait for TWO frames newer than the baseline: the guest may have been
-    // mid-paint when the probe landed, so the first frame we see can predate
-    // its response (live finding: the "after" frame was stale at idle cadence).
-    LiveFrame next = WaitForLiveFrame(cur.frameSeq, shmName, 700);
-    if (next.present) {
-      LiveFrame newer = WaitForLiveFrame(next.frameSeq, shmName, 700);
-      if (newer.present) {
-        next = std::move(newer);
+  auto probeSprite = [&](int dx, int dy) {
+    ShiftLearnResult learned;
+    if (!input.Mouse(holdButtons, dx, dy)) return learned;
+    const auto deadline = std::chrono::steady_clock::now() +
+                          std::chrono::milliseconds(5000);
+    uint64_t sequence = cur.frameSeq;
+    LiveFrame last;
+    do {
+      auto next = WaitForLiveFrame(sequence, shmName, 300);
+      if (!next.present) continue;
+      sequence = next.frameSeq;
+      if (next.frame.pixels != cur.frame.pixels) {
+        learned = LearnCursorByKnownShift(cur.frame, next.frame, dx, dy);
       }
+      last = std::move(next);
+      if (learned.valid) break;
+    } while (std::chrono::steady_clock::now() < deadline);
+    if (last.present) {
+      captureDiagnostic(last);
+      cur = std::move(last);
     }
-    if (!next.present) {
-      break;
-    }
-    const ShiftLearnResult learn =
-        LearnCursorByKnownShift(cur.frame, next.frame, probe[0], probe[1]);
-    cur = std::move(next);
+    return learned;
+  };
+  for (const auto &probe : kProbes) {
+    const auto learn = probeSprite(probe[0], probe[1]);
     if (learn.valid) {
       sprite = learn.sprite;
       px = learn.x;
@@ -581,7 +577,7 @@ AimOutcome AimLivePointer(const LiveInputWriter &input,
   st.cursorY = py;
   st.tolerance = tolerance;
   st.maxIterations = maxIterations;
-  int lostStreak = 0;
+  int shapeChanges = 0;
   for (;;) {
     const PointerAimState::Decision d = st.Next();
     if (d.done) {
@@ -594,30 +590,52 @@ AimOutcome AimLivePointer(const LiveInputWriter &input,
       break;
     }
     input.Mouse(holdButtons, d.dx, d.dy);
-    Sleep(160);
-    LiveFrame next = WaitForLiveFrame(cur.frameSeq, shmName, 700);
+    MoveMeasure m;
+    LiveFrame next;
+    const auto moveDeadline = std::chrono::steady_clock::now() +
+                              std::chrono::milliseconds(5000);
+    uint64_t sequence = cur.frameSeq;
+    do {
+      auto fresh = WaitForLiveFrame(sequence, shmName, 300);
+      if (!fresh.present) continue;
+      sequence = fresh.frameSeq;
+      next = std::move(fresh);
+      m = MeasureMove(next.frame, px, py, d.dx, d.dy, sprite);
+      if (m.valid && (m.dx != 0 || m.dy != 0)) break;
+    } while (std::chrono::steady_clock::now() < moveDeadline);
     if (!next.present) {
       out.error = "live frames stopped mid-aim";
       break;
     }
-    const MoveMeasure m = MeasureMove(cur.frame, next.frame, px, py, d.dx,
-                                      d.dy, sprite);
+    captureDiagnostic(next);
     cur = std::move(next);
     if (m.valid) {
       px = m.x;
       py = m.y;
-      if (m.learnedNew) {
-        sprite = m.sprite;
-      }
       st.Observe(d.dx, d.dy, m.dx, m.dy);
-      lostStreak = 0;
     } else {
-      if (++lostStreak >= 3) {
+      // Entering an edit control changes the arrow to an I-beam. Establish a
+      // NEW observed sprite with a bounded probe; never click at a prediction.
+      bool reacquired = false;
+      if (++shapeChanges <= 2) {
+        for (const auto &probe : kProbes) {
+          auto learned = probeSprite(probe[0], probe[1]);
+          if (!learned.valid) continue;
+          sprite = std::move(learned.sprite);
+          px = learned.x;
+          py = learned.y;
+          st.cursorX = px;
+          st.cursorY = py;
+          ++st.iterations;
+          st.stalls = 0;
+          reacquired = true;
+          break;
+        }
+      }
+      if (!reacquired) {
         out.error = "lost the guest pointer while aiming";
         break;
       }
-      // A failed measurement still consumes a step so the budget is bounded.
-      st.Observe(d.dx, d.dy, 0, 0);
     }
   }
   out.cursorX = st.cursorX;

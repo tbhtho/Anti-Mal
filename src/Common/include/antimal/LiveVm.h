@@ -48,8 +48,8 @@ struct LiveFrame {
 LiveFrame ReadLiveFrame(const std::wstring &shmName = kLiveFrameShmName);
 
 // Waits for a frame newer than `prevSeq` (i.e. the guest painted after our
-// input). Returns the newest frame on timeout with `present=true` still true
-// when a frame exists -- callers measure and decide; they are not left blind.
+// input). A timeout returns present=false; an unchanged image must never be
+// treated as fresh feedback for an automatic click.
 LiveFrame WaitForLiveFrame(uint64_t prevSeq,
                            const std::wstring &shmName = kLiveFrameShmName,
                            int timeoutMs = 700);

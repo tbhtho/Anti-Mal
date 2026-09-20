@@ -1,3 +1,8 @@
+#include "antimal/AgentBootstrapPolicy.h"
+#include "antimal/GuestFlushGate.h"
+#include "antimal/BoundedTelemetryQueue.h"
+#include "antimal/EvidenceDimensions.h"
+#include "antimal/GuestArtifactStore.h"
 #include <stdexcept>
 #include "antimal/Assistant.h"
 #include "antimal/BehaviorScore.h"
@@ -89,6 +94,7 @@
 #include "antimal/hv/WhpHost.h"
 
 #include <Windows.h>
+#include <winioctl.h>
 #include <psapi.h>
 #include <cctype> // K32GetProcessMemoryInfo (benchmark memory accounting)
 
@@ -178,6 +184,24 @@ std::filesystem::path TempRoot() {
   antimal::EnsureDirectory(root);
   TempRootRegistry().push_back(root);
   return root;
+}
+
+// This suite exercises the static-analysis ENGINE deliberately, so its scans
+// carry an explicit, scoped operator-style authorization (the production
+// default is locked; see the private development documentation). Tests that specifically
+// verify the lock use plain ScannerOptions instead.
+antimal::ScannerOptions UnlockedScanOptions(const std::filesystem::path &target) {
+  antimal::ScannerOptions opts;
+  opts.staticUnlock.unlocked = true;
+  opts.staticUnlock.scope = antimal::PathToUtf8(target);
+  opts.staticUnlock.authorizedBy = "test-operator";
+  opts.staticUnlock.mechanism = "test:harness";
+  opts.staticUnlock.recordedAt = "2026-09-19T00:00:00Z";
+  return opts;
+}
+
+antimal::ScanResult ScanFileUnlocked(const std::filesystem::path &target) {
+  return antimal::ScanFile(target, UnlockedScanOptions(target));
 }
 
 void TestHashEntropyJson() {
@@ -1021,6 +1045,22 @@ void TestImmutableSampleStaging() {
     Expect(repaired.ok, "staging: tampered cache entry is repaired");
     Expect(antimal::ReadAllBytes(repaired.stagedPath) == contentA,
            "staging: repaired staging matches the true source bytes");
+  }
+
+  // Restoring the read-only marker must not conceal same-size tampering.
+  {
+    const auto cacheEntry = cache / (hashA + ".bin");
+    const DWORD attributes = GetFileAttributesW(cacheEntry.c_str());
+    Expect(SetFileAttributesW(cacheEntry.c_str(), attributes & ~FILE_ATTRIBUTE_READONLY),
+           "staging: synthetic tamper fixture is writable");
+    { std::fstream file(cacheEntry, std::ios::binary | std::ios::in | std::ios::out);
+      file.seekp(1024); file.put(static_cast<char>(0xEF)); }
+    Expect(SetFileAttributesW(cacheEntry.c_str(), attributes | FILE_ATTRIBUTE_READONLY),
+           "staging: synthetic tamper fixture restores read-only marker");
+    const auto checked = StageSampleImmutable(source, root / "run-readonly-tamper" / "in", cache);
+    Expect(checked.ok && !checked.cacheHit &&
+               antimal::ReadAllBytes(checked.stagedPath) == originalA,
+           "staging: read-only marker cannot conceal cache content tampering");
   }
 
   // 5) Source mutation AFTER staging must not change the staged run (identity is
@@ -5586,7 +5626,7 @@ void TestPeDepthFindings() {
       f.write(reinterpret_cast<const char *>(bytes.data()),
               static_cast<std::streamsize>(bytes.size()));
     }
-    const auto r = antimal::ScanFile(p);
+    const auto r = ScanFileUnlocked(p);
     std::error_code ec;
     std::filesystem::remove(p, ec);
     return r;
@@ -5668,7 +5708,7 @@ void TestPeDepthFindings() {
   {
     wchar_t sysDir[MAX_PATH]{};
     GetSystemDirectoryW(sysDir, MAX_PATH);
-    const auto r = antimal::ScanFile(std::wstring(sysDir) + L"\\kernel32.dll");
+    const auto r = ScanFileUnlocked(std::filesystem::path(std::wstring(sysDir) + L"\\kernel32.dll"));
     Expect(!has(r.findings, "filetype.versioninfo_mismatch"),
            "clean file (matching OriginalFilename stem) does not fire mismatch");
   }
@@ -5678,7 +5718,7 @@ void TestPeDepthFindings() {
 void TestPeDepthJson() {
   wchar_t sysDir[MAX_PATH]{};
   GetSystemDirectoryW(sysDir, MAX_PATH);
-  const auto r = antimal::ScanFile(std::wstring(sysDir) + L"\\kernel32.dll");
+  const auto r = ScanFileUnlocked(std::filesystem::path(std::wstring(sysDir) + L"\\kernel32.dll"));
   Expect(r.peVersionInfo.present, "scan carries kernel32 VERSIONINFO");
   Expect(!r.peExports.empty(), "scan carries kernel32 exports");
   const std::string json = antimal::ToJson(r);
@@ -5697,7 +5737,7 @@ void TestPeDepthJson() {
 void TestPeDepthText() {
   wchar_t sysDir[MAX_PATH]{};
   GetSystemDirectoryW(sysDir, MAX_PATH);
-  const auto r = antimal::ScanFile(std::wstring(sysDir) + L"\\kernel32.dll");
+  const auto r = ScanFileUnlocked(std::filesystem::path(std::wstring(sysDir) + L"\\kernel32.dll"));
   const std::string t = antimal::FormatScanText(r);
   Expect(t.find("exports:") != std::string::npos, "scan text lists the export count");
   Expect(t.find("Microsoft") != std::string::npos,
@@ -6649,8 +6689,8 @@ void TestReportHtmlStructure() {
   auto has = [&](const char *needle) {
     return html.find(needle) != std::string::npos;
   };
-  Expect(has("Verdict"), "html: Verdict panel present");
-  Expect(has("Detections ("), "html: Detections summary present");
+  Expect(has("Security Assessment"), "html: security assessment panel present");
+  Expect(has("Behavioral indicators requiring attribution ("), "html: behavioral indicators separated from confirmation");
   Expect(has("boot outcome"), "html: boot outcome row present");
   Expect(has("live display"), "html: live-display pacing row present");
   Expect(has("Persistence"), "html: Persistence panel present");
@@ -7311,7 +7351,7 @@ void TestFileTypeId() {
   // The running test exe must identify as a PE by content.
   wchar_t modulePath[MAX_PATH]{};
   GetModuleFileNameW(nullptr, modulePath, MAX_PATH);
-  Expect(antimal::ScanFile(modulePath).detectedType == "pe",
+  Expect(ScanFileUnlocked(modulePath).detectedType == "pe",
          "scanned test exe is detected as pe by magic bytes");
 }
 
@@ -7436,7 +7476,7 @@ void TestShellLinkParser() {
       os.write(reinterpret_cast<const char *>(v.data()),
                static_cast<std::streamsize>(v.size()));
     }
-    const antimal::ScanResult r = antimal::ScanFile(tmp);
+    const antimal::ScanResult r = ScanFileUnlocked(tmp);
     std::error_code ec;
     std::filesystem::remove(tmp, ec);
     Expect(r.detectedType == "lnk", "LNK scan: identified as lnk by magic bytes");
@@ -7621,7 +7661,7 @@ void TestScriptAnalyzer() {
       std::ofstream os(tmp, std::ios::binary);
       os.write(ps.data(), static_cast<std::streamsize>(ps.size()));
     }
-    const antimal::ScanResult r = antimal::ScanFile(tmp);
+    const antimal::ScanResult r = ScanFileUnlocked(tmp);
     std::error_code ec;
     std::filesystem::remove(tmp, ec);
     Expect(r.detectedType == "powershell", "PS scan: classified as powershell");
@@ -7651,7 +7691,7 @@ void TestScriptAnalyzer() {
       std::ofstream os(tmp, std::ios::binary);
       os.write(ps.data(), static_cast<std::streamsize>(ps.size()));
     }
-    const antimal::ScanResult r = antimal::ScanFile(tmp);
+    const antimal::ScanResult r = ScanFileUnlocked(tmp);
     std::error_code ec;
     std::filesystem::remove(tmp, ec);
     Expect(r.verdict != antimal::Verdict::Suspicious &&
@@ -7666,7 +7706,7 @@ void TestScriptAnalyzer() {
       std::ofstream os(tmp2, std::ios::binary);
       os.write(cradle.data(), static_cast<std::streamsize>(cradle.size()));
     }
-    const antimal::ScanResult r2 = antimal::ScanFile(tmp2);
+    const antimal::ScanResult r2 = ScanFileUnlocked(tmp2);
     std::filesystem::remove(tmp2, ec);
     Expect(r2.verdict == antimal::Verdict::Suspicious ||
                r2.verdict == antimal::Verdict::Malicious,
@@ -7850,7 +7890,7 @@ void TestContainerAnalyzer() {
       os.write(reinterpret_cast<const char *>(z.data()),
                static_cast<std::streamsize>(z.size()));
     }
-    const antimal::ScanResult r = antimal::ScanFile(tmp);
+    const antimal::ScanResult r = ScanFileUnlocked(tmp);
     std::error_code ec;
     std::filesystem::remove(tmp, ec);
     Expect(r.verdict != antimal::Verdict::Suspicious &&
@@ -8172,7 +8212,7 @@ void TestCobaltStrikeConfig() {
       os.write(reinterpret_cast<const char *>(buf.data()),
                static_cast<std::streamsize>(buf.size()));
     }
-    const antimal::ScanResult r = antimal::ScanFile(tmp);
+    const antimal::ScanResult r = ScanFileUnlocked(tmp);
     std::error_code ec;
     std::filesystem::remove(tmp, ec);
     bool finding = false;
@@ -8531,6 +8571,42 @@ std::filesystem::path FindFirmwareBlob() {
     }
   }
   return repoRoot / "firmware" / firmwareName;
+}
+
+void TestVmDisabledNetworkPolicy() {
+  if (!antimal::hv::WhpHost::IsAvailable() ||
+      !std::filesystem::exists(FindFirmwareBlob())) {
+    std::cout << "SKIP: disabled-network device probe requires WHP and firmware\n";
+    return;
+  }
+  struct RestoreEnvironment {
+    std::string value;
+    RestoreEnvironment() {
+      char *prior = nullptr; size_t length = 0;
+      _dupenv_s(&prior, &length, "ANTIMAL_ENABLE_NIC");
+      if (prior) { value = prior; free(prior); }
+      _putenv_s("ANTIMAL_ENABLE_NIC", "1");
+    }
+    ~RestoreEnvironment() { _putenv_s("ANTIMAL_ENABLE_NIC", value.c_str()); }
+  } restore;
+  antimal::hv::VirtualMachineOptions options;
+  options.lowRamBytes = 128ull << 20;
+  options.enableFramebuffer = false;
+  options.enableAcpiTables = false;
+  {
+    antimal::hv::VirtualMachine vm(FindFirmwareBlob(), nullptr, options);
+    Expect(!vm.HasNetworkDevice(),
+           "VM network: disabled policy overrides NIC environment opt-in");
+  }
+  options.networkMode = antimal::hv::VmNetworkMode::HostOnly;
+  {
+    antimal::hv::VirtualMachine vm(FindFirmwareBlob(), nullptr, options);
+    Expect(vm.HasNetworkDevice(), "VM network: explicit diagnostic NIC fixture attached");
+    bool rejected = false;
+    try { vm.Run(antimal::hv::VmRunRequest{}); }
+    catch (const std::invalid_argument &) { rejected = true; }
+    Expect(rejected, "VM network: disabled run rejects a preattached NIC before execution");
+  }
 }
 
 void TestWhpFirmwareMapping() {
@@ -9905,6 +9981,18 @@ void TestPolicyProbeScriptGuards() {
 }
 
 void TestDetonationProtocol() {
+  Expect(antimal::PreferSampleDisk("small.ISO", 1024),
+         "detonation: small ISO uses package disk delivery");
+  Expect(!antimal::PreferSampleDisk("small.exe", 1024),
+         "detonation: small executable retains serial delivery");
+  antimal::ExecuteJobRequest iso;
+  iso.sampleName = "small.ISO";
+  iso.sampleKind = antimal::SampleKindForName(iso.sampleName);
+  iso.sampleBytes = 1024;
+  iso.allowSampleExecution = true;
+  const auto isoFallback = antimal::ParseExecuteJobJson(antimal::BuildExecuteJobJson(iso));
+  Expect(isoFallback.sampleKind == "iso" && isoFallback.delivery == "serial",
+         "detonation: serial fallback preserves ISO mount dispatch");
   // Execute-job JSON build -> parse round-trip (all fields).
   antimal::ExecuteJobRequest req;
   req.allowSampleExecution = true;
@@ -10312,9 +10400,9 @@ void TestImageLoadTelemetry() {
     Expect(contextNamed,
            "image: the writable-path module is named as context, not a hijack");
 
-    // A shadowing module name (classic search-order hijack shape) is
-    // high-specificity: with attributed egress and a staging drop it confirms
-    // Malicious.
+    // A shadowing module name in a staging path is an investigation LEAD, not
+    // proof of hijacking: the scorer must not confirm Malicious on the name and
+    // location alone.
     antimal::EventRecord shadow;
     shadow.timestampUtc = "2026-01-01T00:10:06Z";
     shadow.category = "image";
@@ -10336,11 +10424,40 @@ void TestImageLoadTelemetry() {
     drop.processId = 2000;
     drop.target = "C:\\Users\\v\\AppData\\Local\\Temp\\stage.exe";
     drop.details["fileType"] = "pe";
-    const antimal::BehaviorScore hijack =
+    const antimal::BehaviorScore lead =
         antimal::ScoreSandboxBehavior(s, {proc, shadow, net, drop});
-    Expect(hijack.verdict == antimal::Verdict::Malicious,
-           "image: a shadowing DLL name from a writable path is a real hijack "
-           "signal and corroborates Malicious");
+    Expect(lead.verdict != antimal::Verdict::Malicious,
+           "image: a shadowing DLL name in a writable path is a lead, not "
+           "confirmed hijacking");
+    bool leadNamed = false;
+    for (const auto &line : lead.rationale) {
+      if (line.find("lead") != std::string::npos &&
+          line.find("NOT a confirmed hijack") != std::string::npos) {
+        leadNamed = true;
+      }
+    }
+    Expect(leadNamed, "image: the rationale states the hijack is unconfirmed");
+
+    // The same load becomes high-specificity ONLY when a validated detector
+    // classification carries concrete evidence references.
+    antimal::EventRecord validated = shadow;
+    validated.details["hijackDetector"] = "module_shadowing_validated";
+    validated.details["hijackEvidence"] =
+        "pair:loader=C:\\Program Files\\Trusted\\trusted.exe|module=C:\\Users\\v"
+        "\\AppData\\Local\\Temp\\version.dll;file:C:\\Users\\v\\AppData\\Local"
+        "\\Temp\\version.dll@sha256:AA11";
+    const antimal::BehaviorScore confirmed =
+        antimal::ScoreSandboxBehavior(s, {proc, validated, net, drop});
+    Expect(confirmed.verdict != antimal::Verdict::Malicious,
+           "image: unsupported detector names and unresolved references remain leads");
+    bool validatedNamed = false;
+    for (const auto &line : confirmed.positiveFindings) {
+      if (line.find("Validated DLL search-order hijack") != std::string::npos) {
+        validatedNamed = true;
+      }
+    }
+    Expect(!validatedNamed,
+           "image: an annotation cannot claim a validated hijack");
   }
 
   // ----- (d) Report renders a "Module Loads" section with the suspicious DLL --
@@ -10357,7 +10474,7 @@ void TestImageLoadTelemetry() {
     const std::string html = antimal::BuildHtmlReportWithFrames(report, {});
     Expect(html.find("Module Loads") != std::string::npos,
            "image report: Module Loads section header present");
-    Expect(html.find("Side-loaded / hijacked modules") != std::string::npos,
+    Expect(html.find("Module loading leads (unconfirmed)") != std::string::npos,
            "image report: suspicious sub-section present");
     Expect(html.find("inject.dll") != std::string::npos,
            "image report: side-loaded module path rendered");
@@ -10753,9 +10870,8 @@ void TestBehaviorScoreSubtreeNetworkAttribution() {
     load.mitre = "T1574.001";
     hijack.push_back(load);
     const auto bsCorroborated = ScoreSandboxBehavior(s, hijack, false);
-    Expect(bsCorroborated.verdict == Verdict::Malicious,
-           "behavior: attributed egress + staging drop + shadowing DLL name -> "
-           "Malicious");
+    Expect(bsCorroborated.verdict == Verdict::Suspicious,
+           "behavior: egress + staging drop + shadowing DLL name remains a lead");
   }
 }
 
@@ -10954,6 +11070,11 @@ void TestBehaviorScoreVerdict() {
     const BehaviorScore bs = ScoreSandboxBehavior(s, events);
     Expect(rationaleHas(bs.rationale, "crash"),
            "behavior: a category=crash event contributes (signal not dead)");
+    Expect(bs.score == 0, "behavior: unrelated crash is not malware evidence");
+    events.push_back(crash);
+    const BehaviorScore duplicate = ScoreSandboxBehavior(s, events);
+    Expect(duplicate.score == 0 && rationaleHas(duplicate.rationale, "1 distinct non-sample"),
+           "behavior: duplicate crash records are not two processes or injection evidence");
   }
 
   // (f) Privilege escalation resolved from the LIVE event stream -- the parent's
@@ -11047,13 +11168,9 @@ void TestBehaviorScoreVerdict() {
            "behavior: unsigned installer-like behavior + anomalous cmdline -> "
            "Malicious");
     const BehaviorScore signedBs = ScoreSandboxBehavior(s, events, true);
-    Expect(signedBs.verdict == Verdict::Suspicious,
-           "behavior: a present signature caps the same behavior at Suspicious");
-    Expect(rationaleHas(signedBs.rationale, "signed") ||
-               rationaleHas(signedBs.rationale, "signature"),
-           "behavior: signed dampener explained in the rationale");
-    Expect(signedBs.score == unsignedBs.score,
-           "behavior: signing changes the threshold, not the raw score");
+    Expect(signedBs.verdict == unsignedBs.verdict && signedBs.score == unsignedBs.score &&
+               signedBs.rationale == unsignedBs.rationale,
+           "behavior: signature state changes neither score, assessment nor rationale");
   }
 }
 
@@ -11137,16 +11254,16 @@ void TestBehaviorScoreReviewFixtures() {
            "review-A: elevation recorded as a fact in the rationale");
   }
 
-  // B: same fixture, signed sample. Signature raises the bar; it must not
-  // produce a *stronger* conclusion than the unsigned case.
+  // B: identical behavior has identical scoring and explanation regardless
+  // of signature state; provenance cannot change confirmation thresholds.
   {
     const BehaviorScore bs = ScoreSandboxBehavior(s, fixture, true);
-    Expect(bs.score == 60, "review-B: signing changes threshold, not score");
+    Expect(bs.score == 60, "review-B: signing does not change score");
     Expect(bs.verdict == Verdict::Suspicious,
            "review-B: signed fixture also caps at Suspicious");
-    Expect(rationaleHas(bs.rationale, "signed") ||
-               rationaleHas(bs.rationale, "signature"),
-           "review-B: signed dampener explained");
+    const auto unsignedResult = ScoreSandboxBehavior(s, fixture, false);
+    Expect(bs.rationale == unsignedResult.rationale && bs.verdict == unsignedResult.verdict,
+           "review-B: provenance does not change behavioral rationale or verdict");
   }
 
   // C: confirmed launch, timed out, no other relevant telemetry. The old scorer
@@ -11268,8 +11385,8 @@ void TestBehaviorScoreReviewFixtures() {
            "review-F1: report JSON round-trips the observation limits");
 
     const std::string html = antimal::BuildHtmlReport(loaded);
-    Expect(html.find("Insufficient evidence") != std::string::npos,
-           "review-F1: HTML banner says insufficient evidence, not 'no threats'");
+    Expect(html.find("Insufficient observation") != std::string::npos,
+           "review-F1: HTML banner preserves insufficient observation");
     Expect(html.find("observation limits") != std::string::npos,
            "review-F1: HTML lists the observation limits");
   }
@@ -14467,8 +14584,8 @@ void TestBehaviorScoreBoundaryProbeV3() {
   {
     auto s = summary();
     const auto bs = ScoreSandboxBehavior(s, {root()});
-    Expect(bs.scorerVersion == "behavior-score-v4",
-           "boundary: scorer semantics version is v4");
+    Expect(bs.scorerVersion == "behavior-score-v4.3",
+           "boundary: scorer semantics version is v4.2");
   }
 }
 
@@ -14700,14 +14817,36 @@ void TestBehaviorScoreFollowupV3() {
            "followup: a contradictory annotation on System32 does not confirm a "
            "hijack");
   }
-  // The same shadowing DLL name in a writable staging location IS the planting
-  // shape and remains a genuine high-specificity detection.
+  // The same shadowing DLL name in a writable staging location is a LEAD, not
+  // a confirmed hijack; a validated detector + evidence references is required
+  // to reach the high-specificity gate.
   {
     auto dll = ev("image", "image.load", 100,
                   R"(C:\Users\antimal\AppData\Local\Temp\version.dll)", 12);
     const auto bs = ScoreSandboxBehavior(s, {root(), dll});
-    Expect(hasFinding(bs, "hijack") || hasFinding(bs, "side-loading"),
-           "followup: a shadowed DLL name in a staging location is a hijack");
+    Expect(hasFinding(bs, "lead") || hasFinding(bs, "NOT a confirmed hijack"),
+           "followup: a shadowed staging DLL is recorded as a lead");
+    Expect(!hasFinding(bs, "Validated DLL search-order hijack"),
+           "followup: the lead is not reported as a validated hijack");
+
+    std::vector<EventRecord> validatedEvents{root()};
+    for (const char *name : {"version.dll", "winmm.dll", "dwmapi.dll"}) {
+      auto d = ev("image", "image.load", 100,
+                  std::string("C:\\Users\\antimal\\AppData\\Local\\Temp\\") + name,
+                  12);
+      d.details["hijackDetector"] = "module_shadowing_validated";
+      d.details["hijackEvidence"] =
+          std::string("pair:loader=C:\\Program Files\\Trusted\\a.exe|module="
+                      "C:\\Users\\antimal\\AppData\\Local\\Temp\\") +
+          name + ";file:C:\\Users\\antimal\\AppData\\Local\\Temp\\" + name +
+          "@sha256:BB22";
+      validatedEvents.push_back(d);
+    }
+    auto net2 = ev("network", "network.connect", 100, "203.0.113.10:443", 15);
+    validatedEvents.push_back(net2);
+    const auto confirmed = ScoreSandboxBehavior(s, validatedEvents);
+    Expect(confirmed.verdict != Verdict::Malicious,
+           "followup: unsupported detector labels do not establish malware");
   }
 
   // The ordinary auto-updater shape: attributed Run-key + temp helper + update
@@ -14789,6 +14928,282 @@ void TestBehaviorScoreFollowupV3() {
     const auto bs = ScoreSandboxBehavior(live, {root(), net});
     Expect(bs.verdict == Verdict::Suspicious,
            "followup: the anchor is honored even when the summary flag is false");
+  }
+}
+
+// Process-instance attribution (v4): membership must be bound to the INSTANCE
+// (pid + captured creation time), not a numeric PID. An unrelated process that
+// reuses the root/child PID -- and its own descendants -- must not inherit
+// sample ownership; a child born before its parent exited keeps membership even
+// when its start record is observed later.
+void TestProcessInstanceAttribution() {
+  using antimal::BehaviorScore;
+  using antimal::DynamicRunSummary;
+  using antimal::EventRecord;
+  using antimal::ScoreSandboxBehavior;
+  using antimal::Verdict;
+  auto ev = [](const char *cat, const char *act, uint32_t pid,
+               const std::string &target, int sec) {
+    EventRecord e;
+    e.category = cat;
+    e.action = act;
+    e.processId = pid;
+    e.target = target;
+    e.source = "GuestAgent";
+    e.timestampUtc = "2026-09-18T12:00:" +
+                     (sec < 10 ? std::string("0") : std::string()) +
+                     std::to_string(sec) + "Z";
+    return e;
+  };
+  auto root = [&]() {
+    auto e = ev("process", "process.create", 100, R"(C:\sample\installer.exe)", 10);
+    e.details["startTime"] = e.timestampUtc;
+    e.details["bootGeneration"] = "1";
+    e.details["sampleExecuted"] = "true";
+    e.userName = "ANTIMAL-VM\\antimal";
+    return e;
+  };
+  DynamicRunSummary s;
+  s.started = true;
+  s.completed = true;
+  s.sampleExecuted = true;
+  s.guestAgentConnected = true;
+  for (const char *n : {"process", "network", "registry", "filesystem",
+                        "image"}) {
+    DynamicRunSummary::SensorCoverage c;
+    c.sensor = n;
+    c.supported = true;
+    c.healthy = true;
+    c.samples = 8;
+    c.lossKnown = true;
+    c.targetUser = "ANTIMAL-VM\\antimal";
+    c.scope = "mixed";
+    s.sensorCoverage.push_back(c);
+  }
+  auto hasFinding = [](const BehaviorScore &bs, const char *needle) {
+    for (const auto &l : bs.positiveFindings) {
+      if (l.find(needle) != std::string::npos) return true;
+    }
+    for (const auto &l : bs.rationale) {
+      if (l.find(needle) != std::string::npos) return true;
+    }
+    return false;
+  };
+  auto newStart = [&](uint32_t pid, uint32_t parent, int sec) {
+    auto e = ev("process", "process.start", pid, "unrelated.exe", sec);
+    e.parentProcessId = parent;
+    e.details["startTime"] = e.timestampUtc;
+    e.details["bootGeneration"] = "1";
+    return e;
+  };
+  auto end = [&](uint32_t pid, int sec, const char *start) {
+    auto e = ev("process", "process.stop", pid, "ended.exe", sec);
+    e.details["startTime"] = start;
+    e.details["bootGeneration"] = "1";
+    return e;
+  };
+
+  // 1. Root exits; an unrelated process reuses its PID; the connection has no
+  // startTime (the real network collector records only a PID).
+  {
+    auto rootExit = end(100, 13, "2026-09-18T12:00:10Z");
+    auto reused = newStart(100, 999, 20);
+    auto rnet = ev("network", "network.connect", 100, "203.0.113.11:443", 21);
+    const auto bs = ScoreSandboxBehavior(s, {root(), rootExit, reused, rnet});
+    Expect(!hasFinding(bs, "Sample-attributed outbound network egress"),
+           "instance: a reused root PID's connection is not sample-attributed");
+    Expect(bs.verdict != Verdict::Suspicious && bs.verdict != Verdict::Malicious,
+           "instance: a reused root PID cannot produce a positive verdict");
+  }
+  // 2. The unrelated reused root PID starts its own child.
+  {
+    auto rootExit = end(100, 13, "2026-09-18T12:00:10Z");
+    auto reused = newStart(100, 999, 20);
+    auto grandchild = newStart(300, 100, 22);
+    grandchild.imagePath = "unrelated-child.exe";
+    auto grandnet = ev("network", "network.connect", 300, "203.0.113.12:443", 23);
+    const auto bs =
+        ScoreSandboxBehavior(s, {root(), rootExit, reused, grandchild, grandnet});
+    Expect(!hasFinding(bs, "Sample-attributed outbound network egress"),
+           "instance: the reused root's child is not adopted");
+  }
+  // 3. Sample child exits; an unrelated process reuses the child PID WITH an
+  // explicit new instance identity.
+  {
+    auto firstChild = newStart(200, 100, 12);
+    auto childExit = end(200, 14, "2026-09-18T12:00:12Z");
+    auto reuseChild = newStart(200, 999, 20);
+    auto cnet = ev("network", "network.connect", 200, "203.0.113.13:443", 21);
+    cnet.details["startTime"] = "2026-09-18T12:00:20Z";
+    cnet.details["bootGeneration"] = "1";
+    const auto bs = ScoreSandboxBehavior(
+        s, {root(), firstChild, childExit, reuseChild, cnet});
+    Expect(!hasFinding(bs, "Sample-attributed outbound network egress"),
+           "instance: an unrelated reuse of the child PID is not attributed");
+  }
+  // 4. A genuine child created BEFORE the parent exited but observed after it:
+  // parentage uses the captured creation time, so the child is retained.
+  {
+    auto rootExit = end(100, 13, "2026-09-18T12:00:10Z");
+    auto delayedChild = newStart(200, 100, 15);
+    delayedChild.details["startTime"] = "2026-09-18T12:00:11Z";
+    auto delayedNet = ev("network", "network.connect", 200, "203.0.113.14:443", 16);
+    delayedNet.details["startTime"] = "2026-09-18T12:00:11Z";
+    const auto bs =
+        ScoreSandboxBehavior(s, {root(), rootExit, delayedChild, delayedNet});
+    Expect(hasFinding(bs, "Sample-attributed outbound network egress"),
+           "instance: a child born before the parent's exit stays attributable");
+    Expect(bs.verdict == Verdict::Suspicious || bs.verdict == Verdict::Malicious,
+           "instance: the retained child's egress is scored");
+  }
+  // A lost stop record must not make the replacement root instance a sample.
+  {
+    auto reused = newStart(100, 999, 20);
+    auto child = newStart(300, 100, 22);
+    auto net = ev("network", "network.connect", 300, "203.0.113.90:443", 23);
+    const auto bs = ScoreSandboxBehavior(s, {root(), reused, child, net});
+    Expect(!hasFinding(bs, "Sample-attributed outbound network egress"),
+           "instance: root reuse without a stop cannot adopt unrelated children");
+  }
+  // An older unrelated lifetime must not suppress a genuine new sample child.
+  {
+    auto old = newStart(200, 999, 1);
+    auto oldEnd = end(200, 3, "2026-09-18T12:00:01Z");
+    auto child = newStart(200, 100, 12);
+    auto net = ev("network", "network.connect", 200, "203.0.113.91:443", 16);
+    const auto bs = ScoreSandboxBehavior(s, {old, oldEnd, root(), child, net});
+    Expect(hasFinding(bs, "Sample-attributed outbound network egress"),
+           "instance: old unrelated PID lifetime does not suppress a new sample child");
+  }
+  // The same numeric PID can legitimately be used by two distinct children.
+  {
+    auto child = newStart(200, 100, 12);
+    auto childEnd = end(200, 14, "2026-09-18T12:00:12Z");
+    auto nextChild = newStart(200, 100, 18);
+    auto net = ev("network", "network.connect", 200, "203.0.113.92:443", 19);
+    const auto bs = ScoreSandboxBehavior(s, {root(), child, childEnd, nextChild, net});
+    Expect(hasFinding(bs, "Sample-attributed outbound network egress"),
+           "instance: a second genuine child instance can reuse the first child PID");
+  }
+  // Genuine-positive control: a normal child that outlives its parent keeps
+  // membership, so fixing false attribution did not discard real children.
+  {
+    auto child = newStart(200, 100, 12);
+    auto rootExit = end(100, 13, "2026-09-18T12:00:10Z");
+    auto childNet = ev("network", "network.connect", 200, "203.0.113.15:443", 16);
+    const auto bs =
+        ScoreSandboxBehavior(s, {root(), child, rootExit, childNet});
+    Expect(hasFinding(bs, "Sample-attributed outbound network egress"),
+           "instance: a legitimate child that outlives its parent stays "
+           "sample-attributed");
+  }
+}
+
+// Dynamic-first policy: deep static enrichment is locked by default, unlock is
+// an explicit operator action scoped to one target, model provenance cannot
+// authorize, and a locked scan is never Clean nor a completed investigation.
+void TestStaticPolicyLock() {
+  using antimal::DeepStaticAllowed;
+  using antimal::ScanFile;
+  using antimal::ScannerOptions;
+  using antimal::StaticUnlock;
+  using antimal::Verdict;
+  const auto dir = TempRoot();
+  const auto sample = dir / "locked-sample.txt";
+  antimal::WriteTextFile(sample, "harmless inventory target");
+  const std::string target = antimal::PathToUtf8(sample);
+
+  // Startup/default lock.
+  {
+    ScannerOptions opts; // defaults
+    std::string reason;
+    Expect(!DeepStaticAllowed(opts.staticUnlock, target, &reason),
+           "policy: deep static analysis is locked by default");
+    Expect(reason.find("locked by default") != std::string::npos,
+           "policy: the default lock names its reason");
+    const auto r = ScanFile(sample, opts);
+    Expect(r.staticAnalysisState == "locked",
+           "policy: a default scan reports the locked state");
+    Expect(r.verdict == Verdict::Unknown,
+           "policy: a locked scan never fabricates a Clean verdict");
+    Expect(r.score == 0, "policy: a locked scan has no heuristic score");
+    Expect(r.ctph.empty() && r.entropy == 0.0 && r.iocs.urls.empty(),
+           "policy: locked inventory does not execute deep analyzers");
+    Expect(r.sha256 == antimal::Sha256File(sample),
+           "policy: locked inventory retains streamed file identity");
+    Expect(!r.investigationComplete,
+           "policy: a static scan never completes an investigation");
+    bool lockedNote = false;
+    for (const auto &f : r.findings) {
+      if (f.ruleId == "static.locked" &&
+          f.message.find("Not run - locked") != std::string::npos) {
+        lockedNote = true;
+      }
+    }
+    Expect(lockedNote, "policy: the locked scan records 'Not run - locked'");
+    antimal::AnalysisReport report;
+    report.runId = "locked-roundtrip";
+    report.scannerVerdict = r;
+    report.sandboxVerdict = Verdict::Unknown;
+    const auto reportPath = dir / "locked-report.json";
+    antimal::WriteReportJson(reportPath, report);
+    const auto loaded = antimal::LoadReportBestEffort(reportPath);
+    Expect(loaded.scannerVerdict.staticAnalysisState == "locked" &&
+               loaded.scannerVerdict.staticLockReason == r.staticLockReason,
+           "policy: report roundtrip preserves lock state and reason");
+    Expect(antimal::BuildHtmlReport(loaded).find("Not run - locked") != std::string::npos,
+           "policy: HTML explicitly displays locked analysis");
+    report.scannerVerdict.verdict = Verdict::Malicious;
+    report.scannerVerdict.staticAnalysisState = "unlocked";
+    Expect(antimal::BuildHtmlReport(report).find("Malicious activity detected") == std::string::npos,
+           "policy: a static finding cannot become observed dynamic activity");
+  }
+
+  // Explicit scoped operator unlock applies to its target (and members), not to
+  // unrelated targets.
+  {
+    StaticUnlock unlock;
+    unlock.unlocked = true;
+    unlock.scope = antimal::PathToUtf8(dir);
+    unlock.authorizedBy = "cli-operator";
+    unlock.mechanism = "cli:--unlock-static";
+    unlock.recordedAt = antimal::UtcNowIso8601();
+    Expect(unlock.AppliesTo(target),
+           "policy: a directory unlock covers its members");
+    Expect(!unlock.AppliesTo(antimal::PathToUtf8(dir / ".." / "outside.bin")),
+           "policy: parent traversal cannot escape an unlock scope");
+    auto incomplete = unlock;
+    incomplete.recordedAt.clear();
+    Expect(!incomplete.AppliesTo(target), "policy: authorization needs recorded provenance");
+    Expect(!unlock.AppliesTo(antimal::PathToUtf8(dir.parent_path() / "other.bin")),
+           "policy: an unlock does not leak to unrelated targets");
+    std::string reason;
+    Expect(DeepStaticAllowed(unlock, target, &reason),
+           "policy: a scoped operator unlock allows its target");
+    ScannerOptions opts;
+    opts.staticUnlock = unlock;
+    const auto r = ScanFile(sample, opts);
+    Expect(r.staticAnalysisState == "unlocked",
+           "policy: an unlocked scan reports the unlocked state");
+  }
+
+  // The model cannot authorize itself.
+  {
+    StaticUnlock unlock;
+    unlock.unlocked = true;
+    unlock.scope = target;
+    unlock.authorizedBy = "assistant";
+    unlock.mechanism = "mcp:unlock_static";
+    std::string reason;
+    Expect(!DeepStaticAllowed(unlock, target, &reason),
+           "policy: model/assistant provenance never unlocks");
+    Expect(reason.find("operator") != std::string::npos,
+           "policy: the denial explains that an operator request is required");
+    ScannerOptions opts;
+    opts.staticUnlock = unlock;
+    const auto r = ScanFile(sample, opts);
+    Expect(r.staticAnalysisState == "locked",
+           "policy: an assistant-provenance unlock leaves the scan locked");
   }
 }
 
@@ -15005,9 +15420,18 @@ void TestOrchestratorCreatesRawCowOverlay() {
 
   const auto sample = root / "benign.txt";
   antimal::WriteTextFile(sample, "benign raw overlay staging check");
+  const auto pastDisk = root / "past-run" / "disk" / "overlay.cow";
+  antimal::WriteTextFile(pastDisk, "prior investigation disk evidence");
+  const auto pastReport = root / "past-run" / "report.json";
+  antimal::WriteTextFile(pastReport, "prior report evidence");
   const auto result =
       orchestrator.PrepareAndRun(sample, 5, antimal::NetworkMode::Disabled, false);
 
+  Expect(std::filesystem::exists(pastDisk) &&
+             antimal::ReadTextFile(pastDisk) == "prior investigation disk evidence",
+         "orchestrator: a new run preserves past VM disks by default");
+  Expect(std::filesystem::exists(pastReport),
+         "orchestrator: a new run preserves past reports by default");
   Expect(result.overlayDiskPath.extension() == L".raw",
          "orchestrator raw overlay: raw extension");
   Expect(std::filesystem::exists(result.overlayDiskPath),
@@ -15668,6 +16092,104 @@ antimal::BgrxFrame MakeTestFrame(uint32_t w, uint32_t h) {
 
 } // namespace
 
+bool CreateTestDirectoryJunction(const std::filesystem::path &link,
+                                const std::filesystem::path &target) {
+  // Mount-point reparse points do not require the symlink privilege.
+  const std::wstring substitute = L"\\??\\" + target.wstring();
+  const std::wstring display = target.wstring();
+  struct MountPoint {
+    DWORD tag;
+    WORD length, reserved;
+    WORD substituteOffset, substituteLength, printOffset, printLength;
+    wchar_t paths[2048];
+  } data{};
+  if (substitute.size() + display.size() + 2 > 2048) return false;
+  data.tag = IO_REPARSE_TAG_MOUNT_POINT;
+  data.substituteLength = static_cast<WORD>(substitute.size() * sizeof(wchar_t));
+  data.printOffset = data.substituteLength + sizeof(wchar_t);
+  data.printLength = static_cast<WORD>(display.size() * sizeof(wchar_t));
+  data.length = 8 + data.printOffset + data.printLength + sizeof(wchar_t);
+  std::memcpy(data.paths, substitute.c_str(), data.substituteLength);
+  std::memcpy(reinterpret_cast<char *>(data.paths) + data.printOffset,
+              display.c_str(), data.printLength);
+  if (!CreateDirectoryW(link.c_str(), nullptr)) return false;
+  HANDLE handle = CreateFileW(link.c_str(), GENERIC_WRITE, 0, nullptr,
+      OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT,
+      nullptr);
+  DWORD returned = 0;
+  const bool ok = handle != INVALID_HANDLE_VALUE && DeviceIoControl(handle,
+      CTL_CODE(FILE_DEVICE_FILE_SYSTEM, 41, METHOD_BUFFERED, FILE_SPECIAL_ACCESS),
+      &data, 8 + data.length, nullptr, 0, &returned, nullptr);
+  if (handle != INVALID_HANDLE_VALUE) CloseHandle(handle);
+  if (!ok) RemoveDirectoryW(link.c_str());
+  return ok;
+}
+
+void TestGuestArtifactBoundaries() {
+  using namespace antimal;
+  const auto root = TempRoot();
+  const auto destination = root / "artifacts";
+  std::filesystem::create_directory(destination);
+  const auto outside = root / "canary.txt";
+  { std::ofstream f(outside); f << "synthetic-secret"; }
+  for (const auto *name : {"../canary.txt", "..", ".", "C:\\canary.txt",
+                           "\\\\host\\share", "x:stream", "NUL", "con.txt",
+                           "COM1", "LPT9.txt", "trailing.", "a/b"}) {
+    Expect(!StoreGuestArtifact(destination, name, "overwrite").written,
+           "Guest artifact: unsafe path/name is refused");
+  }
+  GuestArtifactLimits limits{5, 8, 2};
+  Expect(!StoreGuestArtifact(destination, "large.bin", "123456", limits).written,
+         "Guest artifact: per-file limit is enforced before writing");
+  const auto first = StoreGuestArtifact(destination, "same.txt", "12345", limits);
+  Expect(first.written && first.path.parent_path() == destination &&
+             first.path.filename() != "same.txt",
+         "Guest artifact: destination name is host-owned");
+  Expect(!StoreGuestArtifact(destination, "same.txt", "1234", limits).written,
+         "Guest artifact: aggregate byte limit is enforced");
+  const auto second = StoreGuestArtifact(destination, "same.txt", "123", limits);
+  Expect(second.written && second.path != first.path,
+         "Guest artifact: duplicate guest name cannot overwrite evidence");
+  Expect(!StoreGuestArtifact(destination, "empty.txt", "", limits).written,
+         "Guest artifact: count limit includes empty payloads");
+  std::ifstream f(outside);
+  std::string value; std::getline(f, value);
+  Expect(value == "synthetic-secret", "Guest artifact: outside canary is unchanged");
+  const auto linked = root / "redirected";
+  if (CreateTestDirectoryJunction(linked, destination)) {
+    Expect(!StoreGuestArtifact(linked, "escape.txt", "x").written,
+           "Guest artifact: directory reparse point is refused");
+    const auto child = destination / "nested";
+    std::filesystem::create_directory(child);
+    Expect(!StoreGuestArtifact(linked / "nested", "escape.txt", "x").written,
+           "Guest artifact: reparse ancestor is refused");
+    std::filesystem::remove(linked);
+  } else {
+    Expect(false, "Guest artifact: real junction fixture could not be created");
+  }
+}
+
+void TestOfflineHiveRequiresRecovery() {
+  const auto path = TempRoot() / "pending-hive.bin";
+  std::vector<uint8_t> hive(4096, 0);
+  std::memcpy(hive.data(), "regf", 4);
+  hive[4] = 42;
+  hive[8] = 41;
+  {
+    std::ofstream output(path, std::ios::binary);
+    output.write(reinterpret_cast<const char *>(hive.data()), hive.size());
+  }
+  const auto result = antimal::DebugDumpHiveFile(antimal::PathToUtf8(path),
+                                                "", "", true, 1);
+  Expect(result.rfind("ERR:", 0) == 0 &&
+             result.find("transaction-log recovery") != std::string::npos,
+         "Registry: dirty hive cannot silently produce a stale registry view");
+  std::ifstream input(path, std::ios::binary);
+  const std::vector<uint8_t> unchanged((std::istreambuf_iterator<char>(input)),
+                                      std::istreambuf_iterator<char>());
+  Expect(unchanged == hive, "Registry: recovery detection preserves source bytes");
+}
+
 void TestVmPointerLearnAndTrack() {
   using namespace antimal;
   constexpr int kDx = 12;
@@ -15693,8 +16215,61 @@ void TestVmPointerLearnAndTrack() {
   Expect(!miss.valid,
          "VmPointer: tracking refuses a frame without the pointer");
 
+  BgrxFrame accelerated = MakeTestFrame(320, 240);
+  DrawTestCursor(&accelerated, 110, 100);
+  const auto gain = LearnCursorByKnownShift(before, accelerated, 12, 0);
+  Expect(gain.valid && gain.actualDx == 10 && std::abs(gain.x - 110) <= 1,
+         "VmPointer: 12 input counts can move the visible pointer 10 pixels");
+
   const ShiftLearnResult zero = LearnCursorByKnownShift(before, after, 0, 0);
   Expect(!zero.valid, "VmPointer: a zero probe delta is rejected");
+}
+
+void TestVmPointerRejectsUncoveredBackground() {
+  using namespace antimal;
+  BgrxFrame before;
+  before.width = 320;
+  before.height = 240;
+  before.pixels.assign(320 * 240 * 4, 100);
+  BgrxFrame after = before;
+  DrawTestCursor(&before, 100, 100);
+  // The cursor disappeared (or its new position is outside this frame).
+  // Its uncovered uniform background is not a sprite moving by 12 pixels.
+  Expect(!LearnCursorByKnownShift(before, after, 12, 0).valid,
+         "VmPointer: uncovered wallpaper must not become the learned cursor");
+  DrawTestCursor(&after, 112, 100);
+  const auto moved = LearnCursorByKnownShift(before, after, 12, 0);
+  Expect(moved.valid && std::abs(moved.x - 112) <= 1 &&
+             std::abs(moved.y - 100) <= 1 && moved.actualDx == 12,
+         "VmPointer: real movement remains measurable on uniform wallpaper");
+}
+
+void TestVmPointerIBeam() {
+  using namespace antimal;
+  BgrxFrame before;
+  before.width = 320;
+  before.height = 240;
+  before.pixels.assign(320 * 240 * 4, 255);
+  BgrxFrame after = before;
+  auto draw = [](BgrxFrame &f, int x) {
+    for (int y = 100; y < 116; ++y) {
+      for (int c = 0; c < 5; ++c) {
+        if (c != 2 && y != 100 && y != 115) continue;
+        auto *pixel = f.At(x + c, y);
+        pixel[0] = pixel[1] = pixel[2] = 0;
+      }
+    }
+  };
+  draw(before, 100);
+  draw(after, 110);
+  const auto learned = LearnCursorByKnownShift(before, after, 12, 0);
+  Expect(learned.valid && learned.actualDx == 10,
+         "VmPointer: I-beam shape is learned on an edit control");
+  if (learned.valid) {
+    const auto hit = TrackCursor(after, learned.sprite, 110, 100, 16);
+    Expect(hit.valid && hit.x == 110 && hit.y == 100,
+           "VmPointer: I-beam tracks its outline instead of blank white space");
+  }
 }
 
 void TestVmPointerAimLoop() {
@@ -15791,221 +16366,468 @@ void TestLiveVmInputEncoding() {
   std::filesystem::remove(tmp, ec);
 }
 
+// Test selection + progress. ANTIMAL_TEST_FILTER=<substring> runs only the
+// matching test functions (targeted regression runs); every selected test
+// prints "RUN <name>" before executing so a hang is attributable to an exact
+// test. Long/opt-in work (COW benchmarks, live WHP boot tests) stays behind its
+// own environment flag and reports SKIP separately.
+std::string g_testFilter;
+size_t g_selectedTests = 0;
+#define RUN_TEST(fn)                                                       \
+  do {                                                                     \
+    if (g_testFilter.empty() ||                                             \
+        std::string(#fn).find(g_testFilter) != std::string::npos) {          \
+      ++g_selectedTests;                                                   \
+      const auto began = std::chrono::steady_clock::now();                  \
+      const int failuresBefore = g_failed;                                 \
+      std::printf("RUN %s\n", #fn);                                       \
+      fn();                                                                \
+      const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(\
+          std::chrono::steady_clock::now() - began).count();                \
+      std::printf("%s %s (%lld ms)\n",                                   \
+                  g_failed == failuresBefore ? "DONE" : "FAIL", #fn,     \
+                  static_cast<long long>(ms));                              \
+    }                                                                      \
+  } while (0)
+
+bool AllowWhpLiveTests() {
+  char flag[8]{};
+  size_t needed = 0;
+  return getenv_s(&needed, flag, sizeof(flag), "ANTIMAL_WHP_TESTS") == 0 &&
+         flag[0] == '1';
+}
+
+void TestSeededAgentAutorunScope() {
+  auto encoded = [](const std::string &text) {
+    std::vector<uint8_t> bytes;
+    for (const auto c : text) { bytes.push_back(c); bytes.push_back(0); }
+    bytes.push_back(0); bytes.push_back(0);
+    return bytes;
+  };
+  auto plain = encoded("C:\\AntiMal\\AntiMal.GuestAgent.exe --service");
+  Expect(antimal::IsSeededAgentAutorun(1, plain), "autorun: known plain fallback");
+  Expect(antimal::IsSeededAgentAutorun(1,
+             encoded("\"C:\\AntiMal\\AntiMal.GuestAgent.exe\" --service")),
+         "autorun: known quoted fallback");
+  Expect(!antimal::IsSeededAgentAutorun(1,
+             encoded("C:\\AntiMal\\AntiMal.GuestAgent.exe --service --custom")),
+         "autorun: custom startup arguments preserved");
+  Expect(!antimal::IsSeededAgentAutorun(1,
+             encoded("C:\\Elsewhere\\AntiMal.GuestAgent.exe --service")),
+         "autorun: different program path preserved");
+  Expect(!antimal::IsSeededAgentAutorun(2, plain), "autorun: other registry types preserved");
+  plain.pop_back(); plain.pop_back();
+  Expect(!antimal::IsSeededAgentAutorun(1, plain), "autorun: malformed string preserved");
+}
+
+void TestLiveFrameWaitRequiresFreshSequence() {
+  using namespace std::chrono_literals;
+  const std::wstring name = L"Local\\AntiMalFreshFrame-" +
+      antimal::Utf8ToWide(antimal::MakeRunId());
+  antimal::hv::LiveFrameShmPublisher publisher(name);
+  Expect(publisher.Valid(), "frame wait: isolated publisher created");
+  if (!publisher.Valid()) return;
+  std::vector<uint8_t> pixels(16 * 16 * 4, 0x11);
+  publisher.Publish(pixels.data(), 16, 16, 32);
+  const auto initial = antimal::ReadLiveFrame(name);
+  Expect(initial.present, "frame wait: initial frame available");
+  std::thread delayed([&] {
+    std::this_thread::sleep_for(100ms);
+    std::fill(pixels.begin(), pixels.end(), 0x44);
+    publisher.Publish(pixels.data(), 16, 16, 32);
+  });
+  const auto began = std::chrono::steady_clock::now();
+  const auto fresh = antimal::WaitForLiveFrame(initial.frameSeq, name, 1000);
+  const auto waited = std::chrono::steady_clock::now() - began;
+  delayed.join();
+  Expect(fresh.present && fresh.frameSeq != initial.frameSeq &&
+             !fresh.frame.pixels.empty() && fresh.frame.pixels[0] == 0x44,
+         "frame wait: unchanged first read does not return before delayed paint");
+  Expect(waited >= 50ms, "frame wait: actually waits for the publisher");
+  const auto current = antimal::ReadLiveFrame(name);
+  const auto timeoutBegan = std::chrono::steady_clock::now();
+  const auto stalled = antimal::WaitForLiveFrame(current.frameSeq, name, 100);
+  Expect(!stalled.present && !stalled.error.empty(),
+         "frame wait: frozen screen is not accepted as fresh input feedback");
+  Expect(std::chrono::steady_clock::now() - timeoutBegan >= 80ms,
+         "frame wait: unchanged frame respects its wait budget");
+}
+
+void TestEvidenceDimensionSeparation() {
+  using namespace antimal;
+  AnalysisReport r;
+  r.scannerVerdict.verdict = Verdict::Malicious;
+  r.scannerVerdict.score = 100;
+  r.scannerVerdict.provenanceState = "modified-after-signing";
+  Expect(BuildEvidenceDimensions(r).assessment == "Insufficient observation", "static verdict cannot crown security assessment");
+  auto process = [](unsigned pid, const char* seq, const char* parent, const char* time) {
+    EventRecord e; e.processId=pid; e.category="process"; e.action="process.etw"; e.timestampUtc=time;
+    e.details={{"provider","Microsoft-Windows-Kernel-Process"},{"eventId","1"},{"data.ProcessSequenceNumber",seq},{"data.ParentProcessSequenceNumber",parent},{"startTime",time}};
+    return e;
+  };
+  auto root=process(100,"10","1","2026-09-19T10:00:00Z");
+  auto marker=root; marker.action="process.create"; marker.details["sampleExecuted"]="true";
+  auto child=process(200,"11","10","2026-09-19T10:00:01Z");
+  auto end=child; end.details["eventId"]="2"; end.details["data.ExitTime"]="2026-09-19T10:00:02Z";
+  auto reused=process(200,"12","1","2026-09-19T10:00:03Z");
+  EventRecord read; read.processId=200; read.timestampUtc="2026-09-19T10:00:04Z"; read.category="file"; read.action="file.read-attempt";
+  r.events={root,marker,child,end,reused,read};
+  r.dynamicSummary.sampleExecuted=true; r.dynamicSummary.completed=true; r.dynamicSummary.coverageIncomplete=true;
+  const auto modified=BuildEvidenceDimensions(r);
+  Expect(modified.attribution[2].relationship=="child-process" && modified.attribution[5].relationship=="unrelated-background", "PID reuse must not inherit child attribution");
+  r.scannerVerdict.provenanceState="signature-verified"; r.scannerVerdict.verdict=Verdict::Clean; r.scannerVerdict.score=0;
+  Expect(BuildEvidenceDimensions(r).assessment==modified.assessment, "provenance cannot change behavioral assessment");
+  auto json=ToJson(r); auto html=BuildHtmlReport(r);
+  Expect(json.find("analysisDimensions")!=std::string::npos && json.find("moduleCausality")!=std::string::npos, "structured dimensions preserve attribution limits");
+  Expect(html.find("Provenance / Modification")!=std::string::npos && html.find("Security Assessment")!=std::string::npos && html.find("<h2>Coverage</h2>")!=std::string::npos, "HTML exposes separate evidence dimensions");
+  Expect(html.find("Malicious activity detected")==std::string::npos, "static metadata cannot become malicious behavior banner");
+  auto crash=root;crash.action="process.crash";crash.source="GuestAgent";
+  auto mappedRead=root;mappedRead.action="file.read-attempt";
+  mappedRead.details={{"provider","Microsoft-Windows-Kernel-File"},{"eventId","15"}};
+  r.events.push_back(crash);r.events.push_back(mappedRead);
+  const auto qualified=BuildEvidenceDimensions(r);
+  Expect(qualified.attribution[6].relationship=="unknown", "collector crash PID must not impersonate crashed process");
+  Expect(qualified.attribution[7].basis.find("path association requires corroboration")!=std::string::npos,
+      "inferred file object paths retain lifetime correlation limitation");
+  r.scannerVerdict.provenanceState="modified-after-signing";
+  r.scannerVerdict.signatureVerification="Content digest mismatch";
+  r.scannerVerdict.signatureStatusCode="0x80096010";
+  r.scannerVerdict.signatureVerificationMethod="Offline WinVerifyTrust";
+  const auto path=TempRoot()/"dimensions-roundtrip.json";
+  WriteReportJson(path,r);
+  const auto loaded=LoadReportBestEffort(path);
+  Expect(loaded.scannerVerdict.provenanceState==r.scannerVerdict.provenanceState &&
+      loaded.scannerVerdict.signatureStatusCode==r.scannerVerdict.signatureStatusCode &&
+      loaded.scannerVerdict.signatureVerification==r.scannerVerdict.signatureVerification &&
+      loaded.scannerVerdict.signatureVerificationMethod==r.scannerVerdict.signatureVerificationMethod,
+      "exact provenance verification survives saved report round trip");
+}
+
+void TestTelemetryBurstDrain() {
+  antimal::BoundedTelemetryQueue<unsigned> queue;
+  // Two consecutive full bursts reproduce the backlog problem: draining only
+  // 128 from the first burst makes most of the second burst disappear.
+  for (unsigned burst = 0; burst < 2; ++burst) {
+    for (unsigned i = 0; i < 2048; ++i)
+      Expect(queue.TryPush(burst * 2048 + i), "bounded burst accepted");
+    Expect(!queue.TryPush(99999), "overflow is rejected for explicit loss accounting");
+    auto drained = queue.Drain();
+    Expect(drained.size() == 2048, "complete bounded burst drained in one cycle");
+    for (size_t i = 0; i < drained.size(); ++i)
+      Expect(drained[i] == burst * 2048 + i, "event order and identity preserved");
+    Expect(queue.Drain().empty(), "drain does not duplicate events");
+  }
+}
+
+void TestGuestFlushFinalizationBarrier() {
+  using antimal::GuestFlushGate;
+  GuestFlushGate g;
+  g.Reply(true);
+  Expect(!g.ShouldStop(1), "flush: unsolicited reply cannot stop VM");
+  Expect(g.Request(100), "flush: initial request starts wait");
+  Expect(!g.Request(29000), "flush: repeated request cannot extend deadline");
+  Expect(!g.ShouldStop(30099), "flush: wait for acknowledgment within budget");
+  Expect(g.ShouldStop(30100) && g.GetState() == GuestFlushGate::State::TimedOut,
+         "flush: absent guest ends within 30 seconds");
+  g.Reply(true);
+  Expect(g.GetState() == GuestFlushGate::State::TimedOut,
+         "flush: late reply cannot turn timeout into success");
+  GuestFlushGate success;
+  success.Request(10); success.Reply(true);
+  Expect(success.ShouldStop(11) && success.GetState() == GuestFlushGate::State::Complete,
+         "flush: acknowledged persistence permits normal stop");
+  GuestFlushGate failure;
+  failure.Request(10); failure.Reply(false);
+  Expect(failure.ShouldStop(11) && failure.GetState() == GuestFlushGate::State::Failed,
+         "flush: failed operation stays distinguishable from success");
+  auto bytes = antimal::HostSerialChannel::EncodeText(
+      antimal::HostChannelMessage::FlushStorage, "operator-finalize");
+  antimal::HostSerialChannel decoder;
+  decoder.PushBytes(bytes.data(), bytes.size());
+  auto frame = decoder.PopFrame();
+  Expect(frame && frame->type == antimal::HostChannelMessage::FlushStorage,
+         "flush: request round trips through the actual wire codec");
+}
+
+void TestBootstrapInputStopsAfterTakeover() {
+  using namespace std::chrono_literals;
+  using antimal::hv::BootstrapInputSchedule;
+  std::vector<uint8_t> emitted;
+  auto inject = [&](const auto &keys) {
+    emitted.insert(emitted.end(), keys.begin(), keys.end());
+  };
+  BootstrapInputSchedule schedule({0x1c, 0x9c}, 30ms,
+      {{120ms, {0x1e, 0x9e}}, {180ms, {0x30, 0xb0}}});
+  schedule.Tick(29ms, false, inject);
+  Expect(emitted.empty(), "bootstrap: no early input");
+  schedule.Tick(30ms, false, inject);
+  schedule.Tick(30ms, false, inject);
+  Expect(emitted == std::vector<uint8_t>({0x1c, 0x9c}),
+         "bootstrap: initial input fires once");
+  schedule.Tick(120ms, true, inject);
+  schedule.Tick(360ms, false, inject);
+  Expect(emitted == std::vector<uint8_t>({0x1c, 0x9c}),
+         "bootstrap: takeover wins same tick and permanently cancels retries");
+  BootstrapInputSchedule launchCancelled({0x1c}, 30ms, {{60ms, {0x1e}}});
+  emitted.clear();
+  launchCancelled.Tick(0ms, true, inject);
+  launchCancelled.Tick(360ms, false, inject);
+  Expect(emitted.empty(), "bootstrap: launch cancels initial input and bursts");
+  BootstrapInputSchedule normal({}, 0ms, {{120ms, {0x1e}}, {180ms, {0x30}}});
+  normal.Tick(120ms, false, inject);
+  normal.Tick(180ms, false, inject);
+  normal.Tick(360ms, false, inject);
+  Expect(emitted == std::vector<uint8_t>({0x1e, 0x30}),
+         "bootstrap: boot retries continue once each without takeover");
+}
+
 int main() {
   try {
+    setvbuf(stdout, nullptr, _IONBF, 0);
+    if (const char *f = std::getenv("ANTIMAL_TEST_FILTER"); f != nullptr) {
+      g_testFilter = f;
+      if (!g_testFilter.empty()) {
+        std::printf("TEST FILTER: %s\n", g_testFilter.c_str());
+      }
+    }
     // Must run before anything else touches the guest clock: GuestRtcNowEpoch()
     // resolves its base epoch exactly once, so the ANTIMAL_GUEST_EPOCH override
     // only takes effect if no prior call has cached the base.
-    TestGuestClockControllable();
-    TestTpmIdentityIsScrubbed();
-    TestHashEntropyJson();
-    TestConfig();
-    TestLocalBaseVhdxInfo();
-    TestVirtualDiskDifferencingOverlay();
-    TestMemoryBlockDeviceReadWrite();
-    TestRawFileBlockDeviceReadWrite();
-    TestCowRawBlockDeviceOverlay();
-    TestCowOverlayBatchedAndBounded();
-    BenchmarkCowOverlayWritePath();
+    RUN_TEST(TestGuestClockControllable);
+    RUN_TEST(TestTpmIdentityIsScrubbed);
+    RUN_TEST(TestHashEntropyJson);
+    RUN_TEST(TestConfig);
+    RUN_TEST(TestLocalBaseVhdxInfo);
+    RUN_TEST(TestVirtualDiskDifferencingOverlay);
+    RUN_TEST(TestMemoryBlockDeviceReadWrite);
+    RUN_TEST(TestRawFileBlockDeviceReadWrite);
+    RUN_TEST(TestCowRawBlockDeviceOverlay);
+    RUN_TEST(TestCowOverlayBatchedAndBounded);
+    RUN_TEST(BenchmarkCowOverlayWritePath);
     PrintScoringFixtures();
-    BenchmarkCowStorageBaselineVsNew();
-    BenchmarkCowLargeBounded();
-    BenchmarkCowIndexColdWarm();
-    BenchmarkCowIndexContainers();
-    TestCleanupOwnershipGuard();
-    TestImmutableSampleStaging();
-    TestImmutableStagingConcurrencyAndEviction();
-    TestCowIndexSidecar();
-    TestCowIndexIdentityAndLifecycle();
-    TestLiveInputContractEndToEnd();
-    TestLiveInputLeaseAndTakeover();
-    TestSharedInputLeaseAcrossInstances();
-    TestHumanTakeoverHelper();
-    TestPositiveEvidenceSurvivesApprovalAndIncompleteness();
-    BenchmarkSampleStaging();
-    TestFrameRetentionDecision();
-    TestFrameRetentionActionCapture();
-    BenchmarkScreenshotRetention();
-    TestJobMediaBlockDevice();
-    TestHostSerialChannelFrames();
-    TestProcessTelemetryDiff();
-    TestProcessTelemetryDeepFields();
-    TestCom2UartFrames();
-    TestSerialThreInterruptIsEdgeTriggered();
-    TestSerialRxFifoResetPreservesBacklog();
-    TestPs2QueuedInput();
-    TestPs2HeadOfLineBlocking();
-    TestPs2MouseCommandSequence();
-    TestScreenStateClassifier();
-    TestLiveInputProtocol();
-    TestLiveInputEncode();
-    TestReportProcessTreeCycleGuard();
-    TestWriteTextFileAtomic();
-    TestLiveFrameShmContract();
-    TestLiveFramePublishGate();
-    TestRunDirLiveLock();
-    TestAggregateMitreAndDomains();
-    TestIocExport();
-    TestTpm2CrbDevice();
-    TestAcpiTables();
-    TestPcIoPmSleepByteWrites();
-    TestPcIoFwCfgAcpiFiles();
-    TestPcIoFwCfgE820MemoryInventory();
-    TestBochsVbeDataPortAliases();
-    TestPcIoVgaBarSizing();
-    TestPcIoIdePciResources();
-    TestPcIoAhciPciResources();
-    TestHpetMmioCounter();
-    TestIdeIdentifyDevice();
-    TestAhciIdentifyCommand();
-    TestAhciReadSectors();
-    TestAhciReadDma28HighLba();
-    TestAhciAdversarialDma();
-    TestDeviceIoFuzz();
-    TestJsonValueParser();
-    TestBridgeRouter();
-    TestBridgeFuzz();
-    TestHostChannelFuzz();
-    TestChannelTelemetryRoundTrip();
-    TestKdPipeBridgeRelay();
-    TestIdeReadWriteSectors();
-    TestIdeSecondaryNoDeviceStatus();
-    TestIdeAssertsInterrupt();
-    TestPcIoPicVectorBaseTracking();
-    TestIoApicProgramRedirection();
-    TestIdeInterruptRetriedUntilDelivered();
-    TestMmioBusRouting();
-    TestPeParser();
-    TestPeParserSelfExe();
-    TestPeParserExportsAndVersion();
-    TestPeParserSyntheticDirectories();
-    TestPeParserPe32();
-    TestParseRichHeaderSynthetic();
-    TestPeDepthFindings();
-    TestPeDepthJson();
-    TestPeDepthText();
-    TestSubprocessOutputCap();
-    TestExternalToolParsers();
-    TestSelectRunsToReclaim();
-    TestMd5AndImphash();
-    TestFuzzyHash();
-    TestFramePacingStats();
-    TestSimulatedReport();
-    TestRebuildReportFromEvents();
-    TestYaraGen();
-    TestRc4WrappedConfig();
-    TestCrashSummary();
-    TestBootDiagnostics();
-    TestBootReliability();
-    TestCommandLineClassifier();
-    TestProcessChainClassifier();
-    TestUsabilityDiagnostics();
-    TestPackerDetection();
-    TestMalformedInputRobustness();
-    TestReportHtmlStructure();
-    TestPersistenceClassifier();
-    TestNetworkClassifier();
-    TestEventTime();
-    TestDetectionSummary();
-    TestShellcodeDetector();
-    TestMitreCatalog();
-    TestReportDiff();
-    TestAuthenticodeSigner();
-    TestFileTypeId();
-    TestShellLinkParser();
-    TestScriptAnalyzer();
-    TestContainerAnalyzer();
-    TestPdfAnalyzer();
-    TestRtfAnalyzer();
-    TestIsoAnalyzer();
-    TestOneNoteAnalyzer();
-    TestCobaltStrikeConfig();
-    TestImportCapabilities();
-    TestBrowserRisk();
-    TestStringExtraction();
-    TestIocMining();
-    TestXorObfuscatedUrlMining();
-    TestMultiByteXorObfuscatedUrlMining();
-    TestBase64WrappedIocMining();
-    TestTagger();
-    TestStaticEvidencePolicy();
-    TestSubprocessEcho();
-    TestSubprocessToolMissing();
-    TestEventJournalRoundtrip();
-    TestWerReportParser();
-    TestKdSerialDebuggerPackets();
-    TestKdSerialDebuggerStatePackets();
-    TestKdSerialDebuggerCom1Integration();
-    TestReportRoundtripAndFramePaths();
-    TestPolicyProbeScriptGuards();
-    TestIntelLookupOffline();
-    TestDetonationProtocol();
-    TestNetworkTelemetry();
-    TestRegistryTelemetry();
-    TestRegistryPersistenceMitreTagging();
-    TestRegistryPersistenceLocationTable();
-    TestFileSystemTelemetry();
-    TestImageLoadTelemetry();
-    TestDroppedFileEnrichment();
-    TestBehaviorScoreVerdict();
-    TestBehaviorScoreReviewFixtures();
-    TestAssistantPolicyEnforcement();
-    TestAssistantLoopWithFakeProvider();
-    TestAssistantLifecycleAuthorization();
-    TestFinalizeRequestProtocol();
-    TestAssistantRealRunEvidence();
-    TestBehaviorScoreExcludesBootBaseline();
-    TestBehaviorScoreSubtreeCmdlineAttribution();
-    TestBehaviorScoreSubtreeNetworkAttribution();
-    TestReportSections();
-    TestPacketInspector();
-    TestE1000Device();
-    TestE1000TxMultiDescriptor();
-    TestE1000TxBoundsSafety();
-    TestE1000RxRing();
-    TestE1000RxRingReuse();
-    TestE1000StatisticsRegisters();
-    TestE1000MacIdentity();
-    TestE1000MmioBounds();
-    TestPcapWriter();
-    TestFakeInternet();
-    TestContainedNetworkPath();
-    TestNicPciConfig();
-    TestHttpUrlEncode();
-    TestFramebufferVisiblePixels();
-    TestScreenshotCaptureBestEffort();
-    TestWhpHelloPartition();
-    TestWhpMmioReadOnlyTrapsOnWrite();
-    TestWhpUnmappedMmioTrapsOnRead();
-    TestWhpSerialConsole();
-    TestWhpFirmwareMapping();
-    TestWhpOvmfBoot();
-    TestWhpOvmfBootWithIdeDisk();
-    TestOrchestratorPreflight();
-    TestOrchestratorPreflightRequiresRawBase();
-    TestExecutionPreflightFailsClosed();
-    TestWorkerIsolationPerControlFailClosed();
-    TestExecutionBlockedWhenWorkerControlFails();
-    TestBehaviorScoreCoverageGate();
-    TestSensorCoverageProducerAndFold();
-    TestBehaviorScoreCoverageRequirements();
-    TestVhdxBlockDeviceReadLocalBase();
-    TestVhdxToRawConversionSkipWhenRawExists();
-    TestHarmlessInstallerControl();
-    TestBehaviorScoreBoundaryProbeV3();
-    TestExecuteJobUnlimitedTimeoutPropagation();
-    TestWinChordReleaseEncoding();
-    TestReleaseHeldGuestInputExtendedKeys();
-    TestBehaviorScoreFollowupV3();
-    TestOrchestratorBootAttemptDoesNotExecuteSample();
-    TestOrchestratorCreatesDifferencingOverlay();
-    TestOrchestratorCreatesRawCowOverlay();
+    RUN_TEST(BenchmarkCowStorageBaselineVsNew);
+    RUN_TEST(BenchmarkCowLargeBounded);
+    RUN_TEST(BenchmarkCowIndexColdWarm);
+    RUN_TEST(BenchmarkCowIndexContainers);
+    RUN_TEST(TestCleanupOwnershipGuard);
+    RUN_TEST(TestImmutableSampleStaging);
+    RUN_TEST(TestImmutableStagingConcurrencyAndEviction);
+    RUN_TEST(TestCowIndexSidecar);
+    RUN_TEST(TestCowIndexIdentityAndLifecycle);
+    RUN_TEST(TestLiveInputContractEndToEnd);
+    RUN_TEST(TestLiveInputLeaseAndTakeover);
+    RUN_TEST(TestSharedInputLeaseAcrossInstances);
+    RUN_TEST(TestHumanTakeoverHelper);
+    RUN_TEST(TestPositiveEvidenceSurvivesApprovalAndIncompleteness);
+    RUN_TEST(BenchmarkSampleStaging);
+    RUN_TEST(TestFrameRetentionDecision);
+    RUN_TEST(TestFrameRetentionActionCapture);
+    RUN_TEST(BenchmarkScreenshotRetention);
+    RUN_TEST(TestJobMediaBlockDevice);
+    RUN_TEST(TestHostSerialChannelFrames);
+    RUN_TEST(TestProcessTelemetryDiff);
+    RUN_TEST(TestProcessTelemetryDeepFields);
+    RUN_TEST(TestCom2UartFrames);
+    RUN_TEST(TestSerialThreInterruptIsEdgeTriggered);
+    RUN_TEST(TestSerialRxFifoResetPreservesBacklog);
+    RUN_TEST(TestPs2QueuedInput);
+    RUN_TEST(TestPs2HeadOfLineBlocking);
+    RUN_TEST(TestPs2MouseCommandSequence);
+    RUN_TEST(TestScreenStateClassifier);
+    RUN_TEST(TestSeededAgentAutorunScope);
+    RUN_TEST(TestLiveFrameWaitRequiresFreshSequence);
+    RUN_TEST(TestGuestFlushFinalizationBarrier);
+    RUN_TEST(TestTelemetryBurstDrain);
+    RUN_TEST(TestEvidenceDimensionSeparation);
+    RUN_TEST(TestBootstrapInputStopsAfterTakeover);
+    RUN_TEST(TestLiveInputProtocol);
+    RUN_TEST(TestLiveInputEncode);
+    RUN_TEST(TestReportProcessTreeCycleGuard);
+    RUN_TEST(TestWriteTextFileAtomic);
+    RUN_TEST(TestLiveFrameShmContract);
+    RUN_TEST(TestLiveFramePublishGate);
+    RUN_TEST(TestRunDirLiveLock);
+    RUN_TEST(TestAggregateMitreAndDomains);
+    RUN_TEST(TestIocExport);
+    RUN_TEST(TestTpm2CrbDevice);
+    RUN_TEST(TestAcpiTables);
+    RUN_TEST(TestPcIoPmSleepByteWrites);
+    RUN_TEST(TestPcIoFwCfgAcpiFiles);
+    RUN_TEST(TestPcIoFwCfgE820MemoryInventory);
+    RUN_TEST(TestBochsVbeDataPortAliases);
+    RUN_TEST(TestPcIoVgaBarSizing);
+    RUN_TEST(TestPcIoIdePciResources);
+    RUN_TEST(TestPcIoAhciPciResources);
+    RUN_TEST(TestHpetMmioCounter);
+    RUN_TEST(TestIdeIdentifyDevice);
+    RUN_TEST(TestAhciIdentifyCommand);
+    RUN_TEST(TestAhciReadSectors);
+    RUN_TEST(TestAhciReadDma28HighLba);
+    RUN_TEST(TestAhciAdversarialDma);
+    RUN_TEST(TestDeviceIoFuzz);
+    RUN_TEST(TestJsonValueParser);
+    RUN_TEST(TestBridgeRouter);
+    RUN_TEST(TestBridgeFuzz);
+    RUN_TEST(TestHostChannelFuzz);
+    RUN_TEST(TestChannelTelemetryRoundTrip);
+    RUN_TEST(TestKdPipeBridgeRelay);
+    RUN_TEST(TestIdeReadWriteSectors);
+    RUN_TEST(TestIdeSecondaryNoDeviceStatus);
+    RUN_TEST(TestIdeAssertsInterrupt);
+    RUN_TEST(TestPcIoPicVectorBaseTracking);
+    RUN_TEST(TestIoApicProgramRedirection);
+    RUN_TEST(TestIdeInterruptRetriedUntilDelivered);
+    RUN_TEST(TestMmioBusRouting);
+    RUN_TEST(TestPeParser);
+    RUN_TEST(TestPeParserSelfExe);
+    RUN_TEST(TestPeParserExportsAndVersion);
+    RUN_TEST(TestPeParserSyntheticDirectories);
+    RUN_TEST(TestPeParserPe32);
+    RUN_TEST(TestParseRichHeaderSynthetic);
+    RUN_TEST(TestPeDepthFindings);
+    RUN_TEST(TestPeDepthJson);
+    RUN_TEST(TestPeDepthText);
+    RUN_TEST(TestSubprocessOutputCap);
+    RUN_TEST(TestExternalToolParsers);
+    RUN_TEST(TestSelectRunsToReclaim);
+    RUN_TEST(TestMd5AndImphash);
+    RUN_TEST(TestFuzzyHash);
+    RUN_TEST(TestFramePacingStats);
+    RUN_TEST(TestSimulatedReport);
+    RUN_TEST(TestRebuildReportFromEvents);
+    RUN_TEST(TestYaraGen);
+    RUN_TEST(TestRc4WrappedConfig);
+    RUN_TEST(TestCrashSummary);
+    RUN_TEST(TestBootDiagnostics);
+    RUN_TEST(TestBootReliability);
+    RUN_TEST(TestCommandLineClassifier);
+    RUN_TEST(TestProcessChainClassifier);
+    RUN_TEST(TestUsabilityDiagnostics);
+    RUN_TEST(TestPackerDetection);
+    RUN_TEST(TestMalformedInputRobustness);
+    RUN_TEST(TestReportHtmlStructure);
+    RUN_TEST(TestPersistenceClassifier);
+    RUN_TEST(TestNetworkClassifier);
+    RUN_TEST(TestEventTime);
+    RUN_TEST(TestDetectionSummary);
+    RUN_TEST(TestShellcodeDetector);
+    RUN_TEST(TestMitreCatalog);
+    RUN_TEST(TestReportDiff);
+    RUN_TEST(TestAuthenticodeSigner);
+    RUN_TEST(TestFileTypeId);
+    RUN_TEST(TestShellLinkParser);
+    RUN_TEST(TestScriptAnalyzer);
+    RUN_TEST(TestContainerAnalyzer);
+    RUN_TEST(TestPdfAnalyzer);
+    RUN_TEST(TestRtfAnalyzer);
+    RUN_TEST(TestIsoAnalyzer);
+    RUN_TEST(TestOneNoteAnalyzer);
+    RUN_TEST(TestCobaltStrikeConfig);
+    RUN_TEST(TestImportCapabilities);
+    RUN_TEST(TestBrowserRisk);
+    RUN_TEST(TestStringExtraction);
+    RUN_TEST(TestIocMining);
+    RUN_TEST(TestXorObfuscatedUrlMining);
+    RUN_TEST(TestMultiByteXorObfuscatedUrlMining);
+    RUN_TEST(TestBase64WrappedIocMining);
+    RUN_TEST(TestTagger);
+    RUN_TEST(TestStaticEvidencePolicy);
+    RUN_TEST(TestSubprocessEcho);
+    RUN_TEST(TestSubprocessToolMissing);
+    RUN_TEST(TestEventJournalRoundtrip);
+    RUN_TEST(TestWerReportParser);
+    RUN_TEST(TestKdSerialDebuggerPackets);
+    RUN_TEST(TestKdSerialDebuggerStatePackets);
+    RUN_TEST(TestKdSerialDebuggerCom1Integration);
+    RUN_TEST(TestReportRoundtripAndFramePaths);
+    RUN_TEST(TestPolicyProbeScriptGuards);
+    RUN_TEST(TestIntelLookupOffline);
+    RUN_TEST(TestDetonationProtocol);
+    RUN_TEST(TestNetworkTelemetry);
+    RUN_TEST(TestRegistryTelemetry);
+    RUN_TEST(TestRegistryPersistenceMitreTagging);
+    RUN_TEST(TestRegistryPersistenceLocationTable);
+    RUN_TEST(TestFileSystemTelemetry);
+    RUN_TEST(TestImageLoadTelemetry);
+    RUN_TEST(TestDroppedFileEnrichment);
+    RUN_TEST(TestBehaviorScoreVerdict);
+    RUN_TEST(TestBehaviorScoreReviewFixtures);
+    RUN_TEST(TestAssistantPolicyEnforcement);
+    RUN_TEST(TestAssistantLoopWithFakeProvider);
+    RUN_TEST(TestAssistantLifecycleAuthorization);
+    RUN_TEST(TestFinalizeRequestProtocol);
+    RUN_TEST(TestAssistantRealRunEvidence);
+    RUN_TEST(TestBehaviorScoreExcludesBootBaseline);
+    RUN_TEST(TestBehaviorScoreSubtreeCmdlineAttribution);
+    RUN_TEST(TestBehaviorScoreSubtreeNetworkAttribution);
+    RUN_TEST(TestReportSections);
+    RUN_TEST(TestPacketInspector);
+    RUN_TEST(TestE1000Device);
+    RUN_TEST(TestE1000TxMultiDescriptor);
+    RUN_TEST(TestE1000TxBoundsSafety);
+    RUN_TEST(TestE1000RxRing);
+    RUN_TEST(TestE1000RxRingReuse);
+    RUN_TEST(TestE1000StatisticsRegisters);
+    RUN_TEST(TestE1000MacIdentity);
+    RUN_TEST(TestE1000MmioBounds);
+    RUN_TEST(TestPcapWriter);
+    RUN_TEST(TestFakeInternet);
+    RUN_TEST(TestContainedNetworkPath);
+    RUN_TEST(TestNicPciConfig);
+    RUN_TEST(TestHttpUrlEncode);
+    RUN_TEST(TestFramebufferVisiblePixels);
+    RUN_TEST(TestScreenshotCaptureBestEffort);
+    RUN_TEST(TestWhpHelloPartition);
+    RUN_TEST(TestWhpMmioReadOnlyTrapsOnWrite);
+    RUN_TEST(TestWhpUnmappedMmioTrapsOnRead);
+    // Live WHP boot tests are long (minutes each) and are NOT part of the
+    // ordinary correctness suite: gate them behind an explicit flag and report
+    // the skip separately. The fast WHP partition/MMIO tests remain above.
+    if (AllowWhpLiveTests()) {
+      RUN_TEST(TestWhpSerialConsole);
+      RUN_TEST(TestWhpFirmwareMapping);
+      RUN_TEST(TestWhpOvmfBoot);
+      RUN_TEST(TestWhpOvmfBootWithIdeDisk);
+    } else {
+      std::printf("SKIP: live WHP boot tests (set ANTIMAL_WHP_TESTS=1)\n");
+    }
+    RUN_TEST(TestOrchestratorPreflight);
+    RUN_TEST(TestOrchestratorPreflightRequiresRawBase);
+    RUN_TEST(TestExecutionPreflightFailsClosed);
+    RUN_TEST(TestWorkerIsolationPerControlFailClosed);
+    RUN_TEST(TestExecutionBlockedWhenWorkerControlFails);
+    RUN_TEST(TestBehaviorScoreCoverageGate);
+    RUN_TEST(TestSensorCoverageProducerAndFold);
+    RUN_TEST(TestBehaviorScoreCoverageRequirements);
+    RUN_TEST(TestVhdxBlockDeviceReadLocalBase);
+    RUN_TEST(TestVhdxToRawConversionSkipWhenRawExists);
+    RUN_TEST(TestHarmlessInstallerControl);
+    RUN_TEST(TestBehaviorScoreBoundaryProbeV3);
+    RUN_TEST(TestExecuteJobUnlimitedTimeoutPropagation);
+    RUN_TEST(TestWinChordReleaseEncoding);
+    RUN_TEST(TestReleaseHeldGuestInputExtendedKeys);
+    RUN_TEST(TestBehaviorScoreFollowupV3);
+    RUN_TEST(TestProcessInstanceAttribution);
+    RUN_TEST(TestStaticPolicyLock);
+    RUN_TEST(TestOrchestratorBootAttemptDoesNotExecuteSample);
+    RUN_TEST(TestOrchestratorCreatesDifferencingOverlay);
+    RUN_TEST(TestOrchestratorCreatesRawCowOverlay);
 
-    TestVmPointerLearnAndTrack();
-    TestVmPointerAimLoop();
-    TestLiveVmInputEncoding();
+    RUN_TEST(TestGuestArtifactBoundaries);
+    RUN_TEST(TestVmDisabledNetworkPolicy);
+    RUN_TEST(TestOfflineHiveRequiresRecovery);
+    RUN_TEST(TestVmPointerLearnAndTrack);
+    RUN_TEST(TestVmPointerRejectsUncoveredBackground);
+    RUN_TEST(TestVmPointerIBeam);
+    RUN_TEST(TestVmPointerAimLoop);
+    RUN_TEST(TestLiveVmInputEncoding);
 
     CleanupTempRoots();
+    if (g_selectedTests == 0) {
+      std::cerr << "No tests matched the requested filter.\n";
+      return 2;
+    }
+    std::cout << "Selected tests: " << g_selectedTests << "\n";
     if (g_failed) {
       std::cerr << g_failed << " test(s) failed.\n";
       return 1;

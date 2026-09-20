@@ -1,6 +1,7 @@
 #include "antimal/Json.h"
 
 #include "antimal/FileUtil.h"
+#include "antimal/EvidenceDimensions.h"
 
 #include <iomanip>
 #include <set>
@@ -519,8 +520,16 @@ std::string ToJson(const ScanResult &scan) {
   obj.AddString("ctph", scan.ctph);
   obj.AddString("detectedType", scan.detectedType);
   obj.AddDouble("entropy", scan.entropy);
+  obj.AddString("staticAnalysisState", scan.staticAnalysisState);
+  obj.AddString("staticLockReason", scan.staticLockReason);
+  obj.AddBool("investigationComplete", scan.investigationComplete);
   obj.AddBool("isPe", scan.isPe);
   obj.AddBool("authenticodeSigned", scan.authenticodeSigned);
+  obj.AddString("provenanceState", scan.provenanceState);
+  obj.AddString("signatureVerification", scan.signatureVerification);
+  obj.AddString("signatureStatusCode", scan.signatureStatusCode);
+  obj.AddString("signatureVerificationMethod", scan.signatureVerificationMethod);
+  obj.AddString("staticAssessmentScope", "Supporting indicators and provenance only; not observed behavior or a final security assessment");
   obj.AddString("signerName", scan.signerName);
   obj.AddNumber("peTimestamp", scan.peTimestamp);
   obj.AddNumber("peOverlaySize", static_cast<int64_t>(scan.peOverlaySize));
@@ -629,6 +638,46 @@ std::string ToJson(const AnalysisReport &report) {
   obj.AddNumber("schemaVersion", report.schemaVersion);
   obj.AddString("runId", report.runId);
   obj.AddString("samplePath", PathToUtf8(report.samplePath));
+  {
+    const auto dimensions = BuildEvidenceDimensions(report);
+    JsonObjectBuilder model, provenance, behavior, coverage, assessment;
+    provenance.AddString("state", report.scannerVerdict.provenanceState);
+    provenance.AddString("path", PathToUtf8(report.scannerVerdict.path));
+    provenance.AddString("sha256", report.scannerVerdict.sha256);
+    provenance.AddString("signer", report.scannerVerdict.signerName);
+    provenance.AddString("verification", report.scannerVerdict.signatureVerification);
+    provenance.AddString("statusCode", report.scannerVerdict.signatureStatusCode);
+    provenance.AddString("method", report.scannerVerdict.signatureVerificationMethod);
+    provenance.AddString("scope", "Selected target only; component identity and vendor-original baseline require separate evidence");
+    model.AddRaw("provenanceModification", provenance.Finish());
+    for (const auto& [category,count] : dimensions.observedCategories) behavior.AddNumber(category, count);
+    model.AddRaw("observedBehaviorCounts", behavior.Finish());
+    std::ostringstream attribution;
+    attribution << "[";
+    for (size_t i = 0; i < dimensions.attribution.size(); ++i) {
+      if (i) attribution << ",";
+      JsonObjectBuilder row; const auto& a = dimensions.attribution[i];
+      row.AddNumber("eventIndex", i); row.AddString("relationship", a.relationship);
+      row.AddString("processSequence", a.instance); row.AddString("basis", a.basis);
+      row.AddString("moduleCausality", "not established by process ancestry");
+      attribution << row.Finish();
+    }
+    attribution << "]"; model.AddRaw("attribution", attribution.str());
+    coverage.AddString("networkMode", ToString(report.dynamicSummary.networkMode));
+    coverage.AddBool("incomplete", report.dynamicSummary.coverageIncomplete);
+    coverage.AddBool("sampleExecuted", report.dynamicSummary.sampleExecuted);
+    coverage.AddBool("finalized", report.dynamicSummary.completed);
+    coverage.AddString("sensorDetails", "dynamicSummary.sensorCoverage contains sensor health, scope, user and losses");
+    coverage.AddRaw("limitations", JsonStringArray(report.verdictLimitations));
+    coverage.AddString("workflow", "Only explicitly recorded phases are exercised; finalization is not workflow completion");
+    coverage.AddString("selectedFilePathCorrelation", "Read paths inferred from FileObject mappings lack recorded close-lifetime validation; retain as leads pending corroboration, not confirmed sensitive-file reads");
+    model.AddRaw("coverage", coverage.Finish());
+    assessment.AddString("status", dimensions.assessment); assessment.AddString("basis", dimensions.assessmentBasis);
+    assessment.AddBool("safetyCertified", false);
+    assessment.AddString("legacyFields", "scannerVerdict and sandboxVerdict retain historical heuristic classifications; neither is independent confirmation of malware");
+    model.AddRaw("securityAssessment", assessment.Finish());
+    obj.AddRaw("analysisDimensions", model.Finish());
+  }
   obj.AddRaw("scannerVerdict", ToJson(report.scannerVerdict));
   obj.AddString("sandboxVerdict", ToString(report.sandboxVerdict));
   obj.AddNumber("verdictScore", report.verdictScore);

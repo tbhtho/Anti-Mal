@@ -1,5 +1,6 @@
 #pragma once
 
+#include "antimal/StaticPolicy.h" // dynamic-first lock (default: locked)
 #include "antimal/Types.h"
 
 #include <chrono>
@@ -12,19 +13,24 @@ namespace antimal {
 // Knobs for the enrichment pipeline. Defaults give cheap-and-offline
 // behavior (strings/IOC mining + builtin tags) — every external-tool and
 // network feature is opt-in.
+
 struct ScannerOptions {
   bool mineIocs = true;
   bool runYara = true;
-  std::filesystem::path yaraRulesDir;   // empty → "rules/yara" near exe
   bool runCapa = true;
   bool runDie = true;
   bool applyTagger = true;
+  std::filesystem::path yaraRulesDir;   // empty → "rules/yara" near exe
   std::filesystem::path tagsRulesPath;  // empty → "rules/tags.json" near exe, else builtin
   bool intelLookupEnabled = false;      // master switch (network access)
   std::string virusTotalApiKey;         // empty → VT skipped
   bool malwareBazaarEnabled = true;     // free, no key
   std::filesystem::path intelCacheDir;  // empty → workspaceRoot/_intel_cache when set elsewhere
   std::chrono::milliseconds intelTimeout{15000};
+  // Deep static enrichment runs ONLY when this operator authorization covers the
+  // scanned target; the flags above are additionally required but are not
+  // sufficient on their own (see the private development documentation).
+  StaticUnlock staticUnlock;
 };
 
 double CalculateEntropy(const std::vector<uint8_t> &data);

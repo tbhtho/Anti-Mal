@@ -23,6 +23,7 @@
 #include <algorithm>
 #include <array>
 #include <cmath>
+#include <fstream>
 #include <set>
 #include <sstream>
 
@@ -578,6 +579,40 @@ ScanResult ScanFile(const std::filesystem::path &path,
   ScanResult result;
   result.path = path;
 
+  // Dynamic-first policy: deep static enrichment is locked unless an explicit,
+  // scoped, operator-authorized unlock covers this target. When locked, the
+  // heuristic enrichment pipeline does not run and no score/verdict is
+  // fabricated; basic identity/inventory below still runs.
+  std::string lockReason;
+  const bool deepStatic =
+      DeepStaticAllowed(options.staticUnlock, PathToUtf8(path), &lockReason);
+  if (!deepStatic) {
+    result.staticAnalysisState = "locked";
+    result.staticLockReason = lockReason;
+    result.verdict = Verdict::Unknown;
+    try {
+      result.sha256 = Sha256File(path);
+      // Enough header bytes to identify ISO9660 as well as ordinary magic.
+      // Never load a whole package or enter a deep parser while locked.
+      std::ifstream input(path, std::ios::binary);
+      if (!input) throw std::runtime_error("Cannot open inventory target");
+      std::vector<uint8_t> header(65536);
+      input.read(reinterpret_cast<char *>(header.data()), header.size());
+      if (input.bad()) throw std::runtime_error("Cannot read inventory header");
+      header.resize(static_cast<size_t>(input.gcount()));
+      result.detectedType = IdentifyFileType(header);
+      result.isPe = result.detectedType == "pe";
+      AddFinding(result, "static.locked",
+                 std::string("Deep static enrichment: ") +
+                     StaticAnalysisLockedLabel() + " -- " + lockReason, 0);
+    } catch (const std::exception &ex) {
+      result.verdict = Verdict::Error;
+      AddFinding(result, "scanner.error", ex.what(), 0);
+    }
+    return result;
+  }
+  const ScannerOptions &scanOptions = options;
+
   try {
     const auto data = ReadAllBytes(path);
     result.sha256 = Sha256Hex(data);
@@ -782,21 +817,34 @@ ScanResult ScanFile(const std::filesystem::path &path,
     }
 
     if (pe.isPe) {
-      result.authenticodeSigned = HasAuthenticodeSignature(path);
+      const auto signatureStatus = AuthenticodeVerificationStatus(path);
+      result.authenticodeSigned = signatureStatus == ERROR_SUCCESS;
       // Name the signer (triage depth): a Microsoft-signed binary reads very
       // differently from one signed by an unknown/throwaway publisher.
       result.signerName = AuthenticodeSignerName(path);
-      if (!result.authenticodeSigned && IsUnusualExecutionPath(path)) {
-        AddFinding(result, "signature.unsigned_unusual_path",
-                   "Unsigned PE from a user-writable or transient path", 20);
-      } else if (!result.authenticodeSigned) {
-        AddFinding(result, "signature.unsigned_pe", "Unsigned PE executable", 10);
+      std::ostringstream signatureCode;
+      signatureCode << "0x" << std::hex << signatureStatus;
+      result.signatureStatusCode = signatureCode.str();
+      result.signatureVerificationMethod = "WinVerifyTrust; cache-only URL retrieval; revocation not checked";
+      if (signatureStatus == ERROR_SUCCESS) {
+        result.provenanceState = "signature-verified";
+        result.signatureVerification = "Signature verifies; vendor-original provenance not independently established";
+      } else if (signatureStatus == static_cast<uint32_t>(TRUST_E_BAD_DIGEST)) {
+        result.provenanceState = "modified-after-signing";
+        result.signatureVerification = "Signed digest mismatch: current bytes differ from authenticated bytes; modification or corruption, intent unknown";
+      } else if (signatureStatus == static_cast<uint32_t>(TRUST_E_NOSIGNATURE) && result.signerName.empty()) {
+        result.provenanceState = "unsigned";
+        result.signatureVerification = "No applicable signature found";
+      } else {
+        result.provenanceState = result.signerName.empty() ? "unknown" : "signed-verification-failed";
+        result.signatureVerification = "Verification failed; inspect exact status and signer details";
       }
+      AddFinding(result, "provenance.signature", result.signatureVerification, 0);
 
-      // A large, near-random overlay on an UNSIGNED PE is a classic appended-
-      // payload / packed-stage tell. Signed PEs are excluded because their
-      // Authenticode certificate legitimately lives in the overlay region.
-      if (!result.authenticodeSigned && result.peOverlaySize > 4096 &&
+      // Certificate layout is separate from signature verification. Do not
+      // mistake a certificate-only overlay for an appended packed payload,
+      // including when the signed content has subsequently been modified.
+      if (!pe.overlayIsCertificateOnly && result.peOverlaySize > 4096 &&
           result.peOverlayEntropy > 7.0) {
         AddFinding(result, "pe.overlay_high_entropy",
                    "Large high-entropy overlay appended after the last section "
@@ -953,7 +1001,7 @@ ScanResult ScanFile(const std::filesystem::path &path,
     }
 
     // Enrichment pipeline (strings/IOCs, YARA, capa, DIE, intel, tagger).
-    Enrich(result, data, options);
+    Enrich(result, data, scanOptions);
 
     // Merge C2 URLs recovered from deobfuscated script layers (e.g. a decoded
     // PowerShell -EncodedCommand). Done here because Enrich() reassigns
@@ -995,6 +1043,21 @@ ScanResult ScanFile(const std::filesystem::path &path,
   } catch (const std::exception &ex) {
     result.verdict = Verdict::Error;
     AddFinding(result, "scanner.error", ex.what(), 0);
+  }
+
+  // Record the lock state on every result, and when locked replace any
+  // heuristic accumulation with an explicit "Not run - locked" state. A locked
+  // scan is never Clean and never a fabricated zero-risk result.
+  result.staticAnalysisState = deepStatic ? "unlocked" : "locked";
+  result.staticLockReason = deepStatic ? std::string() : lockReason;
+  if (!deepStatic && result.verdict != Verdict::Error) {
+    result.findings.clear();
+    result.score = 0;
+    result.verdict = Verdict::Unknown;
+    AddFinding(result, "static.locked",
+               std::string("Deep static enrichment: ") +
+                   StaticAnalysisLockedLabel() + " -- " + lockReason,
+               0);
   }
 
   return result;
@@ -1064,7 +1127,23 @@ std::string FormatScanText(const ScanResult &result) {
   if (!result.ctph.empty()) {
     out << "  ctph: " << result.ctph << "\n";
   }
-  out << "  score: " << result.score << " (" << ToString(result.verdict) << ")\n";
+  out << "  static indicator score: " << result.score << " (not a security assessment)\n";
+  if (result.staticAnalysisState == "locked") {
+    out << "  deep static analysis: " << StaticAnalysisLockedLabel() << "\n";
+    if (!result.staticLockReason.empty()) {
+      out << "    reason: " << result.staticLockReason << "\n";
+    }
+    if (!result.detectedType.empty()) {
+      out << "  type: " << result.detectedType << " (header identification)\n";
+    }
+    out << "  signature and deep metadata: not assessed\n";
+    for (const auto &finding : result.findings) {
+      if (finding.ruleId == "scanner.error") out << "  error: " << finding.message << "\n";
+    }
+    return out.str();
+  } else if (result.staticAnalysisState == "unlocked") {
+    out << "  deep static analysis: unlocked by explicit operator authorization\n";
+  }
   out << "  entropy: " << result.entropy << "\n";
   if (!result.detectedType.empty()) {
     out << "  type: " << result.detectedType << " (detected by content)\n";
@@ -1075,6 +1154,9 @@ std::string FormatScanText(const ScanResult &result) {
     out << " (signer: " << result.signerName << ")";
   }
   out << "\n";
+  out << "  Provenance / Modification: " << result.provenanceState << "\n"
+      << "  verification: " << result.signatureVerification << " [" << result.signatureStatusCode << "]\n"
+      << "  method: " << result.signatureVerificationMethod << "\n";
   for (const auto &sec : result.peSections) {
     out << "  section " << sec.name << ": entropy " << sec.entropy
         << (sec.executable ? " X" : "") << (sec.writable ? " W" : "") << "\n";
@@ -1120,7 +1202,7 @@ std::string FormatScanText(const ScanResult &result) {
         << finding.message << "\n";
   }
   if (!result.tags.empty()) {
-    out << "  tags:";
+    out << "  static capability hypotheses (not observed behaviors or confirmed malware families):";
     for (const auto &tag : result.tags) {
       out << " " << tag.tag << "(" << tag.confidence << ")";
     }

@@ -1,5 +1,14 @@
 # AntiMal
 
+> Current policy: dynamic-first analysis (private documentation). Deep static enrichment
+> is locked by default; static-only output does not complete a VM investigation.
+
+Supervised EXE and package-directory workflow:
+Dynamic investigation (private documentation). Current candidate evidence
+and remaining limits are in the 2026-09-19 checkpoint (private documentation);
+historical completion claims below do not replace those checks.
+
+
 AntiMal is a defensive malware-analysis scaffold for Windows. The long-term goal is a local, open-source interactive sandbox for safely detonating suspicious Windows binaries without relying on Windows Sandbox, VirtualBox, VMware, or commercial services.
 
 Overall progress: [██████████████████] 94%
