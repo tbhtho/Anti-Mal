@@ -1,90 +1,151 @@
-# AntiMal
+<h1 align="center">AntiMal</h1>
 
-[![CI](https://github.com/tbhtho/Anti-Mal/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/tbhtho/Anti-Mal/actions/workflows/ci.yml)
-[![License: not declared](https://img.shields.io/badge/License-not_declared-lightgrey.svg)](#license)
-![Platform](https://img.shields.io/badge/platform-Windows%20x64-blue.svg)
+<p align="center"><b>A local workbench for Windows malware analysis.</b><br>
+Observe a Windows guest, follow its behavior, and review the evidence in one place.</p>
 
-A Windows malware-analysis environment with an in-house VM, live observation, telemetry, reports, and optional static enrichment.
+<p align="center">
+  <img src="https://img.shields.io/badge/status-source_preview-orange.svg" alt="Status: source preview">
+  <img src="https://img.shields.io/badge/platform-Windows_x64-3578E5.svg" alt="Platform: Windows x64">
+  <img src="https://img.shields.io/badge/C%2B%2B-20-5965D8.svg" alt="C++20">
+  <a href="#license"><img src="https://img.shields.io/badge/license-not_declared-lightgrey.svg" alt="License: not declared"></a>
+</p>
+
+<p align="center">
+  <a href="#get-started">Get started</a> ·
+  <a href="#features">Features</a> ·
+  <a href="#current-status">Current status</a> ·
+  <a href="https://github.com/tbhtho/Anti-Mal/actions/workflows/ci.yml">Build and test workflow</a>
+</p>
+
+AntiMal combines an in-house Windows Hypervisor Platform VM, a live desktop console, process and event telemetry, and self-contained reports. It is a source preview for defensive research and local labs. **There is no packaged release.**
+
+## Inside the guest
+
+<table>
+  <tr>
+    <td width="50%"><a href="assets/screenshots/windows-guest-desktop.png"><img src="assets/screenshots/windows-guest-desktop.png" width="100%" alt="Historical Windows 11 guest desktop with Recycle Bin and Microsoft Edge shortcuts"><br></a><sub><b>Windows desktop</b> - an earlier guest boot.</sub></td>
+    <td width="50%"><a href="assets/screenshots/edge-in-guest-2026-06-17.png"><img src="assets/screenshots/edge-in-guest-2026-06-17.png" width="100%" alt="Microsoft Edge first-run welcome screen captured inside the Windows guest"><br></a><sub><b>Guest application</b> - Edge's welcome screen, June 17, 2026.</sub></td>
+  </tr>
+</table>
+
+<sub>Genuine historical guest captures, with original pixels preserved. These are not screenshots of the AntiMal console and do not establish current boot reliability, containment or release acceptance. Select an image for full size.</sub>
+
+## Features
+
+- **Interactive VM.** An in-house WHP-based Windows guest with a live framebuffer, keyboard and mouse input, a separate viewer, and command-line controls for the same session.
+- **Behavioral observation.** Process trees and command lines, file and registry activity, persistence, module loads, crashes, screenshots and network events, with attribution and coverage recorded alongside findings.
+- **Evidence and reports.** JSON and self-contained HTML reports with timelines, filmstrips, MITRE ATT&CK tags and per-signal explanations. Compare runs, recover reports from retained journals, and export indicators as STIX 2.1, MISP, CSV or YARA.
+- **Optional static enrichment.** File identity, PE inspection, scripts, documents and containers; strings, indicators and obfuscated configuration recovery; optional YARA, capa, Detect It Easy, MalwareBazaar and VirusTotal integration. Deep scanning is locked unless explicitly requested for that invocation.
+- **Network inspection.** Packet capture and DNS/TLS-SNI extraction, with an opt-in emulated fake-internet sink. Networking starts disabled; contained networking still needs live validation for the selected guest configuration.
+- **Operator tools.** A WebView2 desktop console, CLI and stdio MCP server, plus an optional policy-scoped assistant. Base-image checks, boot diagnostics, offline guest file/registry browsing and deliberate run finalization support repeatable investigations.
+
+<details>
+<summary>Static analysis capabilities</summary>
+
+Static findings describe file contents, not observed VM behavior. Locked scans collect a streaming SHA-256 and bounded header identity, then report **Not run - locked** with an Unknown assessment. `scan <path> --unlock-static` is an explicit, invocation-scoped operator choice; it is not saved to configuration, and MCP/assistant tools do not expose an unlock operation.
+
+When unlocked, the source includes:
+
+- **Hashes and triage:** MD5, SHA-1, SHA-256, imphash, CTPH fuzzy similarity and Shannon entropy; file-type identification, extension/OriginalFilename mismatch checks and rule-based tags.
+- **PE inspection:** imports and capability mapping, Authenticode status, sections and entropy, timestamps, overlays and embedded PE files, exports, VERSIONINFO, TLS callbacks, .NET/CLR, Rich headers and debug/PDB paths.
+- **Scripts:** PowerShell, JScript, VBScript, batch, HTA and WSF indicators, including encoded commands, download cradles, LOLBins, AMSI-bypass patterns, hidden execution and character-code obfuscation. One-layer PowerShell EncodedCommand decoding can recover embedded endpoints.
+- **Shortcuts:** `.lnk` command-line and target extraction, with suspicious launcher patterns.
+- **Office and archives:** OLE/VBA and auto-execution indicators, embedded exploit objects, OOXML macro detection, executable payloads, double-extension lures and password-protected ZIP entries.
+- **PDF and RTF:** JavaScript, auto-actions, launch commands, embedded files, RichMedia and PDF name decoding; RTF OLE objects, decoded embedded PE files, remote-object URLs and known Equation Editor carrier patterns.
+- **ISO/IMG and OneNote:** ISO9660 shortcut/executable delivery patterns and OneNote embedded file, PE and script payload detection.
+- **Strings and indicators:** ASCII/UTF-16 strings, URLs, IPs, domains, registry/file paths, mutex hints, base64 blobs and suspicious APIs. Configuration extraction includes single-byte and repeating-key XOR, base64-wrapped endpoints, RC4-wrapped configurations and Cobalt Strike beacon patterns.
+- **External enrichment:** optional YARA rules, capa capabilities/MITRE techniques, Detect It Easy packer/protector results, and opt-in MalwareBazaar/VirusTotal hash lookups. Missing external analyzers are skipped; their availability must be considered when reading a result.
+- **Hunting output:** recovered-configuration views, defanged indicators, generated YARA rules and report-to-report comparisons.
+
+</details>
+
+<details>
+<summary>Dynamic analysis and VM capabilities</summary>
+
+- **Process and event collection:** guest collectors stream through the COM2 host channel into `events.jsonl`. Process records include paths, command lines, integrity, user/session identity, start times and exit codes. Sensor coverage and losses limit what a run can establish.
+- **Persistence:** Run, Winlogon, Services, IFEO, AppInit, ActiveSetup, Startup and COM-hijack families, with ATT&CK annotations.
+- **Files, modules and crashes:** dropped-file hashes/type identification, module-load and injection-related indicators, and WER fault-module/exception decoding. A module load alone does not establish causality or complete injection coverage.
+- **Live interaction:** shared-memory framebuffer delivery to the WebView2 canvas, PNG fallback, keyboard/mouse input, explicit text paste and Ctrl+Alt+Del. The VM worker is separate from the UI; process separation is not a containment guarantee.
+- **Sample delivery:** framed COM2 delivery and a second read-only AHCI disk for larger packages. ISO mounting and installer selection happen inside the guest.
+- **Network capture:** an emulated Intel 82574L/e1000e device and a local fake-internet responder for DHCP, ARP, ICMP, NTP, DNS, NBNS/LLMNR, TCP and HTTP. That responder has no real network egress. Packet capture records guest traffic and sink replies; TLS SNI reveals requested hostnames without decrypting TLS. This is not general internet access or a complete HTTPS responder.
+- **VM foundation:** WHP vCPU/memory management, OVMF firmware, ACPI and interrupt/timer devices, TPM 2.0 CRB scaffolding, an in-house AHCI/SATA controller, legacy IDE support, VHDX/raw disks and copy-on-write overlays. Guest warm resets preserve the run overlay.
+- **Display and diagnostics:** VGA/VBE/GOP framebuffer capture, serial output, boot-stage and frame-pacing diagnostics, crash/module discovery, PnP/resource inspection and offline base validation.
+- **Run lifecycle:** bounded or until-stopped observation, deliberate finalization with guest-flush acknowledgment, retained overlays and journals, boot-reliability summaries and report recovery. Missing flush acknowledgment remains an artifact-durability limitation.
+- **Console and automation:** editable configuration, in-app reports, confirmation before live execution, a minidump handler, JSON command output, configurable guest clock and sandbox-identifying device-string adjustments. The optional assistant uses an allow-listed VM tool surface, not a general host shell.
+
+</details>
 
 ## Get started
 
-No packaged release is published in this repository. Source setup requires Windows x64, the Visual Studio 2022 C++ toolchain, Windows SDK **10.0.26100.0**, and MSBuild. WHP-based VM work also requires Windows Hypervisor Platform, OVMF, and a separately prepared Windows base image. The project does not provide Windows installation media.
+Build from source on **Windows x64** with the **Visual Studio 2022 C++ toolchain (v143)**, **Windows SDK 10.0.26100.0** and MSBuild available in your developer terminal:
 
 ```powershell
 msbuild AntiMal.sln /p:Configuration=Release /p:Platform=x64
 bin\x64\Release\AntiMal.HostCli.exe init
+bin\x64\Release\AntiMal.exe
 ```
 
-Static enrichment is locked by default and can only be unlocked for an explicit invocation. Dynamic conclusions require observed evidence and stated coverage; a quiet run is not a safety certificate.
+The desktop console needs the Microsoft Edge WebView2 Runtime. A VM investigation additionally needs **Windows Hypervisor Platform**, [OVMF firmware](firmware/README.md) and a separately prepared Windows base image from your own licensed media. Windows installation media and a ready-to-run guest image are not provided. VirtualBox, VMware and Windows Sandbox are not supported providers.
 
-## Features
-
-- In-house WHP-based VM with live display and input tools.
-- Process and event telemetry, screenshots, network capture, and explainable reports.
-- CLI, desktop interface, and scoped agent tooling.
-- Optional YARA, capa, Detect It Easy, and threat-intelligence enrichment.
-
+Opening the console is not a completed VM setup. Validate the base and prove containment, input, observation, finalization and clean reset with harmless fixtures before investigating untrusted files.
 
 <details>
-<summary>Full capability catalog</summary>
+<summary>Source setup, configuration and local checks</summary>
 
+Outputs are written to `bin\x64\Release\`. The solution uses C++20 and the static Visual C++ runtime. Keep the built `webui`, loader, rules and tool files beside the executables as laid out by the projects.
 
-- Win32 GUI: `AntiMal.exe`
-- CLI scanner and report tools: `AntiMal.HostCli.exe`
-- Static enrichment:
-  - multi-hash triage: **MD5 / SHA-1 / SHA-256 / imphash** + Shannon entropy
-  - **deep PE parse**: imports, Authenticode signature, section table + per-section entropy, compile timestamp, overlay + embedded-PE (dropper) detection, exports, VERSIONINFO, TLS callbacks, .NET/CLR, Rich header, debug/PDB path
-  - **magic-byte file-type identification** + masquerade detection (a PE wearing a `.pdf`/`.doc` extension; an OriginalFilename mismatch)
-  - **file-type-aware analyzers** for the non-PE delivery formats malware actually ships in:
-    - **scripts** (PowerShell / JScript / VBScript / batch / HTA / WSF): encoded commands, download cradles, LOLBin fetches, AMSI bypass, IEX/shell exec, hidden/bypass flags, char-code obfuscation - and **one-layer deobfuscation** that decodes a PowerShell `-EncodedCommand` and recovers the hidden C2
-    - **`.lnk` shortcuts** (MS-SHLLINK): recovers the embedded command line + target and flags a shortcut that silently launches a LOLBin (powershell/cmd/mshta/rundll32/…)
-    - **Office / OLE documents**: VBA-macro presence, auto-exec entry points, and embedded exploit objects (Equation Editor CVE-2017-11882 family)
-    - **archives / OOXML** (zip family): macro-doc detection (`vbaProject.bin`) plus executable payloads, double-extension lures, and password-protected entries
-    - **PDF**: `/JavaScript`, auto-actions (`/OpenAction`,`/AA`), `/Launch` external-program, `/EmbeddedFile`, and `/RichMedia` - with PDF name hex-escape de-obfuscation (`/J#61vaScript` → `/JavaScript`)
-    - **RTF**: embedded OLE objects (`\objdata`), `\objupdate` auto-run-on-open, the Equation Editor exploit carrier (CVE-2017-11882 / CVE-2018-0802), an embedded PE decoded from the `\objdata` hex, and remote-object loads (CVE-2017-0199 / OLE2Link - recovers the URL moniker)
-    - **ISO / IMG** (ISO9660): the MOTW-bypass delivery lure - flags an embedded `.lnk` + hidden executable and the small-image-with-payload shape
-    - **OneNote** (`.one`): the 2023-24 malspam carrier - flags an embedded FileDataStore attachment, an embedded PE, and embedded script payloads
-  - ASCII/UTF-16 string extraction + IOC mining for URLs, IPs, domains, registry paths, file paths, mutex hints, base64 blobs, and suspicious APIs
-  - **obfuscated-C2 recovery**: single-byte XOR, multi-byte (2–4 byte repeating-key) XOR, base64-wrapped URLs/IPs/domains, and **base64-wrapped RC4 config** (the .NET-RAT scheme - tries each embedded ASCII string as the RC4 key, keeps only decryptions that yield a valid URL → near-zero false positives) the plaintext miner can't see
-  - import-table → behavioral-capability mapping (anti-debug, keylogging, screen capture, injection, …)
-  - rule-based tracker tags
-  - optional YARA/capa/DIE wrappers
-  - optional MalwareBazaar/VirusTotal hash lookups
-- JSON and self-contained HTML report generation
-- **WebView2 live console** (`AntiMal.exe`): the Win32 app is now a thin shell hosting a hardened WebView2 UI (`webui/`, vanilla HTML/CSS/JS), 8 sections all wired to a real C++ bridge - scan, config, reports, dashboard, browser-impact, and the live VM view (**Boot VM (live)** streams frames + accepts mouse/keyboard). The **same live session is drivable by agents/scripts**: `AntiMal.McpServer.exe` (stdio MCP) and `HostCli vmstatus|vmframe|vmmouse|vmview|vminput` - see private development documentation (private documentation).
-- **Host↔guest telemetry pipeline (3b) - streams live (confirmed 2026-06-09):** in-guest collectors → COM2/AMCH channel → host live-journaling to `events.jsonl` → UI Live Process Telemetry panel (`run.watch`). A live boot streamed 122 KB of real events (process tree, registry, files). The `AntiMalGuestAgent` service is installed in the base image.
-- **Deep dynamic-analysis pipeline (2026-06-09, built + reviewed across 3 review passes; live on Detonate via per-run agent redeploy):**
-  - process telemetry with full path, command line, integrity level, user/SID, session, start time, and **exit codes** (surfaces crash codes like `0xC0000409`)
-  - **persistence** detection across 8 families (Run/Winlogon/Services/IFEO/AppInit/ActiveSetup/Startup/COM-hijack) with **MITRE ATT&CK** tags
-  - in-guest **WER crash decoder** (`ANTIMAL_PROBE_KEEP_WER=1`) - names the faulting module + exception behind a crash
-  - **dropped-file** SHA-256 + magic-byte file type; **DLL-load / injection** detection (side-loaded/hijacked DLLs from writable paths → T1574)
-  - a **scored, explainable behavioral verdict** (per-signal rationale; kills the `timeout==Malicious` FP; raises the bar for signed installers)
-  - an **analyst-grade report**: process tree + grouped Persistence / Dropped-Files / Network / Crashes / Module-Loads / MITRE sections
-  - machine-readable **IOC export** - STIX 2.1 / MISP / CSV / YARA (`AntiMal.HostCli.exe export <run> --format stix|misp|csv|yara`); `yara` emits an auto-generated hunt rule for the run's sample
-- **Live interaction (3c):** the VM framebuffer mirrors into the UI over a **zero-copy shared-memory → WebView2 `SharedBuffer` → `<canvas>`** path (live-confirmed at `LIVE · 14 FPS`; an on-screen fps readout shows live-vs-stalled). Keyboard + mouse, **host→guest clipboard paste**, **Ctrl+Alt+Del**, and paced login/text are injected via a framed `_live-input.bin` protocol; the live display no longer **freezes** on low-variance frames (`LiveFramePublishGate`). The live VM runs in a separate process from the UI (escape-isolation). *(Known input issues, all listed in private development documentation (private documentation): `vminput --mouse` truncates deltas to int8 and uses PS/2 Y-sign; `vmmouse`'s cursor learn is defeated by Windows pointer acceleration; UAC's secure desktop needs the keyboard fallback.)*
-- **Sample delivery beyond COM2:** the staged sample is exposed as a **second read-only AHCI disk** (`PaddedFileBlockDevice`, port 1) for anything >2 MB - no size cap, disk-speed transfer - and a delivered **`.iso` is mounted in-guest** (`Mount-DiskImage`) with a setup/installer auto-pick (`Set-up.exe`/`setup.exe`/…) and launched into the interactive desktop. This is what lets multi-gigabyte installers detonate at all.
-- **Contained network capture:** emulated **Intel 82574L / e1000e** (`8086:10D3`, inbox driver) behind `ANTIMAL_ENABLE_NIC`/`--nic`; guest TX routes through the in-process **`FakeInternet`** sink (DHCP/DNS/ARP/ICMP/NTP/NBNS/LLMNR/HTTP 200) and replies are injected back - **the host never opens a socket**. Both directions are written to `network.pcap`; DNS + TLS **SNI** are surfaced as `network.*` events and `report.networkDomains`.
-- **Console quality-of-life:** editable **Settings** page (writes back to `antimal.toml`), in-app **report viewer**, a **confirmation gate** before arming live detonation, a **minidump crash handler**, **GitHub Actions CI** (build + test on every push), `detonate --json` for automation, anti-evasion scrubbing of the sandbox-identifying disk/ACPI/**TPM** strings, and a controllable guest clock (no longer leaks host wall-clock).
-- In-house WHP VM that boots Windows 11 25H2 through the kernel + GUI stack + OOBE + **login to the desktop** (intermittently - see Current Status):
-  - WHP host and vCPU wrappers; guest RAM and firmware mapping
-  - source-built OVMF (release/debug, TPM2-enabled); serial debugcon capture
-  - CMOS/RTC, PIT, PIC, LAPIC timer injection, IOAPIC (with `\_PIC` ACPI routing), HPET, fw_cfg, TPM 2.0 CRB stub, ACPI table generation
-  - **from-scratch in-house AHCI/SATA controller** (PCI-native ABAR/MMIO + PCI-interrupt + command-list/FIS/PRDT DMA engine) against VHDX or raw/COW overlays - OVMF's AhciBusDxe and Windows' `storahci.sys` both drive it; a legacy PIIX4/IDE path (PIO + bus-master PRD DMA) also exists
-  - the full Windows boot chain: OVMF → bootmgfw → winload → code-integrity → ntoskrnl → Phase 0/1 → **storage mount via AHCI** → service/session init → win32k/dxgkrnl/display → OOBE → **VM warm-reset** → account creation / **login** → "Preparing Windows" → **desktop** (reached intermittently)
-  - **VM warm-reset**: guest-initiated reset (`0xCF9`/ACPI) recreates the VM (cold boot, overlay persists) so Windows' multi-phase first-boot reboots succeed
-  - **paced host→guest keyboard + mouse injection** (the OOBE script types correctly, the login password is accepted) and a framed live-input channel for real-time UI interaction
-  - QEMU/Bochs VGA BAR sizing, Bochs VBE, OVMF GOP, and real guest framebuffer capture (boot spinner, "Getting ready", and BSOD screens visible in `guest-*.png`)
-  - deep boot diagnostics from guest memory: `PsLoadedModuleList` walk, PnP devnode tree + `CM_RESOURCE_LIST`/resource-requirements parse, faulting-module identification, deep-stack + `KiBugCheckData` capture at the bugcheck
-  - PS/2 scaffolding; COM2 host-channel codec and safe GuestAgent heartbeat mode
+Review [config/antimal.toml](config/antimal.toml) for the workspace and base-disk paths. **Base Setup** provides Build Base/Import Base controls; the corresponding source scripts are [New-AntiMalVmBase.ps1](tools/New-AntiMalVmBase.ps1) and [New-AntiMalBaseVhdx.ps1](tools/New-AntiMalBaseVhdx.ps1). Provisioning can require administrator rights. Preserve existing images instead of overwriting them for convenience.
+
+Optional `yara.exe`, `capa.exe` and `diec.exe` are supplied separately. Threat-intelligence HTTP lookups are opt-in, and VirusTotal requires your own key. Keep keys and real credentials out of Git, reports and the guest. The optional assistant is disabled unless configured; its provider integration and live operation require separate validation.
+
+Local developer checks:
+
+```powershell
+bin\x64\Release\AntiMal.Tests.exe
+powershell -File tools\Smoke-AnalystWorkflow.ps1
+```
+
+The native suite and CLI smoke tests are distinct from live guest acceptance. WHP/firmware-dependent tests can skip when prerequisites or explicit opt-in are absent; a skip is not a pass. This presentation update does not claim a new application build or live VM test.
 
 </details>
 
+<details>
+<summary>Useful operator commands</summary>
+
+Run commands from `bin\x64\Release\`, or use the full executable path. These examples inspect readiness or existing evidence; they do not start a guest investigation.
+
+```powershell
+AntiMal.HostCli.exe doctor --json
+AntiMal.HostCli.exe vmstatus --json
+AntiMal.HostCli.exe report <run-id> --summary --json
+AntiMal.HostCli.exe report <run-id> --why
+AntiMal.HostCli.exe report <run-id> --html
+AntiMal.HostCli.exe export <run-id> --format stix
+AntiMal.HostCli.exe boot-report --json
+```
+
+During an explicitly authorized live run, `vmview`, `vmframe`, `vmmouse` and `vminput` operate the shared guest session. `vmfinalize <run-id> --wait` requests deliberate finalization; an emergency stop can lose evidence. `AntiMal.McpServer.exe` exposes the scoped stdio MCP tools.
+
+`fs-ls`, `fs-cat`, `fs-find` and `reg-ls` inspect retained guest storage offline. Dirty registry hives may require recovery; a main hive without its transaction-log companions is not necessarily a current registry view. `simulate` creates synthetic report fixtures, not evidence of real execution.
+
+</details>
+
+## Current status
+
+The source contains the console, analysis/reporting pipeline and in-house VM. Earlier supervised runs reached a Windows desktop and executed benign fixtures, but those observations are not a repeatable acceptance result for every base image or current build.
+
+- **Still in progress:** reliable unattended boots, sustained guest typing, pointer behavior with acceleration/UAC, operator progress visibility and performance. Historical live display measurements included 14 FPS; a sustained 25-30 FPS target has not been established.
+- **Evidence limits:** observation duration, offline networking, sensor gaps, queue/polling loss and incomplete attribution can leave an investigation inconclusive. File provenance and signature status are separate from malicious behavior.
+- **Distribution:** no packaged GitHub release or repository-wide license is declared. Source access alone does not grant redistribution rights.
+
 ## Lab boundaries
 
-For defensive research and local lab use. **Do not execute live malware on the host.** Network access defaults to disabled; the emulated fake-internet sink has no real egress. Guest execution requires all three gates: enabled configuration, per-run authorization, and guest-side arming. Keep threat-intelligence HTTP lookups opt-in, preserve base images and previous runs, and use only synthetic credentials in the isolated guest.
+**Do not execute or load untrusted files on the host.** Keep the source collection read-only, preserve base images and previous run disks, and use only synthetic credentials in the isolated guest. Do not expose host credentials, the host clipboard, writable shares or the LAN to samples.
 
-Boot reliability, input handling, operator progress, and performance remain active work. A quiet run or heuristic clean label is not a safety certificate. See current work (private documentation).
+Networking defaults to disabled. Guest execution requires all three gates: enabled configuration, per-run authorization and guest-side arming. Do not enable unrestricted public command-and-control traffic, upload samples or disable host security to make a run succeed.
+
+Static enrichment is optional supporting evidence. A failed, locked or incomplete investigation must not become Clean; a quiet run or heuristic label is **not a safety certificate**. State what was observed, which process it belongs to, how long it was observed and what the sensors could not see.
 
 ## License
 
-No repository-wide license is declared in this checkout. Do not infer redistribution permission from source access; third-party materials retain their own terms.
+No repository-wide license is declared. Do not infer redistribution permission from source access. OVMF, WebView2 and other third-party materials retain their own terms; see [THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md).
