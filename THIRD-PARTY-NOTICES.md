@@ -51,3 +51,12 @@ license texts here.
 The dynamic-analysis VM boots a **Windows** guest from an image **you supply**
 (your own licensed Windows media). AntiMal does not redistribute Windows or any
 Microsoft operating-system component.
+
+## Screenshots
+
+The historical guest captures in `assets/screenshots/` depict Microsoft Windows,
+Microsoft Edge and Adobe After Effects, alongside AntiMal's own benign test
+fixture. Third-party application interfaces, trademarks and artwork remain the
+property of their respective owners and are not covered by AntiMal's MIT license.
+The images illustrate recorded guest activity; they imply no endorsement,
+affiliation, security certification or right to redistribute those applications.

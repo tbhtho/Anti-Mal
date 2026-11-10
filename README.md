@@ -21,14 +21,29 @@ AntiMal combines an in-house Windows Hypervisor Platform VM, a live desktop cons
 
 ## Inside the guest
 
+<p align="center">
+  <a href="assets/screenshots/after-effects-synthetic-composition-2026-09.png"><img src="assets/screenshots/after-effects-synthetic-composition-2026-09.png" width="960" alt="Adobe After Effects 2020 running inside the Windows guest, with an AntiMal synthetic composition, test text and a two-layer timeline"></a><br>
+  <sub><b>Application workflow</b> - After Effects displaying a synthetic test composition inside the guest, September 2026.</sub>
+</p>
+
+<p align="center">
+  <a href="assets/screenshots/guest-input-probe-2026-09.png"><img src="assets/screenshots/guest-input-probe-2026-09.png" width="720" alt="AntiMal's benign GUI Probe inside the Windows guest, showing entered test text and matching echoed text"></a><br>
+  <sub><b>Guest interaction</b> - a benign input fixture displaying the entered test text, September 2026.</sub>
+</p>
+
+These are genuine historical guest captures, with original pixels preserved and synthetic test content. They show the applications visible in those runs, not the AntiMal host console, a security verdict or current release acceptance. Select an image for full size. Third-party interfaces and artwork remain subject to their owners' rights; see [notices](THIRD-PARTY-NOTICES.md#screenshots).
+
+<details>
+<summary>Earlier guest captures</summary>
+
 <table>
   <tr>
-    <td width="50%"><a href="assets/screenshots/windows-guest-desktop.png"><img src="assets/screenshots/windows-guest-desktop.png" width="100%" alt="Historical Windows 11 guest desktop with Recycle Bin and Microsoft Edge shortcuts"><br></a><sub><b>Windows desktop</b> - an earlier guest boot.</sub></td>
-    <td width="50%"><a href="assets/screenshots/edge-in-guest-2026-06-17.png"><img src="assets/screenshots/edge-in-guest-2026-06-17.png" width="100%" alt="Microsoft Edge first-run welcome screen captured inside the Windows guest"><br></a><sub><b>Guest application</b> - Edge's welcome screen, June 17, 2026.</sub></td>
+    <td width="50%"><a href="assets/screenshots/windows-guest-desktop.png"><img src="assets/screenshots/windows-guest-desktop.png" width="100%" alt="Historical Windows 11 guest desktop with Recycle Bin and Microsoft Edge shortcuts"></a><br><sub><b>Windows desktop</b> - an earlier guest boot.</sub></td>
+    <td width="50%"><a href="assets/screenshots/edge-in-guest-2026-06-17.png"><img src="assets/screenshots/edge-in-guest-2026-06-17.png" width="100%" alt="Microsoft Edge first-run welcome screen captured inside the Windows guest"></a><br><sub><b>Guest application</b> - Edge's welcome screen, June 17, 2026.</sub></td>
   </tr>
 </table>
 
-<sub>Genuine historical guest captures, with original pixels preserved. These are not screenshots of the AntiMal console and do not establish current boot reliability, containment or release acceptance. Select an image for full size.</sub>
+</details>
 
 ## Features
 
