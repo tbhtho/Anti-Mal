@@ -1,8 +1,11 @@
 # AntiMal Firmware Drop-in
 
 The in-house hypervisor needs a UEFI firmware blob (OVMF) to boot a Windows
-guest. The firmware is not redistributed in this repo because AntiMal is
-upstream-agnostic — drop your preferred build in here under the expected name.
+guest. This repository includes OVMF firmware images under this directory.
+See the [image inventory and provenance limits](PROVENANCE.md). The images retain
+their upstream licenses; see [license texts](licenses/) and the
+[third-party notices](../THIRD-PARTY-NOTICES.md). You can also supply a compatible
+build under the expected name.
 
 ## What to put here
 
@@ -25,7 +28,7 @@ the file here:
 1. **Tianocore upstream EDK2 source**, build yourself. Highest assurance, most
    effort. See <https://github.com/tianocore/edk2> and `OvmfPkg` build docs.
 2. **retrage's edk2-nightly** at <https://retrage.github.io/edk2-nightly/>.
-   Daily builds of upstream EDK2 with published SHA-256 hashes. BSD-2 licensed.
+   Daily builds of upstream EDK2. Preserve the licenses for the selected build.
    Look for `RELEASEX64_OVMF.fd` (release) or `DEBUGX64_OVMF.fd` (verbose
    serial output — useful while iterating Phase 3b).
 3. **Linux distribution package** (`ovmf` on Debian/Ubuntu, `edk2-ovmf` on
@@ -38,6 +41,10 @@ before any of AntiMal's protections engage; a tampered blob would have full
 control of the guest.
 
 ## Building the TPM2 firmware locally
+
+The download mode records the observed SHA-256 when `-PinHash` is omitted;
+that record alone does not authenticate the upstream download. Supply an
+independently verified `-PinHash` when fetching a prebuilt image.
 
 `tools\Build-Firmware.ps1 -FromSource` builds OVMF from Tianocore EDK2 source
 and installs `firmware\OVMF-tpm2.fd`. The default source build pins
@@ -71,9 +78,11 @@ If it proves better than the retrage blob, rerun the build with
 
 ## License attribution
 
-EDK2 / OVMF is BSD-2-Clause. If we ever ship binaries, the corresponding
-license text from <https://github.com/tianocore/edk2/blob/master/License.txt>
-must be included alongside the blob.
+EDK2 uses BSD-2-Clause-Patent, with additional licenses for some components.
+The [EDK2 license](licenses/EDK2-LICENSE.txt) and
+[OVMF license](licenses/OVMF-LICENSE.txt) are included. Preserve applicable
+component licenses and notices alongside firmware when redistributing it.
+A build's components and provenance determine which additional terms apply.
 
 ## After dropping the file
 
