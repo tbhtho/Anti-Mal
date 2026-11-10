@@ -7,7 +7,7 @@ Observe a Windows guest, follow its behavior, and review the evidence in one pla
   <img src="https://img.shields.io/badge/status-source_preview-orange.svg" alt="Status: source preview">
   <img src="https://img.shields.io/badge/platform-Windows_x64-3578E5.svg" alt="Platform: Windows x64">
   <img src="https://img.shields.io/badge/C%2B%2B-20-5965D8.svg" alt="C++20">
-  <a href="#license"><img src="https://img.shields.io/badge/license-not_declared-lightgrey.svg" alt="License: not declared"></a>
+  <a href="#license"><img src="https://img.shields.io/badge/license-MIT-green.svg" alt="License: MIT"></a>
 </p>
 
 <p align="center">
@@ -136,7 +136,7 @@ The source contains the console, analysis/reporting pipeline and in-house VM. Ea
 
 - **Still in progress:** reliable unattended boots, sustained guest typing, pointer behavior with acceleration/UAC, operator progress visibility and performance. Historical live display measurements included 14 FPS; a sustained 25-30 FPS target has not been established.
 - **Evidence limits:** observation duration, offline networking, sensor gaps, queue/polling loss and incomplete attribution can leave an investigation inconclusive. File provenance and signature status are separate from malicious behavior.
-- **Distribution:** no packaged GitHub release or repository-wide license is declared. Source access alone does not grant redistribution rights.
+- **Distribution:** no packaged GitHub release is available. Original AntiMal code is licensed under MIT; bundled third-party materials retain their own terms.
 
 ## Lab boundaries
 
@@ -148,4 +148,4 @@ Static enrichment is optional supporting evidence. A failed, locked or incomplet
 
 ## License
 
-No repository-wide license is declared. Do not infer redistribution permission from source access. OVMF, WebView2 and other third-party materials retain their own terms; see [THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md).
+Original AntiMal code is licensed under the [MIT License](LICENSE), copyright 2026 tbhtho. OVMF, WebView2 and other third-party materials retain their separate licenses; see [THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md) and the [firmware provenance inventory](firmware/PROVENANCE.md).

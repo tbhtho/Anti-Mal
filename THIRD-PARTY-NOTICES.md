@@ -1,8 +1,8 @@
 # Third-Party Notices
 
 AntiMal redistributes, or builds upon, the third-party components listed below.
-Each remains under its own license; the AntiMal license (see `LICENSE`, when
-present) does not supersede them. Included license texts and upstream notices are
+Each remains under its own license. The [MIT License](LICENSE) for original
+AntiMal code does not supersede those terms. Included license texts and upstream notices are
 linked below. See the firmware inventory for the extent of the provenance checks
 and any remaining gaps before redistributing those images.
 
