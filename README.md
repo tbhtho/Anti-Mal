@@ -22,19 +22,28 @@ AntiMal combines an in-house Windows Hypervisor Platform VM, a live desktop cons
 ## Inside the guest
 
 <p align="center">
-  <a href="assets/screenshots/after-effects-synthetic-composition-2026-09.png"><img src="assets/screenshots/after-effects-synthetic-composition-2026-09.png" width="960" alt="Adobe After Effects 2020 running inside the Windows guest, with an AntiMal synthetic composition, test text and a two-layer timeline"></a><br>
-  <sub><b>Application workflow</b> - After Effects displaying a synthetic test composition inside the guest, September 2026.</sub>
-</p>
-
-<p align="center">
-  <a href="assets/screenshots/guest-input-probe-2026-09.png"><img src="assets/screenshots/guest-input-probe-2026-09.png" width="720" alt="AntiMal's benign GUI Probe inside the Windows guest, showing entered test text and matching echoed text"></a><br>
+  <a href="assets/screenshots/guest-input-probe-2026-09.png"><img src="assets/screenshots/guest-input-probe-2026-09.png" width="960" alt="AntiMal's benign GUI Probe inside the Windows guest, showing entered test text and matching echoed text"></a><br>
   <sub><b>Guest interaction</b> - a benign input fixture displaying the entered test text, September 2026.</sub>
 </p>
 
-These are genuine historical guest captures, with original pixels preserved and synthetic test content. They show the applications visible in those runs, not the AntiMal host console, a security verdict or current release acceptance. Select an image for full size. Third-party interfaces and artwork remain subject to their owners' rights; see [notices](THIRD-PARTY-NOTICES.md#screenshots).
+This is a genuine historical guest capture with original pixels and synthetic test content. It shows the fixture visible in that run, not a security verdict or current release acceptance. Select the image for full size.
+
+## The console
+
+<p align="center">
+  <a href="assets/screenshots/antimal-console-frontend.png"><img src="assets/screenshots/antimal-console-frontend.png" width="960" alt="AntiMal console frontend showing its dashboard, navigation, empty analysis panels and status log; the log explicitly reports that the native host bridge is unavailable"></a><br>
+  <sub><b>Console layout</b> - the unchanged frontend rendered without its native host bridge, November 2026. No VM, scans or run data were loaded.</sub>
+</p>
+
+The visible bridge errors are expected in this frontend-only capture. It illustrates the interface, not a successful native-app launch or live investigation.
 
 <details>
-<summary>Earlier guest captures</summary>
+<summary>More historical guest captures</summary>
+
+<p align="center">
+  <a href="assets/screenshots/after-effects-synthetic-composition-2026-09.png"><img src="assets/screenshots/after-effects-synthetic-composition-2026-09.png" width="960" alt="Adobe After Effects 2020 running inside the Windows guest, with an AntiMal synthetic composition, test text and a two-layer timeline"></a><br>
+  <sub><b>Application workflow</b> - After Effects displaying a synthetic test composition inside the guest, September 2026.</sub>
+</p>
 
 <table>
   <tr>
@@ -42,6 +51,8 @@ These are genuine historical guest captures, with original pixels preserved and 
     <td width="50%"><a href="assets/screenshots/edge-in-guest-2026-06-17.png"><img src="assets/screenshots/edge-in-guest-2026-06-17.png" width="100%" alt="Microsoft Edge first-run welcome screen captured inside the Windows guest"></a><br><sub><b>Guest application</b> - Edge's welcome screen, June 17, 2026.</sub></td>
   </tr>
 </table>
+
+These historical images are not current acceptance evidence. Third-party interfaces and artwork remain subject to their owners' rights; see [notices](THIRD-PARTY-NOTICES.md#screenshots).
 
 </details>
 
