@@ -32,7 +32,7 @@ This is a genuine historical guest capture with original pixels and synthetic te
 
 <p align="center">
   <a href="assets/screenshots/antimal-console-frontend.png"><img src="assets/screenshots/antimal-console-frontend.png" width="960" alt="AntiMal console frontend showing its dashboard, navigation, empty analysis panels and status log; the log explicitly reports that the native host bridge is unavailable"></a><br>
-  <sub><b>Console layout</b> - the unchanged frontend rendered without its native host bridge, November 2026. No VM, scans or run data were loaded.</sub>
+  <sub><b>Console layout</b> - the current frontend rendered without its native host bridge, November 2026. No VM, scans or run data were loaded.</sub>
 </p>
 
 The visible bridge errors are expected in this frontend-only capture. It illustrates the interface, not a successful native-app launch or live investigation.

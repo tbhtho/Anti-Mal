@@ -39,8 +39,6 @@ html, body {
   border-bottom: 1px solid var(--border);
   flex: 0 0 auto;
 }
-.brand { font-weight: 600; font-size: 15px; letter-spacing: .3px; white-space: nowrap; }
-.brand .vx { color: var(--blue); }
 .topbar .spacer { flex: 1; }
 .actions { display: flex; gap: 6px; }
 .btn {
@@ -87,7 +85,6 @@ html, body {
 .badge.idle { color: var(--muted); }
 .badge.booting { color: #ffe2a8; border-color: #5b4a1f; background: #2a2414; }
 .badge.ready { color: #b7f5cd; border-color: #1f5b32; background: #14271b; }
-.dot { width: 7px; height: 7px; border-radius: 50%; background: currentColor; }
 
 /* ---------- Body: sidebar | content | log ---------- */
 .body { display: grid; grid-template-columns: 216px 1fr 336px; flex: 1; min-height: 0; }
@@ -162,9 +159,7 @@ table.grid tbody tr:hover { background: var(--panel2); }
 /* timeline */
 .timeline { list-style: none; margin: 0; padding: 0; }
 .timeline li { display: flex; align-items: center; gap: 10px; padding: 6px 0; font-size: 12.5px; }
-.timeline .mark { width: 16px; height: 16px; border-radius: 50%; border: 2px solid var(--border2); flex: 0 0 auto; }
-.timeline li.done .mark { background: var(--green); border-color: var(--green); }
-.timeline li.cur .mark { background: var(--blue); border-color: var(--blue); box-shadow: 0 0 0 3px var(--blue-dim); }
+.timeline li.done { color: var(--green); }
 .timeline li.cur { color: var(--text-strong); }
 .timeline li.todo { color: var(--muted); }
 .gate { display: flex; align-items: center; gap: 9px; padding: 6px 0; font-size: 12.5px; }

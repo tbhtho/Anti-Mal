@@ -202,7 +202,7 @@
         '<div id="vm-state"><p class="page-sub" style="margin:0">Loading…</p></div>' +
         '<p class="page-sub" style="margin:8px 0 0">“Boot VM (live)” starts a clean interactive session; “Detonate Sample (live)” runs a chosen BENIGN sample inside it and streams its process / registry / file / network behavior below.</p></div>' +
         '<div class="panel" style="flex:1;min-width:260px"><h2>Boot Timeline</h2><ul class="timeline">' +
-        steps.map(function (s) { return '<li class="' + s[1] + '"><span class="mark"></span>' + esc(s[0]) + '</li>'; }).join('') + '</ul></div></div>' +
+        steps.map(function (s) { return '<li class="' + s[1] + '">' + esc(s[0]) + '</li>'; }).join('') + '</ul></div></div>' +
         '<div class="panel"><h2>Safety Gates</h2><div id="vm-gates"><p class="page-sub" style="margin:0">Loading…</p></div></div>';
     },
     reports: function () {
@@ -216,7 +216,7 @@
       return '<h1 class="page-title">Base Setup</h1><p class="page-sub">Build or import the clean Windows base image the sandbox boots.</p>' +
         '<div class="panel"><h2>Base Image Status</h2><div id="base-status"><p class="page-sub" style="margin:0">Checking…</p></div></div>' +
         '<div class="panel"><h2>Setup Steps</h2><ul class="timeline">' +
-        steps.map(function (s, i) { return '<li class="' + (i === 0 ? 'cur' : 'todo') + '"><span class="mark"></span>' + esc((i + 1) + '. ' + s) + '</li>'; }).join('') +
+        steps.map(function (s, i) { return '<li class="' + (i === 0 ? 'cur' : 'todo') + '">' + esc((i + 1) + '. ' + s) + '</li>'; }).join('') +
         '</ul><p class="page-sub" style="margin:8px 0 0">Build or import the base image from the command line — see <span class="mono">tools\\New-AntiMalVmBase.ps1</span> (README → Base Image).</p></div>' +
         '<div class="panel"><h2>Requirements</h2>' + reqs.map(function (r) { return '<div class="gate"><span class="g">✓</span>' + esc(r) + '</div>'; }).join('') + '</div>';
     },
@@ -615,7 +615,7 @@
     else if (d.type === 'error') { assistantLine('error', d.text); }
     else if (d.type === 'start') {
       assistantLine('task', d.task || '');
-      var st = $('#assistant-status'); if (st) st.textContent = '· running';
+      var st = $('#assistant-status'); if (st) st.textContent = 'running';
     }
   }
   function onAssistantDone(d) {
@@ -642,7 +642,7 @@
         assistantLine('error', 'No API key found in the host environment (ANTIMAL_ASSISTANT_API_KEY or OPENAI_API_KEY).');
         return;
       }
-      if (st) st.textContent = '· starting';
+      if (st) st.textContent = 'starting';
       send('assistant.ask', { task: task, max_actions: 40 }).then(function (rr) {
         var ok = rr && rr.ok && rr.result && rr.result.started;
         if (!ok) {
@@ -664,9 +664,9 @@
     if (!d) return;
     var s = String(d.state || '');
     var ts = $('#vm-telemetry-status');
-    if (s === 'watching') { appendLog('SAFE', 'Live telemetry: watching journal for events…'); if (ts) ts.textContent = '· watching'; }
-    else if (s === 'done') { appendLog('INFO', 'Live telemetry ended (' + (d.streamed | 0) + ' events streamed).'); if (ts) ts.textContent = '· ended (' + (d.streamed | 0) + ' events)'; }
-    else if (s === 'no-run') { appendLog('WARN', 'Live telemetry: no run available to watch.'); if (ts) ts.textContent = '· no run'; }
+    if (s === 'watching') { appendLog('SAFE', 'Live telemetry: watching journal for events…'); if (ts) ts.textContent = 'watching'; }
+    else if (s === 'done') { appendLog('INFO', 'Live telemetry ended (' + (d.streamed | 0) + ' events streamed).'); if (ts) ts.textContent = 'ended (' + (d.streamed | 0) + ' events)'; }
+    else if (s === 'no-run') { appendLog('WARN', 'Live telemetry: no run available to watch.'); if (ts) ts.textContent = 'no run'; }
   }
   function loadDashboard() {
     renderDashResults();
@@ -790,13 +790,13 @@
     function badge(sel, cls, text) {
       var el = $(sel); if (!el) return;
       el.className = 'badge ' + cls;
-      el.innerHTML = '<span class="dot"></span>' + esc(text);
+      el.textContent = text;
     }
     var live = $('#vm-live-status'), lt = '';
-    if (state === 'booting') { badge('#vm-badge', 'booting', 'VM Booting'); badge('#mode-badge', 'idle', 'Sandbox Ready'); lt = '· ' + (detail || 'booting…'); }
-    else if (state === 'running') { badge('#vm-badge', 'ready', 'VM Running'); badge('#mode-badge', 'idle', 'Sandbox Ready'); lt = detail ? '· ' + detail : ''; }
-    else if (state === 'detonating') { badge('#vm-badge', 'ready', 'VM Running'); badge('#mode-badge', 'blocked', 'Detonating'); lt = '· ' + (detail || 'detonating'); }
-    else if (state === 'stopped') { badge('#vm-badge', 'idle', 'VM Idle'); badge('#mode-badge', 'idle', 'Sandbox Ready'); lt = '· stopped'; }
+    if (state === 'booting') { badge('#vm-badge', 'booting', 'VM Booting'); badge('#mode-badge', 'idle', 'Sandbox Ready'); lt = detail || 'booting…'; }
+    else if (state === 'running') { badge('#vm-badge', 'ready', 'VM Running'); badge('#mode-badge', 'idle', 'Sandbox Ready'); lt = detail || ''; }
+    else if (state === 'detonating') { badge('#vm-badge', 'ready', 'VM Running'); badge('#mode-badge', 'blocked', 'Detonating'); lt = detail || 'detonating'; }
+    else if (state === 'stopped') { badge('#vm-badge', 'idle', 'VM Idle'); badge('#mode-badge', 'idle', 'Sandbox Ready'); lt = 'stopped'; }
     else { badge('#vm-badge', 'idle', 'VM Idle'); badge('#mode-badge', 'idle', 'Sandbox Ready'); lt = ''; }
     if (live) live.textContent = lt;
   }
@@ -879,10 +879,10 @@
     liveFps = liveFrameCount; liveFrameCount = 0;
     var up = liveStartMs ? ' · up ' + fmtUptime(Date.now() - liveStartMs) : '';
     if (liveFps > 0) {
-      el.textContent = '● ' + liveFps + ' fps' + up;
+      el.textContent = liveFps + ' fps' + up;
       el.style.color = '#7ee2a8';
     } else {
-      el.textContent = '○ stalled · 0 fps' + up;
+      el.textContent = 'stalled · 0 fps' + up;
       el.style.color = '#d9a441';
     }
   }
@@ -902,7 +902,7 @@
         if (res.live === false) {
           stopLivePoll(); liveWatchRun = null; liveSession = null;
           setVmState('idle');
-          var ts0 = $('#vm-telemetry-status'); if (ts0) ts0.textContent = '· ended';
+          var ts0 = $('#vm-telemetry-status'); if (ts0) ts0.textContent = 'ended';
           appendLog('INFO', 'Live VM ended.');
           return;
         }
@@ -912,7 +912,7 @@
         if (run && run !== liveWatchRun) {
           liveWatchRun = run;
           appendLog('INFO', 'Live telemetry tail starting for ' + run + '…');
-          var ts = $('#vm-telemetry-status'); if (ts) ts.textContent = '· tailing ' + run;
+          var ts = $('#vm-telemetry-status'); if (ts) ts.textContent = 'tailing ' + run;
           send('run.watch', { runDir: run, live: true });
         }
         // Pixels come from the shared-buffer <canvas> when active; only fall back
@@ -956,7 +956,7 @@
       appendLog('WARN', 'Live VM stopped.');
       var box = $('#live-frame'); if (box) box.textContent = 'Stopped.';
       setVmState('stopped');
-      var ts = $('#vm-telemetry-status'); if (ts) ts.textContent = '· stopped';
+      var ts = $('#vm-telemetry-status'); if (ts) ts.textContent = 'stopped';
     };
     var fsb = $('#vm-fs-btn');
     if (fsb) fsb.onclick = toggleFullscreen;
